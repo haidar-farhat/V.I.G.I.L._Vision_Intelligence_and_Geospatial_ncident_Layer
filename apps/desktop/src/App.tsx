@@ -1,6 +1,7 @@
 import { useMemo, useState } from 'react';
 import { SiteMap } from './components/SiteMap.tsx';
 import { IncidentAnalysis } from './components/IncidentAnalysis.tsx';
+import { MapEditor } from './components/MapEditor.tsx';
 import type { Snapshot, SnapshotIncident } from './data/types.ts';
 import rawSnapshot from './data/snapshot.json';
 import './styles/app.css';
@@ -89,7 +90,9 @@ export const App = (): JSX.Element => {
         </div>
       </header>
 
-      {section === 'COMMAND' ? (
+      {section === 'MAP' ? (
+        <MapEditor snapshot={snapshot} />
+      ) : section === 'COMMAND' ? (
         <main className="command">
           {/* ---------------------------------------------------- cameras */}
           <section className="panel">
