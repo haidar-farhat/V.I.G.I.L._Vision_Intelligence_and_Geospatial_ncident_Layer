@@ -25,10 +25,14 @@
     "simulator": "node scripts/dev.mjs simulator",
     "demo": "node scripts/dev.mjs demo",
     "slice": "node scripts/dev.mjs slice",
-    "db": "node scripts/dev.mjs db"
+    "db": "node scripts/dev.mjs db",
+    "snapshot": "node scripts/snapshot.mjs"
   },
   "devDependencies": {
     "@types/node": "^24.13.3",
     "typescript": "^5.9.3"
+  },
+  "allowScripts": {
+    "esbuild@0.21.5": true
   }
 }

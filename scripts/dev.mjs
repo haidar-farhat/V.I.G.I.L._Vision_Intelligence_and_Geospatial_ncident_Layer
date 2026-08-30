@@ -57,6 +57,7 @@ Sentinel Vision - development commands
   slice         run the end-to-end vertical slice and print the incident it produces
   demo          seed and launch the scripted demonstration scenario
   db <cmd>      migrate | rollback | status
+  snapshot      regenerate the demo data the desktop UI renders
 
 Every command works with the network cable unplugged.
 `;
@@ -106,6 +107,10 @@ const commands = {
 
   async db() {
     return node(['packages/database/src/cli.ts', ...process.argv.slice(3)]);
+  },
+
+  async snapshot() {
+    return node(['scripts/snapshot.mjs']);
   },
 };
 
