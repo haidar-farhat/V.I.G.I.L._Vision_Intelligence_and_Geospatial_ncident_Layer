@@ -6,3 +6,8 @@
  */
 
 export * from './pipeline.ts';
+export * from './ingest/queue.ts';
+export * from './ingest/backoff.ts';
+export * from './rtsp/sdp.ts';
+export * from './rtsp/auth.ts';
+export * from './rtsp/client.ts';

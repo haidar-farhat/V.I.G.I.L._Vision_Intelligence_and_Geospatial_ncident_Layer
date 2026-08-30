@@ -18,5 +18,8 @@
     "@sentinel/protocol": "*",
     "@sentinel/event-engine": "*",
     "@sentinel/security": "*"
+  },
+  "devDependencies": {
+    "@sentinel/test-utils": "*"
   }
 }
