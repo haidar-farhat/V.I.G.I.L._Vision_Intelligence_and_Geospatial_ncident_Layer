@@ -25,6 +25,11 @@ export type MockOnvifBehaviour = {
   readonly credentialsInStreamUri?: boolean;
   /** Report a stream host the client cannot reach, as a NATed camera does. */
   readonly wrongStreamHost?: string;
+  /**
+   * Port to advertise in the stream URI. Set this to a mock RTSP server's port to
+   * exercise the full ONVIF-then-RTSP onboarding chain end to end.
+   */
+  readonly rtspPort?: number;
   /** Namespace prefix for response elements. Vendors vary wildly. */
   readonly prefix?: string;
   /** Answer with a SOAP fault carrying this text. */
@@ -189,12 +194,13 @@ export const startMockOnvifDevice = async (
         const host = behaviour.wrongStreamHost ?? '127.0.0.1';
         const userinfo = behaviour.credentialsInStreamUri === true ? `${username}:${password}@` : '';
         const path = token === 'SubProfile' ? '/Streaming/Channels/102' : '/Streaming/Channels/101';
+        const streamPort = behaviour.rtspPort ?? 554;
 
         reply(
           200,
           envelope(
             '<trt:GetStreamUriResponse xmlns:trt="http://www.onvif.org/ver10/media/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema">' +
-              `<trt:MediaUri><tt:Uri>rtsp://${userinfo}${host}:554${path}</tt:Uri>` +
+              `<trt:MediaUri><tt:Uri>rtsp://${userinfo}${host}:${streamPort}${path}</tt:Uri>` +
               '<tt:InvalidAfterConnect>false</tt:InvalidAfterConnect>' +
               '<tt:Timeout>PT60S</tt:Timeout></trt:MediaUri>' +
               '</trt:GetStreamUriResponse>',

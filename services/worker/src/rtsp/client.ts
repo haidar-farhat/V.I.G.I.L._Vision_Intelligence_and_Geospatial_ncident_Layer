@@ -12,7 +12,7 @@ import {
   parseAuthChallenges,
 } from './auth.ts';
 import type { SdpSession } from './sdp.ts';
-import { parseSdp, resolveControlUrl, selectVideoTrack } from './sdp.ts';
+import { hasVideoTrack, parseSdp, resolveControlUrl, selectVideoTrack } from './sdp.ts';
 
 /**
  * RTSP 1.0 (RFC 2326) control client.
@@ -553,13 +553,26 @@ export class RtspClient {
 
     const track = selectVideoTrack(sdp);
     if (track === null) {
-      throw new RtspError(
-        `The camera at ${this.#url} offers no video track this system can decode. ` +
-          `It described: ${sdp.media.map((m) => `${m.kind}/${m.encoding ?? 'unknown'}`).join(', ') || 'nothing'}.`,
-        'RTSP_NO_VIDEO_TRACK',
-        null,
-        false,
-      );
+      // Two different problems needing two different fixes: a camera streaming
+      // only audio needs a profile enabling, whereas one streaming VP9 needs its
+      // codec changing. Collapsing them into one error sends an integrator to
+      // the wrong screen.
+      const described =
+        sdp.media.map((m) => `${m.kind}/${m.encoding ?? 'unknown'}`).join(', ') || 'nothing';
+
+      throw hasVideoTrack(sdp)
+        ? new RtspError(
+            `The camera at ${this.#url} streams video this system cannot decode. It described: ${described}.`,
+            'RTSP_UNSUPPORTED_CODEC',
+            null,
+            false,
+          )
+        : new RtspError(
+            `The camera at ${this.#url} offers no video track at all. It described: ${described}.`,
+            'RTSP_NO_VIDEO_TRACK',
+            null,
+            false,
+          );
     }
 
     const base = resolveControlUrl(this.#url, sdp.control);

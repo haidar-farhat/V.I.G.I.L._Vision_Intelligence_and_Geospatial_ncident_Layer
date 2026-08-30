@@ -240,6 +240,27 @@ export const parseSdp = (raw: string): SdpSession => {
 };
 
 /**
+ * Codecs the decode pipeline handles.
+ *
+ * The single source of truth. An earlier version had this list in two places -
+ * here and in the connection test - and they disagreed, which meant a camera
+ * could be rejected by one layer for a reason the other layer would not report.
+ * Two lists that both claim to describe "what we support" is a defect waiting for
+ * a site visit.
+ */
+export const DECODABLE_CODECS: readonly string[] = Object.freeze([
+  'H264',
+  'H265',
+  'HEVC',
+  'JPEG',
+  'MP4V-ES',
+]);
+
+/** Whether the description contains any video media at all, decodable or not. */
+export const hasVideoTrack = (session: SdpSession): boolean =>
+  session.media.some((m) => m.kind === 'video');
+
+/**
  * The video track this pipeline can actually use.
  *
  * Returns null when the description contains no usable video, which is a real
@@ -249,7 +270,7 @@ export const parseSdp = (raw: string): SdpSession => {
  */
 export const selectVideoTrack = (
   session: SdpSession,
-  supported: readonly string[] = ['H264', 'H265', 'HEVC', 'JPEG', 'MP4V-ES'],
+  supported: readonly string[] = DECODABLE_CODECS,
 ): SdpMedia | null => {
   const video = session.media.filter((m) => m.kind === 'video');
   if (video.length === 0) return null;
