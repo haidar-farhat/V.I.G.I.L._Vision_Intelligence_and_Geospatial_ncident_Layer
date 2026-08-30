@@ -1,5 +1,5 @@
 import type { AiIncidentReport, GroundedStatement, ModelId, UtcMillis } from '@sentinel/shared-types';
-import { asId } from '@sentinel/shared-types';
+import { asId, compareSeverity } from '@sentinel/shared-types';
 import type { AnalystEngine, EvidenceBundle } from './analyst.ts';
 import { INSUFFICIENT_EVIDENCE, insufficientEvidenceReport } from './analyst.ts';
 
@@ -147,9 +147,10 @@ export const createDeterministicAnalyst = (
       `${plural(events.length, 'event was', 'events were')} recorded across ` +
       `${plural(cameras.length, 'camera', 'cameras')} over ${durationSeconds} seconds, ` +
       `beginning at ${clock(first.occurredAt)} UTC. ` +
-      `The highest severity recorded was ${
-        events.reduce((worst, e) => (e.severity === 'CRITICAL' ? e.severity : worst), first.severity)
-      }.`;
+      `The highest severity recorded was ${events.reduce(
+        (worst, e) => (compareSeverity(e.severity, worst) > 0 ? e.severity : worst),
+        first.severity,
+      )}.`;
 
     return {
       incidentId: bundle.incidentId,

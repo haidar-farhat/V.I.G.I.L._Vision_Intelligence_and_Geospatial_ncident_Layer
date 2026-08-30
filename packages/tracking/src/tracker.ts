@@ -35,6 +35,12 @@ import { bearingDegrees, haversineDistance, projectDetection } from '@sentinel/g
 export type TrackerOptions = {
   /** Minimum IoU for a detection to be considered the same object. */
   readonly iouThreshold?: number;
+  /**
+   * Fallback gate for small, fast-moving boxes, as a multiple of object size.
+   * A detection whose centre lands within this radius of the predicted position
+   * associates even when the boxes do not overlap.
+   */
+  readonly gateFactor?: number;
   /** How long a track coasts without detections before it is closed. */
   readonly maxGapMillis?: number;
   /** Consecutive detections required before a track is reported at all. */
@@ -52,6 +58,7 @@ export type TrackerOptions = {
 
 const DEFAULTS = {
   iouThreshold: 0.2,
+  gateFactor: 2.5,
   maxGapMillis: 2000,
   minHitsToConfirm: 2,
   maxTrajectoryPoints: 120,
@@ -118,6 +125,7 @@ export class Tracker {
     this.#pose = options.pose ?? null;
     this.#options = {
       iouThreshold: options.iouThreshold ?? DEFAULTS.iouThreshold,
+      gateFactor: options.gateFactor ?? DEFAULTS.gateFactor,
       maxGapMillis: options.maxGapMillis ?? DEFAULTS.maxGapMillis,
       minHitsToConfirm: options.minHitsToConfirm ?? DEFAULTS.minHitsToConfirm,
       maxTrajectoryPoints: options.maxTrajectoryPoints ?? DEFAULTS.maxTrajectoryPoints,
@@ -151,10 +159,44 @@ export class Tracker {
   }
 
   /**
+   * How well a detection matches a predicted track box, or null if it cannot.
+   *
+   * Two tiers, because IoU alone is not enough. A person 25 m from a wide-angle
+   * camera occupies a box under two percent of the frame width, and at walking
+   * pace crosses half a box width between inference frames. Consecutive
+   * detections of the same person then overlap by barely a third, and detector
+   * jitter regularly pushes that under any sane IoU threshold - so a pure-IoU
+   * tracker shatters one person into a dozen tracks, which destroys both dwell
+   * timing and cross-camera correlation.
+   *
+   * So: a real overlap always wins (scored above 1), and when overlap fails, a
+   * detection whose centre lands within a size-scaled gate of the *predicted*
+   * position is still accepted, ranked by proximity (scored below 1). The gate
+   * scales with object size, so it stays tight for large nearby objects and
+   * generous only where the geometry demands it.
+   */
+  #associationScore(predicted: BoundingBox, detected: BoundingBox): number | null {
+    const overlap = iou(predicted, detected);
+    if (overlap >= this.#options.iouThreshold) return 1 + overlap;
+
+    const gate =
+      this.#options.gateFactor *
+      Math.max(predicted.w, predicted.h, detected.w, detected.h);
+    if (gate <= 0) return null;
+
+    const a = boxCenter(predicted);
+    const b = boxCenter(detected);
+    const separation = Math.hypot(b.x - a.x, b.y - a.y);
+    if (separation > gate) return null;
+
+    return 1 - separation / gate;
+  }
+
+  /**
    * Feed one frame's detections.
    *
    * Detections must belong to this tracker's camera and carry the frame time.
-   * Association is greedy by descending IoU, which for the handful of objects a
+   * Association is greedy by descending score, which for the handful of objects a
    * single camera sees at once is both optimal in practice and stable - the same
    * input always yields the same assignment, with no dependence on iteration
    * order.
@@ -178,10 +220,8 @@ export class Tracker {
         // never silently absorb a "vehicle" detection.
         if (detection.objectClass !== state.objectClass) continue;
 
-        const score = iou(box, detection.box);
-        if (score >= this.#options.iouThreshold) {
-          candidates.push({ trackId, index: i, score });
-        }
+        const score = this.#associationScore(box, detection.box);
+        if (score !== null) candidates.push({ trackId, index: i, score });
       }
     }
 

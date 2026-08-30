@@ -1,5 +1,6 @@
 import type {
   EventType,
+  TrackId,
   RiskAssessment,
   RiskContribution,
   SecurityEvent,
@@ -75,6 +76,12 @@ export type RiskContext = {
     readonly points: number;
   }[];
   readonly assessedAt: UtcMillis;
+  /**
+   * Maps a track id onto the object it belongs to, so a single person followed
+   * across three cameras counts once. Without it, group-size scoring inflates
+   * with camera coverage rather than with the number of people.
+   */
+  readonly objectGroupOf?: (trackId: TrackId) => string;
 };
 
 /**
@@ -181,12 +188,12 @@ export const assessRisk = (
   }
 
   // --- group size ------------------------------------------------------------
-  const tracks = new Set(events.flatMap((e) => e.trackIds));
-  if (tracks.size > 1) {
+  const objects = distinctObjects(events, context.objectGroupOf);
+  if (objects > 1) {
     contributions.push({
       code: RiskFactor.GroupSize,
-      detail: `${tracks.size} distinct objects involved`,
-      points: Math.min(15, (tracks.size - 1) * 5),
+      detail: `${objects} distinct objects involved`,
+      points: Math.min(15, (objects - 1) * 5),
     });
   }
 
@@ -232,6 +239,25 @@ export const assessRisk = (
     contributions,
     assessedAt: context.assessedAt,
   };
+};
+
+/**
+ * How many distinct objects a set of events involves.
+ *
+ * Falls back to counting track segments when no association mapping is supplied,
+ * which is correct for single-camera situations and the safest default.
+ */
+export const distinctObjects = (
+  events: readonly SecurityEvent[],
+  objectGroupOf?: (trackId: TrackId) => string,
+): number => {
+  const groups = new Set<string>();
+  for (const event of events) {
+    for (const trackId of event.trackIds) {
+      groups.add(objectGroupOf === undefined ? String(trackId) : objectGroupOf(trackId));
+    }
+  }
+  return groups.size;
 };
 
 /**

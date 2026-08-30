@@ -14,7 +14,7 @@ import type {
 } from '@sentinel/shared-types';
 import { asId } from '@sentinel/shared-types';
 import type { RiskContext } from './risk.ts';
-import { assessRisk } from './risk.ts';
+import { assessRisk, distinctObjects } from './risk.ts';
 
 /**
  * Event correlation.
@@ -91,10 +91,48 @@ export const CorrelationReason = {
 } as const;
 export type CorrelationReason = (typeof CorrelationReason)[keyof typeof CorrelationReason];
 
+/**
+ * Disjoint-set over track ids linked by accepted associations.
+ *
+ * Association chains must be transitive. A group can walk from camera 07 to 08 to
+ * 09 while camera 08 observes no zone and therefore produces no events - so its
+ * track never enters an incident, and a pairwise-only check silently breaks the
+ * chain, splitting one journey into two incidents. Union-find makes "is this the
+ * same object we have been following?" a single lookup that survives any number
+ * of intermediate cameras.
+ */
+class TrackGroups {
+  readonly #parent = new Map<string, string>();
+
+  find(id: string): string {
+    const parent = this.#parent.get(id);
+    if (parent === undefined) {
+      this.#parent.set(id, id);
+      return id;
+    }
+    if (parent === id) return id;
+
+    const root = this.find(parent);
+    this.#parent.set(id, root);
+    return root;
+  }
+
+  union(a: string, b: string): void {
+    const rootA = this.find(a);
+    const rootB = this.find(b);
+    if (rootA !== rootB) this.#parent.set(rootB, rootA);
+  }
+
+  connected(a: string, b: string): boolean {
+    return this.find(a) === this.find(b);
+  }
+}
+
 export class Correlator {
   readonly #open = new Map<IncidentId, OpenIncident>();
   readonly #options: Required<CorrelationOptions>;
   readonly #associations: TrackAssociation[] = [];
+  readonly #groups = new TrackGroups();
   #riskContext: RiskContext;
 
   constructor(riskContext: RiskContext, options: CorrelationOptions = {}) {
@@ -122,6 +160,7 @@ export class Correlator {
   addAssociation(association: TrackAssociation): void {
     if (association.score >= this.#options.minAssociationScore) {
       this.#associations.push(association);
+      this.#groups.union(String(association.fromTrackId), String(association.toTrackId));
     }
   }
 
@@ -168,15 +207,12 @@ export class Correlator {
     }
 
     for (const open of this.#open.values()) {
-      for (const association of this.#associations) {
-        const linksIn =
-          event.trackIds.includes(association.toTrackId) &&
-          open.trackIds.has(association.fromTrackId);
-        const linksOut =
-          event.trackIds.includes(association.fromTrackId) &&
-          open.trackIds.has(association.toTrackId);
-
-        if (linksIn || linksOut) return [open, CorrelationReason.AssociatedTrack];
+      for (const eventTrack of event.trackIds) {
+        for (const openTrack of open.trackIds) {
+          if (this.#groups.connected(String(eventTrack), String(openTrack))) {
+            return [open, CorrelationReason.AssociatedTrack];
+          }
+        }
       }
     }
 
@@ -253,13 +289,20 @@ export class Correlator {
 
   #materialise(open: OpenIncident): Incident {
     const events = [...open.events].sort((a, b) => a.occurredAt - b.occurredAt);
-    const risk = assessRisk(events, { ...this.#riskContext, assessedAt: open.lastEventAt });
+    const objectGroupOf = (trackId: TrackId): string => this.#groups.find(String(trackId));
+
+    const risk = assessRisk(events, {
+      ...this.#riskContext,
+      assessedAt: open.lastEventAt,
+      objectGroupOf,
+    });
 
     const positioned = events.find((e) => e.position !== null);
+    const distinctObjectCount = distinctObjects(events, objectGroupOf);
 
     return {
       id: open.id,
-      title: titleFor(events, open.cameraIds.size),
+      title: titleFor(events, open.cameraIds.size, distinctObjectCount),
       severity: risk.severity,
       status: 'NEW',
       openedAt: open.openedAt,
@@ -269,6 +312,7 @@ export class Correlator {
       cameraIds: [...open.cameraIds],
       zoneIds: [...open.zoneIds],
       trackIds: [...open.trackIds],
+      distinctObjectCount,
       eventIds: events.map((e) => e.id),
       evidenceIds: [...new Set(events.flatMap((e) => e.evidenceIds))],
       risk,
@@ -295,12 +339,24 @@ export class Correlator {
     return [...open.timeline].sort((a, b) => a.at - b.at);
   }
 
-  /** Associations recorded for an incident, for the investigation view. */
+  /**
+   * Associations recorded for an incident, for the investigation view.
+   *
+   * Includes hand-offs through cameras that produced no events of their own -
+   * those are exactly the transitions the operator most needs to see, because
+   * they are the part of the journey nothing else in the UI would show.
+   */
   associationsFor(id: IncidentId): readonly TrackAssociation[] {
     const open = this.#open.get(id);
     if (open === undefined) return [];
+
+    const roots = new Set<string>();
+    for (const trackId of open.trackIds) roots.add(this.#groups.find(String(trackId)));
+
     return this.#associations.filter(
-      (a) => open.trackIds.has(a.fromTrackId) || open.trackIds.has(a.toTrackId),
+      (a) =>
+        roots.has(this.#groups.find(String(a.fromTrackId))) ||
+        roots.has(this.#groups.find(String(a.toTrackId))),
     );
   }
 
@@ -316,14 +372,20 @@ export class Correlator {
  *
  * States what happened and where, never who or why.
  */
-export const titleFor = (events: readonly SecurityEvent[], cameraCount: number): string => {
+export const titleFor = (
+  events: readonly SecurityEvent[],
+  cameraCount: number,
+  objectCount: number,
+): string => {
   const first = events[0];
   if (first === undefined) return 'Incident';
 
-  const tracks = new Set(events.flatMap((e) => e.trackIds)).size;
+  // Counts objects, not track segments. One person walking past three cameras is
+  // one person, and a title claiming otherwise is the first thing an operator
+  // would notice was wrong.
   const subject =
-    tracks > 1
-      ? `${tracks} ${first.objectClass === 'person' ? 'people' : `${first.objectClass}s`}`
+    objectCount > 1
+      ? `${objectCount} ${first.objectClass === 'person' ? 'people' : `${first.objectClass}s`}`
       : `a ${first.objectClass ?? 'object'}`;
 
   const detail = String(first.detail['zone'] ?? '');
