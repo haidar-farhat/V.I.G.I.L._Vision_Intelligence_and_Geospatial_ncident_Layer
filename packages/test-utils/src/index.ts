@@ -9,3 +9,4 @@
 
 export * from './mock-rtsp.ts';
 export * from './mock-onvif.ts';
+export * from './pmtiles-fixture.ts';

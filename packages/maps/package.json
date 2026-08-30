@@ -1,0 +1,20 @@
+{
+  "name": "@sentinel/maps",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Offline map packages: PMTiles reading, style validation, integrity",
+  "type": "module",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./*": "./src/*.ts"
+  },
+  "sideEffects": false,
+  "dependencies": {
+    "@sentinel/shared-types": "*",
+    "@sentinel/security": "*"
+  },
+  "devDependencies": {
+    "@sentinel/test-utils": "*"
+  }
+}

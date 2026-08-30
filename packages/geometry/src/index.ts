@@ -11,3 +11,4 @@ export * from './geodesy.ts';
 export * from './polygon.ts';
 export * from './projection.ts';
 export * from './zones.ts';
+export * from './coverage.ts';
