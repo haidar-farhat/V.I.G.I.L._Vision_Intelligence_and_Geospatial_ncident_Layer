@@ -92,7 +92,7 @@ inferred from silence.
 | Search + natural-language retrieval | `PLANNED` | |
 | Backup / restore | `PLANNED` | |
 | Packaging + offline updates | `PLANNED` | |
-| Internationalisation (EN/FR/AR, RTL) | `PLANNED` | No hard-coded UI strings introduced so far. |
+| Internationalisation (EN/FR/AR, RTL) | `PLANNED` | The React UI hard-codes English throughout and would need extracting before any of this starts. Domain code emits structured codes rather than prose, so the event and risk vocabularies are already translatable. |
 | Chaos + network partition tests | `PLANNED` | Simulator hooks exist for camera dropout only. |
 
 ---
