@@ -113,7 +113,7 @@ const isSensitiveKey = (key: string): boolean => {
 /**
  * Strip credentials embedded in a URL's userinfo section.
  *
- * `rtsp://admin:hunter2@192.168.1.50/stream` is how essentially every camera
+ * `rtsp://admin:<password>@192.168.1.50/stream` is how essentially every camera
  * integration leaks a password: the URL is built once and then logged, thrown in
  * an error, or shown in a diagnostic. The host and path are operationally useful,
  * so they are kept; the userinfo is not.
