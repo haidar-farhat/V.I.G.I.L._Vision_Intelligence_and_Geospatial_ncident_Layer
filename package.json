@@ -1,0 +1,33 @@
+{
+  "name": "sentinel-vision",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Sentinel Vision - local-first AI multi-camera security & situational awareness platform",
+  "license": "SEE LICENSE IN LICENSE",
+  "type": "module",
+  "engines": {
+    "node": ">=22.6.0"
+  },
+  "workspaces": [
+    "packages/*",
+    "services/*",
+    "simulator",
+    "apps/desktop"
+  ],
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "up": "node scripts/dev.mjs up",
+    "down": "node scripts/dev.mjs down",
+    "test": "node scripts/dev.mjs test",
+    "lint": "node scripts/dev.mjs lint",
+    "typecheck": "node scripts/dev.mjs typecheck",
+    "build": "node scripts/dev.mjs build",
+    "simulator": "node scripts/dev.mjs simulator",
+    "demo": "node scripts/dev.mjs demo",
+    "slice": "node scripts/dev.mjs slice",
+    "db": "node scripts/dev.mjs db"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.2"
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "name": "@sentinel/recorder",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Segmented recording and tiered retention",
+  "type": "module",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./*": "./src/*.ts"
+  },
+  "sideEffects": false
+}

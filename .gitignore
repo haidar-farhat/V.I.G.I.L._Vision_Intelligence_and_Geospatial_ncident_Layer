@@ -1,0 +1,48 @@
+# dependencies
+node_modules/
+.pnpm-store/
+
+# build output
+dist/
+build/
+out/
+*.tsbuildinfo
+apps/desktop/src-tauri/target/
+
+# runtime data - never commit operational data or evidence
+data/
+var/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# local model + map binaries (imported by the operator, never committed)
+models/*
+!models/.gitkeep
+!models/README.md
+map-data/*
+!map-data/.gitkeep
+!map-data/README.md
+
+# secrets - MUST never be committed
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+!**/testdata/*.key
+secrets/
+
+# logs
+logs/
+*.log
+npm-debug.log*
+
+# os / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
