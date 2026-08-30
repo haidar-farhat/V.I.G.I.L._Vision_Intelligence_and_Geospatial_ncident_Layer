@@ -99,8 +99,12 @@ installed. The map is how you understand a site, not how the system works.
 lat . lon . altitude . heading . pitch . roll . hfov . vfov . range . mountHeight
 ```
 
-The operator places a camera by clicking the map, then drags to rotate and adjusts
-the field of view directly on the wedge. Changes persist immediately.
+The operator places a camera by clicking the map and adjusts heading, tilt, mount
+height, field of view and range directly, with the footprint and the coverage
+analysis recomputing as they move.
+
+Placement is **not persisted**: there is no API yet, so edits live in the UI
+session and the panel says so rather than implying a save that never happens.
 
 ### The FOV footprint is an annular sector
 
@@ -162,3 +166,61 @@ Site → building → floor → room share the same zone and event model with a 
 coordinate frame instead of a geographic one, so indoor deployments reuse the
 entire engine rather than needing a parallel implementation. The map switches
 between outdoor and indoor views.
+
+---
+
+## Coverage analysis
+
+The question an operator actually has when placing a camera is **can anything here
+be seen?** A site with four cameras around a restricted zone looks protected on a
+map. If none of their footprints reach one corner, nothing detects an intrusion
+there — and nothing reports that it could not. The gap is found by whoever walks
+through it.
+
+So a zone is sampled on a grid and each point tested against every placed camera's
+real annular footprint. The result is one of four verdicts:
+
+| Verdict | Meaning |
+|---|---|
+| `REDUNDANT` | Every point seen by two or more cameras. Survives one failing. |
+| `COVERED` | Every point seen, some by only one camera. One failure opens a gap. |
+| `PARTIAL` | Some of the zone is visible, some is not. The rest is a blind spot. |
+| `BLIND` | No camera sees any part of it. |
+
+Three details matter:
+
+- **The grid is deterministic.** Random sampling makes the percentage jitter
+  between runs, and an operator nudging a camera needs the number to move because
+  of the camera.
+- **Spacing widens for large zones** rather than the grid truncating, so a
+  site-sized zone is sampled evenly at lower resolution instead of finely in one
+  corner and not at all elsewhere.
+- **Unplaced cameras are skipped, not counted as blind.** Reporting a gap that
+  placement would close sends an operator installing hardware they already own.
+
+### What it does not model
+
+Coverage here is **geometric reach**, and is therefore an upper bound:
+
+- **No occlusion.** Walls, fences, vehicles and vegetation block nothing.
+- **No detectability.** A person at 85 m may be four pixels tall and invisible to
+  the detector even though the geometry says the camera points at them.
+- **Flat ground** at the camera's mount height.
+
+Real coverage is never better than this figure and is usually worse. It is
+diagnostic for finding gaps, not a certificate that the rest is watched.
+
+### In the UI
+
+The map section recomputes footprints and blind spots **in the browser using the
+production geometry package**, not a display-only reimplementation. Dragging a
+heading updates the coverage the system will actually have.
+
+A UI that draws its own approximation of a field of view will eventually disagree
+with the engine, and the disagreement is discovered by someone standing in a gap
+the map called covered.
+
+Running it against the shipped demo site immediately reported Restricted Zone A at
+50% coverage and the Perimeter Road at 35%. That scenario was laid out to exercise
+cross-camera correlation rather than to be well covered — but until this existed,
+nothing could have told us which it was.
