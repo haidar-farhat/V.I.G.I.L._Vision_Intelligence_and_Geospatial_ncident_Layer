@@ -17,7 +17,8 @@ been run against a physical IP camera, a GPU, or a multi-machine LAN. Everything
 below marked `TESTED` is tested against the simulator and unit fixtures, which is
 a real bar but not the same bar.
 
-Last updated with the operator-interface milestone. Current suite: **247 tests**,
+Last updated at the end of Phase 2 (camera discovery and ingestion). Current
+suite: **405 tests**,
 clean typecheck under `strict` + `noUncheckedIndexedAccess`, clean architectural
 lint.
 
@@ -59,6 +60,24 @@ lint.
 | Quiet-site behaviour | `TESTED` | An empty site raises nothing. |
 | Determinism across runs | `TESTED` | Same seed reproduces identical event and incident ids. |
 
+## Camera discovery and ingestion (Phase 2)
+
+| Capability | State | Notes |
+|---|---|---|
+| Bounded queues and backpressure | `TESTED` | Ring buffer with per-queue drop policy. Frames drop oldest; events refuse rather than lose evidence. |
+| Bounded exponential backoff | `TESTED` | Full jitter, so cameras that dropped together do not retry in lockstep. Abortable mid-wait. |
+| SDP parsing | `TESTED` | Bounded against hostile input; reports what it could not parse instead of failing a working camera. |
+| RTSP Digest/Basic authentication | `TESTED` | RFC 7616. Unimplemented algorithms refused rather than downgraded. Basic is opt-in. |
+| RTSP control client | `TESTED` | Full OPTIONS/DESCRIBE/SETUP/PLAY/TEARDOWN handshake with keep-alive, against a mock camera that misbehaves the way real ones do. |
+| ONVIF WS-Discovery | `TESTED` | Link-local multicast, probes every private interface. Parser tested; the multicast send path has no physical device to answer it. |
+| SOAP + WS-Security | `TESTED` | UsernameToken PasswordDigest. Bounded extractor rather than an XML parser; DTDs refused. |
+| ONVIF device/media client | `TESTED` | Device info, capabilities, profiles, stream URI. Credentials stripped from returned URIs. |
+| Camera connection test | `TESTED` | The onboarding wizard's verification step. Every failure carries a remedy, enforced by test. |
+| Camera persistence | `TESTED` | Cameras, profiles, topology edges. No column can hold a credential. |
+| Supervised video source | `TESTED` | Reconnect with backoff, flapping detection, honest DEGRADED vs OFFLINE, decoder boundary. |
+| Video decode (H.264/H.265) | `PLANNED` | The `Decoder` interface is defined and the supervisor is tested against a stub. No FFmpeg implementation is written - see the gaps below. |
+| Live view rendering | `PLANNED` | Requires decode. |
+
 ## Not yet built
 
 Everything below is designed in [ARCHITECTURE.md](ARCHITECTURE.md) and has no
@@ -70,8 +89,7 @@ inferred from silence.
 | REST API + WebSocket hub (`services/api`) | `PLANNED` | Contracts specified in docs/PROTOCOL.md; no server yet. |
 | Desktop shell (Tauri, Rust) | `SKELETON` | Manifest, config and keychain command surface written. **Never compiled** - no Rust toolchain was available in this environment. |
 | Operator UI (React) | `IMPLEMENTED` | Command centre, map, timeline and analysis panels render real pipeline output; verified in a headless browser with zero console errors and zero network requests. Reads a generated snapshot, not a live API. |
-| RTSP ingestion | `PLANNED` | `VideoSource` abstraction defined; no decoder integration. |
-| ONVIF discovery + Profile T | `PLANNED` | Camera and profile models exist; no protocol implementation. |
+| ONVIF Profile T events | `PLANNED` | Discovery, device and media services are implemented; the event service is not. |
 | Real detector (YOLO-family, ONNX/TensorRT) | `PLANNED` | `Detector` interface and model registry exist; only the simulated detector is implemented. |
 | GPU device discovery | `SKELETON` | `selectDevice` chooses among reported devices; nothing enumerates real hardware yet. |
 | VLM integration | `PLANNED` | Interface defined; no runtime. |
@@ -99,10 +117,20 @@ inferred from silence.
 
 ## Honest gaps worth naming
 
-1. **No real video has ever passed through this system.** The pipeline consumes
-   detections, and the only detector implemented is the simulated one. RTSP,
-   decode, and hardware inference are the largest remaining unknowns, and the
-   performance targets in the specification are design targets, not measurements.
+1. **No real video has ever passed through this system, and no physical camera
+   has ever been contacted.** The RTSP and ONVIF protocol layers are implemented
+   and tested, but against mock devices written from the specifications - which
+   means they are tested against my reading of those specifications. Real cameras
+   deviate from both in ways no mock anticipates, and that gap will only close on
+   hardware.
+
+   Decode is not implemented at all. The `Decoder` interface is defined and the
+   supervisor is tested against a stub, but no FFmpeg integration exists, because
+   no FFmpeg was available in the environment where this was written and shipping
+   an unverifiable subprocess wrapper would be exactly the fake implementation
+   this file exists to prevent. Hardware inference is likewise untouched, and the
+   performance targets in the specification remain design targets rather than
+   measurements.
 
 2. **The Tauri shell has never been compiled.** No Rust toolchain was present, so
    the native layer - keychain access, tray, service supervision - has never been
