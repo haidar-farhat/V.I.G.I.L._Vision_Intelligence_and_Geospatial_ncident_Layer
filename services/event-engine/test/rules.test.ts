@@ -149,8 +149,8 @@ describe('event identity', () => {
     };
 
     assert.notEqual(deriveEventId(base), deriveEventId({ ...base, timeBucket: 101 }));
-    assert.notEqual(deriveEventId(base), deriveEventId({ ...base, cameraId: asId('cam-08') }));
-    assert.notEqual(deriveEventId(base), deriveEventId({ ...base, trackId: asId('t2') }));
+    assert.notEqual(deriveEventId(base), deriveEventId({ ...base, cameraId: asId<CameraId>('cam-08') }));
+    assert.notEqual(deriveEventId(base), deriveEventId({ ...base, trackId: asId<TrackId>('t2') }));
   });
 });
 
