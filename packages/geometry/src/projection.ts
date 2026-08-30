@@ -7,7 +7,7 @@ import type {
 } from '@sentinel/shared-types';
 import { PositionSource } from '@sentinel/shared-types';
 import { clamp, normalizeDegrees, toDegrees, toRadians } from './vec.ts';
-import { destinationPoint, haversineDistance } from './geodesy.ts';
+import { bearingDegrees, destinationPoint, haversineDistance } from './geodesy.ts';
 
 /**
  * Image-space to ground-plane projection.
@@ -248,3 +248,131 @@ export const bearingInFov = (pose: CameraPose, bearingDeg: number): boolean => {
 /** Degrees of arc subtended by one metre at a given distance. Useful for sizing hints. */
 export const angularSizeDeg = (sizeMeters: number, distanceMeters: number): number =>
   distanceMeters <= 0 ? 0 : toDegrees(2 * Math.atan(sizeMeters / (2 * distanceMeters)));
+
+/**
+ * The exact inverse of `projectToGround`: where does a point on the ground appear
+ * in the image?
+ *
+ * Returns null when the point falls outside the frame or behind the camera.
+ *
+ * This is what allows the simulator to drive the *real* pipeline rather than a
+ * parallel one. A synthetic person at a known position is projected into image
+ * space here, handed to the tracker and zone engine as an ordinary detection, and
+ * projected back onto the ground by the production code. Ground truth is known,
+ * so the round-trip measures the pipeline's actual spatial error instead of
+ * assuming it away - and any drift between the forward and inverse models shows
+ * up immediately as a failing test.
+ */
+export type ImageCoordinate = {
+  readonly u: number;
+  readonly v: number;
+  readonly distanceMeters: number;
+  /** True when the point falls within the frame and the pose's range. */
+  readonly inFrame: boolean;
+};
+
+/**
+ * Image coordinates for a world point, **without** clipping to the frame.
+ *
+ * Coordinates outside 0..1 are meaningful and are returned as such: an object
+ * standing half out of frame still has a well-defined position, and box
+ * synthesis needs the unclipped value for the part that is off-screen. Callers
+ * that want frame membership read `inFrame` or use `projectToImage`.
+ */
+export const imageCoordinates = (
+  pose: CameraPose,
+  point: LatLon,
+  heightMeters = 0,
+): ImageCoordinate | null => {
+  const distance = haversineDistance(pose.position, point);
+  if (distance <= 0) return null;
+
+  const bearing = bearingDegrees(pose.position, point);
+  const yawDeg = ((normalizeDegrees(bearing - pose.heading) + 180) % 360) - 180;
+  const halfH = pose.horizontalFov / 2;
+
+  // Beyond a quarter turn off-axis the tangent mapping is meaningless: the point
+  // is beside or behind the camera, not merely out of frame.
+  if (Math.abs(yawDeg) >= 90) return null;
+
+  // Height above the ground plane raises the point in the frame.
+  const elevationDeg = toDegrees(Math.atan2(heightMeters - pose.mountHeight, distance));
+  const pitchOffsetDeg = elevationDeg - pose.pitch;
+  const halfV = pose.verticalFov / 2;
+  if (Math.abs(pitchOffsetDeg) >= 90) return null;
+
+  // Invert the rectilinear (tangent) mapping used by rayAngles.
+  const dx = Math.tan(toRadians(yawDeg)) / Math.tan(toRadians(halfH));
+  const dy = Math.tan(toRadians(pitchOffsetDeg)) / Math.tan(toRadians(halfV));
+
+  return {
+    u: (dx + 1) / 2,
+    v: (1 - dy) / 2,
+    distanceMeters: distance,
+    inFrame:
+      Math.abs(yawDeg) <= halfH && Math.abs(pitchOffsetDeg) <= halfV && distance <= pose.rangeMeters,
+  };
+};
+
+export const projectToImage = (
+  pose: CameraPose,
+  point: LatLon,
+  heightMeters = 0,
+): { readonly u: number; readonly v: number; readonly distanceMeters: number } | null => {
+  const coordinate = imageCoordinates(pose, point, heightMeters);
+  if (coordinate === null || !coordinate.inFrame) return null;
+  return { u: coordinate.u, v: coordinate.v, distanceMeters: coordinate.distanceMeters };
+};
+
+/**
+ * Synthesise the bounding box an object of a given real-world size would occupy.
+ *
+ * Both dimensions come from the same projective model - the corners of the
+ * object's bounding volume are projected and the extent is measured in image
+ * space. An earlier version mixed a projected height with an angular-size width
+ * and fell back to the angular formula when the object's top left the frame,
+ * which produced a discontinuity: boxes *grew* as the object receded past that
+ * point. Anything sizing detections must use one model throughout.
+ *
+ * Note that on a steeply tilted camera the projected height is legitimately
+ * non-monotonic with distance - perspective compression near the bottom of the
+ * frame is severe - while width falls off cleanly. That is the real geometry,
+ * not an artefact.
+ */
+export const boxForObject = (
+  pose: CameraPose,
+  point: LatLon,
+  heightMeters: number,
+  widthMeters: number,
+): BoundingBox | null => {
+  const base = imageCoordinates(pose, point, 0);
+  if (base === null) return null;
+
+  const top = imageCoordinates(pose, point, heightMeters);
+  if (top === null) return null;
+
+  // Width is measured by projecting the object's lateral extent, so it uses the
+  // same tangent mapping as the height rather than a parallel approximation.
+  const halfWidthBearing = toDegrees(Math.atan2(widthMeters / 2, base.distanceMeters));
+  const left = imageCoordinates(
+    pose,
+    destinationPoint(pose.position, bearingDegrees(pose.position, point) - halfWidthBearing, base.distanceMeters),
+    0,
+  );
+  const right = imageCoordinates(
+    pose,
+    destinationPoint(pose.position, bearingDegrees(pose.position, point) + halfWidthBearing, base.distanceMeters),
+    0,
+  );
+  if (left === null || right === null) return null;
+
+  const boxHeight = Math.abs(base.v - top.v);
+  const boxWidth = Math.abs(right.u - left.u);
+
+  return {
+    x: Math.min(left.u, right.u),
+    y: Math.min(base.v, top.v),
+    w: boxWidth,
+    h: boxHeight,
+  };
+};

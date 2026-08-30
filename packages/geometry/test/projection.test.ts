@@ -4,15 +4,17 @@ import type { BoundingBox, CameraPose, LatLon } from '@sentinel/shared-types';
 import { PositionSource } from '@sentinel/shared-types';
 import {
   bearingInFov,
+  boxForObject,
   farGroundDistance,
   fieldOfViewWedge,
   groundContactPoint,
   nearGroundDistance,
   projectDetection,
   projectToGround,
+  projectToImage,
   rayAngles,
 } from '../src/projection.ts';
-import { bearingDegrees, haversineDistance } from '../src/geodesy.ts';
+import { bearingDegrees, destinationPoint, haversineDistance } from '../src/geodesy.ts';
 import { angleDifference } from '../src/vec.ts';
 
 const SITE: LatLon = { lat: 33.8938, lon: 35.5018 };
@@ -211,5 +213,92 @@ describe('field of view footprint', () => {
     const near = nearGroundDistance(POSE);
     const closest = Math.min(...wedge.map((p) => haversineDistance(POSE.position, p)));
     closeTo(closest, near, 0.5, 'closest footprint point equals the near ground distance');
+  });
+});
+
+describe('image projection round-trip', () => {
+  test('a ground point projected into the image comes back where it started', () => {
+    // The property the whole simulator rests on: if the forward and inverse
+    // models ever drift apart, every simulated scenario silently stops
+    // representing the production pipeline.
+    for (const bearingOffset of [-20, -5, 0, 5, 20]) {
+      for (const distance of [12, 20, 40, 80]) {
+        const truth = destinationPoint(POSE.position, POSE.heading + bearingOffset, distance);
+
+        const image = projectToImage(POSE, truth);
+        if (image === null) continue;
+
+        const recovered = projectToGround(POSE, image.u, image.v, { enforceRange: false });
+        assert.notEqual(recovered, null, `no ground point for ${distance} m / ${bearingOffset} deg`);
+
+        const error = haversineDistance(truth, recovered!.position);
+        assert.ok(
+          error < 0.01,
+          `round-trip error ${error.toFixed(4)} m at ${distance} m, ${bearingOffset} deg`,
+        );
+      }
+    }
+  });
+
+  test('points outside the frame are rejected', () => {
+    const behind = destinationPoint(POSE.position, POSE.heading + 180, 30);
+    assert.equal(projectToImage(POSE, behind), null, 'behind the camera');
+
+    const offAxis = destinationPoint(POSE.position, POSE.heading + 50, 30);
+    assert.equal(projectToImage(POSE, offAxis), null, 'outside the horizontal FOV');
+
+    const tooFar = destinationPoint(POSE.position, POSE.heading, POSE.rangeMeters + 50);
+    assert.equal(projectToImage(POSE, tooFar), null, 'beyond the stated range');
+  });
+
+  test('a synthesised box narrows monotonically with distance', () => {
+    let previousWidth = Number.POSITIVE_INFINITY;
+
+    for (const distance of [6, 8, 10, 12, 14, 16, 18, 24, 40]) {
+      const target = destinationPoint(POSE.position, POSE.heading, distance);
+      const box = boxForObject(POSE, target, 1.75, 0.5);
+
+      assert.notEqual(box, null, `no box at ${distance} m`);
+      assert.ok(box!.w > 0 && box!.h > 0, `degenerate box at ${distance} m`);
+      assert.ok(
+        box!.w < previousWidth,
+        `width must fall with distance: ${box!.w} at ${distance} m vs ${previousWidth}`,
+      );
+      previousWidth = box!.w;
+    }
+  });
+
+  test('box size comes from one projective model, with no discontinuity', () => {
+    // Regression guard. Mixing a projected height with an angular-size width, and
+    // falling back to the angular formula once the object's top left the frame,
+    // made boxes *grow* as the object receded past that point.
+    const heights: number[] = [];
+    for (let distance = 6; distance <= 40; distance += 1) {
+      const target = destinationPoint(POSE.position, POSE.heading, distance);
+      const box = boxForObject(POSE, target, 1.75, 0.5);
+      assert.notEqual(box, null, `no box at ${distance} m`);
+      heights.push(box!.h);
+    }
+
+    for (let i = 1; i < heights.length; i += 1) {
+      const change = Math.abs(heights[i]! - heights[i - 1]!);
+      assert.ok(
+        change < 0.02,
+        `height jumped by ${change.toFixed(4)} between ${5 + i} m and ${6 + i} m`,
+      );
+    }
+  });
+
+  test('the synthesised box sits on the ground contact point', () => {
+    const target = destinationPoint(POSE.position, POSE.heading, 14);
+    const box = boxForObject(POSE, target, 1.75, 0.5);
+    assert.notEqual(box, null);
+
+    // The bottom edge of the box is where the object meets the ground, which is
+    // precisely what projectDetection reads back out.
+    const contact = groundContactPoint(box!);
+    const image = projectToImage(POSE, target);
+    closeTo(contact.y, image!.v, 1e-9, 'box bottom equals the ground contact');
+    closeTo(contact.x, image!.u, 1e-9, 'box centre equals the contact bearing');
   });
 });
