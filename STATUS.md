@@ -17,8 +17,8 @@ been run against a physical IP camera, a GPU, or a multi-machine LAN. Everything
 below marked `TESTED` is tested against the simulator and unit fixtures, which is
 a real bar but not the same bar.
 
-Last updated at the end of Phase 2 (camera discovery and ingestion). Current
-suite: **405 tests**,
+Last updated at the end of Phase 5 (map, geospatial placement, FOV). Current
+suite: **481 tests**,
 clean typecheck under `strict` + `noUncheckedIndexedAccess`, clean architectural
 lint.
 
@@ -78,6 +78,20 @@ lint.
 | Video decode (H.264/H.265) | `PLANNED` | The `Decoder` interface is defined and the supervisor is tested against a stub. No FFmpeg implementation is written - see the gaps below. |
 | Live view rendering | `PLANNED` | Requires decode. |
 
+## Map and geospatial placement (Phase 5)
+
+| Capability | State | Notes |
+|---|---|---|
+| PMTiles v3 reading | `TESTED` | Header and metadata, with every declared region checked against the real file length before any read. Tests build genuine archives, not stubs. |
+| Map style validation | `TESTED` | Every URL a style can carry, including ones buried in a layer property, checked against the private ranges and the package's own file listing. |
+| Map package import | `TESTED` | Content-addressed id, integrity hash, path-traversal refusal, warnings for coarse zoom and for style layers the archive lacks. |
+| Map package persistence | `TESTED` | Install, list, set default, remove. Removing the default promotes the most detailed remaining package. |
+| Camera coverage analysis | `TESTED` | Deterministic grid sampling against the real annular footprint. Reports covered, redundant, partial or blind, with the blind points themselves. |
+| Camera placement UI | `IMPLEMENTED` | Live pose editing with footprints and blind spots recomputed in the browser by the production geometry. Verified in a headless browser. Not persisted - no API. |
+| Map rendering | `IMPLEMENTED` | Cameras, footprints, zones, events and blind spots. Reports `OFFLINE MAP DATA NOT INSTALLED` and never fetches tiles. |
+| Tile rendering from a package | `PLANNED` | The reader and validator exist; wiring an imported archive into MapLibre as a source does not. |
+| Zone drawing on the map | `PLANNED` | Zones render and are analysed; drawing and editing them by hand is not built. |
+
 ## Not yet built
 
 Everything below is designed in [ARCHITECTURE.md](ARCHITECTURE.md) and has no
@@ -96,8 +110,6 @@ inferred from silence.
 | Local LLM analyst | `PLANNED` | `AnalystEngine` interface is satisfied by the deterministic engine; no LLM client. |
 | Recording + segmentation | `PLANNED` | Schema and retention policy exist; no recorder. |
 | Evidence export + manifest | `PLANNED` | Format specified; not implemented. |
-| Offline map packages (PMTiles) | `PLANNED` | Import and validation flow specified; not implemented. |
-| MapLibre rendering | `IMPLEMENTED` | Renders cameras, true FOV footprints, zones and uncertainty-ringed events from local GeoJSON. Correctly reports `OFFLINE MAP DATA NOT INSTALLED` with no basemap and never fetches tiles. |
 | LAN discovery (mDNS) | `PLANNED` | Protocol chosen; not implemented. |
 | Node pairing + mTLS | `PLANNED` | Flow specified in ARCHITECTURE.md section 9.3; no implementation. |
 | Worker buffering + reconciliation | `PLANNED` | Deterministic event ids make replay idempotent, which is the hard half; the buffer itself is not written. |
@@ -151,3 +163,15 @@ inferred from silence.
    ground plane with a perfectly known camera pose. Real deployments have sloping
    ground, mis-surveyed masts and lens distortion. The uncertainty model is
    honest about its inputs; its inputs are currently ideal.
+
+   Coverage analysis inherits the same assumption, and one more: it models what a
+   camera can *geometrically* reach, not what it can usefully *see*. A person at
+   85 m may be four pixels tall and undetectable, and no wall, fence, vehicle or
+   tree occludes anything. Coverage is therefore an upper bound - real coverage is
+   never better than this and is usually worse.
+
+6. **No tiles have ever been rendered from an imported package.** The PMTiles
+   reader and the package validator are tested against archives built byte by
+   byte, but nothing has yet handed a real basemap to MapLibre. The map draws site
+   geometry over an empty background, which is the correct behaviour with no
+   package installed and also the only behaviour so far exercised.

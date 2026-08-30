@@ -1,8 +1,9 @@
 # Maps
 
-> **Status:** architecture specified; rendering and package import are `PLANNED`.
-> The geospatial model, ground projection, FOV footprints and zone geometry that
-> the map renders are implemented and tested. See [STATUS.md](../STATUS.md).
+> **Status:** package reading, style validation, coverage analysis and the
+> placement UI are implemented and tested. Handing an imported archive to MapLibre
+> as a tile source is not yet built, so the map currently draws site geometry over
+> an empty background. See [STATUS.md](../STATUS.md).
 
 ## Why the map is a first-class part of the product
 
@@ -45,14 +46,37 @@ metadata.json       region, bounds, zoom range, tile type, version, checksum
 
 Import validates:
 
-- **CRS** — EPSG:3857 tiles, WGS84 coordinates
-- **Bounding box** — sane, and covering the configured site
-- **Zoom range** — declared range matches what the archive contains
-- **Tile type** — vector or raster, matching the style's expectations
-- **Integrity** — SHA-256 over the archive
+- **Format** — PMTiles v3 magic and version. A future version is refused with an
+  instruction to re-export rather than parsed hopefully.
+- **Structure** — every region the header declares (metadata, directories, tile
+  data) must lie inside the file that actually exists. A truncated download and a
+  crafted header look identical from the inside, and a declared length overrunning
+  the file would otherwise be a read of adjacent memory.
+- **Bounding box** — within ±90/±180 and not inverted.
+- **Zoom range** — not inverted. A maximum below 14 is a warning, not an error: a
+  country-scale package is worth importing, but blurring at the perimeter should
+  not be a surprise.
+- **Tile type** — vector or raster the renderer handles. AVIF is refused.
+- **Integrity** — SHA-256 over the archive, recorded and re-checkable from
+  diagnostics. A corrupted archive renders blank tiles rather than failing, so an
+  operator would otherwise see an empty map and assume the region was never
+  imported.
+- **Storage path** — refused if absolute or traversing outside the map directory.
 - **Style dependencies** — every source, glyph and sprite the style names resolves
   to something inside the package. A style that resolves at import time but
   reaches the network at render time is the exact failure this check exists for.
+- **Cross-check** — the layers the style draws from against the layers the archive
+  contains. This is the only place the two halves of a package are compared, and a
+  mismatch renders nothing for those layers.
+
+The package id is derived from the archive's content hash, so re-importing the
+same region replaces rather than duplicating, and the same package is recognisable
+after being copied between machines.
+
+One subtlety worth recording: MapLibre's `sprite` is a **base name**, not a
+filename. The renderer appends `.json` and `.png` itself. Checking it literally
+reports every correctly-built package as missing its sprite, which is exactly what
+the first version of this validator did.
 
 Managed in the UI: import, remove, validate, set default.
 

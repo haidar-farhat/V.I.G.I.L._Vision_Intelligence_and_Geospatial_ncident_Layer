@@ -59,15 +59,16 @@ events and model version.
 
 See **[STATUS.md](STATUS.md)** for a per-capability breakdown. In short: the
 domain core, geometry, tracking, correlation, incident engine, security controls,
-database, an end-to-end vertical slice, and the ONVIF and RTSP protocol layers
-are implemented and tested. Video decode, real inference, the Tauri shell and
-distributed mode are designed but not built.
+database, an end-to-end vertical slice, the ONVIF and RTSP protocol layers, and
+offline map packages with camera coverage analysis are implemented and tested.
+Video decode, real inference, the Tauri shell and distributed mode are designed
+but not built.
 
 Nothing here has been run against a physical camera. The camera protocols are
 tested against mock devices written from the specifications, which is a real bar
 and not the same one.
 
-**405 tests.** Clean typecheck under `strict` + `noUncheckedIndexedAccess`. Clean
+**481 tests.** Clean typecheck under `strict` + `noUncheckedIndexedAccess`. Clean
 architectural lint.
 
 ---
@@ -79,7 +80,7 @@ third-party runtime dependencies, and the embedded database ships inside Node.
 
 ```bash
 npm install          # dev dependencies only: TypeScript and Node types
-npm test             # 405 tests, no network
+npm test             # 481 tests, no network
 npm run lint         # architectural invariants
 npm run typecheck    # strict TypeScript across the workspace
 ```
@@ -154,6 +155,7 @@ packages/
   geometry/         geodesy, polygons, projection, FOV, zones
   tracking/         track lifecycle and cross-camera association
   ai/               model abstraction, registry, analyst guardrails
+  maps/             PMTiles reading, style validation, package integrity
   database/         driver, migrations, schema
   security/         Secret<T>, redaction, egress guard, authz
   test-utils/       deterministic clock, seeded RNG, fixtures
