@@ -17,7 +17,7 @@ been run against a physical IP camera, a GPU, or a multi-machine LAN. Everything
 below marked `TESTED` is tested against the simulator and unit fixtures, which is
 a real bar but not the same bar.
 
-Last updated with the vertical-slice milestone. Current suite: **247 tests**,
+Last updated with the operator-interface milestone. Current suite: **247 tests**,
 clean typecheck under `strict` + `noUncheckedIndexedAccess`, clean architectural
 lint.
 
@@ -68,8 +68,8 @@ inferred from silence.
 | Capability | State | Notes |
 |---|---|---|
 | REST API + WebSocket hub (`services/api`) | `PLANNED` | Contracts specified in docs/PROTOCOL.md; no server yet. |
-| Desktop shell (Tauri, Rust) | `SKELETON` | Scaffolded. Not built or run - no Rust toolchain was available in this environment. |
-| Operator UI (React) | `SKELETON` | Command centre, map and incident views scaffolded; not wired to a live API. |
+| Desktop shell (Tauri, Rust) | `SKELETON` | Manifest, config and keychain command surface written. **Never compiled** - no Rust toolchain was available in this environment. |
+| Operator UI (React) | `IMPLEMENTED` | Command centre, map, timeline and analysis panels render real pipeline output; verified in a headless browser with zero console errors and zero network requests. Reads a generated snapshot, not a live API. |
 | RTSP ingestion | `PLANNED` | `VideoSource` abstraction defined; no decoder integration. |
 | ONVIF discovery + Profile T | `PLANNED` | Camera and profile models exist; no protocol implementation. |
 | Real detector (YOLO-family, ONNX/TensorRT) | `PLANNED` | `Detector` interface and model registry exist; only the simulated detector is implemented. |
@@ -79,7 +79,7 @@ inferred from silence.
 | Recording + segmentation | `PLANNED` | Schema and retention policy exist; no recorder. |
 | Evidence export + manifest | `PLANNED` | Format specified; not implemented. |
 | Offline map packages (PMTiles) | `PLANNED` | Import and validation flow specified; not implemented. |
-| MapLibre rendering | `SKELETON` | Component scaffolded; no tiles, no offline package. |
+| MapLibre rendering | `IMPLEMENTED` | Renders cameras, true FOV footprints, zones and uncertainty-ringed events from local GeoJSON. Correctly reports `OFFLINE MAP DATA NOT INSTALLED` with no basemap and never fetches tiles. |
 | LAN discovery (mDNS) | `PLANNED` | Protocol chosen; not implemented. |
 | Node pairing + mTLS | `PLANNED` | Flow specified in ARCHITECTURE.md section 9.3; no implementation. |
 | Worker buffering + reconciliation | `PLANNED` | Deterministic event ids make replay idempotent, which is the hard half; the buffer itself is not written. |
@@ -104,9 +104,11 @@ inferred from silence.
    decode, and hardware inference are the largest remaining unknowns, and the
    performance targets in the specification are design targets, not measurements.
 
-2. **The desktop application has not been compiled.** The Tauri shell is
-   scaffolded but no Rust toolchain was present, so it has never been built or
-   launched. Treat the UI as a design artefact until that changes.
+2. **The Tauri shell has never been compiled.** No Rust toolchain was present, so
+   the native layer - keychain access, tray, service supervision - has never been
+   built or run. The React interface *has* been built and verified in a headless
+   browser, but it reads a generated snapshot rather than a live API, because
+   there is no API yet.
 
 3. **The AI analyst is not a language model.** It is a deterministic, grounded
    report generator that satisfies the same contract an LLM would have to satisfy.

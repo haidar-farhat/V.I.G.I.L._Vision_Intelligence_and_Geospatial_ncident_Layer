@@ -1,0 +1,70 @@
+name: CI
+
+# The suite must pass with no network access, because that is the product's
+# central claim. The `offline` job below enforces it rather than trusting it.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  verify:
+    name: verify (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # The product ships on all three, so all three are checked. Nothing in the
+        # codebase is platform-specific by design - no shell scripts, no native
+        # modules, no absolute paths - and this is what keeps that true.
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install
+        run: npm ci --ignore-scripts
+
+      - name: Architectural checks
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      - name: Vertical slice
+        run: npm run slice
+
+  offline:
+    name: offline acceptance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install
+        run: npm ci --ignore-scripts
+
+      # Everything above this line may use the network. Nothing below it may.
+      - name: Block all outbound traffic except loopback
+        run: |
+          sudo iptables -P OUTPUT DROP
+          sudo iptables -A OUTPUT -o lo -j ACCEPT
+          echo "outbound traffic blocked"
+
+      - name: Test suite with WAN blocked
+        run: npm test
+
+      - name: Vertical slice with WAN blocked
+        run: npm run slice
