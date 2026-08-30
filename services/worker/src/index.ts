@@ -11,3 +11,6 @@ export * from './ingest/backoff.ts';
 export * from './rtsp/sdp.ts';
 export * from './rtsp/auth.ts';
 export * from './rtsp/client.ts';
+export * from './onvif/soap.ts';
+export * from './onvif/discovery.ts';
+export * from './onvif/device.ts';
