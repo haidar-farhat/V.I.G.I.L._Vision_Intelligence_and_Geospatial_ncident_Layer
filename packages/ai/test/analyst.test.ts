@@ -6,8 +6,13 @@ import type {
   EventId,
   EvidenceId,
   IncidentId,
+  ModelId,
+  NodeId,
+  RuleId,
   SecurityEvent,
+  TrackId,
   UtcMillis,
+  ZoneId,
 } from '@sentinel/shared-types';
 import { asId, utcMillis } from '@sentinel/shared-types';
 import type { EvidenceBundle } from '../src/analyst.ts';
@@ -36,14 +41,14 @@ const event = (id: string, cameraId: CameraId, at: number, summary: string): Sec
   occurredAt: utcMillis(at),
   recordedAt: utcMillis(at + 50),
   cameraId,
-  nodeId: asId('node-1'),
-  zoneIds: [asId('zone-restricted-a')],
-  trackIds: [asId('track-1')],
+  nodeId: asId<NodeId>('node-1'),
+  zoneIds: [asId<ZoneId>('zone-restricted-a')],
+  trackIds: [asId<TrackId>('track-1')],
   objectClass: 'person',
   confidence: 0.91,
   position: null,
-  ruleId: asId('rule-restricted'),
-  modelId: asId('model-1'),
+  ruleId: asId<RuleId>('rule-restricted'),
+  modelId: asId<ModelId>('model-1'),
   evidenceIds: [EVIDENCE_1],
   incidentId: INCIDENT,
   summary,
@@ -67,7 +72,7 @@ const bundle = (events: readonly SecurityEvent[]): EvidenceBundle => ({
 const baseReport = (overrides: Partial<AiIncidentReport> = {}): AiIncidentReport => ({
   incidentId: INCIDENT,
   generatedAt: utcMillis(1000),
-  modelId: asId('model-analyst'),
+  modelId: asId<ModelId>('model-analyst'),
   promptVersion: 'v1',
   inputEvidenceIds: [EVIDENCE_1],
   inputEventIds: [asId<EventId>('e1')],
@@ -188,7 +193,7 @@ describe('guardrails: evidence grounding', () => {
   });
 
   test('accepts an explicit declaration of insufficient evidence', () => {
-    const report = insufficientEvidenceReport(bundle([]), asId('m'), 'v1', utcMillis(0));
+    const report = insufficientEvidenceReport(bundle([]), asId<ModelId>('m'), 'v1', utcMillis(0));
     assert.equal(report.summary, INSUFFICIENT_EVIDENCE);
     assert.deepEqual(validateReport(report, bundle([])), []);
   });
@@ -260,7 +265,7 @@ describe('analyseWithGuardrails', () => {
 
   test('returns a valid report unchanged', async () => {
     const engine = {
-      modelId: asId('m'),
+      modelId: asId<ModelId>('m'),
       promptVersion: 'v1',
       analyse: async (): Promise<AiIncidentReport> => baseReport(),
     };
@@ -271,7 +276,7 @@ describe('analyseWithGuardrails', () => {
 
   test('throws rather than returning an invalid report', async () => {
     const engine = {
-      modelId: asId('m'),
+      modelId: asId<ModelId>('m'),
       promptVersion: 'v1',
       analyse: async (): Promise<AiIncidentReport> =>
         baseReport({
