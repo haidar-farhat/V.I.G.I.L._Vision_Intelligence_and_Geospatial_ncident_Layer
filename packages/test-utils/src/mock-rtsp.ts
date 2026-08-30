@@ -77,7 +77,21 @@ export const startMockRtspServer = async (
   const realm = 'Sentinel Test Camera';
   const schemes = behaviour.authSchemes ?? ['Digest'];
 
+  /*
+   * Every accepted socket is tracked so close() can destroy it.
+   *
+   * net.Server.close() stops accepting but waits for existing connections to end
+   * on their own, and an RTSP client deliberately holds its session open. Without
+   * this the server never closes, the event loop never drains, and the test
+   * process hangs until the runner kills it - which is exactly what happened the
+   * first time this suite ran.
+   */
+  const sockets = new Set<Socket>();
+
   const server: Server = createServer((socket: Socket) => {
+    sockets.add(socket);
+    socket.on('close', () => sockets.delete(socket));
+
     socket.setEncoding('utf8');
     let buffer = '';
 
@@ -306,10 +320,9 @@ export const startMockRtspServer = async (
     authorizations,
     close: () =>
       new Promise<void>((resolve) => {
+        for (const socket of sockets) socket.destroy();
+        sockets.clear();
         server.close(() => resolve());
-        // Sockets a test left open must not hold the suite up.
-        server.unref();
-        resolve();
       }),
   };
 };

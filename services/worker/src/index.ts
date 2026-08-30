@@ -15,3 +15,4 @@ export * from './onvif/soap.ts';
 export * from './onvif/discovery.ts';
 export * from './onvif/device.ts';
 export * from './ingest/connection-test.ts';
+export * from './ingest/source.ts';
