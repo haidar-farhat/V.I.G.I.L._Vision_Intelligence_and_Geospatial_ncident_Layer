@@ -1,0 +1,13 @@
+# Normalise line endings in the repository. The product ships on Windows, Linux
+# and macOS, and a mixed-ending checkout produces spurious diffs and breaks the
+# SHA-256 hashes that evidence manifests depend on.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.ico binary
+*.pmtiles binary
+*.onnx binary
+*.gguf binary
+*.mp4 binary
+*.mkv binary

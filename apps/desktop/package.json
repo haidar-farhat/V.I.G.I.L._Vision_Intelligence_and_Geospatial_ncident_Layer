@@ -1,0 +1,25 @@
+{
+  "name": "@sentinel/desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Sentinel Vision operator interface (Tauri + React)",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit -p tsconfig.json && vite build",
+    "preview": "vite preview",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "maplibre-gl": "^4.7.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.3",
+    "typescript": "^5.9.2",
+    "vite": "^5.4.11"
+  }
+}

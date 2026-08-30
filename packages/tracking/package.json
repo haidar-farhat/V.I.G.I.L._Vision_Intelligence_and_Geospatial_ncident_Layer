@@ -9,5 +9,9 @@
     ".": "./src/index.ts",
     "./*": "./src/*.ts"
   },
-  "sideEffects": false
+  "sideEffects": false,
+  "dependencies": {
+    "@sentinel/shared-types": "*",
+    "@sentinel/geometry": "*"
+  }
 }

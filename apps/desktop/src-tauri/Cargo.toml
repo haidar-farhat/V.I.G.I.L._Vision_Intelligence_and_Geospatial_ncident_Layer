@@ -1,0 +1,25 @@
+[package]
+name = "sentinel-vision"
+version = "0.1.0"
+description = "Sentinel Vision - local-first security operations platform"
+authors = ["Haydar Farhat"]
+edition = "2021"
+rust-version = "1.77"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+tauri-plugin-notification = "2"
+# OS keychain: Windows Credential Manager, macOS Keychain, Linux Secret Service.
+# The one place camera and node credentials are permitted to live.
+keyring = "3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[features]
+# Ships a smaller binary and disables the dev-time console.
+custom-protocol = ["tauri/custom-protocol"]

@@ -34,7 +34,18 @@ export type Incident = {
   readonly position: PositionEstimate | null;
   readonly cameraIds: readonly CameraId[];
   readonly zoneIds: readonly ZoneId[];
+  /**
+   * Every track segment that contributed. One object crossing three cameras
+   * appears here three times - these are observations, not objects.
+   */
   readonly trackIds: readonly TrackId[];
+  /**
+   * How many distinct objects those segments are believed to represent, after
+   * cross-camera association. Reporting the segment count instead would tell an
+   * operator that six people walked past when three did, which is the kind of
+   * error that destroys trust in everything else on the screen.
+   */
+  readonly distinctObjectCount: number;
   readonly eventIds: readonly EventId[];
   readonly evidenceIds: readonly EvidenceId[];
 

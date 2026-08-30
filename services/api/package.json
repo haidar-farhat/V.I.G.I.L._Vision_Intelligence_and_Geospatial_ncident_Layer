@@ -9,5 +9,12 @@
     ".": "./src/index.ts",
     "./*": "./src/*.ts"
   },
-  "sideEffects": false
+  "sideEffects": false,
+  "dependencies": {
+    "@sentinel/shared-types": "*",
+    "@sentinel/protocol": "*",
+    "@sentinel/database": "*",
+    "@sentinel/security": "*",
+    "@sentinel/event-engine": "*"
+  }
 }

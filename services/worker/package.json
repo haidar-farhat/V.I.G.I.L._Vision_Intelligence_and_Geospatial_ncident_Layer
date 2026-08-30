@@ -9,5 +9,14 @@
     ".": "./src/index.ts",
     "./*": "./src/*.ts"
   },
-  "sideEffects": false
+  "sideEffects": false,
+  "dependencies": {
+    "@sentinel/shared-types": "*",
+    "@sentinel/geometry": "*",
+    "@sentinel/tracking": "*",
+    "@sentinel/ai": "*",
+    "@sentinel/protocol": "*",
+    "@sentinel/event-engine": "*",
+    "@sentinel/security": "*"
+  }
 }
