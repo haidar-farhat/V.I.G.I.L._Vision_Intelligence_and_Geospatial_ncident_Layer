@@ -60,15 +60,18 @@ events and model version.
 See **[STATUS.md](STATUS.md)** for a per-capability breakdown. In short: the
 domain core, geometry, tracking, correlation, incident engine, security controls,
 database, an end-to-end vertical slice, the ONVIF and RTSP protocol layers, and
-offline map packages with camera coverage analysis are implemented and tested.
-Video decode, real inference, the Tauri shell and distributed mode are designed
-but not built.
+offline map packages with camera coverage analysis, and the control plane (REST,
+WebSocket, authentication) are implemented and tested. Video decode, real
+inference, the Tauri shell and distributed mode are designed but not built.
+
+The API runs but nothing is connected to it yet: the desktop still reads a
+generated snapshot, and no worker has spoken to it.
 
 Nothing here has been run against a physical camera. The camera protocols are
 tested against mock devices written from the specifications, which is a real bar
 and not the same one.
 
-**481 tests.** Clean typecheck under `strict` + `noUncheckedIndexedAccess`. Clean
+**619 tests.** Clean typecheck under `strict` + `noUncheckedIndexedAccess`. Clean
 architectural lint.
 
 ---
@@ -80,7 +83,7 @@ third-party runtime dependencies, and the embedded database ships inside Node.
 
 ```bash
 npm install          # dev dependencies only: TypeScript and Node types
-npm test             # 481 tests, no network
+npm test             # 619 tests, no network
 npm run lint         # architectural invariants
 npm run typecheck    # strict TypeScript across the workspace
 ```
@@ -112,6 +115,15 @@ incidents                1                  <- the whole point
   INC-53CB4075B8  [CRITICAL]  3 people in Restricted Zone A (2 cameras)
 ```
 
+### Run the stack
+
+```bash
+npm run up           # API + realtime + embedded database, on loopback
+```
+
+Prints where it is listening and a development administrator password. Needs no
+network, no services, and no configuration.
+
 ### Database
 
 ```bash
@@ -134,6 +146,7 @@ is one set of instructions and no shell-script pair to drift apart.
 | `npm run typecheck` | Strict TypeScript across the workspace |
 | `npm run slice` | End-to-end vertical slice with printed results |
 | `npm run simulator` | Camera simulator on its own |
+| `npm run up` | Start the local stack (API, realtime, database) |
 | `npm run db <cmd>` | `migrate` / `rollback` / `status` |
 | `npm run build` | Typecheck, then build the desktop bundle |
 

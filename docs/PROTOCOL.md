@@ -1,8 +1,9 @@
 # Protocol
 
-> **Status:** specified, not implemented. See [STATUS.md](../STATUS.md). The parts
-> that make reconciliation correct — deterministic event identity and idempotent
-> correlation — *are* implemented and tested; the transport is not.
+> **Status:** the operator-facing half is implemented and tested — versioned
+> envelopes, the RFC 6455 codec and handshake, and the `ui` channel over a running
+> server. The node-to-node half (worker telemetry, observations, pairing,
+> discovery) is specified here and not built. See [STATUS.md](../STATUS.md).
 
 ## Principles
 
@@ -119,6 +120,76 @@ control node in each heartbeat, and the UI surfaces it. **Skew is never silently
 corrected**: `events.occurred_at` (per the observing node) and
 `events.recorded_at` (per the control node) are separate columns, because the
 difference between them is evidence about the deployment.
+
+## The realtime connection
+
+Implemented, and driven by 58 tests over real loopback sockets.
+
+```
+ client                                        server
+   |  GET /ws?token=<session>  Upgrade: websocket
+   |------------------------------------------------>
+   |                     session checked BEFORE the handshake completes
+   |  <---- 101 Switching Protocols ----  or  ---- 401 ----
+   |
+   |  <---- welcome { channels, heartbeatIntervalMillis } ----
+   |  ---- subscribe { channels: ["events","incidents"] } ---->
+   |  <---- subscribed { subscribed, accepted, rejected } ----
+   |  <---- event / incident.opened / track / ... ----
+   |  <---- ping ----      (every 30s)
+   |  ---- pong ---->
+```
+
+Decisions worth knowing:
+
+- **The session is verified before the upgrade completes.** Upgrading first and
+  authenticating afterwards leaves a window in which an unauthenticated socket is
+  attached to the hub. Logging out closes that operator's stream too.
+- **Subscriptions are explicit and per-channel.** The cost that matters is the
+  operator's attention as much as the bandwidth: a camera-wall window has no use
+  for incident updates. A refused channel is *named* in the reply — a silently
+  dropped subscription produces a client waiting forever for a channel it never
+  joined.
+- **Outbound queues are bounded.** A console whose machine went to sleep still
+  holds a socket, and without a cap its backlog grows until the process dies,
+  taking every other console with it. One disconnected operator is recoverable; a
+  dead control node is not.
+- **Heartbeats every 30 seconds.** TCP will not report a yanked cable for minutes,
+  so without them a dead connection and an idle one are indistinguishable.
+- **Clients cannot inject server messages.** A client sending `event` is refused:
+  authentication happens once, validation happens per message.
+
+### Why the codec is written rather than imported
+
+The frame codec parses bytes that arrived from the network, and a security
+appliance's dependency list is part of its attack surface. Writing it also makes
+the limits decisions taken here rather than inherited from a library's defaults.
+Four rules the specification requires and implementations routinely miss are
+enforced and tested:
+
+| Rule | Why |
+|---|---|
+| Unmasked client frames fail the connection | Masking exists so a frame cannot be crafted to look like an HTTP request to a proxy |
+| Declared length refused from the header alone | A peer must not be able to claim 2 GB and have it allocated on its say-so |
+| A 64-bit length above 2^53 cannot round into acceptability | Silent precision loss would turn a refusal into an allocation |
+| Fragmentation cannot exceed the message cap | Otherwise the per-frame limit is trivially bypassed |
+
+## REST surface
+
+Versioned, permission-checked, and audited. Every route declares the permission
+it requires; `permission: null` is an explicit, greppable decision rather than an
+omission, and only health and login use it.
+
+Order of operations per request: **match, authenticate, rate-limit, authorise,
+run**. Rate limiting before authorisation means a flood cannot be used to probe
+which routes exist.
+
+Every response carries `X-Request-Id`, and the same id appears in the audit record
+— so "the export that failed yesterday" is an answerable question.
+
+Errors are `{ error: { code, message, recoverable } }`. Internal failures are
+logged redacted and returned sanitised: an internal message can carry a file path,
+a query or a credential.
 
 ## Rate limits
 

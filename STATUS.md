@@ -17,8 +17,8 @@ been run against a physical IP camera, a GPU, or a multi-machine LAN. Everything
 below marked `TESTED` is tested against the simulator and unit fixtures, which is
 a real bar but not the same bar.
 
-Last updated at the end of Phase 5 (map, geospatial placement, FOV). Current
-suite: **481 tests**,
+Last updated with the control plane (API, realtime, authentication). Current
+suite: **619 tests**,
 clean typecheck under `strict` + `noUncheckedIndexedAccess`, clean architectural
 lint.
 
@@ -92,6 +92,23 @@ lint.
 | Tile rendering from a package | `PLANNED` | The reader and validator exist; wiring an imported archive into MapLibre as a source does not. |
 | Zone drawing on the map | `PLANNED` | Zones render and are analysed; drawing and editing them by hand is not built. |
 
+## Control plane
+
+| Capability | State | Notes |
+|---|---|---|
+| Versioned envelopes | `TESTED` | Hard failure on version mismatch, naming which side to upgrade. Fields validated individually. |
+| WebSocket codec (RFC 6455) | `TESTED` | Hand-written, zero-dependency. Direction-correct masking, size limits enforced from the header, fragmentation capped. |
+| WebSocket handshake | `TESTED` | Validated against the specification's own worked example. Rejections are real HTTP responses, not dropped sockets. |
+| Password hashing and sessions | `TESTED` | scrypt with parameters stored per hash. Opaque revocable tokens, idle and absolute timeouts. |
+| Login flow | `TESTED` | Equal work for unknown usernames; rate limited per username and per source address independently. |
+| HTTP router | `TESTED` | Every route declares its permission. Match, authenticate, rate-limit, authorise, run. |
+| Realtime hub | `TESTED` | Per-channel subscriptions, bounded outbound queues, heartbeats, administrative disconnect. |
+| Running server | `TESTED` | HTTP and WebSocket on one loopback port. `npm run up` starts it; 31 end-to-end tests drive it over real sockets. |
+| REST surface | `IMPLEMENTED` | Health, auth, cameras, map packages and diagnostics. Zones, events, incidents, rules and nodes are not exposed yet. |
+| Audit persistence | `SKELETON` | Every privileged call reaches an audit sink with its request id and outcome; the sink does not yet write to `audit_logs`. |
+| User persistence | `SKELETON` | Schema and lookup seam exist; accounts are held in memory and the startup banner says so. |
+| Desktop connected to the API | `PLANNED` | The UI still reads a generated snapshot. |
+
 ## Not yet built
 
 Everything below is designed in [ARCHITECTURE.md](ARCHITECTURE.md) and has no
@@ -100,9 +117,8 @@ inferred from silence.
 
 | Capability | State | Notes |
 |---|---|---|
-| REST API + WebSocket hub (`services/api`) | `PLANNED` | Contracts specified in docs/PROTOCOL.md; no server yet. |
 | Desktop shell (Tauri, Rust) | `SKELETON` | Manifest, config and keychain command surface written. **Never compiled** - no Rust toolchain was available in this environment. |
-| Operator UI (React) | `IMPLEMENTED` | Command centre, map, timeline and analysis panels render real pipeline output; verified in a headless browser with zero console errors and zero network requests. Reads a generated snapshot, not a live API. |
+| Operator UI (React) | `IMPLEMENTED` | Command centre, map, timeline and analysis panels render real pipeline output; verified in a headless browser. Still reads a generated snapshot rather than the API, which now exists. |
 | ONVIF Profile T events | `PLANNED` | Discovery, device and media services are implemented; the event service is not. |
 | Real detector (YOLO-family, ONNX/TensorRT) | `PLANNED` | `Detector` interface and model registry exist; only the simulated detector is implemented. |
 | GPU device discovery | `SKELETON` | `selectDevice` chooses among reported devices; nothing enumerates real hardware yet. |
@@ -114,8 +130,6 @@ inferred from silence.
 | Node pairing + mTLS | `PLANNED` | Flow specified in ARCHITECTURE.md section 9.3; no implementation. |
 | Worker buffering + reconciliation | `PLANNED` | Deterministic event ids make replay idempotent, which is the hard half; the buffer itself is not written. |
 | OS keychain integration | `PLANNED` | `CredentialsRef` indirection exists throughout; no platform binding. |
-| Authentication (login, sessions) | `PLANNED` | Password hash column and permission model exist; no auth flow. |
-| Audit log writes | `SKELETON` | Table and record type exist; nothing writes to them yet. |
 | PTZ control | `PLANNED` | Permission and confirmation model exist; no ONVIF PTZ. |
 | Alerting (desktop, audible, webhook) | `PLANNED` | |
 | Incident replay (synchronised playback) | `PLANNED` | Timeline data exists and is ordered; no player. |
@@ -170,7 +184,12 @@ inferred from silence.
    tree occludes anything. Coverage is therefore an upper bound - real coverage is
    never better than this and is usually worse.
 
-6. **No tiles have ever been rendered from an imported package.** The PMTiles
+6. **The API exists but nothing is connected to it.** The server runs, the routes
+   work and the realtime hub delivers, all under test - but the desktop UI still
+   reads a generated snapshot, no worker has ever spoken to it, and accounts and
+   audit records are not persisted. It is a working control plane with no clients.
+
+7. **No tiles have ever been rendered from an imported package.** The PMTiles
    reader and the package validator are tested against archives built byte by
    byte, but nothing has yet handed a real basemap to MapLibre. The map draws site
    geometry over an empty background, which is the correct behaviour with no
