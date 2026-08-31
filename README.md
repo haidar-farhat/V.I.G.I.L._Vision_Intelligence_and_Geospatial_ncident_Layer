@@ -74,25 +74,49 @@ no rule.
 See **[STATUS.md](STATUS.md)** for a per-capability breakdown, honestly stated.
 In short:
 
-**Works, end to end, on real video today.** A file is decoded through a real
-H.264 decoder, run through a real detector, tracked through the Rust engine core,
-and each object projected onto the ground with an uncertainty that travels with
-it — then drawn in a native Qt console with a plan view that fetches nothing.
+**The whole spine runs, end to end, on real video today.**
 
-**140 tests**: 32 Rust, 89 engine, 19 console. `cargo fmt` and
+```
+VIDEO -> DETECTION -> TRACKING -> SPATIAL CONTEXT -> TEMPORAL CONTEXT
+      -> EVENT ANALYSIS -> MULTI-CAMERA CORRELATION -> RISK SCORING
+      -> INCIDENT -> EVIDENCE
+```
+
+A file is decoded through a real H.264 decoder, run through a real detector,
+tracked in the Rust core, projected onto the ground with an uncertainty that
+travels with it, tested against zones and schedules, turned into events that
+carry their own evidence, and correlated into incidents — then persisted,
+displayed in a native Qt console, and exportable as a verifiable package.
+
+**The central claim is measured, not asserted.** One person, two cameras
+rendered from one world through their real poses, two pipelines that know
+nothing of each other:
+
+| | |
+|---|---|
+| Position error against world ground truth | median **0.32 m** |
+| True position inside the stated 2σ disc | > 80% |
+| Events raised by the two cameras | 3 |
+| Incidents an operator sees | **1** |
+| Distinct objects in that incident | **1** |
+
+On a single-camera scene, 16 events become 1 incident — a 94% reduction in what
+a person has to read. That reduction is the product.
+
+**331 tests**: 44 Rust, 247 engine, 40 console. `cargo fmt` and
 `clippy -D warnings` clean.
 
 **Not yet true, and stated as such.** No physical camera has been contacted. No
-detection model has been run — the ONNX path is written and its error paths are
-tested, but no weights have ever been loaded into it. The test scene is
-generated, so nothing here is an accuracy claim about real footage. The
-multi-camera reasoning that is this system's central idea is designed and
-documented but not implemented in the current codebase.
+trained detection model has been run — the ONNX path executes against a model
+built locally for the purpose, which tests the machinery around a model and
+nothing about detection quality. All footage is rendered, so none of this is an
+accuracy claim about the real world. There is no authentication, no keychain
+storage, and no networking between machines.
 
-The system currently reports **5 distinct objects where 3 people walked past**,
-with 8 identity switches over ~410 observations. Both numbers are bounded by
-tests so they cannot silently get worse, and both are the known limit of tracking
-without an appearance model.
+The system reports **5 distinct objects where 3 people walked past** on the
+single-camera scene, inheriting the tracker's over-count. That and every other
+known failure is bounded by a test so it cannot quietly get worse, and recorded
+in [STATUS.md](STATUS.md).
 
 ---
 
@@ -105,7 +129,7 @@ fetched at runtime, ever.
 python -m pip install -e "engine[dev]" PySide6
 
 python tasks.py build      # build the Rust engine core
-python tasks.py test       # 140 tests, no network
+python tasks.py test       # 331 tests, no network
 python tasks.py lint       # rustfmt + clippy
 python tasks.py check      # all of the above — what CI runs
 ```
@@ -116,7 +140,7 @@ python tasks.py check      # all of the above — what CI runs
 python tasks.py console    # the operator console
 ```
 
-Open a video file, press Start, and place the camera. The console shows the
+Add one or more video files, place each camera, draw a zone, and press Start. The console shows the
 frame with its overlay, the ground beside it, and one table row per tracked
 object carrying class, confidence, duration, speed, heading, position,
 uncertainty and provenance.
@@ -143,6 +167,9 @@ there is one set of instructions and no shell-script pair to drift apart.
 | `python tasks.py lint` | `cargo fmt --check` and `clippy -D warnings` |
 | `python tasks.py check` | Lint, build, test |
 | `python tasks.py console` | Run the operator console |
+| `python tasks.py db` | Report the database's migration state |
+| `python tasks.py db-migrate` | Apply pending migrations |
+| `python tasks.py db-rollback` | Undo the most recent migration |
 
 ---
 
@@ -154,10 +181,15 @@ core/               Rust engine core: geometry, projection, zones, tracking
   src/tracking.rs     track lifecycle, association, motion
   src/ffi.rs          the C ABI
 engine/             Python engine
-  sentinel/core.py    ctypes bindings to the core
-  sentinel/decode.py  video decode, credential redaction, live streams
-  sentinel/detect.py  motion and ONNX detectors
-  sentinel/pipeline.py decode -> detect -> track -> project
+  sentinel/core.py       ctypes bindings to the core
+  sentinel/decode.py     decode, credential redaction, live streams
+  sentinel/detect.py     motion and ONNX detectors
+  sentinel/zones.py      zones, schedules, presence with hysteresis
+  sentinel/events.py     rules and events, each carrying its evidence
+  sentinel/incidents.py  correlation, object identity, risk scoring
+  sentinel/store.py      SQLite persistence, migrations, audit
+  sentinel/evidence.py   verifiable evidence export
+  sentinel/pipeline.py   the whole spine, per camera
 apps/console/       PySide6 operator console — native widgets, no webview
 models/             operator-imported models (never committed, never downloaded)
 map-data/           operator-imported map packages (never committed)
