@@ -1,9 +1,12 @@
 # Maps
 
-> **Status:** package reading, style validation, coverage analysis and the
-> placement UI are implemented and tested. Handing an imported archive to MapLibre
-> as a tile source is not yet built, so the map currently draws site geometry over
-> an empty background. See [STATUS.md](../STATUS.md).
+> **Status:** the console's plan view is implemented and tested — a metric grid,
+> the camera, its annular ground footprint, per-object uncertainty discs, trails,
+> zoom and pan — and it fetches nothing, which a test asserts. Map *package*
+> import, style validation and coverage analysis were implemented and tested in
+> the TypeScript prototype and were removed with it, so the view currently draws
+> site geometry over an empty background. That is also the correct behaviour with
+> no package installed. See [STATUS.md](../STATUS.md).
 
 ## Why the map is a first-class part of the product
 

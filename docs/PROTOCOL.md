@@ -1,9 +1,10 @@
 # Protocol
 
-> **Status:** the operator-facing half is implemented and tested — versioned
-> envelopes, the RFC 6455 codec and handshake, and the `ui` channel over a running
-> server. The node-to-node half (worker telemetry, observations, pairing,
-> discovery) is specified here and not built. See [STATUS.md](../STATUS.md).
+> **Status:** none of this is built in the current codebase. It was implemented
+> and tested in the TypeScript prototype — versioned envelopes, the RFC 6455 codec
+> and handshake, and the `ui` channel over a running server — and removed with it.
+> This document is the design the rebuild will follow, and the reasoning in it is
+> what carried over. See [STATUS.md](../STATUS.md).
 
 ## Principles
 
@@ -109,9 +110,11 @@ at-least-once, so the control node will see duplicates. That is fine, because:
 The result converges regardless of the order batches arrive in — which matters,
 because after a multi-node outage they will not arrive in order.
 
-Both properties are implemented and covered by tests today
-(`services/event-engine/test/correlation.test.ts`), even though the transport
-that would exercise them is not built.
+Both properties were implemented and covered by tests in the prototype, and both
+are requirements on the rebuild rather than nice-to-haves: without them,
+at-least-once delivery after a multi-node outage produces duplicate events and
+duplicate incidents, which is the alert-fatigue failure mode this system exists
+to avoid.
 
 ## Clock handling
 
@@ -123,7 +126,7 @@ difference between them is evidence about the deployment.
 
 ## The realtime connection
 
-Implemented, and driven by 58 tests over real loopback sockets.
+Designed. Was driven by 58 tests over real loopback sockets in the prototype; not yet rebuilt.
 
 ```
  client                                        server
@@ -164,8 +167,8 @@ Decisions worth knowing:
 The frame codec parses bytes that arrived from the network, and a security
 appliance's dependency list is part of its attack surface. Writing it also makes
 the limits decisions taken here rather than inherited from a library's defaults.
-Four rules the specification requires and implementations routinely miss are
-enforced and tested:
+Four rules the specification requires and implementations routinely miss, all of
+which the rebuild must enforce and test:
 
 | Rule | Why |
 |---|---|

@@ -2,9 +2,12 @@
 
 How Sentinel Vision finds, authenticates to, and ingests from IP cameras.
 
-> **Status:** discovery, ONVIF and the RTSP control plane are implemented and
-> tested against mock devices. Video decode is not implemented. No physical
-> camera has been contacted. See [STATUS.md](../STATUS.md).
+> **Status:** video decode from a file works and is tested against real encoded
+> media. RTSP is a code path with a reachability pre-check, and **no physical
+> camera has ever been contacted**. Discovery and ONVIF were implemented and
+> tested against mock devices in the TypeScript prototype and were removed with
+> it; the reasoning below is what the rebuild will follow.
+> See [STATUS.md](../STATUS.md).
 
 ---
 

@@ -1,135 +1,145 @@
 # Testing
 
-## Runner
-
-`node:test`, built into Node. No runner to configure, no dependency to audit, and
-the suite runs with the network cable unplugged.
+Three suites, one command:
 
 ```bash
-npm test              # everything
-npm run test:watch    # re-run on change
-node --test "packages/geometry/test/*.test.ts"   # one package
+python tasks.py test     # Rust, engine, console — 140 tests
+python tasks.py check    # lint first, then all of the above (what CI runs)
 ```
 
-**405 tests**, running in about a second and a half. That number matters: a suite
-fast enough to run on every save is a suite that actually gets run.
+Or individually:
 
-Roughly a quarter of them drive real sockets - a mock RTSP camera and a mock ONVIF
-device, both on loopback, both bound to ephemeral ports so parallel runs never
-collide.
-
-## What is tested, and why those things
-
-### Unit — the deterministic core
-
-`geometry`, `tracking`, `event-engine`, `security`, `ai`, `database`. These are
-pure and seedable, so their tests are exact rather than statistical.
-
-The tests worth knowing about are the ones that encode a *product* decision rather
-than a code path:
-
-| Test | Protects |
-|---|---|
-| a single pass produces exactly one ENTERED and one EXITED | zone boundaries must not chatter, or dwell timing and alert volume both break |
-| planar distance agrees with haversine to under a centimetre | the local-frame approximation is safe at site scale |
-| uncertainty grows super-linearly toward the horizon | the map must not show false precision |
-| the footprint excludes the blind foreground | an operator must not believe a camera covers ground it cannot see |
-| a track survives an occlusion with the same id | fragmenting identity destroys correlation before it starts |
-| a physically impossible hand-off is rejected | an impossible candidate must never reach a review queue |
-| an unknown route never outscores a known one | missing evidence must not be normalised away |
-| three cameras seeing one person produce ONE incident | the entire purpose of the product |
-| a replayed event is not counted twice | worker reconnect is at-least-once |
-| the password never appears in any serialisation | credential containment |
-| a public host is refused with an explanatory error | zero WAN |
-| a discovered camera advertising an off-network address is discarded | a device cannot lure the system off the LAN |
-| a Digest algorithm we do not implement is refused, not downgraded | a silent downgrade looks exactly like a wrong password |
-| a stream URI's embedded credential is stripped | the most common way camera passwords reach log files |
-| every failed onboarding check carries a remedy | a diagnosis without an action is half a diagnosis |
-| no schema column can hold a credential | credential containment, structurally |
-| a position is never stored without its uncertainty | false precision, structurally |
-| an AI report citing unsupplied evidence is rejected | fabricated citations are the worst AI failure mode |
-
-### Integration — the vertical slice
-
-`simulator/test/slice.test.ts` runs a full scenario through the **production**
-pipeline: detections → tracker → ground projection → zone engine → rules →
-cross-camera association → correlator → incident → analyst. Only the camera and
-the detector are simulated.
-
-This is the difference between testing components and testing a system. Four real
-defects surfaced the first time the slice ran end to end — a tracker that
-fragmented three people into 31 tracks, a broken association chain, incidents
-counting track segments as people, and an evidence bundle omitting a camera — none
-of which any unit test would have caught, because each lived in a seam.
-
-### Ground-truth measurement
-
-The simulator knows where its actors actually are, so the slice does not merely
-check that the pipeline produces *a* position — it measures the error:
-
-```
-samples               1119
-mean error            0.52 m
-p95 error             1.27 m
-within stated 2-sigma 100.0 %
+```bash
+cd core         && cargo test
+cd engine       && python -m pytest
+cd apps/console && python -m pytest        # QT_QPA_PLATFORM=offscreen
 ```
 
-That last line is the important one. It asserts the uncertainty the system reports
-actually covers the error it makes. A confident-looking dot that is wrong is worse
-than an honest wide ellipse, and this is how that stays true as the code changes.
+No network is used at any point. The CI `offline` job proves this rather than
+assuming it: it drops all outbound traffic, **verifies the drop actually took
+effect** — a firewall rule that silently failed would let the job pass while
+testing nothing — and then runs every suite.
 
-### Determinism
+---
 
-Every scenario is seeded. The slice asserts that two runs of the same seed produce
-identical event ids, identical incident ids and identical risk scores, and that a
-*different* seed changes the noise but not the conclusion.
+## What is tested where
 
-An expectation that depends on unseeded randomness is not an expectation.
+| Suite | Count | Covers |
+|---|---|---|
+| `core` (Rust) | 32 | geodesy, projection, field of view, polygons, tracking, the C ABI |
+| `engine` (Python) | 89 | the boundary, decode, detection, and the full pipeline on real video |
+| `apps/console` | 19 | placement, overlay honesty, threading, redaction, fault handling |
 
-### The quiet site
+The mathematics is tested in Rust, where it lives. The Python tests over the same
+area deliberately do **not** re-test the mathematics; they test what only a caller
+can break — struct layouts, ownership, buffer limits, and whether a value that is
+correct in Rust is still correct after it crosses. Read them as "does the boundary
+lie?" rather than "is the maths right?".
 
-An empty site must raise nothing. This is the hardest test to pass in a real
-deployment and the one that decides whether an operator keeps the system switched
-on, so it is asserted explicitly rather than assumed.
+---
 
-## Architectural tests
+## Principles
 
-`npm run lint` fails the build on layering violations, cloud SDK imports,
-hard-coded external URLs, credential-shaped literals, unfinished markers, and
-syntax that does not survive type-stripping. These are tests; they simply run
-against the source rather than against behaviour.
+### A test names the failure, not the behaviour
 
-## Writing tests here
+`test_a_ray_above_the_horizon_yields_nothing_rather_than_a_guess` says what goes
+wrong if it breaks. `test_project_to_ground` does not. When one of these fails at
+three in the morning, the name is the first thing anybody reads.
 
-- **Name the property, not the function.** `a track survives an occlusion and
-  keeps its identity` says what breaks if it fails; `test tracker update` does not.
-- **Assert the reason in the message.** A failure should explain why the property
-  matters, not just that a number differed.
-- **Use exact values where the maths allows it.** A camera at 45 degrees down lands
-  its image centre at exactly one mount height; that is checkable by hand and
-  worth checking that way.
-- **Use tolerances honestly.** Floating point never lands on exact decimals, and
-  writing `assert.equal(iou(a, a), 1)` produces a test that fails at 1.0000000000009
-  for no useful reason.
-- **Prefer a fixture that carries a real credential** in the security suite. The
-  whole point is that it must not appear in the output.
+### Assert the imperfect truth, not the intention
 
-## Not yet covered
+Where the system currently does something badly, the test asserts the bad thing
+and names it. The pipeline reports 5 distinct objects where 3 people walked past;
+the test bounds that at 6 and explains why the number is what it is. A test that
+asserted 3 would be marked skip within a week, and a skipped test protects
+nothing.
 
-Named here rather than left to be discovered:
+### Numbers in tests are measured, then floored
 
-- **Chaos and partition testing.** The simulator injects detector dropout and false
-  positives. It does not yet kill workers, delay networks, corrupt streams, fill
-  disks or restart the database.
-- **Security testing beyond unit level.** Partly covered now. The camera layer is
-  exercised against mock devices that send malformed packets, oversized bodies,
-  DTDs and credentials embedded in stream URIs, and several tests assert the
-  fixture password appears in no serialisation, log line or error path. What
-  remains uncovered is everything targeting the API and node transport - login,
-  session handling, replay across a real connection, path traversal on import -
-  because neither is built.
-- **Performance.** The numbers in the specification are design targets, not
-  measurements. Nothing has been benchmarked against real video.
-- **Cross-platform.** Developed and run on Windows. Nothing is platform-specific by
-  design — no shell scripts, no native modules, no absolute paths — but Linux and
-  macOS have not been exercised.
+Every threshold — recall, overlap, throughput, identity switches — was measured
+first and the assertion set below it with room for machine-to-machine variation.
+The measured value is written in a comment beside the assertion, so a later
+reader can tell a genuine regression from noise. A threshold chosen by intuition
+either fails constantly or never fails.
+
+### Test the property, not an arbitrary sample of it
+
+`test_uncertainty_grows_with_distance_from_the_camera` asserts a correlation and
+a super-linear ratio across all samples, not that uncertainty at 15 m exceeds
+uncertainty at 25 m. The bucketed version passed until the scene changed and
+every sample landed in one bucket, at which point it silently proved nothing.
+
+### Never assert on something your own fixture put there
+
+A check for an error string matches the error you injected as readily as the one
+you were looking for, and the test passes while proving nothing. Assert only on
+values the system under test produced.
+
+### A hanging test is a finding
+
+`test_a_failed_source_reports_in_place_rather_than_in_a_modal` would hang forever
+if the console opened a modal dialog — which is exactly what an operator would
+experience. It found that defect by hanging.
+
+---
+
+## Determinism
+
+Replaying evidence must reproduce it, or an incident review shows something other
+than what the operator saw. Three tests hold this:
+
+- decoding the same file twice yields byte-identical frames;
+- the tracker produces identical output from identical input;
+- the whole pipeline over the same video produces identical track ids and boxes.
+
+Anything that would break these — wall-clock time in the analysis path, iteration
+over an unordered set, an unseeded random number — is a defect regardless of
+whether it changes any current result.
+
+---
+
+## The reference scene
+
+`engine/tests/scene.py` generates a video and encodes it to a real file, once per
+test session. It is not committed: it is fully determined by that module, and a
+binary in version control that can be regenerated exactly is a binary that will
+eventually disagree with the code that generates it.
+
+**Be clear about what it establishes.** The *file* is real — a genuine container
+written by a real encoder and read by a real decoder, so the decode path under
+test is the one a camera exercises. The *scene* is generated geometry. It proves
+the pipeline carries frames, detections, tracks and positions end to end without
+lying about them. It proves nothing about real footage.
+
+It is built to be honest work for the stages below it rather than easy on them:
+
+- perspective, so objects further away are smaller and move less per frame;
+- sensor noise and an illumination drift, so a background model has something to
+  cope with;
+- an object that walks behind an occluder, which decides whether a tracker keeps
+  an identity or invents one;
+- two objects that cross, which is where naive association swaps them;
+- an object that stops moving, which is the loitering case and the one background
+  subtraction cannot see.
+
+The walkers are drawn with internal structure — head, torso, swinging legs — and
+that is not decoration. A uniformly shaded rectangle is an unrealistically *hard*
+case: a background model absorbs the unchanging interior of a slow solid block
+and leaves only its leading edge. Testing against a shape real objects do not
+have would mean tuning the detector for a problem nobody has.
+
+`scene.ground_truth(index)` returns what is actually where in each frame, which
+makes it the specification the measurements are taken against.
+
+---
+
+## Credentials in tests
+
+No camera password may appear in test output. The decode tests use a fixed
+sentinel string and assert it is unreachable through `repr`, `str`, the display
+URL, the source id, and every error message — including its *length*, since a
+redaction that prints one asterisk per character leaks that.
+
+Unreachable network addresses in tests use `203.0.113.0/24` (TEST-NET-3), which is
+reserved for documentation and routed nowhere. A test that reaches a real host is
+a test that behaves differently on someone else's network.

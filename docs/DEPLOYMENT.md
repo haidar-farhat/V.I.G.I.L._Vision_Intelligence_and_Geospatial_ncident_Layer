@@ -1,5 +1,9 @@
 # Deployment
 
+> **Status:** this describes a design that has not been rebuilt since the move to
+> Python and Rust. The reasoning is intact and is what the implementation will
+> follow; the code it refers to no longer exists. See [STATUS.md](../STATUS.md).
+
 > **Status:** `PLANNED`. Packaging, installers and the offline update flow are
 > designed here and not built. See [STATUS.md](../STATUS.md).
 
@@ -12,9 +16,9 @@ a local worker. Suitable up to roughly a dozen cameras on a machine with a
 mid-range GPU.
 
 ```
- sentinel-desktop (Tauri)
+ sentinel-console (Python + Qt)
    +-- supervises --> sentinel-api        127.0.0.1:8787
-                        +-- database        node:sqlite (WAL)
+                        +-- database        sqlite3 (WAL)
                         +-- event-engine    in-process
                         +-- recorder        in-process
                         +-- worker (local)  child process
