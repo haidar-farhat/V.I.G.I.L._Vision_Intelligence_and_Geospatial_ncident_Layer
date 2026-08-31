@@ -712,8 +712,11 @@ class ConsoleWindow(QMainWindow):
             self.incidents.show_incidents([])
             return
 
-        correlator = Correlator(zone_kinds={zone.id: zone.kind for zone in self._zones})
-        self._incidents = correlator.correlate(events)
+        kinds = {zone.id: zone.kind for zone in self._zones}
+        self._incidents = []
+        for _s in self._sessions.values():
+            if _s.events:
+                self._incidents.extend(Correlator(zone_kinds=kinds).correlate(_s.events))
         self.incidents.show_incidents(self._incidents)
 
         # Written every time, and idempotent every time: ids are deterministic,
