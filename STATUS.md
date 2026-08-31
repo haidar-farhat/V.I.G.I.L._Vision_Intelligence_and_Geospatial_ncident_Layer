@@ -22,7 +22,7 @@ implementation was removed in `582d0a8`; its architecture documents were kept
 because the thinking in them carried over, and are being brought up to date.
 Anything below that is not yet re-established after the rewrite says so.
 
-Current suite: **253 tests** — 42 Rust, 185 engine, 26 console. `cargo fmt` and
+Current suite: **266 tests** — 44 Rust, 196 engine, 26 console. `cargo fmt` and
 `clippy -D warnings` clean. Run everything with `python tasks.py check`.
 
 ---
@@ -42,6 +42,7 @@ Geometry, projection, zones and tracking, behind a C ABI.
 | Motion (speed, heading) | `TESTED` | Three states, not two: unknown, standing still, moving. Speed is withheld until it spans 1.2 s, because dividing a distance by one frame interval amplifies position error fivefold. |
 | Uncertainty-aware zones | `TESTED` | Three states again: inside, outside, and *uncertain* when the position's own error disc straddles the boundary. |
 | C ABI | `TESTED` | Every entry point checks its pointers, is marked `unsafe`, and carries a `# Safety` contract. `panic = "abort"`, so no unwind crosses the boundary. |
+| Inverse projection | `TESTED` | Where a world point appears in an image. Round-trips with the forward projection to within 1e-6. |
 | Struct-layout guard | `TESTED` | The core exports its struct sizes; the Python binding refuses to load on a mismatch. |
 
 ## Engine (Python)
@@ -58,7 +59,7 @@ Geometry, projection, zones and tracking, behind a C ABI.
 | ONNX detection | `TESTED` | Letterboxing, per-class NMS, layout inference, model digest recorded — all now executed against a real ONNX graph. **No trained weights have been run** — see gap 2. |
 | Zones, schedules, presence | `TESTED` | Hysteresis on both edges; exit slower than entry. Schedules wrap midnight. |
 | Rules and events | `TESTED` | Deterministic ids for idempotent replay. Every event carries its own evidence and the conditions that fired. |
-| Correlation and incidents | `TESTED` | Union-find object identity, transitive across cameras. Risk is scored with an explicit breakdown. |
+| Correlation and incidents | `TESTED` | Union-find object identity, transitive across cameras. Exercised through two independent pipelines over two rendered views of one world — see "the central claim" below. |
 | Pipeline | `TESTED` | decode → detect → track → project → zones → events → incidents. Deterministic: the same file twice gives identical output. |
 
 ## Operator console (PySide6)
@@ -95,6 +96,26 @@ is synthetic (`engine/tests/scene.py`); see gap 1.
 | Events raised on the reference scene | 16 |
 | Incidents after correlation | **1** |
 | Reduction in what a person must read | **94%** |
+
+### The central claim, measured
+
+One person, one world, two cameras rendered from it through their real poses and
+processed by two pipelines that know nothing of each other
+(`engine/tests/test_multicamera.py`).
+
+| Measurement | Value |
+|---|---|
+| Distinct objects per camera | 1 and 1 |
+| Position error against **world** ground truth | median **0.32 m**, p90 ~1.0 m |
+| True position inside the stated 2σ disc | > 80% |
+| Events from both cameras | 3 |
+| Incidents after correlation | **1** |
+| Distinct objects in that incident | **1** |
+
+This is the strongest available check short of hardware. The renderer projects
+world → image; the pipeline projects image → world. If the geometry were wrong
+anywhere in that loop the cameras would disagree about where the person was, the
+association would fail, and one person would be reported as two.
 
 The last two are honest failures, bounded by tests so they cannot quietly get
 worse. They are the appearance-free tracking limit: when two people cross, box
@@ -178,12 +199,11 @@ exists for them in `docs/`.
    The suites it runs all pass locally on Windows with Python 3.14; CI targets
    3.12, which has not been tried.
 
-7. **Multi-camera correlation is implemented but has never seen two cameras.**
-   The central claim — three cameras seeing one person is one incident — is
-   implemented, and `test_three_cameras_seeing_one_person_produce_one_incident`
-   holds it. But that test builds its events by hand. No two real cameras have
-   ever been correlated, because the console runs one source at a time and no
-   second camera exists to run.
+7. **Multi-camera correlation works, on rendered footage.** Two pipelines over
+   two views of one world produce one incident containing one object. What has
+   still never happened is two *physical* cameras: the geometry is exercised, the
+   optics and the disagreements real hardware brings are not. The console also
+   still runs one source at a time, so an operator cannot yet see this.
 
    The association itself is deliberately weak and says so. Without appearance
    features, position and time are all there is, so it will merge two people who

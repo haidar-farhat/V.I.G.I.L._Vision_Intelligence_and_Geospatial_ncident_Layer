@@ -25,7 +25,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Iterable, Sequence
 
-ABI_VERSION = 4
+ABI_VERSION = 5
 
 # --------------------------------------------------------------------- structs
 
@@ -271,6 +271,13 @@ def _bind(lib: ctypes.CDLL) -> None:
     ]
     lib.sentinel_point_in_zone.restype = ctypes.c_int32
 
+    lib.sentinel_image_coordinates.argtypes = [
+        ctypes.POINTER(CPose), ctypes.c_double, ctypes.c_double, ctypes.c_double,
+        ctypes.POINTER(ctypes.c_double), ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_double), ctypes.POINTER(ctypes.c_uint32),
+    ]
+    lib.sentinel_image_coordinates.restype = ctypes.c_int32
+
     lib.sentinel_zone_membership.argtypes = [
         ctypes.POINTER(CPoint), ctypes.c_uint32,
         ctypes.c_double, ctypes.c_double, ctypes.c_double,
@@ -477,6 +484,51 @@ def point_in_zone(ring: Sequence[LatLon], point: LatLon) -> bool:
     lib = load_core()
     buffer = (CPoint * len(ring))(*[CPoint(p.lat, p.lon) for p in ring])
     return lib.sentinel_point_in_zone(buffer, len(ring), point.lat, point.lon) == 1
+
+
+@dataclass(frozen=True, slots=True)
+class ImagePoint:
+    """Where a world point appears in a camera's image.
+
+    ``u`` and ``v`` are normalised and **not clipped**: a value outside 0..1
+    means the point is off frame in that direction, which is a meaningful answer
+    rather than an error. ``in_frame`` is the clipped question.
+    """
+
+    u: float
+    v: float
+    distance_meters: float
+    in_frame: bool
+
+
+def image_coordinates(
+    pose: CameraPose, point: LatLon, height_meters: float = 0.0
+) -> ImagePoint | None:
+    """Where a point at a given height appears in this camera's image.
+
+    The exact inverse of :func:`project_to_ground`. ``None`` when the point is
+    behind the camera, where no image position exists — which is different from
+    being off the edge of the frame, and must not be confused with it.
+    """
+    lib = load_core()
+    c_pose = pose.to_c()
+    u = ctypes.c_double(0.0)
+    v = ctypes.c_double(0.0)
+    distance = ctypes.c_double(0.0)
+    in_frame = ctypes.c_uint32(0)
+
+    result = lib.sentinel_image_coordinates(
+        ctypes.byref(c_pose), point.lat, point.lon, height_meters,
+        ctypes.byref(u), ctypes.byref(v), ctypes.byref(distance), ctypes.byref(in_frame),
+    )
+    if result < 0:
+        raise CoreError("image_coordinates failed")
+    if result == 0:
+        return None
+
+    return ImagePoint(
+        u=u.value, v=v.value, distance_meters=distance.value, in_frame=bool(in_frame.value)
+    )
 
 
 class ZoneMembership(str, Enum):

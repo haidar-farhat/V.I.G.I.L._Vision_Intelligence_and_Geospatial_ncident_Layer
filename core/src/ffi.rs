@@ -23,7 +23,7 @@ use crate::tracking::{Detection, Tracker, TrackerConfig};
 
 /// Version of this ABI. Python checks it on load and refuses a mismatch rather
 /// than calling functions whose signatures may have moved.
-pub const ABI_VERSION: u32 = 4;
+pub const ABI_VERSION: u32 = 5;
 
 #[no_mangle]
 pub extern "C" fn sentinel_abi_version() -> u32 {
@@ -352,6 +352,63 @@ pub unsafe extern "C" fn sentinel_point_in_zone(
         1
     } else {
         0
+    }
+}
+
+/// Where a point at a given height appears in a camera's image.
+///
+/// The exact inverse of `sentinel_project_to_ground`. Two uses, both real:
+/// drawing a map object onto a camera view, and generating test footage of a
+/// known world from a known pose — which is the only way to check that two
+/// cameras looking at one scene agree about what they are seeing.
+///
+/// `u` and `v` are normalised image coordinates and are **not clipped**: a value
+/// outside 0..1 means the point is off frame in that direction, which is a
+/// meaningful answer rather than an error. `in_frame` is 1 only when the point
+/// is inside the field of view on both axes and within range.
+///
+/// # Safety
+///
+/// Null is accepted and produces a defined failure. A **non-null** pointer,
+/// however, is taken at its word: it must point to a live, aligned,
+/// initialised value of the named type. Null-checking cannot establish that,
+/// which is why this is `unsafe` despite checking.
+#[no_mangle]
+pub unsafe extern "C" fn sentinel_image_coordinates(
+    pose: *const CPose,
+    lat: f64,
+    lon: f64,
+    height_meters: f64,
+    out_u: *mut f64,
+    out_v: *mut f64,
+    out_distance: *mut f64,
+    out_in_frame: *mut u32,
+) -> i32 {
+    if pose.is_null()
+        || out_u.is_null()
+        || out_v.is_null()
+        || out_distance.is_null()
+        || out_in_frame.is_null()
+    {
+        return -1;
+    }
+
+    // SAFETY: every pointer checked non-null above.
+    let camera = unsafe { (*pose).to_pose() };
+    let point = LatLon { lat, lon };
+
+    match geometry::image_coordinates(&camera, point, height_meters) {
+        None => 0,
+        Some((u, v, distance, in_frame)) => {
+            // SAFETY: as above.
+            unsafe {
+                *out_u = u;
+                *out_v = v;
+                *out_distance = distance;
+                *out_in_frame = u32::from(in_frame);
+            }
+            1
+        }
     }
 }
 
@@ -798,6 +855,19 @@ mod tests {
                 sentinel_zone_membership(std::ptr::null(), 4, 0.0, 0.0, 1.0),
                 -1
             );
+            assert_eq!(
+                sentinel_image_coordinates(
+                    std::ptr::null(),
+                    0.0,
+                    0.0,
+                    1.7,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                ),
+                -1
+            );
 
             // Destroying null is a no-op, so a double free is survivable.
             sentinel_tracker_destroy(std::ptr::null_mut());
@@ -839,6 +909,71 @@ mod tests {
             );
 
             sentinel_tracker_destroy(handle);
+        }
+    }
+
+    #[test]
+    fn image_coordinates_invert_the_projection() {
+        // Project a ray to the ground, then ask where that ground point appears.
+        // It has to come back where it started, or the two halves of the camera
+        // model disagree and every overlay drawn from the map is wrong.
+        unsafe {
+            let camera = pose();
+            let mut projected = CProjection {
+                valid: 0,
+                _pad: 0,
+                lat: 0.0,
+                lon: 0.0,
+                ground_distance_meters: 0.0,
+                bearing_deg: 0.0,
+                uncertainty_meters: 0.0,
+            };
+            assert_eq!(
+                sentinel_project_to_ground(&camera, 0.62, 0.71, 1.5, 1, &mut projected),
+                0
+            );
+            assert_eq!(projected.valid, 1);
+
+            let (mut u, mut v, mut distance, mut in_frame) = (0.0, 0.0, 0.0, 0u32);
+            let found = sentinel_image_coordinates(
+                &camera,
+                projected.lat,
+                projected.lon,
+                0.0,
+                &mut u,
+                &mut v,
+                &mut distance,
+                &mut in_frame,
+            );
+
+            assert_eq!(found, 1);
+            assert!((u - 0.62).abs() < 1e-6, "u came back as {u}");
+            assert!((v - 0.71).abs() < 1e-6, "v came back as {v}");
+            assert_eq!(in_frame, 1);
+            assert!((distance - projected.ground_distance_meters).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn a_point_behind_the_camera_has_no_image_coordinates() {
+        unsafe {
+            let camera = pose();
+            let (mut u, mut v, mut d, mut f) = (0.0, 0.0, 0.0, 0u32);
+
+            assert_eq!(
+                sentinel_image_coordinates(
+                    &camera,
+                    camera.lat - 0.001,
+                    camera.lon,
+                    0.0,
+                    &mut u,
+                    &mut v,
+                    &mut d,
+                    &mut f,
+                ),
+                0,
+                "a point behind the camera must not be given a position in its image"
+            );
         }
     }
 
