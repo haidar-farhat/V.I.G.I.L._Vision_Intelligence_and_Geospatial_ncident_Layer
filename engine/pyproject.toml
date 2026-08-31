@@ -10,7 +10,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0"]
+# `onnx` is a test-fixture dependency only: it builds the small model that makes
+# the ONNX inference path executable in tests. Nothing at runtime imports it, and
+# no model is ever downloaded.
+dev = ["pytest>=8.0", "onnx>=1.16"]
 
 # No network at runtime. Nothing here reaches the Internet, and nothing may be
 # added that does: see docs/SECURITY.md.

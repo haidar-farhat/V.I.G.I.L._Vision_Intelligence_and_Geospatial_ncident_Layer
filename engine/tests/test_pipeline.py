@@ -24,10 +24,11 @@ from pathlib import Path
 
 import pytest
 
+import onnx_fixture
 import scene
 from sentinel.core import CameraPose, haversine_distance
 from sentinel.decode import VideoSource
-from sentinel.detect import UNCLASSIFIED, MotionDetector
+from sentinel.detect import UNCLASSIFIED, MotionDetector, OnnxDetector
 from sentinel.pipeline import Pipeline
 
 #: Objects genuinely present in the reference scene.
@@ -324,3 +325,53 @@ def test_moving_the_camera_moves_the_map_positions_not_the_identities(
     assert before is not None and after is not None, "the track did not survive the pan"
     assert before.position is not None and after.position is not None
     assert haversine_distance(before.position.point, after.position.point) > 5.0
+
+
+# ------------------------------------------------------ the pipeline on a model
+
+
+def test_the_whole_pipeline_runs_on_a_real_onnx_model(
+    tmp_path: Path, reference_video: Path, reference_pose: CameraPose
+):
+    """Decode, ONNX inference, tracking and projection, with no mocks anywhere.
+
+    The detector is a locally built brightness model rather than trained weights,
+    so this says nothing about detection quality. What it does establish is that
+    the two detectors are genuinely interchangeable — that everything downstream
+    of `detect()` is indifferent to which produced the detections, which is the
+    property that lets an operator supply a model without the rest of the system
+    changing.
+    """
+    model = onnx_fixture.build_model(tmp_path / "brightness.onnx")
+    detector = OnnxDetector(model, confidence_threshold=0.45)
+
+    with Pipeline(
+        VideoSource(reference_video, source_id="cam-onnx"),
+        detector,
+        pose=reference_pose,
+    ) as pipeline:
+        results = list(pipeline.run())
+        stats = pipeline.stats
+
+    assert len(results) == scene.FRAME_COUNT
+    assert stats.detections > 0, "the model produced nothing across the whole clip"
+    assert stats.distinct_objects > 0, "detections never became tracks"
+
+    # A classifying detector must label its tracks with the model's own class
+    # names, where the motion detector leaves them UNCLASSIFIED.
+    labelled = {t.class_id for r in results for t in r.tracks}
+    assert labelled and UNCLASSIFIED not in labelled
+    assert pipeline.detector_info.classifies is True
+    assert pipeline.detector_info.class_names == {0: "bright_region"}
+
+
+def test_provenance_names_the_exact_weights(tmp_path: Path, reference_video: Path):
+    # Months later, with three model versions through the site, "which model said
+    # that" has to be answerable from the record alone.
+    model = onnx_fixture.build_model(tmp_path / "brightness.onnx")
+
+    with Pipeline(VideoSource(reference_video), OnnxDetector(model)) as pipeline:
+        info = pipeline.detector_info
+
+    assert info.model_path == str(model.resolve())
+    assert info.model_sha256 is not None and len(info.model_sha256) == 64

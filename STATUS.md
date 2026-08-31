@@ -22,7 +22,7 @@ implementation was removed in `582d0a8`; its architecture documents were kept
 because the thinking in them carried over, and are being brought up to date.
 Anything below that is not yet re-established after the rewrite says so.
 
-Current suite: **140 tests** — 32 Rust, 89 engine, 19 console. `cargo fmt` and
+Current suite: **158 tests** — 32 Rust, 107 engine, 19 console. `cargo fmt` and
 `clippy -D warnings` clean. Run everything with `python tasks.py check`.
 
 ---
@@ -54,7 +54,7 @@ Geometry, projection, zones and tracking, behind a C ABI.
 | Live-stream frame dropping | `TESTED` | Newest-wins with a count of what was dropped. Refuses to wrap a file, because that would make replay non-deterministic. |
 | Credential redaction | `TESTED` | A password is unreachable through `repr`, `str`, display URL, source id, or any error message — including its length. |
 | Motion detection | `TESTED` | MOG2 with a resolution-scaled vertical morphology kernel. Emits `UNCLASSIFIED` and never claims otherwise. |
-| ONNX detection | `IMPLEMENTED` | Letterboxing, per-class NMS, layout inference, model digest recorded. **No detection model has ever been run through it** — see gap 2. |
+| ONNX detection | `TESTED` | Letterboxing, per-class NMS, layout inference, model digest recorded — all now executed against a real ONNX graph. **No trained weights have been run** — see gap 2. |
 | Pipeline | `TESTED` | decode → detect → track → project, with measured statistics. Deterministic: the same file twice gives identical output. |
 
 ## Operator console (PySide6)
@@ -136,12 +136,20 @@ exists for them in `docs/`.
    frames, detections, tracks and positions end to end without lying about them",
    not as an accuracy claim. Nothing stronger is possible without footage.
 
-2. **No detection model has ever been run.** `OnnxDetector` is written against
-   onnxruntime with real preprocessing, real NMS and real output-layout
-   inference, but it has never had weights loaded into it, because a model may
-   not be downloaded and none was available. It is `IMPLEMENTED`, not `TESTED`,
-   and the distinction is the point. Its error paths *are* tested; its inference
-   path is not.
+2. **No *trained* detection model has been run.** The ONNX path now executes
+   end to end against a real model — `engine/tests/onnx_fixture.py` builds one
+   locally with genuine ONNX operators, since none may be downloaded. It is a
+   brightness detector: it reduces the image to luminance, pools it into a 20×20
+   grid, and emits one candidate per cell scored by that cell's brightness.
+   Crude, but its output is a real function of its input, so the tests can fail —
+   move the object and the box must move, which is what catches a transposed
+   output or a dropped letterbox offset.
+
+   That establishes the machinery *around* a model: preprocessing, session
+   execution, layout inference, coordinate un-letterboxing, per-class NMS,
+   provenance, and that the two detectors are interchangeable everywhere
+   downstream. It establishes **nothing** about detection quality, classes, or
+   real-world behaviour. Trained weights remain untried.
 
 3. **No physical camera has ever been contacted.** RTSP support is a code path,
    not a verified capability. Real cameras deviate from the specifications in
