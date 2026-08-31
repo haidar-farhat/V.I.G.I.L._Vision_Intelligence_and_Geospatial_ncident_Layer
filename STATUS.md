@@ -22,7 +22,7 @@ implementation was removed in `582d0a8`; its architecture documents were kept
 because the thinking in them carried over, and are being brought up to date.
 Anything below that is not yet re-established after the rewrite says so.
 
-Current suite: **304 tests** — 44 Rust, 223 engine, 37 console. `cargo fmt` and
+Current suite: **331 tests** — 44 Rust, 247 engine, 40 console. `cargo fmt` and
 `clippy -D warnings` clean. Run everything with `python tasks.py check`.
 
 ---
@@ -63,6 +63,7 @@ Geometry, projection, zones and tracking, behind a C ABI.
 | Pipeline | `TESTED` | decode → detect → track → project → zones → events → incidents. Deterministic: the same file twice gives identical output. |
 | Persistence | `TESTED` | SQLite in WAL, forward migrations with a reversal each, idempotent upserts on deterministic ids. No column holds a credential — asserted by walking the schema. |
 | Audit log | `TESTED` | Append-only. There is deliberately no method to edit one, and a test fails if somebody adds it. |
+| Evidence export | `TESTED` | A folder per incident: the full record, a report a person can read without tooling, and a SHA-256 for every file. Verifiable by somebody who has only the folder. |
 
 ## Operator console (PySide6)
 
@@ -148,7 +149,7 @@ exists for them in `docs/`.
 | Node discovery and pairing | `PLANNED` | |
 | Worker autonomy and reconciliation | `PLANNED` | |
 | Camera discovery (ONVIF/mDNS) | `PLANNED` | |
-| Recording and evidence export | `PLANNED` | |
+| Continuous recording | `PLANNED` | Export exists; there is no recorded video to attach to it yet. |
 | Map package import | `PLANNED` | |
 | Authentication | `PLANNED` | The audit half is built; there is nobody to attribute an action to yet. |
 | Secret storage in the OS keychain | `PLANNED` | No secret is stored at all today. |

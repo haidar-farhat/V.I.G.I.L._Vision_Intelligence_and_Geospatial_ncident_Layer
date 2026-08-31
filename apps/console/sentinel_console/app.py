@@ -67,6 +67,7 @@ from sentinel.events import (
     RapidMovementRule,
     ZoneEntryRule,
 )
+from sentinel.evidence import ExportError, export_incident
 from sentinel.incidents import Correlator
 from sentinel.store import Store, default_database_path
 from sentinel.zones import Zone, ZoneKind
@@ -264,6 +265,16 @@ class ConsoleWindow(QMainWindow):
         )
         self.zone_button.clicked.connect(self._add_zone)
         row.addWidget(self.zone_button)
+
+        self.export_button = QPushButton("Export incident…")
+        self.export_button.setEnabled(False)
+        self.export_button.setToolTip(
+            "Writes the selected incident, its evidence and a readable report "
+            "to a folder, with a SHA-256 for every file so any later alteration "
+            "is detectable."
+        )
+        self.export_button.clicked.connect(self._export_incident)
+        row.addWidget(self.export_button)
 
         self.zone_radius = QDoubleSpinBox()
         self.zone_radius.setRange(2.0, 200.0)
@@ -524,6 +535,69 @@ class ConsoleWindow(QMainWindow):
 
     # ------------------------------------------------------------------ running
 
+    def _export_incident(self) -> None:
+        """Write the selected incident out as an evidence package.
+
+        Audited, because who exported what and when is part of the chain of
+        custody and is exactly the question asked when a package turns up
+        somewhere it should not have.
+        """
+        incident = self._selected_incident()
+        if incident is None:
+            QMessageBox.information(
+                self, "No incident selected", "Select an incident to export."
+            )
+            return
+
+        destination = QFileDialog.getExistingDirectory(
+            self, "Export evidence to", str(Path.home())
+        )
+        if not destination:
+            return
+
+        try:
+            export = export_incident(
+                incident,
+                Path(destination),
+                # No authentication yet, so there is nobody to name. Recording
+                # "console" is the truth; inventing an operator name would be a
+                # false entry in a chain of custody.
+                exported_by="console (unauthenticated)",
+            )
+        except ExportError as error:
+            QMessageBox.warning(self, "Export failed", str(error))
+            return
+
+        self.store.audit(
+            "console", "incident.exported", incident.id, str(export.directory)
+        )
+        QMessageBox.information(
+            self,
+            "Evidence exported",
+            "\n".join([
+                incident.id,
+                "",
+                f"{len(export.files)} files written to",
+                str(export.directory),
+                "",
+                "Manifest SHA-256:",
+                export.manifest_sha256,
+                "",
+            ])
+            + "Record that digest separately. It is what makes the package "
+            "checkable later.",
+        )
+
+    def _selected_incident(self):
+        item = self.incidents.currentItem()
+        while item is not None and item.parent() is not None:
+            item = item.parent()
+        if item is None:
+            return self._incidents[0] if self._incidents else None
+
+        chosen = item.data(0, Qt.ItemDataRole.UserRole)
+        return next((i for i in self._incidents if i.id == chosen), None)
+
     def _rules(self) -> list:
         if not self._zones:
             # Without a zone there is nothing to be inside, so only the rules
@@ -645,6 +719,8 @@ class ConsoleWindow(QMainWindow):
         # Written every time, and idempotent every time: ids are deterministic,
         # so re-correlating a growing window upserts the same incident rather
         # than accumulating a new one each pass.
+        self.export_button.setEnabled(bool(self._incidents))
+
         for incident in self._incidents:
             self.store.save_incident(incident)
             if incident.id not in self._persisted:

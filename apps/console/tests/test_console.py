@@ -720,3 +720,43 @@ def test_re_correlating_does_not_multiply_stored_incidents(qt_app, window, refer
 
     assert after_one > 0
     assert window.store.incident_count() == after_one
+
+
+# ------------------------------------------------------------------- export
+
+
+def test_export_is_disabled_until_there_is_something_to_export(qt_app, window):
+    assert window.export_button.isEnabled() is False
+
+
+def test_an_incident_can_be_exported_with_a_verifiable_manifest(qt_app, window, tmp_path):
+    from sentinel.evidence import export_incident, verify_export
+    from sentinel.incidents import Correlator
+    from test_store import make_event
+
+    incident = Correlator().correlate([make_event(track=n) for n in (1, 2)])[0]
+    window._incidents = [incident]
+
+    export = export_incident(incident, tmp_path, exported_by="console (unauthenticated)")
+    window.store.audit("console", "incident.exported", incident.id, str(export.directory))
+
+    assert verify_export(export.directory) == []
+    assert any(
+        row["action"] == "incident.exported" for row in window.store.audit_trail()
+    ), "an export that is not audited breaks the chain of custody"
+
+
+def test_the_export_names_no_operator_it_cannot_verify(qt_app, window, tmp_path):
+    # There is no authentication yet, so there is nobody to name. Inventing an
+    # operator would be a false entry in a chain of custody.
+    import json
+
+    from sentinel.evidence import export_incident
+    from sentinel.incidents import Correlator
+    from test_store import make_event
+
+    incident = Correlator().correlate([make_event()])[0]
+    export = export_incident(incident, tmp_path, exported_by="console (unauthenticated)")
+
+    manifest = json.loads((export.directory / "manifest.json").read_text(encoding="utf-8"))
+    assert "unauthenticated" in manifest["exported_by"]
