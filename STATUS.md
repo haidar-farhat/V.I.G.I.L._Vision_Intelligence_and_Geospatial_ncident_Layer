@@ -22,7 +22,7 @@ implementation was removed in `582d0a8`; its architecture documents were kept
 because the thinking in them carried over, and are being brought up to date.
 Anything below that is not yet re-established after the rewrite says so.
 
-Current suite: **273 tests** — 44 Rust, 196 engine, 33 console. `cargo fmt` and
+Current suite: **304 tests** — 44 Rust, 223 engine, 37 console. `cargo fmt` and
 `clippy -D warnings` clean. Run everything with `python tasks.py check`.
 
 ---
@@ -61,6 +61,8 @@ Geometry, projection, zones and tracking, behind a C ABI.
 | Rules and events | `TESTED` | Deterministic ids for idempotent replay. Every event carries its own evidence and the conditions that fired. |
 | Correlation and incidents | `TESTED` | Union-find object identity, transitive across cameras. Exercised through two independent pipelines over two rendered views of one world — see "the central claim" below. |
 | Pipeline | `TESTED` | decode → detect → track → project → zones → events → incidents. Deterministic: the same file twice gives identical output. |
+| Persistence | `TESTED` | SQLite in WAL, forward migrations with a reversal each, idempotent upserts on deterministic ids. No column holds a credential — asserted by walking the schema. |
+| Audit log | `TESTED` | Append-only. There is deliberately no method to edit one, and a test fails if somebody adds it. |
 
 ## Operator console (PySide6)
 
@@ -70,7 +72,7 @@ Geometry, projection, zones and tracking, behind a C ABI.
 | Camera view with overlay | `TESTED` | Detections, confirmed tracks and coasting tracks drawn distinctly. |
 | Plan view | `TESTED` | Metric grid, annular footprint, per-object uncertainty discs, trails, zoom and pan. Fetches nothing — asserted by test. |
 | Track table | `TESTED` | One row per object with class, confidence, duration, motion, position, uncertainty and provenance. |
-| Camera placement | `TESTED` | Reports the ground band a pose actually covers as it is typed. No default placement exists. |
+| Camera placement | `TESTED` | Reports the ground band a pose actually covers as it is typed. No default placement exists. Persisted, so it survives a restart. |
 | Off-thread analysis | `TESTED` | Asserted by test that `run()` executes on the worker's own thread. |
 | Fault reporting | `TESTED` | In place, not modal — twenty cameras drop together when a switch loses power. |
 | Incident panel | `TESTED` | One row per incident, expandable into its risk factors, cross-camera links and timeline. Sorted by severity, not arrival. |
@@ -141,7 +143,6 @@ exists for them in `docs/`.
 
 | Capability | State | Notes |
 |---|---|---|
-| Persistence | `PLANNED` | Schema designed in docs/DATABASE.md. |
 | Grounded AI analyst | `PLANNED` | |
 | REST and WebSocket control plane | `PLANNED` | |
 | Node discovery and pairing | `PLANNED` | |
@@ -149,7 +150,7 @@ exists for them in `docs/`.
 | Camera discovery (ONVIF/mDNS) | `PLANNED` | |
 | Recording and evidence export | `PLANNED` | |
 | Map package import | `PLANNED` | |
-| Authentication and audit | `PLANNED` | |
+| Authentication | `PLANNED` | The audit half is built; there is nobody to attribute an action to yet. |
 | Secret storage in the OS keychain | `PLANNED` | No secret is stored at all today. |
 
 ## Honest gaps worth naming

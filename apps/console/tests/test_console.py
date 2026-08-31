@@ -52,7 +52,9 @@ def qt_app():
 
 @pytest.fixture
 def window(qt_app):
-    win = ConsoleWindow()
+    # In memory, always. A test that wrote to the operator's real database
+    # would leave fabricated incidents in an evidence trail.
+    win = ConsoleWindow(":memory:")
     win.resize(1280, 800)
     # Shown, because a child widget's isVisible() is False while its top-level
     # window is hidden — a test against an unshown window cannot tell a widget
@@ -278,7 +280,7 @@ def test_the_newest_result_wins_rather_than_a_backlog_building(qt_app, reference
 
 
 def test_closing_the_window_stops_the_analysis(qt_app, reference_video: Path):
-    win = ConsoleWindow()
+    win = ConsoleWindow(":memory:")
     session = win.add_camera(reference_video, "cam-07")
     win._start()
     pump(qt_app, win, 2.0)
@@ -596,3 +598,125 @@ def test_an_unplaced_camera_is_named_as_unplaced(qt_app, window, reference_video
 
     assert "1 of 2" in window.placement_label.text()
     assert "will not locate" in window.placement_label.text()
+
+
+# --------------------------------------------------------------- persistence
+
+
+def test_incidents_survive_the_console_being_closed(qt_app, reference_video, tmp_path):
+    """The point of persisting anything.
+
+    An incident an operator cannot go back to a week later did not, as far as
+    anybody reviewing it is concerned, happen.
+    """
+    from sentinel.core import CameraPose, LatLon
+
+    database = tmp_path / "sentinel.db"
+
+    first = ConsoleWindow(database)
+    first.show()
+    session = first.add_camera(reference_video, "cam-07")
+    session.pose = CameraPose(
+        position=LatLon(33.8938, 35.5018),
+        mount_height=6.0,
+        heading=180.0,
+        pitch=-22.0,
+        horizontal_fov=62.0,
+        vertical_fov=36.0,
+        range_meters=90.0,
+    )
+    first._refresh_placement()
+    first.zone_radius.setValue(10.0)
+    first._add_zone()
+    first._start()
+    pump(qt_app, first, 16.0)
+    first._stop()
+    first._correlate()
+    stored_incidents = first.store.incident_count()
+    first.close()
+
+    assert stored_incidents > 0, "nothing was persisted, so nothing was checked"
+
+    second = ConsoleWindow(database)
+    try:
+        assert second.store.incident_count() == stored_incidents
+        assert second.store.event_count() > 0
+        # A zone describes the ground, not the run, so it comes back.
+        assert len(second._zones) == 1
+        assert second._zones[0].name == "Restricted Area A"
+    finally:
+        second.close()
+
+
+def test_a_camera_placement_is_remembered(qt_app, reference_video, tmp_path):
+    from sentinel.core import CameraPose, LatLon
+
+    database = tmp_path / "sentinel.db"
+
+    first = ConsoleWindow(database)
+    session = first.add_camera(reference_video, "cam-07")
+    session.pose = CameraPose(
+        position=LatLon(33.8938, 35.5018),
+        mount_height=7.25,
+        heading=145.0,
+        pitch=-24.0,
+    )
+    first.store.save_camera("cam-07", "cam-07", str(reference_video), session.pose)
+    first.close()
+
+    second = ConsoleWindow(database)
+    try:
+        restored = second.store.camera_pose("cam-07")
+        assert restored is not None
+        assert restored.mount_height == pytest.approx(7.25)
+        assert restored.heading == pytest.approx(145.0)
+    finally:
+        second.close()
+
+
+def test_the_console_records_what_the_operator_did(qt_app, window, reference_video):
+    from sentinel.core import CameraPose, LatLon
+
+    session = window.add_camera(reference_video, "cam-07")
+    session.pose = CameraPose(
+        position=LatLon(33.8938, 35.5018), mount_height=6.0, heading=180.0, pitch=-22.0
+    )
+    window.store.save_camera("cam-07", "cam-07", str(reference_video), session.pose)
+    window.store.audit("console", "camera.placed", "cam-07", "6.0 m, bearing 180")
+
+    actions = {row["action"] for row in window.store.audit_trail()}
+    assert "console.started" in actions
+    assert "camera.placed" in actions
+
+
+def test_re_correlating_does_not_multiply_stored_incidents(qt_app, window, reference_video):
+    # The correlate timer runs every second and a half over a growing window,
+    # so the same incident is written many times. Deterministic ids make each
+    # of those an upsert; without that a ten-minute run would leave hundreds of
+    # copies of one intrusion.
+    from sentinel.core import CameraPose, LatLon
+
+    session = window.add_camera(reference_video, "cam-07")
+    session.pose = CameraPose(
+        position=LatLon(33.8938, 35.5018),
+        mount_height=6.0,
+        heading=180.0,
+        pitch=-22.0,
+        horizontal_fov=62.0,
+        vertical_fov=36.0,
+        range_meters=90.0,
+    )
+    window._refresh_placement()
+    window.zone_radius.setValue(10.0)
+    window._add_zone()
+    window._start()
+    pump(qt_app, window, 16.0)
+    window._stop()
+
+    window._correlate()
+    after_one = window.store.incident_count()
+    for _ in range(5):
+        window._correlate()
+
+    assert after_one > 0
+    assert window.store.incident_count() == after_one

@@ -5,6 +5,9 @@
     python tasks.py test       everything: Rust, engine, console
     python tasks.py lint       rustfmt and clippy
     python tasks.py console    run the operator console
+    python tasks.py db         report the database's migration state
+    python tasks.py db-migrate apply pending migrations
+    python tasks.py db-rollback undo the most recent migration
     python tasks.py check      lint, build and test — what CI runs
 
 Python rather than a Makefile or a shell script, because the product ships on
@@ -82,6 +85,69 @@ def check() -> None:
     test()
 
 
+def db() -> None:
+    """Report the database's migration state.
+
+    Read-only, and deliberately so: applying a migration is something an
+    operator does knowingly, so `db-migrate` is a separate word.
+    """
+    import sys as _sys
+
+    _sys.path.insert(0, str(ENGINE))
+    from sentinel.store import MIGRATIONS, Store, default_database_path
+
+    path = default_database_path()
+    existed = path.exists()
+
+    print()
+    print(f"database   {path}")
+    print(f"existed    {existed}")
+
+    # Opened without auto-migrating, so `db` reports what is actually there
+    # rather than what it would be after silently fixing it.
+    with Store(path, auto_migrate=False) as store:
+        applied = store.applied_versions()
+        pending = store.pending()
+        print(f"applied    {applied or 'none'}")
+        print(f"pending    {[m.version for m in pending] or 'none'}")
+        print(f"known      {[m.version for m in MIGRATIONS]}")
+
+        # Counted only when the tables exist. `db` is most useful on a database
+        # that is *not* migrated, so it must not fall over on one.
+        if pending:
+            print("events     — schema not applied")
+            print("incidents  — schema not applied")
+        else:
+            print(f"events     {store.event_count()}")
+            print(f"incidents  {store.incident_count()}")
+
+
+def db_migrate() -> None:
+    import sys as _sys
+
+    _sys.path.insert(0, str(ENGINE))
+    from sentinel.store import Store, default_database_path
+
+    with Store(default_database_path(), auto_migrate=False) as store:
+        applied = store.migrate()
+    if applied:
+        for migration in applied:
+            print(f"applied {migration.version}: {migration.name}")
+    else:
+        print("nothing to apply")
+
+
+def db_rollback() -> None:
+    import sys as _sys
+
+    _sys.path.insert(0, str(ENGINE))
+    from sentinel.store import Store, default_database_path
+
+    with Store(default_database_path(), auto_migrate=False) as store:
+        undone = store.rollback()
+    print(f"undid {undone.version}: {undone.name}" if undone else "nothing to undo")
+
+
 def console() -> None:
     build()
     run([sys.executable, str(CONSOLE / "main.py")], ROOT, python_path())
@@ -93,6 +159,9 @@ TASKS = {
     "test": test,
     "check": check,
     "console": console,
+    "db": db,
+    "db-migrate": db_migrate,
+    "db-rollback": db_rollback,
 }
 
 

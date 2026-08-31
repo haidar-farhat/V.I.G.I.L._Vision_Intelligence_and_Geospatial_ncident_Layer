@@ -68,6 +68,7 @@ from sentinel.events import (
     ZoneEntryRule,
 )
 from sentinel.incidents import Correlator
+from sentinel.store import Store, default_database_path
 from sentinel.zones import Zone, ZoneKind
 
 from . import theme
@@ -111,7 +112,13 @@ def _panel(title: str, body: QWidget) -> QFrame:
 class ConsoleWindow(QMainWindow):
     """The main window."""
 
-    def __init__(self):
+    def __init__(self, database: str | Path | None = None):
+        """
+        ``database`` is the path to persist to. ``":memory:"`` runs the console
+        without keeping anything, which is right for a test and wrong for a
+        deployment — a system whose output is evidence that forgets on restart
+        has not really produced evidence at all.
+        """
         super().__init__()
         self.setWindowTitle("Sentinel Vision — Console")
         self.resize(1500, 920)
@@ -120,6 +127,12 @@ class ConsoleWindow(QMainWindow):
         self._sessions: dict[str, CameraSession] = {}
         self._zones: list[Zone] = []
         self._incidents: list = []
+        self._persisted: set[str] = set()
+
+        self.store = Store(database if database is not None else default_database_path())
+        self.store.audit("console", "console.started")
+        # Zones outlive a session: they describe the ground, not the run.
+        self._zones = self.store.zones()
 
         self._build()
 
@@ -417,6 +430,19 @@ class ConsoleWindow(QMainWindow):
         if session.worker is not None:
             session.worker.set_pose(session.pose)
 
+        self.store.save_camera(
+            session.camera_id,
+            session.camera_id,
+            # Already redacted: a source's display URL never carries a password.
+            source=str(session.source_path),
+            pose=session.pose,
+        )
+        self.store.audit(
+            "console",
+            "camera.placed",
+            session.camera_id,
+            f"{session.pose.mount_height:.1f} m, bearing {session.pose.heading:.0f}",
+        )
         self._refresh_placement()
 
     def _refresh_placement(self) -> None:
@@ -488,6 +514,9 @@ class ConsoleWindow(QMainWindow):
                 enter_after_millis=600,
             )
         )
+        self.store.save_zone(self._zones[-1])
+        self.store.audit("console", "zone.created", self._zones[-1].id, self._zones[-1].name)
+
         self.map.set_zones(self._zones)
         self._set_status(
             f"{len(self._zones)} zone(s). Rules apply to cameras started from now."
@@ -555,6 +584,7 @@ class ConsoleWindow(QMainWindow):
         self.detector_label.setText("MOG2 background subtraction — does not classify")
         self._timer.start()
         self._correlate_timer.start()
+        self.store.audit("console", "analysis.started", detail=f"{started} camera(s)")
 
         self.open_button.setEnabled(False)
         self.start_button.setEnabled(False)
@@ -611,6 +641,17 @@ class ConsoleWindow(QMainWindow):
         correlator = Correlator(zone_kinds={zone.id: zone.kind for zone in self._zones})
         self._incidents = correlator.correlate(events)
         self.incidents.show_incidents(self._incidents)
+
+        # Written every time, and idempotent every time: ids are deterministic,
+        # so re-correlating a growing window upserts the same incident rather
+        # than accumulating a new one each pass.
+        for incident in self._incidents:
+            self.store.save_incident(incident)
+            if incident.id not in self._persisted:
+                self._persisted.add(incident.id)
+                self.store.audit(
+                    "engine", "incident.opened", incident.id, incident.summary
+                )
 
     def _refresh_tracks(self) -> None:
         # Rebuilt rather than diffed. At the handful of objects a site sees this
@@ -740,6 +781,8 @@ class ConsoleWindow(QMainWindow):
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt naming
         for session in self._sessions.values():
             session.stop()
+        self.store.audit("console", "console.stopped")
+        self.store.close()
         event.accept()
 
 
