@@ -1,7 +1,7 @@
 """The per-camera pipeline: decode, detect, track, place on the map.
 
 VIDEO -> DETECTION -> TRACKING -> SPATIAL CONTEXT -> TEMPORAL CONTEXT
-      -> EVENT ANALYSIS
+      -> EVENT ANALYSIS -> CORRELATION -> INCIDENT
 
 Each stage answers a different question, and the value is in the sequence rather
 than any one of them:
@@ -39,6 +39,7 @@ from .core import CameraPose, Detection, Track, Tracker
 from .decode import Frame, VideoSource
 from .detect import Detector, DetectorInfo
 from .events import Event, EventEngine, Rule, utc_from_millis
+from .incidents import Correlator, Incident
 from .zones import Zone, ZoneEvaluator
 
 
@@ -134,7 +135,8 @@ class Pipeline:
     """
 
     __slots__ = ("_source", "_detector", "_pose", "_tracker", "stats", "_config",
-                 "_keep_images", "_zones", "_evaluator", "_engine", "_epoch_millis")
+                 "_keep_images", "_zones", "_evaluator", "_engine", "_epoch_millis",
+                 "_correlator", "_recent_events", "_event_retention")
 
     def __init__(
         self,
@@ -151,6 +153,7 @@ class Pipeline:
         rules: Sequence[Rule] = (),
         node_id: str = "local",
         wall_clock_epoch_millis: int | None = None,
+        event_retention: int = 5000,
     ):
         """
         ``max_gap_millis`` is how long a track survives without a detection. It
@@ -186,6 +189,15 @@ class Pipeline:
         # the same footage produce different events on different days, which is
         # exactly what an evidence trail must not do.
         self._epoch_millis = wall_clock_epoch_millis
+
+        self._event_retention = event_retention
+        self._correlator = Correlator(
+            zone_kinds={zone.id: zone.kind for zone in zones}
+        )
+        # Retained so correlation can be re-run over a window. Bounded, because a
+        # node running for a month must not accumulate every event it ever saw in
+        # memory; persistence is where the full history belongs.
+        self._recent_events: list[Event] = []
 
     @property
     def detector_info(self) -> DetectorInfo:
@@ -280,7 +292,30 @@ class Pipeline:
         )
 
         self.stats.events += len(events)
+
+        self._recent_events.extend(events)
+        if len(self._recent_events) > self._event_retention:
+            del self._recent_events[: len(self._recent_events) - self._event_retention]
+
         return events
+
+    def incidents(self) -> list[Incident]:
+        """Correlate the retained events into incidents.
+
+        Batch, over what is currently retained. An incident is a statement about
+        a span of time, and deciding it is closed means knowing nothing more is
+        coming — which a per-frame correlator can only guess at. A live console
+        calls this on a timer; the semantics are the same either way, and the
+        ids are deterministic so re-correlating produces the same incidents
+        rather than new ones beside them.
+        """
+        return Correlator(
+            zone_kinds={zone.id: zone.kind for zone in self._zones.values()}
+        ).correlate(self._recent_events)
+
+    @property
+    def recent_events(self) -> tuple[Event, ...]:
+        return tuple(self._recent_events)
 
     def _record(
         self, frame: Frame, detections: Sequence[Detection], tracks: Sequence[Track]

@@ -34,6 +34,11 @@ TRACK = QColor(74, 222, 128)         # a confirmed, persisting object
 TRACK_COASTING = QColor(250, 204, 21)  # held open with no detection this frame
 UNCERTAINTY = QColor(96, 165, 250, 40)  # the 1-sigma position disc
 
+# Zones. Deliberately distinct from both evidence and footprint colours: a zone
+# boundary is a rule an operator wrote, not something the system observed.
+ZONE_FILL = QColor(248, 113, 113, 26)
+ZONE_EDGE = QColor(248, 113, 113, 150)
+
 # The map.
 CAMERA = QColor(226, 232, 240)
 FOOTPRINT = QColor(96, 165, 250, 28)

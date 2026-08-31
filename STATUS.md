@@ -22,7 +22,7 @@ implementation was removed in `582d0a8`; its architecture documents were kept
 because the thinking in them carried over, and are being brought up to date.
 Anything below that is not yet re-established after the rewrite says so.
 
-Current suite: **158 tests** — 32 Rust, 107 engine, 19 console. `cargo fmt` and
+Current suite: **253 tests** — 42 Rust, 185 engine, 26 console. `cargo fmt` and
 `clippy -D warnings` clean. Run everything with `python tasks.py check`.
 
 ---
@@ -39,7 +39,8 @@ Geometry, projection, zones and tracking, behind a C ABI.
 | Point-in-polygon zones | `TESTED` | Does not chatter on an edge; a degenerate ring contains nothing. |
 | Multi-object tracking | `TESTED` | Constant-velocity prediction, globally-sorted greedy association, two-tier scoring. |
 | Anisotropic association gate | `TESTED` | An ellipse, not a circle: vertical image motion is depth, so the vertical axis is the tight one. See "measured behaviour" below. |
-| Motion (speed, heading) | `TESTED` | Three states, not two: unknown, standing still, moving. Collapsing the first two would erase the loitering signal. |
+| Motion (speed, heading) | `TESTED` | Three states, not two: unknown, standing still, moving. Speed is withheld until it spans 1.2 s, because dividing a distance by one frame interval amplifies position error fivefold. |
+| Uncertainty-aware zones | `TESTED` | Three states again: inside, outside, and *uncertain* when the position's own error disc straddles the boundary. |
 | C ABI | `TESTED` | Every entry point checks its pointers, is marked `unsafe`, and carries a `# Safety` contract. `panic = "abort"`, so no unwind crosses the boundary. |
 | Struct-layout guard | `TESTED` | The core exports its struct sizes; the Python binding refuses to load on a mismatch. |
 
@@ -55,7 +56,10 @@ Geometry, projection, zones and tracking, behind a C ABI.
 | Credential redaction | `TESTED` | A password is unreachable through `repr`, `str`, display URL, source id, or any error message — including its length. |
 | Motion detection | `TESTED` | MOG2 with a resolution-scaled vertical morphology kernel. Emits `UNCLASSIFIED` and never claims otherwise. |
 | ONNX detection | `TESTED` | Letterboxing, per-class NMS, layout inference, model digest recorded — all now executed against a real ONNX graph. **No trained weights have been run** — see gap 2. |
-| Pipeline | `TESTED` | decode → detect → track → project, with measured statistics. Deterministic: the same file twice gives identical output. |
+| Zones, schedules, presence | `TESTED` | Hysteresis on both edges; exit slower than entry. Schedules wrap midnight. |
+| Rules and events | `TESTED` | Deterministic ids for idempotent replay. Every event carries its own evidence and the conditions that fired. |
+| Correlation and incidents | `TESTED` | Union-find object identity, transitive across cameras. Risk is scored with an explicit breakdown. |
+| Pipeline | `TESTED` | decode → detect → track → project → zones → events → incidents. Deterministic: the same file twice gives identical output. |
 
 ## Operator console (PySide6)
 
@@ -68,8 +72,10 @@ Geometry, projection, zones and tracking, behind a C ABI.
 | Camera placement | `TESTED` | Reports the ground band a pose actually covers as it is typed. No default placement exists. |
 | Off-thread analysis | `TESTED` | Asserted by test that `run()` executes on the worker's own thread. |
 | Fault reporting | `TESTED` | In place, not modal — twenty cameras drop together when a switch loses power. |
+| Incident panel | `TESTED` | One row per incident, expandable into its risk factors, cross-camera links and timeline. Sorted by severity, not arrival. |
+| Zones on the plan view | `TESTED` | Drawn distinctly from evidence: a zone is a rule someone wrote, not something observed. |
 | Multi-camera wall | `PLANNED` | One source at a time today. |
-| Incident review | `PLANNED` | |
+| Incident replay and export | `PLANNED` | |
 
 ## Measured behaviour
 
@@ -86,6 +92,9 @@ is synthetic (`engine/tests/scene.py`); see gap 1.
 | Whole pipeline throughput | ~68 fps at 640×480 |
 | Distinct objects reported | **5**, for 3 people |
 | Identity switches | **8** over ~410 unambiguous observations |
+| Events raised on the reference scene | 16 |
+| Incidents after correlation | **1** |
+| Reduction in what a person must read | **94%** |
 
 The last two are honest failures, bounded by tests so they cannot quietly get
 worse. They are the appearance-free tracking limit: when two people cross, box
@@ -112,10 +121,6 @@ exists for them in `docs/`.
 | Capability | State | Notes |
 |---|---|---|
 | Persistence | `PLANNED` | Schema designed in docs/DATABASE.md. |
-| Event and rule engine | `PLANNED` | |
-| Incident correlation | `PLANNED` | Deterministic ids and union-find object counting were implemented and tested previously; the design is in docs/. |
-| Multi-camera association | `PLANNED` | |
-| Risk scoring | `PLANNED` | |
 | Grounded AI analyst | `PLANNED` | |
 | REST and WebSocket control plane | `PLANNED` | |
 | Node discovery and pairing | `PLANNED` | |
@@ -173,8 +178,22 @@ exists for them in `docs/`.
    The suites it runs all pass locally on Windows with Python 3.14; CI targets
    3.12, which has not been tried.
 
-7. **The console shows one camera.** The multi-camera reasoning that is the
-   product's central claim — three cameras seeing one person is one incident —
-   has no implementation in the current codebase. It was built and tested in the
-   TypeScript and is described in `docs/`, but it is `PLANNED` here, and this
-   file will keep saying so until it is not.
+7. **Multi-camera correlation is implemented but has never seen two cameras.**
+   The central claim — three cameras seeing one person is one incident — is
+   implemented, and `test_three_cameras_seeing_one_person_produce_one_incident`
+   holds it. But that test builds its events by hand. No two real cameras have
+   ever been correlated, because the console runs one source at a time and no
+   second camera exists to run.
+
+   The association itself is deliberately weak and says so. Without appearance
+   features, position and time are all there is, so it will merge two people who
+   crossed the same spot ten seconds apart and will fail to merge one person
+   whose two cameras disagree about where they were. Both failures are visible in
+   the association's own score and reasons rather than buried in a threshold.
+
+8. **The object count inherits the tracker's over-count.** On the reference scene
+   the single incident correctly collapses 16 events into one — but reports **5
+   objects where 3 people walked past**, because that is what the tracker
+   believes. Correlation deliberately does not second-guess a tracker within one
+   camera: doing so from positions alone would discard the tracker's own stronger
+   evidence. The fix belongs upstream, in appearance-based association.

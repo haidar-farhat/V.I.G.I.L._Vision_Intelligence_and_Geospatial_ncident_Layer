@@ -62,6 +62,7 @@ class MapView(QWidget):
         self._view_centre = (0.0, 0.0)
         self._span_meters = 60.0
         self._drag_from: QPoint | None = None
+        self._zones: list = []
 
         self.setMouseTracking(False)
         self.setCursor(Qt.CursorShape.OpenHandCursor)
@@ -140,6 +141,16 @@ class MapView(QWidget):
             [self._to_local(p) for p in self._footprint] if pose else []
         )
         self._fit_view()
+        self.update()
+
+    def set_zones(self, zones) -> None:
+        """Areas whose boundaries mean something.
+
+        Drawn under the tracks and over the footprint, so an operator can see at
+        a glance whether an object is inside one — and, because uncertainty
+        discs are drawn too, whether the system could possibly know.
+        """
+        self._zones = list(zones)
         self.update()
 
     def set_tracks(self, tracks: tuple[Track, ...]) -> None:
@@ -233,6 +244,7 @@ class MapView(QWidget):
             return
 
         self._paint_footprint(painter)
+        self._paint_zones(painter)
         self._paint_trails(painter)
         self._paint_tracks(painter)
         self._paint_camera(painter)
@@ -280,6 +292,22 @@ class MapView(QWidget):
         painter.setPen(QPen(theme.FOOTPRINT_EDGE, 1.5))
         painter.setBrush(QBrush(theme.FOOTPRINT))
         painter.drawPolygon(polygon)
+
+    def _paint_zones(self, painter: QPainter) -> None:
+        font = QFont(painter.font())
+        font.setPointSize(8)
+        font.setBold(True)
+        painter.setFont(font)
+
+        for zone in self._zones:
+            polygon = QPolygonF([self._to_screen(*self._to_local(p)) for p in zone.ring])
+            painter.setPen(QPen(theme.ZONE_EDGE, 1.6, Qt.PenStyle.DashLine))
+            painter.setBrush(QBrush(theme.ZONE_FILL))
+            painter.drawPolygon(polygon)
+
+            painter.setPen(QPen(theme.ZONE_EDGE))
+            centroid = polygon.boundingRect().center()
+            painter.drawText(centroid, zone.name)
 
     def _paint_camera(self, painter: QPainter) -> None:
         assert self._pose is not None

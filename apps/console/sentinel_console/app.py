@@ -25,6 +25,7 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction, QCloseEvent, QFont
 from PySide6.QtWidgets import (
     QCheckBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -42,9 +43,13 @@ from PySide6.QtWidgets import (
 
 from sentinel.core import CameraPose, LatLon
 from sentinel.decode import DecodeError, VideoSource
+from sentinel.core import destination_point, field_of_view, haversine_distance
 from sentinel.detect import MotionDetector
+from sentinel.events import AfterHoursRule, LoiteringRule, RapidMovementRule, ZoneEntryRule
+from sentinel.zones import Zone, ZoneKind
 
 from . import theme
+from .incident_view import IncidentView
 from .map_view import MapView
 from .placement import PlacementDialog
 from .video_view import VideoView
@@ -87,6 +92,7 @@ class ConsoleWindow(QMainWindow):
         self._worker: AnalysisWorker | None = None
         self._pose: CameraPose | None = None
         self._source_path: Path | None = None
+        self._zones: list[Zone] = []
 
         self._build()
 
@@ -107,6 +113,7 @@ class ConsoleWindow(QMainWindow):
         self.video = VideoView()
         self.map = MapView()
         self.tracks = self._build_track_table()
+        self.incidents = IncidentView()
 
         outer.addLayout(self._build_toolbar())
 
@@ -116,11 +123,20 @@ class ConsoleWindow(QMainWindow):
         top.setStretchFactor(0, 3)
         top.setStretchFactor(1, 2)
 
+        # Incidents above tracks, and larger. Tracks are how the system reached
+        # its conclusions; incidents are the conclusions, and they are what an
+        # operator is actually here to read.
+        lower = QSplitter(Qt.Orientation.Horizontal)
+        lower.addWidget(_panel("INCIDENTS", self.incidents))
+        lower.addWidget(_panel("TRACKED OBJECTS", self.tracks))
+        lower.setStretchFactor(0, 3)
+        lower.setStretchFactor(1, 2)
+
         split = QSplitter(Qt.Orientation.Vertical)
         split.addWidget(top)
-        split.addWidget(_panel("TRACKED OBJECTS", self.tracks))
+        split.addWidget(lower)
         split.setStretchFactor(0, 3)
-        split.setStretchFactor(1, 1)
+        split.setStretchFactor(1, 2)
 
         outer.addWidget(split, 1)
         self.setCentralWidget(central)
@@ -151,6 +167,23 @@ class ConsoleWindow(QMainWindow):
         self.place_button = QPushButton("Place camera…")
         self.place_button.clicked.connect(self._place_camera)
         row.addWidget(self.place_button)
+
+        self.zone_button = QPushButton("Add restricted zone")
+        self.zone_button.setToolTip(
+            "Adds a restricted area on the ground in front of this camera. "
+            "Requires the camera to be placed first: a zone without a placed "
+            "camera has nothing to be measured against."
+        )
+        self.zone_button.clicked.connect(self._add_zone)
+        row.addWidget(self.zone_button)
+
+        row.addWidget(QLabel("radius"))
+        self.zone_radius = QDoubleSpinBox()
+        self.zone_radius.setRange(2.0, 200.0)
+        self.zone_radius.setValue(9.0)
+        self.zone_radius.setSuffix(" m")
+        self.zone_radius.setFixedWidth(84)
+        row.addWidget(self.zone_radius)
 
         row.addSpacing(12)
 
@@ -261,6 +294,57 @@ class ConsoleWindow(QMainWindow):
             f"{self._pose.mount_height:.1f} m, bearing {self._pose.heading:.0f}°"
         )
 
+    def _add_zone(self) -> None:
+        """Put a restricted area on the ground in front of the camera.
+
+        A placeholder for drawing one on the plan view, and honest about being
+        one. What it is not is a default: a zone is only ever created because an
+        operator asked for it, because a zone nobody drew is a source of alerts
+        nobody expects.
+        """
+        if self._pose is None:
+            QMessageBox.information(
+                self,
+                "Place the camera first",
+                "A zone is an area on the ground. Until the camera is placed "
+                "there is nothing to measure it against, and objects are tracked "
+                "but not located.",
+            )
+            return
+
+        radius = self.zone_radius.value()
+
+        # Placed just beyond the near edge of what this camera can *actually*
+        # see, which is not the range it claims: a 6 m mast tilted 22 degrees
+        # with a 36 degree vertical field covers 7 m to 86 m however large the
+        # stated range is. The near end is also where positions are most
+        # accurate, because uncertainty grows super-linearly with distance — so
+        # a zone there is one the system can genuinely adjudicate rather than
+        # one it will mostly report as UNCERTAIN.
+        footprint = field_of_view(self._pose, arc_segments=16)
+        near = (
+            min(haversine_distance(self._pose.position, point) for point in footprint)
+            if footprint
+            else 10.0
+        )
+        centre = destination_point(self._pose.position, self._pose.heading, near + radius)
+        ring = tuple(destination_point(centre, bearing, radius) for bearing in (0.0, 90.0, 180.0, 270.0))
+
+        index = len(self._zones) + 1
+        self._zones.append(
+            Zone(
+                id=f"zone-{index}",
+                name=f"Restricted Area {chr(64 + index)}",
+                kind=ZoneKind.RESTRICTED,
+                ring=ring,
+                enter_after_millis=600,
+            )
+        )
+        self.map.set_zones(self._zones)
+        self._set_status(
+            f"{len(self._zones)} zone(s). Rules apply from the next run."
+        )
+
     def _start(self) -> None:
         if self._worker is not None or self._source_path is None:
             return
@@ -286,7 +370,22 @@ class ConsoleWindow(QMainWindow):
             else detector.info.name
         )
 
-        worker = AnalysisWorker(source, detector, self._pose, realtime=True, parent=self)
+        rules = [
+            ZoneEntryRule(),
+            AfterHoursRule(),
+            LoiteringRule(dwell_millis=8000),
+            RapidMovementRule(speed_mps=6.0),
+        ]
+        worker = AnalysisWorker(
+            source,
+            detector,
+            self._pose,
+            realtime=True,
+            zones=self._zones,
+            rules=rules if self._zones else [RapidMovementRule(speed_mps=6.0)],
+            node_id="local",
+            parent=self,
+        )
         worker.finished_run.connect(self._on_finished)
         worker.failed.connect(self._on_failed)
 
@@ -328,6 +427,7 @@ class ConsoleWindow(QMainWindow):
         self.video.show_update(update)
         self.map.set_tracks(update.result.tracks)
         self._refresh_tracks(update)
+        self.incidents.show_incidents(list(update.incidents))
 
     def _refresh_tracks(self, update: Update) -> None:
         info = self._worker.detector_info if self._worker else None
@@ -386,10 +486,14 @@ class ConsoleWindow(QMainWindow):
             f"{update.analysis_fps:.0f} fps analysed   "
             f"{len(tracks)} tracked now   "
             f"{stats.distinct_objects} distinct objects so far   "
-            f"{stats.detections} detections"
+            f"{stats.events} events -> {len(update.incidents)} incidents"
         )
 
     def _on_finished(self, reason: str) -> None:
+        # One last collection before the timer stops. Without it the final
+        # frames — and the incidents correlated from them — are produced and
+        # then thrown away, so a file that ends on an intrusion shows nothing.
+        self._collect()
         self._teardown()
         self._set_status(reason)
 

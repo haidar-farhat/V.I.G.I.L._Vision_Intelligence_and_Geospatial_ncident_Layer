@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from typing import Sequence
 
 import numpy as np
 from PySide6.QtCore import QMutex, QMutexLocker, QThread, Signal
@@ -32,6 +33,9 @@ from PySide6.QtCore import QMutex, QMutexLocker, QThread, Signal
 from sentinel.core import CameraPose
 from sentinel.decode import DecodeError, VideoSource
 from sentinel.detect import Detector, DetectorInfo
+from sentinel.events import Rule
+from sentinel.zones import Zone
+from sentinel.incidents import Incident
 from sentinel.pipeline import FrameResult, Pipeline, PipelineStats
 
 
@@ -51,6 +55,10 @@ class Update:
     #: Results the interface never saw because it was busy.
     skipped: int
     stats: PipelineStats
+    #: Incidents as of this update. Recomputed on a slow timer rather than per
+    #: frame: correlation is a batch operation over a window, and running it at
+    #: frame rate would cost far more than it tells anyone.
+    incidents: tuple[Incident, ...] = ()
 
     @property
     def image(self) -> np.ndarray | None:
@@ -73,6 +81,11 @@ class AnalysisWorker(QThread):
         pose: CameraPose | None = None,
         *,
         realtime: bool = True,
+        zones: Sequence[Zone] = (),
+        rules: Sequence[Rule] = (),
+        node_id: str = "local",
+        wall_clock_epoch_millis: int | None = None,
+        correlate_every_millis: int = 2000,
         parent=None,
     ):
         """
@@ -85,6 +98,13 @@ class AnalysisWorker(QThread):
         self._detector = detector
         self._pose = pose
         self._realtime = realtime
+        self._zones = list(zones)
+        self._rules = list(rules)
+        self._node_id = node_id
+        self._epoch_millis = wall_clock_epoch_millis
+        self._correlate_every = correlate_every_millis
+        self._last_correlated = 0
+        self._incidents: tuple[Incident, ...] = ()
 
         self._mutex = QMutex()
         self._stopping = False
@@ -144,7 +164,16 @@ class AnalysisWorker(QThread):
             self._latest = update
 
     def run(self) -> None:  # noqa: D102 - QThread entry point
-        pipeline = Pipeline(self._source, self._detector, pose=self._pose, keep_images=True)
+        pipeline = Pipeline(
+            self._source,
+            self._detector,
+            pose=self._pose,
+            keep_images=True,
+            zones=self._zones,
+            rules=self._rules,
+            node_id=self._node_id,
+            wall_clock_epoch_millis=self._epoch_millis,
+        )
         started_wall = time.perf_counter()
         first_stamp: int | None = None
         recent: list[float] = []
@@ -170,6 +199,10 @@ class AnalysisWorker(QThread):
                     (len(recent) - 1) / (now - recent[0]) if len(recent) > 1 else 0.0
                 )
 
+                if result.timestamp_millis - self._last_correlated >= self._correlate_every:
+                    self._last_correlated = result.timestamp_millis
+                    self._incidents = tuple(pipeline.incidents())
+
                 with QMutexLocker(self._mutex):
                     skipped = self._skipped
                 self._publish(
@@ -178,6 +211,7 @@ class AnalysisWorker(QThread):
                         analysis_fps=measured,
                         skipped=skipped,
                         stats=pipeline.stats,
+                        incidents=self._incidents,
                     )
                 )
 

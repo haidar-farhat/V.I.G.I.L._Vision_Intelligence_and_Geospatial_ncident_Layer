@@ -375,3 +375,122 @@ def test_provenance_names_the_exact_weights(tmp_path: Path, reference_video: Pat
 
     assert info.model_path == str(model.resolve())
     assert info.model_sha256 is not None and len(info.model_sha256) == 64
+
+
+# ------------------------------------------------- the spine, end to end
+
+
+def _restricted_zone(pose: CameraPose):
+    """A restricted area on the ground the reference scene's walkers cross."""
+    from sentinel.core import destination_point
+    from sentinel.zones import Zone, ZoneKind
+
+    centre = destination_point(pose.position, 180.0, 14.0)
+    return Zone(
+        id="zone-a",
+        name="Restricted Area A",
+        kind=ZoneKind.RESTRICTED,
+        ring=tuple(destination_point(centre, b, 9.0) for b in (0.0, 90.0, 180.0, 270.0)),
+        enter_after_millis=600,
+    )
+
+
+@pytest.fixture(scope="module")
+def spine(reference_video: Path, reference_pose: CameraPose):
+    """The whole chain: video to incidents, on a real file."""
+    from datetime import datetime, time, timezone
+
+    from sentinel.events import AfterHoursRule, LoiteringRule, ZoneEntryRule
+    from sentinel.zones import Schedule
+
+    from dataclasses import replace
+
+    zone = replace(_restricted_zone(reference_pose), schedule=Schedule(time(18, 0), time(6, 0)))
+
+    # 02:00, so the after-hours schedule is active. Supplied explicitly rather
+    # than read from the clock, so the same footage produces the same events on
+    # any day — which an evidence trail requires.
+    epoch = int(datetime(2026, 8, 30, 2, 0, tzinfo=timezone.utc).timestamp() * 1000)
+    rules = [ZoneEntryRule(), AfterHoursRule(), LoiteringRule(dwell_millis=4000)]
+
+    with Pipeline(
+        VideoSource(reference_video, source_id="cam-07"),
+        MotionDetector(),
+        pose=reference_pose,
+        zones=[zone],
+        rules=rules,
+        node_id="nd_test",
+        wall_clock_epoch_millis=epoch,
+    ) as pipeline:
+        events = [event for result in pipeline.run() for event in result.events]
+        incidents = pipeline.incidents()
+        stats = pipeline.stats
+
+    return events, incidents, stats
+
+
+def test_the_whole_spine_runs_on_real_video(spine):
+    events, incidents, stats = spine
+
+    assert stats.presences_started > 0, "nothing ever entered the zone"
+    assert events, "presences never became events"
+    assert incidents, "events never became an incident"
+
+
+def test_many_events_collapse_into_one_incident(spine):
+    # The measure of this system is how little it says. Twelve seconds of people
+    # walking through a restricted area is one thing that happened.
+    events, incidents, _ = spine
+
+    assert len(events) > 8
+    assert len(incidents) == 1, f"{len(incidents)} incidents reached the operator"
+
+
+def test_the_incident_carries_its_evidence(spine):
+    _, incidents, _ = spine
+    incident = incidents[0]
+
+    assert incident.events, "an incident with no events cannot be reviewed"
+    assert incident.timeline()
+    assert incident.risk.factors, "a risk score with no reasoning is a number to ignore"
+    assert incident.zones == ("Restricted Area A",)
+    assert incident.cameras == ("cam-07",)
+
+    for event in incident.events:
+        assert event.evidence.detector
+        assert event.evidence.observations > 0
+
+
+def test_the_incident_does_not_claim_people(spine):
+    # The detector is motion. A blob is not a person.
+    _, incidents, _ = spine
+
+    assert "object" in incidents[0].summary
+    assert "person" not in incidents[0].summary
+
+
+def test_correlating_twice_produces_the_same_incident(spine):
+    _, incidents, _ = spine
+    from sentinel.incidents import Correlator
+    from sentinel.zones import ZoneKind
+
+    again = Correlator(zone_kinds={"zone-a": ZoneKind.RESTRICTED}).correlate(
+        [event for incident in incidents for event in incident.events]
+    )
+
+    assert [i.id for i in again] == [i.id for i in incidents]
+
+
+def test_the_object_count_is_the_tracker_s_count_not_a_segment_count(spine):
+    # It currently reports 5 objects where 3 people walked past. That is the
+    # tracker's over-count surfacing at the top of the stack, which is exactly
+    # where it hurts most — and it is reported rather than hidden. The bound
+    # here stops it silently getting worse.
+    _, incidents, _ = spine
+    incident = incidents[0]
+
+    assert incident.distinct_objects >= 3
+    assert incident.distinct_objects <= 6, (
+        f"{incident.distinct_objects} objects for 3 people — fragmentation "
+        "has regressed"
+    )

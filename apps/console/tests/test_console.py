@@ -340,3 +340,139 @@ def test_state_colours_are_distinct():
 def test_evidence_and_inference_are_drawn_differently():
     assert theme.TRACK.name() != theme.TRACK_COASTING.name()
     assert theme.DETECTION.name() != theme.TRACK.name()
+
+
+# ----------------------------------------------------------------- incidents
+
+
+def _incident_from_events(count: int = 3):
+    """A real incident, built by the real correlator from real events."""
+    from datetime import datetime, timezone
+
+    from sentinel.core import LatLon
+    from sentinel.events import Event, Evidence, EventType, Severity
+    from sentinel.incidents import Correlator
+
+    site = LatLon(33.8938, 35.5018)
+    events = []
+    for index in range(count):
+        evidence = Evidence(
+            camera_id="cam-07",
+            track_id=index + 1,
+            first_seen_millis=index * 500,
+            last_seen_millis=index * 500 + 2000,
+            observations=12,
+            detector="MOG2 background subtraction",
+            detector_classifies=False,
+            model_digest=None,
+            class_label="unclassified",
+            latitude=site.lat,
+            longitude=site.lon,
+            position_uncertainty_meters=1.5,
+            position_source="GROUND_PROJECTION",
+            speed_mps=1.1,
+            heading_degrees=90.0,
+            frame_indices=(index,),
+        )
+        events.append(
+            Event(
+                id=f"ev_{index}",
+                type=EventType.ZONE_ENTRY,
+                severity=Severity.HIGH,
+                summary="An object entered Restricted Area A",
+                occurred_at_millis=index * 500,
+                occurred_at=datetime(2026, 8, 30, 3, 0, tzinfo=timezone.utc),
+                zone_id="zone-a",
+                zone_name="Restricted Area A",
+                rule_id="zone-entry",
+                evidence=evidence,
+                triggering_conditions=("membership held for 600 ms",),
+                confidence=1.0,
+            )
+        )
+    return Correlator().correlate(events)
+
+
+def test_the_incident_panel_shows_one_row_for_many_events(qt_app):
+    # The product. Three events describing one situation must not be three rows.
+    from sentinel_console.incident_view import IncidentView
+
+    view = IncidentView()
+    incidents = _incident_from_events(3)
+    view.show_incidents(incidents)
+
+    assert len(incidents) == 1
+    assert view.topLevelItemCount() == 1
+
+
+def test_an_incident_row_shows_its_object_count_and_risk(qt_app):
+    from sentinel_console.incident_view import IncidentView
+
+    view = IncidentView()
+    view.show_incidents(_incident_from_events(3))
+    row = view.topLevelItem(0)
+
+    assert row.text(2) == "3", "the object count is what an operator triages on"
+    assert float(row.text(4)) > 0.0
+
+
+def test_an_incident_carries_its_reasoning_as_children(qt_app):
+    # A risk score with no reasons attached is a number an operator learns to
+    # ignore. Every factor must be reachable without leaving the panel.
+    from sentinel_console.incident_view import IncidentView
+
+    view = IncidentView()
+    incidents = _incident_from_events(3)
+    view.show_incidents(incidents)
+    row = view.topLevelItem(0)
+
+    children = [row.child(i).text(2) for i in range(row.childCount())]
+    assert any("severity" in text for text in children)
+    assert any("entered Restricted Area A" in text for text in children)
+    assert row.childCount() >= len(incidents[0].events)
+
+
+def test_the_panel_never_claims_people_from_motion_blobs(qt_app):
+    from sentinel_console.incident_view import IncidentView
+
+    view = IncidentView()
+    view.show_incidents(_incident_from_events(3))
+    row = view.topLevelItem(0)
+
+    assert "object" in row.text(0)
+    assert "person" not in row.text(0) and "people" not in row.text(0)
+
+
+def test_an_expanded_incident_stays_expanded_across_a_refresh(qt_app):
+    # An operator reading an incident must not have it collapse under them when
+    # a new event arrives.
+    from sentinel_console.incident_view import IncidentView
+
+    view = IncidentView()
+    incidents = _incident_from_events(3)
+    view.show_incidents(incidents)
+    view.topLevelItem(0).setExpanded(True)
+
+    view.show_incidents(incidents)
+    assert view.topLevelItem(0).isExpanded()
+
+
+def test_incidents_are_listed_most_serious_first(qt_app):
+    from sentinel_console.incident_view import IncidentView
+
+    view = IncidentView()
+    first = _incident_from_events(1)
+    second = _incident_from_events(3)
+    view.show_incidents(first + second)
+
+    severities = [view.topLevelItem(i).text(1) for i in range(view.topLevelItemCount())]
+    ranked = sorted(severities, key=lambda s: ["INFO", "LOW", "MEDIUM", "HIGH", "CRITICAL"].index(s), reverse=True)
+    assert severities == ranked
+
+
+def test_a_zone_needs_a_placed_camera(qt_app, window):
+    # A zone is an area on the ground. With no camera placed there is nothing to
+    # measure it against, and creating one anyway would produce alerts nobody
+    # can act on.
+    assert window._pose is None
+    assert window._zones == []
