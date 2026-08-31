@@ -1,0 +1,23 @@
+[project]
+name = "sentinel-engine"
+version = "0.1.0"
+description = "Sentinel Vision engine: decode, detect, track, project, correlate."
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.0",
+    "opencv-python-headless>=4.10",
+    "onnxruntime>=1.20",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+# No network at runtime. Nothing here reaches the Internet, and nothing may be
+# added that does: see docs/SECURITY.md.
+
+[build-system]
+requires = ["setuptools>=70"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["sentinel*"]

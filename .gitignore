@@ -49,3 +49,14 @@ Thumbs.db
 
 # desktop build output
 apps/desktop/dist/
+
+# Rust build output
+core/target/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
