@@ -1,13 +1,7 @@
-# dependencies
-node_modules/
-.pnpm-store/
-
 # build output
 dist/
 build/
 out/
-*.tsbuildinfo
-apps/desktop/src-tauri/target/
 
 # runtime data - never commit operational data or evidence
 data/

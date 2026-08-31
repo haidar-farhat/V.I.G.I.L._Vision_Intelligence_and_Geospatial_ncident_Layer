@@ -51,11 +51,17 @@ impl BoundingBox {
     /// For a standing person or a vehicle this is the contact patch, which is the
     /// only part of the box whose ground position means anything.
     pub fn ground_contact(&self) -> Vec2 {
-        Vec2 { x: self.x + self.w / 2.0, y: self.y + self.h }
+        Vec2 {
+            x: self.x + self.w / 2.0,
+            y: self.y + self.h,
+        }
     }
 
     pub fn center(&self) -> Vec2 {
-        Vec2 { x: self.x + self.w / 2.0, y: self.y + self.h / 2.0 }
+        Vec2 {
+            x: self.x + self.w / 2.0,
+            y: self.y + self.h / 2.0,
+        }
     }
 
     pub fn iou(&self, other: &BoundingBox) -> f64 {
@@ -72,7 +78,11 @@ impl BoundingBox {
 
         let intersection = w * h;
         let union = self.w * self.h + other.w * other.h - intersection;
-        if union <= 0.0 { 0.0 } else { intersection / union }
+        if union <= 0.0 {
+            0.0
+        } else {
+            intersection / union
+        }
     }
 }
 
@@ -118,8 +128,7 @@ pub struct PositionEstimate {
 /// sub-centimetre across a site.
 pub fn meters_per_degree_latitude(latitude_deg: f64) -> f64 {
     let lat = latitude_deg.to_radians();
-    111_132.92 - 559.82 * (2.0 * lat).cos() + 1.175 * (4.0 * lat).cos()
-        - 0.0023 * (6.0 * lat).cos()
+    111_132.92 - 559.82 * (2.0 * lat).cos() + 1.175 * (4.0 * lat).cos() - 0.0023 * (6.0 * lat).cos()
 }
 
 pub fn meters_per_degree_longitude(latitude_deg: f64) -> f64 {
@@ -201,8 +210,7 @@ pub fn destination_point(origin: LatLon, bearing_deg: f64, distance_meters: f64)
     let sin_lat2 = lat1.sin() * angular.cos() + lat1.cos() * angular.sin() * bearing.cos();
     let lat2 = sin_lat2.clamp(-1.0, 1.0).asin();
     let lon2 = lon1
-        + (bearing.sin() * angular.sin() * lat1.cos())
-            .atan2(angular.cos() - lat1.sin() * sin_lat2);
+        + (bearing.sin() * angular.sin() * lat1.cos()).atan2(angular.cos() - lat1.sin() * sin_lat2);
 
     LatLon {
         lat: lat2.to_degrees(),
@@ -213,13 +221,21 @@ pub fn destination_point(origin: LatLon, bearing_deg: f64, distance_meters: f64)
 /// Wrap any angle into [0, 360).
 pub fn normalize_degrees(deg: f64) -> f64 {
     let wrapped = deg % 360.0;
-    if wrapped < 0.0 { wrapped + 360.0 } else { wrapped }
+    if wrapped < 0.0 {
+        wrapped + 360.0
+    } else {
+        wrapped
+    }
 }
 
 /// Smallest signed difference a - b, in (-180, 180].
 pub fn angle_difference(a: f64, b: f64) -> f64 {
     let diff = normalize_degrees(a - b);
-    if diff > 180.0 { diff - 360.0 } else { diff }
+    if diff > 180.0 {
+        diff - 360.0
+    } else {
+        diff
+    }
 }
 
 // ------------------------------------------------------------------ projection
@@ -354,8 +370,7 @@ pub fn field_of_view_wedge(pose: &CameraPose, arc_segments: usize) -> Vec<LatLon
         .unwrap_or(pose.range_meters);
     let near_range = near_ground_distance(pose).min(far_range);
 
-    let bearing_at =
-        |t: f64| normalize_degrees(pose.heading - half_fov + t * pose.horizontal_fov);
+    let bearing_at = |t: f64| normalize_degrees(pose.heading - half_fov + t * pose.horizontal_fov);
 
     let mut points = Vec::with_capacity(segments * 2 + 2);
 
@@ -400,7 +415,9 @@ pub fn image_coordinates(
         return None;
     }
 
-    let elevation_deg = (height_meters - pose.mount_height).atan2(distance).to_degrees();
+    let elevation_deg = (height_meters - pose.mount_height)
+        .atan2(distance)
+        .to_degrees();
     let pitch_offset_deg = elevation_deg - pose.pitch;
     let half_v = pose.vertical_fov / 2.0;
     if pitch_offset_deg.abs() >= 90.0 {
@@ -472,7 +489,13 @@ pub fn point_to_segment(p: Vec2, a: Vec2, b: Vec2) -> f64 {
 pub fn segments_intersect(p1: Vec2, p2: Vec2, q1: Vec2, q2: Vec2) -> bool {
     let orientation = |a: Vec2, b: Vec2, c: Vec2| -> i32 {
         let v = (b.y - a.y) * (c.x - b.x) - (b.x - a.x) * (c.y - b.y);
-        if v > 0.0 { 1 } else if v < 0.0 { -1 } else { 0 }
+        if v > 0.0 {
+            1
+        } else if v < 0.0 {
+            -1
+        } else {
+            0
+        }
     };
 
     let o1 = orientation(p1, p2, q1);
@@ -487,7 +510,10 @@ pub fn segments_intersect(p1: Vec2, p2: Vec2, q1: Vec2, q2: Vec2) -> bool {
 mod tests {
     use super::*;
 
-    const SITE: LatLon = LatLon { lat: 33.8938, lon: 35.5018 };
+    const SITE: LatLon = LatLon {
+        lat: 33.8938,
+        lon: 35.5018,
+    };
 
     /// A 10 m mast looking due north, tilted 45 degrees down. At that tilt the
     /// image centre lands exactly one mount-height away, which makes every
@@ -515,7 +541,10 @@ mod tests {
     #[test]
     fn local_frame_round_trips() {
         let frame = LocalFrame::new(SITE);
-        let point = LatLon { lat: SITE.lat + 0.0012, lon: SITE.lon - 0.0008 };
+        let point = LatLon {
+            lat: SITE.lat + 0.0012,
+            lon: SITE.lon - 0.0008,
+        };
         let back = frame.to_lat_lon(frame.to_local(point));
 
         close(back.lat, point.lat, 1e-12, "latitude");
@@ -531,7 +560,12 @@ mod tests {
         let local = frame.to_local(target);
 
         let planar = (local.x * local.x + local.y * local.y).sqrt();
-        close(planar, haversine_distance(SITE, target), 0.01, "planar vs geodesic");
+        close(
+            planar,
+            haversine_distance(SITE, target),
+            0.01,
+            "planar vs geodesic",
+        );
     }
 
     #[test]
@@ -554,16 +588,25 @@ mod tests {
 
     #[test]
     fn a_ray_at_or_above_the_horizon_has_no_ground_intersection() {
-        let level = CameraPose { pitch: 0.0, ..pose() };
+        let level = CameraPose {
+            pitch: 0.0,
+            ..pose()
+        };
         assert!(project_to_ground(&level, 0.5, 0.5, 1.5, true).is_none());
 
-        let upward = CameraPose { pitch: 10.0, ..pose() };
+        let upward = CameraPose {
+            pitch: 10.0,
+            ..pose()
+        };
         assert!(project_to_ground(&upward, 0.5, 0.5, 1.5, true).is_none());
     }
 
     #[test]
     fn out_of_range_projections_are_rejected_not_clamped() {
-        let shallow = CameraPose { pitch: -3.0, ..pose() };
+        let shallow = CameraPose {
+            pitch: -3.0,
+            ..pose()
+        };
         assert!(project_to_ground(&shallow, 0.5, 0.5, 1.5, true).is_none());
 
         let unbounded = project_to_ground(&shallow, 0.5, 0.5, 1.5, false)
@@ -573,10 +616,28 @@ mod tests {
 
     #[test]
     fn uncertainty_grows_sharply_toward_the_horizon() {
-        let near = project_to_ground(&CameraPose { pitch: -60.0, ..pose() }, 0.5, 0.5, 1.5, true)
-            .unwrap();
-        let far = project_to_ground(&CameraPose { pitch: -10.0, ..pose() }, 0.5, 0.5, 1.5, true)
-            .unwrap();
+        let near = project_to_ground(
+            &CameraPose {
+                pitch: -60.0,
+                ..pose()
+            },
+            0.5,
+            0.5,
+            1.5,
+            true,
+        )
+        .unwrap();
+        let far = project_to_ground(
+            &CameraPose {
+                pitch: -10.0,
+                ..pose()
+            },
+            0.5,
+            0.5,
+            1.5,
+            true,
+        )
+        .unwrap();
 
         assert!(near.uncertainty_meters < far.uncertainty_meters);
 
@@ -584,7 +645,10 @@ mod tests {
         // never be shown with the same confidence as one at the camera's feet.
         let near_ratio = near.uncertainty_meters / near.ground_distance_meters;
         let far_ratio = far.uncertainty_meters / far.ground_distance_meters;
-        assert!(far_ratio > near_ratio * 2.0, "relative error must worsen with distance");
+        assert!(
+            far_ratio > near_ratio * 2.0,
+            "relative error must worsen with distance"
+        );
     }
 
     #[test]
@@ -613,12 +677,28 @@ mod tests {
 
     #[test]
     fn detection_falls_back_rather_than_inventing_a_position() {
-        let level = CameraPose { pitch: 5.0, ..pose() };
-        let estimate = project_detection(&level, &BoundingBox { x: 0.45, y: 0.4, w: 0.1, h: 0.2 });
+        let level = CameraPose {
+            pitch: 5.0,
+            ..pose()
+        };
+        let estimate = project_detection(
+            &level,
+            &BoundingBox {
+                x: 0.45,
+                y: 0.4,
+                w: 0.1,
+                h: 0.2,
+            },
+        );
 
         assert_eq!(estimate.source, PositionSource::CameraFallback);
         // The uncertainty must cover the whole field of view, not imply precision.
-        close(estimate.radius_meters, level.range_meters, 1e-9, "fallback radius");
+        close(
+            estimate.radius_meters,
+            level.range_meters,
+            1e-9,
+            "fallback radius",
+        );
     }
 
     #[test]
@@ -667,7 +747,13 @@ mod tests {
         let mut transitions = 0;
         let mut inside = false;
         for step in -10..60 {
-            let now = point_in_polygon(Vec2 { x: step as f64, y: 20.0 }, &square);
+            let now = point_in_polygon(
+                Vec2 {
+                    x: step as f64,
+                    y: 20.0,
+                },
+                &square,
+            );
             if now != inside {
                 transitions += 1;
                 inside = now;
@@ -678,11 +764,29 @@ mod tests {
 
     #[test]
     fn iou_behaves() {
-        let a = BoundingBox { x: 0.2, y: 0.5, w: 0.1, h: 0.3 };
+        let a = BoundingBox {
+            x: 0.2,
+            y: 0.5,
+            w: 0.1,
+            h: 0.3,
+        };
         close(a.iou(&a), 1.0, 1e-9, "identical");
-        assert_eq!(a.iou(&BoundingBox { x: 0.9, y: 0.5, w: 0.1, h: 0.3 }), 0.0);
+        assert_eq!(
+            a.iou(&BoundingBox {
+                x: 0.9,
+                y: 0.5,
+                w: 0.1,
+                h: 0.3
+            }),
+            0.0
+        );
 
-        let partial = a.iou(&BoundingBox { x: 0.25, y: 0.5, w: 0.1, h: 0.3 });
+        let partial = a.iou(&BoundingBox {
+            x: 0.25,
+            y: 0.5,
+            w: 0.1,
+            h: 0.3,
+        });
         assert!(partial > 0.0 && partial < 1.0);
     }
 
@@ -691,8 +795,23 @@ mod tests {
         let a = Vec2 { x: 0.0, y: -20.0 };
         let b = Vec2 { x: 0.0, y: 20.0 };
 
-        assert!(segments_intersect(Vec2 { x: -10.0, y: 0.0 }, Vec2 { x: 10.0, y: 0.0 }, a, b));
-        assert!(!segments_intersect(Vec2 { x: -10.0, y: 0.0 }, Vec2 { x: -5.0, y: 0.0 }, a, b));
-        assert!(!segments_intersect(Vec2 { x: -10.0, y: 50.0 }, Vec2 { x: 10.0, y: 50.0 }, a, b));
+        assert!(segments_intersect(
+            Vec2 { x: -10.0, y: 0.0 },
+            Vec2 { x: 10.0, y: 0.0 },
+            a,
+            b
+        ));
+        assert!(!segments_intersect(
+            Vec2 { x: -10.0, y: 0.0 },
+            Vec2 { x: -5.0, y: 0.0 },
+            a,
+            b
+        ));
+        assert!(!segments_intersect(
+            Vec2 { x: -10.0, y: 50.0 },
+            Vec2 { x: 10.0, y: 50.0 },
+            a,
+            b
+        ));
     }
 }

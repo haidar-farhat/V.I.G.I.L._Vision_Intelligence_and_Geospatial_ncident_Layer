@@ -8,6 +8,6 @@
 //! No dependencies. For a security appliance the dependency list is part of the
 //! attack surface, and everything here is arithmetic.
 
+pub mod ffi;
 pub mod geometry;
 pub mod tracking;
-pub mod ffi;

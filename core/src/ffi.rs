@@ -18,9 +18,7 @@
 //!    `panic = "abort"`; unwinding into C is undefined behaviour, so the code
 //!    below simply does not panic — every fallible path returns a status.
 
-use crate::geometry::{
-    self, BoundingBox, CameraPose, LatLon, PositionSource, Vec2,
-};
+use crate::geometry::{self, BoundingBox, CameraPose, LatLon, PositionSource, Vec2};
 use crate::tracking::{Detection, Tracker, TrackerConfig};
 
 /// Version of this ABI. Python checks it on load and refuses a mismatch rather
@@ -41,8 +39,16 @@ pub extern "C" fn sentinel_abi_version() -> u32 {
 /// checked, rather than assumed to have stayed in step.
 ///
 /// Returns the number written, or -1 on a null or undersized buffer.
+///
+/// # Safety
+///
+/// Null is accepted and produces a defined failure. A **non-null** pointer,
+/// however, is taken at its word: it must point to a live, aligned,
+/// initialised value of the named type. Null-checking cannot establish that,
+/// which is why this is `unsafe` despite checking.
+/// `out` must have room for at least `capacity` `u32` values.
 #[no_mangle]
-pub extern "C" fn sentinel_struct_sizes(out: *mut u32, capacity: u32) -> i32 {
+pub unsafe extern "C" fn sentinel_struct_sizes(out: *mut u32, capacity: u32) -> i32 {
     const COUNT: usize = 5;
     if out.is_null() || (capacity as usize) < COUNT {
         return -1;
@@ -83,7 +89,10 @@ pub struct CPose {
 impl CPose {
     fn to_pose(self) -> CameraPose {
         CameraPose {
-            position: LatLon { lat: self.lat, lon: self.lon },
+            position: LatLon {
+                lat: self.lat,
+                lon: self.lon,
+            },
             mount_height: self.mount_height,
             heading: self.heading,
             pitch: self.pitch,
@@ -171,8 +180,15 @@ pub struct CPoint {
 ///
 /// `valid = 0` means the ray is at or above the horizon, or beyond range. The
 /// caller must check it: the remaining fields are meaningless when it is zero.
+///
+/// # Safety
+///
+/// Null is accepted and produces a defined failure. A **non-null** pointer,
+/// however, is taken at its word: it must point to a live, aligned,
+/// initialised value of the named type. Null-checking cannot establish that,
+/// which is why this is `unsafe` despite checking.
 #[no_mangle]
-pub extern "C" fn sentinel_project_to_ground(
+pub unsafe extern "C" fn sentinel_project_to_ground(
     pose: *const CPose,
     u: f64,
     v: f64,
@@ -185,13 +201,8 @@ pub extern "C" fn sentinel_project_to_ground(
     }
     let pose = unsafe { *pose }.to_pose();
 
-    let result = geometry::project_to_ground(
-        &pose,
-        u,
-        v,
-        angular_uncertainty_deg,
-        enforce_range != 0,
-    );
+    let result =
+        geometry::project_to_ground(&pose, u, v, angular_uncertainty_deg, enforce_range != 0);
 
     let projection = match result {
         Some(p) => CProjection {
@@ -223,8 +234,16 @@ pub extern "C" fn sentinel_project_to_ground(
 /// Writes at most `capacity` points and reports how many were produced. A caller
 /// that under-sized its buffer gets a truncated polygon and a count it can check,
 /// rather than a heap overflow.
+///
+/// # Safety
+///
+/// Null is accepted and produces a defined failure. A **non-null** pointer,
+/// however, is taken at its word: it must point to a live, aligned,
+/// initialised value of the named type. Null-checking cannot establish that,
+/// which is why this is `unsafe` despite checking.
+/// `out` must have room for at least `capacity` `CPoint` values.
 #[no_mangle]
-pub extern "C" fn sentinel_field_of_view(
+pub unsafe extern "C" fn sentinel_field_of_view(
     pose: *const CPose,
     arc_segments: u32,
     out: *mut CPoint,
@@ -241,16 +260,30 @@ pub extern "C" fn sentinel_field_of_view(
 
     let slice = unsafe { std::slice::from_raw_parts_mut(out, count) };
     for (index, point) in wedge.iter().take(count).enumerate() {
-        slice[index] = CPoint { lat: point.lat, lon: point.lon };
+        slice[index] = CPoint {
+            lat: point.lat,
+            lon: point.lon,
+        };
     }
 
     unsafe { *written = count as u32 };
-    if wedge.len() > capacity as usize { 1 } else { 0 }
+    if wedge.len() > capacity as usize {
+        1
+    } else {
+        0
+    }
 }
 
 /// Whether a camera can see a ground point, accounting for the blind foreground.
+///
+/// # Safety
+///
+/// Null is accepted and produces a defined failure. A **non-null** pointer,
+/// however, is taken at its word: it must point to a live, aligned,
+/// initialised value of the named type. Null-checking cannot establish that,
+/// which is why this is `unsafe` despite checking.
 #[no_mangle]
-pub extern "C" fn sentinel_camera_sees(pose: *const CPose, lat: f64, lon: f64) -> i32 {
+pub unsafe extern "C" fn sentinel_camera_sees(pose: *const CPose, lat: f64, lon: f64) -> i32 {
     if pose.is_null() {
         return -1;
     }
@@ -268,15 +301,27 @@ pub extern "C" fn sentinel_camera_sees(pose: *const CPose, lat: f64, lon: f64) -
     }
 
     let bearing = geometry::bearing_degrees(pose.position, point);
-    if geometry::bearing_in_fov(&pose, bearing) { 1 } else { 0 }
+    if geometry::bearing_in_fov(&pose, bearing) {
+        1
+    } else {
+        0
+    }
 }
 
 /// Point-in-polygon over a ring supplied in geographic coordinates.
 ///
 /// The ring is converted into a local metric frame anchored at its first vertex,
 /// which is what keeps the test consistent between the polygon and the point.
+///
+/// # Safety
+///
+/// Null is accepted and produces a defined failure. A **non-null** pointer,
+/// however, is taken at its word: it must point to a live, aligned,
+/// initialised value of the named type. Null-checking cannot establish that,
+/// which is why this is `unsafe` despite checking.
+/// `ring` must point to at least `count` contiguous `CPoint` values.
 #[no_mangle]
-pub extern "C" fn sentinel_point_in_zone(
+pub unsafe extern "C" fn sentinel_point_in_zone(
     ring: *const CPoint,
     count: u32,
     lat: f64,
@@ -287,12 +332,20 @@ pub extern "C" fn sentinel_point_in_zone(
     }
     let ring = unsafe { std::slice::from_raw_parts(ring, count as usize) };
 
-    let anchor = LatLon { lat: ring[0].lat, lon: ring[0].lon };
+    let anchor = LatLon {
+        lat: ring[0].lat,
+        lon: ring[0].lon,
+    };
     let frame = geometry::LocalFrame::new(anchor);
 
     let local: Vec<Vec2> = ring
         .iter()
-        .map(|p| frame.to_local(LatLon { lat: p.lat, lon: p.lon }))
+        .map(|p| {
+            frame.to_local(LatLon {
+                lat: p.lat,
+                lon: p.lon,
+            })
+        })
         .collect();
 
     if geometry::point_in_polygon(frame.to_local(LatLon { lat, lon }), &local) {
@@ -303,22 +356,42 @@ pub extern "C" fn sentinel_point_in_zone(
 }
 
 #[no_mangle]
-pub extern "C" fn sentinel_haversine_distance(
-    lat1: f64,
-    lon1: f64,
-    lat2: f64,
-    lon2: f64,
-) -> f64 {
-    geometry::haversine_distance(LatLon { lat: lat1, lon: lon1 }, LatLon { lat: lat2, lon: lon2 })
+pub extern "C" fn sentinel_haversine_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    geometry::haversine_distance(
+        LatLon {
+            lat: lat1,
+            lon: lon1,
+        },
+        LatLon {
+            lat: lat2,
+            lon: lon2,
+        },
+    )
 }
 
 #[no_mangle]
 pub extern "C" fn sentinel_bearing_degrees(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
-    geometry::bearing_degrees(LatLon { lat: lat1, lon: lon1 }, LatLon { lat: lat2, lon: lon2 })
+    geometry::bearing_degrees(
+        LatLon {
+            lat: lat1,
+            lon: lon1,
+        },
+        LatLon {
+            lat: lat2,
+            lon: lon2,
+        },
+    )
 }
 
+///
+/// # Safety
+///
+/// Null is accepted and produces a defined failure. A **non-null** pointer,
+/// however, is taken at its word: it must point to a live, aligned,
+/// initialised value of the named type. Null-checking cannot establish that,
+/// which is why this is `unsafe` despite checking.
 #[no_mangle]
-pub extern "C" fn sentinel_destination_point(
+pub unsafe extern "C" fn sentinel_destination_point(
     lat: f64,
     lon: f64,
     bearing_deg: f64,
@@ -328,9 +401,13 @@ pub extern "C" fn sentinel_destination_point(
     if out.is_null() {
         return -1;
     }
-    let result =
-        geometry::destination_point(LatLon { lat, lon }, bearing_deg, distance_meters);
-    unsafe { *out = CPoint { lat: result.lat, lon: result.lon } };
+    let result = geometry::destination_point(LatLon { lat, lon }, bearing_deg, distance_meters);
+    unsafe {
+        *out = CPoint {
+            lat: result.lat,
+            lon: result.lon,
+        }
+    };
     0
 }
 
@@ -347,8 +424,17 @@ pub struct TrackerHandle {
     ended: Vec<u64>,
 }
 
+///
+/// # Safety
+///
+/// Null is accepted and produces a defined failure. A **non-null** pointer,
+/// however, is taken at its word: it must point to a live, aligned,
+/// initialised value of the named type. Null-checking cannot establish that,
+/// which is why this is `unsafe` despite checking.
+/// The returned handle must eventually be passed to
+/// `sentinel_tracker_destroy`, exactly once.
 #[no_mangle]
-pub extern "C" fn sentinel_tracker_create(
+pub unsafe extern "C" fn sentinel_tracker_create(
     pose: *const CPose,
     iou_threshold: f64,
     gate_factor: f64,
@@ -364,7 +450,11 @@ pub extern "C" fn sentinel_tracker_create(
     };
 
     // A null pose is the normal state for a camera nobody has placed on the map.
-    let camera = if pose.is_null() { None } else { Some(unsafe { *pose }.to_pose()) };
+    let camera = if pose.is_null() {
+        None
+    } else {
+        Some(unsafe { *pose }.to_pose())
+    };
 
     Box::into_raw(Box::new(TrackerHandle {
         tracker: Tracker::new(config, camera),
@@ -373,8 +463,17 @@ pub extern "C" fn sentinel_tracker_create(
     }))
 }
 
+///
+/// # Safety
+///
+/// Null is accepted and produces a defined failure. A **non-null** pointer,
+/// however, is taken at its word: it must point to a live, aligned,
+/// initialised value of the named type. Null-checking cannot establish that,
+/// which is why this is `unsafe` despite checking.
+/// `handle` must come from `sentinel_tracker_create` and must not have been
+/// destroyed already. Passing the same handle twice is a double free.
 #[no_mangle]
-pub extern "C" fn sentinel_tracker_destroy(handle: *mut TrackerHandle) {
+pub unsafe extern "C" fn sentinel_tracker_destroy(handle: *mut TrackerHandle) {
     if handle.is_null() {
         return;
     }
@@ -382,8 +481,16 @@ pub extern "C" fn sentinel_tracker_destroy(handle: *mut TrackerHandle) {
     unsafe { drop(Box::from_raw(handle)) };
 }
 
+///
+/// # Safety
+///
+/// Null is accepted and produces a defined failure. A **non-null** pointer,
+/// however, is taken at its word: it must point to a live, aligned,
+/// initialised value of the named type. Null-checking cannot establish that,
+/// which is why this is `unsafe` despite checking.
+/// `handle` must come from `sentinel_tracker_create` and still be live.
 #[no_mangle]
-pub extern "C" fn sentinel_tracker_set_pose(
+pub unsafe extern "C" fn sentinel_tracker_set_pose(
     handle: *mut TrackerHandle,
     pose: *const CPose,
 ) -> i32 {
@@ -391,9 +498,11 @@ pub extern "C" fn sentinel_tracker_set_pose(
         return -1;
     }
     let handle = unsafe { &mut *handle };
-    handle
-        .tracker
-        .set_pose(if pose.is_null() { None } else { Some(unsafe { *pose }.to_pose()) });
+    handle.tracker.set_pose(if pose.is_null() {
+        None
+    } else {
+        Some(unsafe { *pose }.to_pose())
+    });
     0
 }
 
@@ -402,8 +511,17 @@ pub extern "C" fn sentinel_tracker_set_pose(
 /// Returns the number of confirmed tracks, or a negative status. The tracks
 /// themselves are then read with `sentinel_tracker_tracks`, which keeps this call
 /// free of output-buffer sizing decisions the caller cannot make in advance.
+///
+/// # Safety
+///
+/// Null is accepted and produces a defined failure. A **non-null** pointer,
+/// however, is taken at its word: it must point to a live, aligned,
+/// initialised value of the named type. Null-checking cannot establish that,
+/// which is why this is `unsafe` despite checking.
+/// `detections` must point to at least `count` contiguous `CDetection`
+/// values, and `handle` must come from `sentinel_tracker_create`.
 #[no_mangle]
-pub extern "C" fn sentinel_tracker_update(
+pub unsafe extern "C" fn sentinel_tracker_update(
     handle: *mut TrackerHandle,
     detections: *const CDetection,
     count: u32,
@@ -424,7 +542,12 @@ pub extern "C" fn sentinel_tracker_update(
         unsafe { std::slice::from_raw_parts(detections, count as usize) }
             .iter()
             .map(|d| Detection {
-                bbox: BoundingBox { x: d.x, y: d.y, w: d.w, h: d.h },
+                bbox: BoundingBox {
+                    x: d.x,
+                    y: d.y,
+                    w: d.w,
+                    h: d.h,
+                },
                 confidence: d.confidence,
                 class_id: d.class_id,
             })
@@ -468,8 +591,17 @@ pub extern "C" fn sentinel_tracker_update(
 }
 
 /// Copy the confirmed tracks from the last update into the caller's buffer.
+///
+/// # Safety
+///
+/// Null is accepted and produces a defined failure. A **non-null** pointer,
+/// however, is taken at its word: it must point to a live, aligned,
+/// initialised value of the named type. Null-checking cannot establish that,
+/// which is why this is `unsafe` despite checking.
+/// `out` must have room for at least `capacity` `CTrack` values, and
+/// `handle` must come from `sentinel_tracker_create`.
 #[no_mangle]
-pub extern "C" fn sentinel_tracker_tracks(
+pub unsafe extern "C" fn sentinel_tracker_tracks(
     handle: *const TrackerHandle,
     out: *mut CTrack,
     capacity: u32,
@@ -487,8 +619,17 @@ pub extern "C" fn sentinel_tracker_tracks(
 }
 
 /// Track ids closed on the last update, so downstream state can be released.
+///
+/// # Safety
+///
+/// Null is accepted and produces a defined failure. A **non-null** pointer,
+/// however, is taken at its word: it must point to a live, aligned,
+/// initialised value of the named type. Null-checking cannot establish that,
+/// which is why this is `unsafe` despite checking.
+/// `out` must have room for at least `capacity` `u64` values, and `handle`
+/// must come from `sentinel_tracker_create`.
 #[no_mangle]
-pub extern "C" fn sentinel_tracker_ended(
+pub unsafe extern "C" fn sentinel_tracker_ended(
     handle: *const TrackerHandle,
     out: *mut u64,
     capacity: u32,
@@ -505,8 +646,16 @@ pub extern "C" fn sentinel_tracker_ended(
     count as i32
 }
 
+///
+/// # Safety
+///
+/// Null is accepted and produces a defined failure. A **non-null** pointer,
+/// however, is taken at its word: it must point to a live, aligned,
+/// initialised value of the named type. Null-checking cannot establish that,
+/// which is why this is `unsafe` despite checking.
+/// `handle` must come from `sentinel_tracker_create` and still be live.
 #[no_mangle]
-pub extern "C" fn sentinel_tracker_reset(handle: *mut TrackerHandle) -> i32 {
+pub unsafe extern "C" fn sentinel_tracker_reset(handle: *mut TrackerHandle) -> i32 {
     if handle.is_null() {
         return -1;
     }
@@ -526,11 +675,27 @@ mod tests {
     /// A zeroed track, for the read buffers a caller must supply.
     fn blank_track() -> CTrack {
         CTrack {
-            id: 0, class_id: 0, confirmed: 0, x: 0.0, y: 0.0, w: 0.0, h: 0.0,
-            confidence: 0.0, first_seen_millis: 0, last_seen_millis: 0, hits: 0,
-            has_position: 0, lat: 0.0, lon: 0.0, uncertainty_meters: 0.0,
-            position_source: 0, has_speed: 0, has_heading: 0, _pad2: 0,
-            speed_mps: 0.0, heading_degrees: 0.0,
+            id: 0,
+            class_id: 0,
+            confirmed: 0,
+            x: 0.0,
+            y: 0.0,
+            w: 0.0,
+            h: 0.0,
+            confidence: 0.0,
+            first_seen_millis: 0,
+            last_seen_millis: 0,
+            hits: 0,
+            has_position: 0,
+            lat: 0.0,
+            lon: 0.0,
+            uncertainty_meters: 0.0,
+            position_source: 0,
+            has_speed: 0,
+            has_heading: 0,
+            _pad2: 0,
+            speed_mps: 0.0,
+            heading_degrees: 0.0,
         }
     }
 
@@ -550,151 +715,252 @@ mod tests {
 
     #[test]
     fn every_entry_point_tolerates_null() {
-        // A caller's bug must produce a defined failure, not a segfault inside a
-        // security appliance.
-        let mut projection = CProjection {
-            valid: 0, _pad: 0, lat: 0.0, lon: 0.0,
-            ground_distance_meters: 0.0, bearing_deg: 0.0, uncertainty_meters: 0.0,
-        };
+        // Every call below crosses the C ABI, which is what this test is for.
+        unsafe {
+            // A caller's bug must produce a defined failure, not a segfault inside a
+            // security appliance.
+            let mut projection = CProjection {
+                valid: 0,
+                _pad: 0,
+                lat: 0.0,
+                lon: 0.0,
+                ground_distance_meters: 0.0,
+                bearing_deg: 0.0,
+                uncertainty_meters: 0.0,
+            };
 
-        assert_eq!(
-            sentinel_project_to_ground(std::ptr::null(), 0.5, 0.5, 1.5, 1, &mut projection),
-            -1
-        );
-        assert_eq!(sentinel_project_to_ground(&pose(), 0.5, 0.5, 1.5, 1, std::ptr::null_mut()), -1);
-        assert_eq!(sentinel_camera_sees(std::ptr::null(), 0.0, 0.0), -1);
-        assert_eq!(sentinel_tracker_update(std::ptr::null_mut(), std::ptr::null(), 0, 0), -1);
-        assert_eq!(sentinel_tracker_tracks(std::ptr::null(), std::ptr::null_mut(), 0), -1);
-        assert_eq!(sentinel_tracker_reset(std::ptr::null_mut()), -1);
-        assert_eq!(sentinel_tracker_set_pose(std::ptr::null_mut(), &pose()), -1);
-        assert_eq!(sentinel_struct_sizes(std::ptr::null_mut(), 5), -1);
+            assert_eq!(
+                sentinel_project_to_ground(std::ptr::null(), 0.5, 0.5, 1.5, 1, &mut projection),
+                -1
+            );
+            assert_eq!(
+                sentinel_project_to_ground(&pose(), 0.5, 0.5, 1.5, 1, std::ptr::null_mut()),
+                -1
+            );
+            assert_eq!(sentinel_camera_sees(std::ptr::null(), 0.0, 0.0), -1);
+            assert_eq!(
+                sentinel_tracker_update(std::ptr::null_mut(), std::ptr::null(), 0, 0),
+                -1
+            );
+            assert_eq!(
+                sentinel_tracker_tracks(std::ptr::null(), std::ptr::null_mut(), 0),
+                -1
+            );
+            assert_eq!(sentinel_tracker_reset(std::ptr::null_mut()), -1);
+            assert_eq!(sentinel_tracker_set_pose(std::ptr::null_mut(), &pose()), -1);
+            assert_eq!(sentinel_struct_sizes(std::ptr::null_mut(), 5), -1);
 
-        // Destroying null is a no-op, so a double free is survivable.
-        sentinel_tracker_destroy(std::ptr::null_mut());
+            // Destroying null is a no-op, so a double free is survivable.
+            sentinel_tracker_destroy(std::ptr::null_mut());
+        }
     }
 
     #[test]
     fn standing_still_is_distinguishable_from_not_knowing() {
-        // The three motion states must survive the boundary. A person standing
-        // in one place for four minutes is the loitering signal the system
-        // exists to notice; reporting it as "motion unknown" throws that away.
-        let handle = sentinel_tracker_create(&pose(), 0.2, 2.5, 5_000, 2);
-        let detection = CDetection {
-            x: 0.45, y: 0.55, w: 0.06, h: 0.12,
-            confidence: 0.9, class_id: 0, _pad: 0,
-        };
+        // Every call below crosses the C ABI, which is what this test is for.
+        unsafe {
+            // The three motion states must survive the boundary. A person standing
+            // in one place for four minutes is the loitering signal the system
+            // exists to notice; reporting it as "motion unknown" throws that away.
+            let handle = sentinel_tracker_create(&pose(), 0.2, 2.5, 5_000, 2);
+            let detection = CDetection {
+                x: 0.45,
+                y: 0.55,
+                w: 0.06,
+                h: 0.12,
+                confidence: 0.9,
+                class_id: 0,
+                _pad: 0,
+            };
 
-        let mut out = [blank_track(); 4];
+            let mut out = [blank_track(); 4];
 
-        sentinel_tracker_update(handle, &detection, 1, 0);
-        sentinel_tracker_update(handle, &detection, 1, 200);
-        for step in 2..14 {
-            sentinel_tracker_update(handle, &detection, 1, step * 200);
+            sentinel_tracker_update(handle, &detection, 1, 0);
+            sentinel_tracker_update(handle, &detection, 1, 200);
+            for step in 2..14 {
+                sentinel_tracker_update(handle, &detection, 1, step * 200);
+            }
+
+            assert_eq!(sentinel_tracker_tracks(handle, out.as_mut_ptr(), 4), 1);
+            assert_eq!(out[0].has_speed, 1, "we know the speed");
+            assert_eq!(out[0].speed_mps, 0.0, "and the speed is zero");
+            assert_eq!(
+                out[0].has_heading, 0,
+                "a heading from jitter is worse than none"
+            );
+
+            sentinel_tracker_destroy(handle);
         }
-
-        assert_eq!(sentinel_tracker_tracks(handle, out.as_mut_ptr(), 4), 1);
-        assert_eq!(out[0].has_speed, 1, "we know the speed");
-        assert_eq!(out[0].speed_mps, 0.0, "and the speed is zero");
-        assert_eq!(out[0].has_heading, 0, "a heading from jitter is worse than none");
-
-        sentinel_tracker_destroy(handle);
     }
 
     #[test]
     fn struct_sizes_are_reported_for_every_boundary_type() {
-        // These are what a hand-written binding in another language must match.
-        let mut sizes = [0u32; 5];
-        assert_eq!(sentinel_struct_sizes(sizes.as_mut_ptr(), 5), 5);
-        assert!(sizes.iter().all(|&s| s > 0));
+        // Every call below crosses the C ABI, which is what this test is for.
+        unsafe {
+            // These are what a hand-written binding in another language must match.
+            let mut sizes = [0u32; 5];
+            assert_eq!(sentinel_struct_sizes(sizes.as_mut_ptr(), 5), 5);
+            assert!(sizes.iter().all(|&s| s > 0));
 
-        // An undersized buffer is refused rather than partially filled: a caller
-        // that got the count wrong has a stale layout, which is the exact
-        // condition this function exists to catch.
-        let mut small = [0u32; 4];
-        assert_eq!(sentinel_struct_sizes(small.as_mut_ptr(), 4), -1);
-        assert_eq!(small, [0u32; 4]);
+            // An undersized buffer is refused rather than partially filled: a caller
+            // that got the count wrong has a stale layout, which is the exact
+            // condition this function exists to catch.
+            let mut small = [0u32; 4];
+            assert_eq!(sentinel_struct_sizes(small.as_mut_ptr(), 4), -1);
+            assert_eq!(small, [0u32; 4]);
+        }
     }
 
     #[test]
     fn projection_crosses_the_boundary_intact() {
-        let mut out = CProjection {
-            valid: 0, _pad: 0, lat: 0.0, lon: 0.0,
-            ground_distance_meters: 0.0, bearing_deg: 0.0, uncertainty_meters: 0.0,
-        };
+        // Every call below crosses the C ABI, which is what this test is for.
+        unsafe {
+            let mut out = CProjection {
+                valid: 0,
+                _pad: 0,
+                lat: 0.0,
+                lon: 0.0,
+                ground_distance_meters: 0.0,
+                bearing_deg: 0.0,
+                uncertainty_meters: 0.0,
+            };
 
-        assert_eq!(sentinel_project_to_ground(&pose(), 0.5, 0.5, 1.5, 1, &mut out), 0);
-        assert_eq!(out.valid, 1);
-        assert!((out.ground_distance_meters - 10.0).abs() < 1e-9);
+            assert_eq!(
+                sentinel_project_to_ground(&pose(), 0.5, 0.5, 1.5, 1, &mut out),
+                0
+            );
+            assert_eq!(out.valid, 1);
+            assert!((out.ground_distance_meters - 10.0).abs() < 1e-9);
+        }
     }
 
     #[test]
     fn an_impossible_projection_reports_invalid_rather_than_a_guess() {
-        let level = CPose { pitch: 5.0, ..pose() };
-        let mut out = CProjection {
-            valid: 1, _pad: 0, lat: 9.0, lon: 9.0,
-            ground_distance_meters: 9.0, bearing_deg: 9.0, uncertainty_meters: 9.0,
-        };
+        // Every call below crosses the C ABI, which is what this test is for.
+        unsafe {
+            let level = CPose {
+                pitch: 5.0,
+                ..pose()
+            };
+            let mut out = CProjection {
+                valid: 1,
+                _pad: 0,
+                lat: 9.0,
+                lon: 9.0,
+                ground_distance_meters: 9.0,
+                bearing_deg: 9.0,
+                uncertainty_meters: 9.0,
+            };
 
-        assert_eq!(sentinel_project_to_ground(&level, 0.5, 0.5, 1.5, 1, &mut out), 0);
-        assert_eq!(out.valid, 0, "the caller must be told, not handed a number");
+            assert_eq!(
+                sentinel_project_to_ground(&level, 0.5, 0.5, 1.5, 1, &mut out),
+                0
+            );
+            assert_eq!(out.valid, 0, "the caller must be told, not handed a number");
+        }
     }
 
     #[test]
     fn an_undersized_buffer_truncates_and_says_so() {
-        let mut points = [CPoint { lat: 0.0, lon: 0.0 }; 4];
-        let mut written = 0u32;
+        // Every call below crosses the C ABI, which is what this test is for.
+        unsafe {
+            let mut points = [CPoint { lat: 0.0, lon: 0.0 }; 4];
+            let mut written = 0u32;
 
-        let status =
-            sentinel_field_of_view(&pose(), 24, points.as_mut_ptr(), 4, &mut written);
+            let status = sentinel_field_of_view(&pose(), 24, points.as_mut_ptr(), 4, &mut written);
 
-        assert_eq!(status, 1, "truncation is reported");
-        assert_eq!(written, 4, "and never overruns the buffer");
+            assert_eq!(status, 1, "truncation is reported");
+            assert_eq!(written, 4, "and never overruns the buffer");
+        }
     }
 
     #[test]
     fn a_tracker_round_trips_through_the_boundary() {
-        let handle = sentinel_tracker_create(&pose(), 0.2, 2.5, 2000, 2);
-        assert!(!handle.is_null());
+        // Every call below crosses the C ABI, which is what this test is for.
+        unsafe {
+            let handle = sentinel_tracker_create(&pose(), 0.2, 2.5, 2000, 2);
+            assert!(!handle.is_null());
 
-        let detections = [CDetection {
-            x: 0.45, y: 0.5, w: 0.08, h: 0.2, confidence: 0.9, class_id: 0, _pad: 0,
-        }];
+            let detections = [CDetection {
+                x: 0.45,
+                y: 0.5,
+                w: 0.08,
+                h: 0.2,
+                confidence: 0.9,
+                class_id: 0,
+                _pad: 0,
+            }];
 
-        assert_eq!(sentinel_tracker_update(handle, detections.as_ptr(), 1, 0), 0, "not confirmed yet");
-        let confirmed = sentinel_tracker_update(handle, detections.as_ptr(), 1, 200);
-        assert_eq!(confirmed, 1);
+            assert_eq!(
+                sentinel_tracker_update(handle, detections.as_ptr(), 1, 0),
+                0,
+                "not confirmed yet"
+            );
+            let confirmed = sentinel_tracker_update(handle, detections.as_ptr(), 1, 200);
+            assert_eq!(confirmed, 1);
 
-        let mut out = [blank_track(); 8];
+            let mut out = [blank_track(); 8];
 
-        assert_eq!(sentinel_tracker_tracks(handle, out.as_mut_ptr(), 8), 1);
-        assert_eq!(out[0].confirmed, 1);
-        assert_eq!(out[0].has_position, 1, "a posed camera yields a map position");
-        assert!(out[0].uncertainty_meters > 0.0, "uncertainty always travels with it");
+            assert_eq!(sentinel_tracker_tracks(handle, out.as_mut_ptr(), 8), 1);
+            assert_eq!(out[0].confirmed, 1);
+            assert_eq!(
+                out[0].has_position, 1,
+                "a posed camera yields a map position"
+            );
+            assert!(
+                out[0].uncertainty_meters > 0.0,
+                "uncertainty always travels with it"
+            );
 
-        sentinel_tracker_destroy(handle);
+            sentinel_tracker_destroy(handle);
+        }
     }
 
     #[test]
     fn zone_membership_crosses_intact() {
-        let anchor = LatLon { lat: 33.8938, lon: 35.5018 };
-        let corner = |east: f64, north: f64| {
-            let p = geometry::destination_point(
-                geometry::destination_point(anchor, 0.0, north),
+        // Every call below crosses the C ABI, which is what this test is for.
+        unsafe {
+            let anchor = LatLon {
+                lat: 33.8938,
+                lon: 35.5018,
+            };
+            let corner = |east: f64, north: f64| {
+                let p = geometry::destination_point(
+                    geometry::destination_point(anchor, 0.0, north),
+                    90.0,
+                    east,
+                );
+                CPoint {
+                    lat: p.lat,
+                    lon: p.lon,
+                }
+            };
+
+            let ring = [
+                corner(0.0, 0.0),
+                corner(40.0, 0.0),
+                corner(40.0, 40.0),
+                corner(0.0, 40.0),
+            ];
+            let inside = geometry::destination_point(
+                geometry::destination_point(anchor, 0.0, 20.0),
                 90.0,
-                east,
+                20.0,
             );
-            CPoint { lat: p.lat, lon: p.lon }
-        };
 
-        let ring = [corner(0.0, 0.0), corner(40.0, 0.0), corner(40.0, 40.0), corner(0.0, 40.0)];
-        let inside = geometry::destination_point(
-            geometry::destination_point(anchor, 0.0, 20.0),
-            90.0,
-            20.0,
-        );
-
-        assert_eq!(sentinel_point_in_zone(ring.as_ptr(), 4, inside.lat, inside.lon), 1);
-        assert_eq!(sentinel_point_in_zone(ring.as_ptr(), 4, anchor.lat - 0.01, anchor.lon), 0);
-        assert_eq!(sentinel_point_in_zone(ring.as_ptr(), 2, inside.lat, inside.lon), 0, "a ring needs 3 points");
+            assert_eq!(
+                sentinel_point_in_zone(ring.as_ptr(), 4, inside.lat, inside.lon),
+                1
+            );
+            assert_eq!(
+                sentinel_point_in_zone(ring.as_ptr(), 4, anchor.lat - 0.01, anchor.lon),
+                0
+            );
+            assert_eq!(
+                sentinel_point_in_zone(ring.as_ptr(), 2, inside.lat, inside.lon),
+                0,
+                "a ring needs 3 points"
+            );
+        }
     }
 }

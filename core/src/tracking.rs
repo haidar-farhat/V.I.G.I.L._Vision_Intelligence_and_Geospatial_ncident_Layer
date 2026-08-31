@@ -21,8 +21,8 @@
 //! centre lands within a size-scaled gate of the *predicted* position associates
 //! too, ranked below any real overlap.
 
-use crate::geometry::{BoundingBox, CameraPose, LatLon, PositionEstimate, PositionSource, Vec2};
 use crate::geometry::{bearing_degrees, haversine_distance, project_detection};
+use crate::geometry::{BoundingBox, CameraPose, LatLon, PositionEstimate, PositionSource, Vec2};
 
 #[derive(Debug, Clone, Copy)]
 pub struct Detection {
@@ -105,7 +105,13 @@ pub struct TrackerUpdate {
 
 impl Tracker {
     pub fn new(config: TrackerConfig, pose: Option<CameraPose>) -> Self {
-        Self { config, pose, tracks: Vec::new(), next_id: 1, last_update_millis: None }
+        Self {
+            config,
+            pose,
+            tracks: Vec::new(),
+            next_id: 1,
+            last_update_millis: None,
+        }
     }
 
     pub fn set_pose(&mut self, pose: Option<CameraPose>) {
@@ -176,10 +182,8 @@ impl Tracker {
 
         let widen = elapsed_ratio.clamp(1.0, MAX_GATE_WIDENING);
         let gate_x = self.config.gate_factor * predicted.w.max(detected.w) * widen;
-        let gate_y = self.config.gate_factor
-            * predicted.h.max(detected.h)
-            * VERTICAL_GATE_RATIO
-            * widen;
+        let gate_y =
+            self.config.gate_factor * predicted.h.max(detected.h) * VERTICAL_GATE_RATIO * widen;
 
         if gate_x <= 0.0 || gate_y <= 0.0 {
             return None;
@@ -189,7 +193,11 @@ impl Tracker {
         let b = detected.center();
         let normalized = ((b.x - a.x) / gate_x).powi(2) + ((b.y - a.y) / gate_y).powi(2);
 
-        if normalized > 1.0 { None } else { Some(1.0 - normalized.sqrt()) }
+        if normalized > 1.0 {
+            None
+        } else {
+            Some(1.0 - normalized.sqrt())
+        }
     }
 
     /// Feed one frame's detections.
@@ -198,8 +206,11 @@ impl Tracker {
     /// one camera sees at a time is both effectively optimal and stable: the same
     /// input always yields the same assignment, with no dependence on ordering.
     pub fn update(&mut self, detections: &[Detection], at_millis: i64) -> TrackerUpdate {
-        let predicted: Vec<BoundingBox> =
-            self.tracks.iter().map(|t| Self::predict(t, at_millis)).collect();
+        let predicted: Vec<BoundingBox> = self
+            .tracks
+            .iter()
+            .map(|t| Self::predict(t, at_millis))
+            .collect();
 
         // The observed frame interval, used to judge how stale a track is. Taken
         // from the stream rather than configured, because a camera's real rate is
@@ -251,7 +262,13 @@ impl Tracker {
             let pose = self.pose;
             let config = self.config;
             let track = &mut self.tracks[track_index];
-            apply_detection(track, &detections[detection_index], at_millis, pose, &config);
+            apply_detection(
+                track,
+                &detections[detection_index],
+                at_millis,
+                pose,
+                &config,
+            );
         }
 
         // Unmatched detections start new tracks.
@@ -330,7 +347,10 @@ fn apply_detection(
     if dt > 0.0 {
         // Exponential smoothing: responsive enough to follow a turn, damped
         // enough that one noisy box does not fling the prediction away.
-        let instant = Vec2 { x: (next.x - previous.x) / dt, y: (next.y - previous.y) / dt };
+        let instant = Vec2 {
+            x: (next.x - previous.x) / dt,
+            y: (next.y - previous.y) / dt,
+        };
         track.velocity = Vec2 {
             x: track.velocity.x * 0.6 + instant.x * 0.4,
             y: track.velocity.y * 0.6 + instant.y * 0.4,
@@ -356,7 +376,9 @@ fn apply_detection(
 /// object's, so feeding them in would compute the speed of a stationary pole and
 /// report it as the target's.
 fn record_ground(track: &mut Track, at_millis: i64, config: &TrackerConfig) {
-    let Some(position) = track.position else { return };
+    let Some(position) = track.position else {
+        return;
+    };
     if position.source != PositionSource::GroundProjection {
         return;
     }
@@ -409,11 +431,20 @@ mod tests {
     use super::*;
 
     fn walking(x: f64) -> BoundingBox {
-        BoundingBox { x, y: 0.5, w: 0.1, h: 0.3 }
+        BoundingBox {
+            x,
+            y: 0.5,
+            w: 0.1,
+            h: 0.3,
+        }
     }
 
     fn detection(bbox: BoundingBox, class_id: u32) -> Detection {
-        Detection { bbox, confidence: 0.9, class_id }
+        Detection {
+            bbox,
+            confidence: 0.9,
+            class_id,
+        }
     }
 
     #[test]
@@ -421,7 +452,11 @@ mod tests {
         let mut tracker = Tracker::new(TrackerConfig::default(), None);
 
         tracker.update(&[detection(walking(0.2), 0)], 0);
-        assert_eq!(tracker.tracks().count(), 0, "one detection is not yet a track");
+        assert_eq!(
+            tracker.tracks().count(),
+            0,
+            "one detection is not yet a track"
+        );
 
         tracker.update(&[detection(walking(0.22), 0)], 200);
         assert_eq!(tracker.tracks().count(), 1, "confirmed on the second hit");
@@ -464,7 +499,11 @@ mod tests {
             }
         }
 
-        assert_eq!(ids.len(), 1, "the proximity gate must hold small fast boxes together");
+        assert_eq!(
+            ids.len(),
+            1,
+            "the proximity gate must hold small fast boxes together"
+        );
     }
 
     #[test]
@@ -488,12 +527,20 @@ mod tests {
         }
 
         tracker.update(&[detection(walking(0.1 + 7.0 * 0.05), 0)], 1400);
-        assert_eq!(tracker.tracks().next().map(|t| t.id), Some(id), "same object, same id");
+        assert_eq!(
+            tracker.tracks().next().map(|t| t.id),
+            Some(id),
+            "same object, same id"
+        );
     }
 
     #[test]
     fn a_track_closes_once_the_gap_exceeds_the_limit() {
-        let config = TrackerConfig { min_hits_to_confirm: 1, max_gap_millis: 1000, ..Default::default() };
+        let config = TrackerConfig {
+            min_hits_to_confirm: 1,
+            max_gap_millis: 1000,
+            ..Default::default()
+        };
         let mut tracker = Tracker::new(config, None);
 
         tracker.update(&[detection(walking(0.2), 0)], 0);
@@ -506,26 +553,52 @@ mod tests {
 
     #[test]
     fn different_classes_never_merge() {
-        let config = TrackerConfig { min_hits_to_confirm: 1, ..Default::default() };
+        let config = TrackerConfig {
+            min_hits_to_confirm: 1,
+            ..Default::default()
+        };
         let mut tracker = Tracker::new(config, None);
 
         tracker.update(&[detection(walking(0.3), 0)], 0);
         tracker.update(&[detection(walking(0.3), 1)], 200);
 
-        assert_eq!(tracker.active_count(), 2, "a person track must not absorb a vehicle");
+        assert_eq!(
+            tracker.active_count(),
+            2,
+            "a person track must not absorb a vehicle"
+        );
     }
 
     #[test]
     fn two_objects_get_two_tracks() {
-        let config = TrackerConfig { min_hits_to_confirm: 1, ..Default::default() };
+        let config = TrackerConfig {
+            min_hits_to_confirm: 1,
+            ..Default::default()
+        };
         let mut tracker = Tracker::new(config, None);
 
         for step in 0..5 {
             let at = step * 200;
             tracker.update(
                 &[
-                    detection(BoundingBox { x: 0.1 + step as f64 * 0.02, y: 0.5, w: 0.08, h: 0.25 }, 0),
-                    detection(BoundingBox { x: 0.7 - step as f64 * 0.02, y: 0.5, w: 0.08, h: 0.25 }, 0),
+                    detection(
+                        BoundingBox {
+                            x: 0.1 + step as f64 * 0.02,
+                            y: 0.5,
+                            w: 0.08,
+                            h: 0.25,
+                        },
+                        0,
+                    ),
+                    detection(
+                        BoundingBox {
+                            x: 0.7 - step as f64 * 0.02,
+                            y: 0.5,
+                            w: 0.08,
+                            h: 0.25,
+                        },
+                        0,
+                    ),
                 ],
                 at,
             );
@@ -544,8 +617,24 @@ mod tests {
                 let at = step * 200;
                 tracker.update(
                     &[
-                        detection(BoundingBox { x: 0.1 + step as f64 * 0.03, y: 0.5, w: 0.08, h: 0.25 }, 0),
-                        detection(BoundingBox { x: 0.6 - step as f64 * 0.02, y: 0.4, w: 0.08, h: 0.25 }, 0),
+                        detection(
+                            BoundingBox {
+                                x: 0.1 + step as f64 * 0.03,
+                                y: 0.5,
+                                w: 0.08,
+                                h: 0.25,
+                            },
+                            0,
+                        ),
+                        detection(
+                            BoundingBox {
+                                x: 0.6 - step as f64 * 0.02,
+                                y: 0.4,
+                                w: 0.08,
+                                h: 0.25,
+                            },
+                            0,
+                        ),
                     ],
                     at,
                 );
@@ -556,13 +645,20 @@ mod tests {
             output
         };
 
-        assert_eq!(run(), run(), "the same input must reproduce the same tracks");
+        assert_eq!(
+            run(),
+            run(),
+            "the same input must reproduce the same tracks"
+        );
     }
 
     #[test]
     fn a_stationary_object_reports_zero_speed_and_no_heading() {
         let pose = CameraPose {
-            position: LatLon { lat: 33.8938, lon: 35.5018 },
+            position: LatLon {
+                lat: 33.8938,
+                lon: 35.5018,
+            },
             mount_height: 10.0,
             heading: 0.0,
             pitch: -45.0,
@@ -571,24 +667,45 @@ mod tests {
             vertical_fov: 34.0,
             range_meters: 200.0,
         };
-        let config = TrackerConfig { min_hits_to_confirm: 1, ..Default::default() };
+        let config = TrackerConfig {
+            min_hits_to_confirm: 1,
+            ..Default::default()
+        };
         let mut tracker = Tracker::new(config, Some(pose));
 
         for step in 0..10 {
             tracker.update(
-                &[detection(BoundingBox { x: 0.45, y: 0.6, w: 0.08, h: 0.15 }, 0)],
+                &[detection(
+                    BoundingBox {
+                        x: 0.45,
+                        y: 0.6,
+                        w: 0.08,
+                        h: 0.15,
+                    },
+                    0,
+                )],
                 step * 500,
             );
         }
 
         let track = tracker.tracks().next().expect("track exists");
-        assert_eq!(track.speed_mps, Some(0.0), "standing still is zero, not noise");
-        assert_eq!(track.heading_degrees, None, "a heading from jitter is worse than none");
+        assert_eq!(
+            track.speed_mps,
+            Some(0.0),
+            "standing still is zero, not noise"
+        );
+        assert_eq!(
+            track.heading_degrees, None,
+            "a heading from jitter is worse than none"
+        );
     }
 
     #[test]
     fn no_pose_means_no_map_position() {
-        let config = TrackerConfig { min_hits_to_confirm: 1, ..Default::default() };
+        let config = TrackerConfig {
+            min_hits_to_confirm: 1,
+            ..Default::default()
+        };
         let mut tracker = Tracker::new(config, None);
         tracker.update(&[detection(walking(0.2), 0)], 0);
 
