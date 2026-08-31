@@ -38,6 +38,9 @@ const cameras = scenario.cameras.map((camera) => ({
   horizontalFov: camera.pose.horizontalFov,
   rangeMeters: camera.pose.rangeMeters,
   detectionRate: camera.detectionRate,
+  // The complete pose, so the desktop can recompute footprints as an operator
+  // adjusts them rather than being limited to the placement shipped here.
+  pose: camera.pose,
 }));
 
 const cameraFeatures = scenario.cameras.map((camera) =>
@@ -154,10 +157,13 @@ const snapshot = {
     positionError: result.positionError,
   },
   cameras,
+  // Full geometry, so the desktop can rebuild Zone objects and run the real
+  // coverage analysis in the browser rather than rendering a precomputed answer.
   zones: scenario.zones.map((z) => ({
     id: String(z.id),
     name: z.name,
     purpose: z.purpose,
+    geometry: z.geometry,
   })),
   events: result.events.map((event) => ({
     id: String(event.id),

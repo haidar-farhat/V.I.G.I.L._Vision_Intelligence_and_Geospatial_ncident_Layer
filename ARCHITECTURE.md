@@ -116,7 +116,7 @@ Nothing crosses the WAN boundary. Ever. See section 13.
                   +------------------+
 
 pure, dependency-free, deterministic packages used by everything above:
-  shared-types . protocol . geometry . tracking . ai . security . database . test-utils
+  shared-types . protocol . geometry . tracking . ai . maps . security . database . test-utils
 ```
 
 ### Layering rule
@@ -535,6 +535,19 @@ database. Tracking is appearance-based and identity-free. Optional face blurring
 Offline map packages are imported as local files (`region.pmtiles`, `style.json`,
 `metadata.json`) and validated for CRS, bounding box, zoom range, tile type, integrity, and
 style dependency completeness. Managed in the UI: import, remove, validate, set default.
+
+Style validation is the check that matters most. A style that imports cleanly and
+then reaches for a font server at render time produces a map that works in the lab
+and shows unlabelled roads on the isolated site - so every URL a style can carry,
+including ones buried in a layer property, is checked against the private ranges
+and against the package's own file listing.
+
+**Coverage analysis.** Given a zone and the placed cameras, the geometry package
+samples the zone on a deterministic grid and reports what fraction is visible, to
+how many cameras, and exactly where the blind spots are. A site with four cameras
+around a restricted zone looks protected on a map; if none of their footprints
+reach one corner, nothing detects an intrusion there and nothing reports that it
+could not. That gap is otherwise found by whoever walks through it.
 
 **Camera geospatial model:** `lat . lon . altitude . heading . pitch . roll . hfov . vfov .
 range`, rendered as an FOV wedge the operator can drag and rotate directly on the map.

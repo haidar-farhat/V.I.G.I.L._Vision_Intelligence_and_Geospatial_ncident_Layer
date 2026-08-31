@@ -160,6 +160,13 @@ const checkOfflineOnly = (file, rel, text) => {
     const url = match[1];
     if (url === undefined) continue;
 
+    // A template literal builds its host at runtime, so no static rule can judge
+    // it. Pretending otherwise produces a false positive on every legitimate
+    // "http://${host}:${port}" and teaches people to ignore the linter. The
+    // actual control for those is the runtime EgressGuard, which is the only
+    // thing that can see the resolved address.
+    if (url.includes('${')) continue;
+
     const host = (() => {
       try {
         return new URL(url).hostname;
@@ -174,11 +181,14 @@ const checkOfflineOnly = (file, rel, text) => {
       host === '::1' ||
       host.endsWith('.local') ||
       /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(host) ||
-      // Schema and spec identifiers are namespaces, not endpoints.
+      // XML namespace and schema URIs are *identifiers*, not endpoints. They
+      // appear verbatim in SOAP envelopes because the protocol defines them as
+      // strings; nothing ever dereferences one, and doing so would be a bug.
       host === 'json.schemastore.org' ||
       host === 'www.w3.org' ||
       host === 'schemas.xmlsoap.org' ||
-      host === 'www.onvif.org';
+      host === 'www.onvif.org' ||
+      host === 'docs.oasis-open.org';
 
     if (!isLocal) {
       fail(
@@ -229,16 +239,35 @@ const checkRtspCredentials = (file, code) => {
   }
 };
 
+/**
+ * Whether an offset sits inside an XML tag.
+ *
+ * `token="MainProfile"` in a SOAP response is a public identifier, not a
+ * credential, and an ONVIF mock is full of them. Scanning backwards for an
+ * unclosed "<" distinguishes markup from a code assignment precisely, without
+ * resorting to guessing at the entropy of the value.
+ */
+const insideXmlTag = (code, index) => {
+  for (let i = index; i >= 0 && index - i < 400; i -= 1) {
+    if (code[i] === '>') return false;
+    if (code[i] === '<') return true;
+  }
+  return false;
+};
+
 const checkSecrets = (file, rel, text) => {
   // Test fixtures deliberately contain credential-shaped strings in order to
   // prove they are redacted. Their whole job is to fail loudly if that stops
-  // working, so scanning them would invert the intent.
+  // working, so scanning them would invert the intent. `test-utils` exists
+  // solely to provide test doubles - a mock camera must hold a fixture
+  // credential in order to verify that authentication works at all.
   if (rel.includes('/test/') || rel.endsWith('.test.ts')) return;
+  if (rel.startsWith('packages/test-utils/')) return;
 
   const code = withoutComments(text);
   for (const [pattern, why] of SECRET_PATTERNS) {
     const match = pattern.exec(code);
-    if (match !== null) {
+    if (match !== null && !insideXmlTag(code, match.index)) {
       fail(file, lineOf(code, match.index), 'secrets', why);
     }
   }

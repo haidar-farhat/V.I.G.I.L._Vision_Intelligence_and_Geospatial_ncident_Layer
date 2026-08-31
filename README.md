@@ -59,11 +59,16 @@ events and model version.
 
 See **[STATUS.md](STATUS.md)** for a per-capability breakdown. In short: the
 domain core, geometry, tracking, correlation, incident engine, security controls,
-database and an end-to-end vertical slice are implemented and tested. RTSP
-ingestion, real inference, the desktop shell and distributed mode are designed
-but not built. Nothing here has been run against a physical camera.
+database, an end-to-end vertical slice, the ONVIF and RTSP protocol layers, and
+offline map packages with camera coverage analysis are implemented and tested.
+Video decode, real inference, the Tauri shell and distributed mode are designed
+but not built.
 
-**247 tests.** Clean typecheck under `strict` + `noUncheckedIndexedAccess`. Clean
+Nothing here has been run against a physical camera. The camera protocols are
+tested against mock devices written from the specifications, which is a real bar
+and not the same one.
+
+**481 tests.** Clean typecheck under `strict` + `noUncheckedIndexedAccess`. Clean
 architectural lint.
 
 ---
@@ -75,7 +80,7 @@ third-party runtime dependencies, and the embedded database ships inside Node.
 
 ```bash
 npm install          # dev dependencies only: TypeScript and Node types
-npm test             # 247 tests, no network
+npm test             # 481 tests, no network
 npm run lint         # architectural invariants
 npm run typecheck    # strict TypeScript across the workspace
 ```
@@ -150,6 +155,7 @@ packages/
   geometry/         geodesy, polygons, projection, FOV, zones
   tracking/         track lifecycle and cross-camera association
   ai/               model abstraction, registry, analyst guardrails
+  maps/             PMTiles reading, style validation, package integrity
   database/         driver, migrations, schema
   security/         Secret<T>, redaction, egress guard, authz
   test-utils/       deterministic clock, seeded RNG, fixtures
@@ -172,6 +178,7 @@ auditable by reading and testable in milliseconds.
 | [STATUS.md](STATUS.md) | What is actually built, per capability |
 | [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) | Working on the codebase |
 | [docs/SECURITY.md](docs/SECURITY.md) | Threat model and controls |
+| [docs/CAMERAS.md](docs/CAMERAS.md) | Discovery, ONVIF, RTSP, and diagnosing a camera that will not add |
 | [docs/PROTOCOL.md](docs/PROTOCOL.md) | Wire format between nodes |
 | [docs/DATABASE.md](docs/DATABASE.md) | Schema and migration policy |
 | [docs/AI.md](docs/AI.md) | Model pipeline and analyst guardrails |

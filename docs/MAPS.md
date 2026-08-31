@@ -1,8 +1,9 @@
 # Maps
 
-> **Status:** architecture specified; rendering and package import are `PLANNED`.
-> The geospatial model, ground projection, FOV footprints and zone geometry that
-> the map renders are implemented and tested. See [STATUS.md](../STATUS.md).
+> **Status:** package reading, style validation, coverage analysis and the
+> placement UI are implemented and tested. Handing an imported archive to MapLibre
+> as a tile source is not yet built, so the map currently draws site geometry over
+> an empty background. See [STATUS.md](../STATUS.md).
 
 ## Why the map is a first-class part of the product
 
@@ -45,14 +46,37 @@ metadata.json       region, bounds, zoom range, tile type, version, checksum
 
 Import validates:
 
-- **CRS** — EPSG:3857 tiles, WGS84 coordinates
-- **Bounding box** — sane, and covering the configured site
-- **Zoom range** — declared range matches what the archive contains
-- **Tile type** — vector or raster, matching the style's expectations
-- **Integrity** — SHA-256 over the archive
+- **Format** — PMTiles v3 magic and version. A future version is refused with an
+  instruction to re-export rather than parsed hopefully.
+- **Structure** — every region the header declares (metadata, directories, tile
+  data) must lie inside the file that actually exists. A truncated download and a
+  crafted header look identical from the inside, and a declared length overrunning
+  the file would otherwise be a read of adjacent memory.
+- **Bounding box** — within ±90/±180 and not inverted.
+- **Zoom range** — not inverted. A maximum below 14 is a warning, not an error: a
+  country-scale package is worth importing, but blurring at the perimeter should
+  not be a surprise.
+- **Tile type** — vector or raster the renderer handles. AVIF is refused.
+- **Integrity** — SHA-256 over the archive, recorded and re-checkable from
+  diagnostics. A corrupted archive renders blank tiles rather than failing, so an
+  operator would otherwise see an empty map and assume the region was never
+  imported.
+- **Storage path** — refused if absolute or traversing outside the map directory.
 - **Style dependencies** — every source, glyph and sprite the style names resolves
   to something inside the package. A style that resolves at import time but
   reaches the network at render time is the exact failure this check exists for.
+- **Cross-check** — the layers the style draws from against the layers the archive
+  contains. This is the only place the two halves of a package are compared, and a
+  mismatch renders nothing for those layers.
+
+The package id is derived from the archive's content hash, so re-importing the
+same region replaces rather than duplicating, and the same package is recognisable
+after being copied between machines.
+
+One subtlety worth recording: MapLibre's `sprite` is a **base name**, not a
+filename. The renderer appends `.json` and `.png` itself. Checking it literally
+reports every correctly-built package as missing its sprite, which is exactly what
+the first version of this validator did.
 
 Managed in the UI: import, remove, validate, set default.
 
@@ -75,8 +99,12 @@ installed. The map is how you understand a site, not how the system works.
 lat . lon . altitude . heading . pitch . roll . hfov . vfov . range . mountHeight
 ```
 
-The operator places a camera by clicking the map, then drags to rotate and adjusts
-the field of view directly on the wedge. Changes persist immediately.
+The operator places a camera by clicking the map and adjusts heading, tilt, mount
+height, field of view and range directly, with the footprint and the coverage
+analysis recomputing as they move.
+
+Placement is **not persisted**: there is no API yet, so edits live in the UI
+session and the panel says so rather than implying a save that never happens.
 
 ### The FOV footprint is an annular sector
 
@@ -138,3 +166,61 @@ Site → building → floor → room share the same zone and event model with a 
 coordinate frame instead of a geographic one, so indoor deployments reuse the
 entire engine rather than needing a parallel implementation. The map switches
 between outdoor and indoor views.
+
+---
+
+## Coverage analysis
+
+The question an operator actually has when placing a camera is **can anything here
+be seen?** A site with four cameras around a restricted zone looks protected on a
+map. If none of their footprints reach one corner, nothing detects an intrusion
+there — and nothing reports that it could not. The gap is found by whoever walks
+through it.
+
+So a zone is sampled on a grid and each point tested against every placed camera's
+real annular footprint. The result is one of four verdicts:
+
+| Verdict | Meaning |
+|---|---|
+| `REDUNDANT` | Every point seen by two or more cameras. Survives one failing. |
+| `COVERED` | Every point seen, some by only one camera. One failure opens a gap. |
+| `PARTIAL` | Some of the zone is visible, some is not. The rest is a blind spot. |
+| `BLIND` | No camera sees any part of it. |
+
+Three details matter:
+
+- **The grid is deterministic.** Random sampling makes the percentage jitter
+  between runs, and an operator nudging a camera needs the number to move because
+  of the camera.
+- **Spacing widens for large zones** rather than the grid truncating, so a
+  site-sized zone is sampled evenly at lower resolution instead of finely in one
+  corner and not at all elsewhere.
+- **Unplaced cameras are skipped, not counted as blind.** Reporting a gap that
+  placement would close sends an operator installing hardware they already own.
+
+### What it does not model
+
+Coverage here is **geometric reach**, and is therefore an upper bound:
+
+- **No occlusion.** Walls, fences, vehicles and vegetation block nothing.
+- **No detectability.** A person at 85 m may be four pixels tall and invisible to
+  the detector even though the geometry says the camera points at them.
+- **Flat ground** at the camera's mount height.
+
+Real coverage is never better than this figure and is usually worse. It is
+diagnostic for finding gaps, not a certificate that the rest is watched.
+
+### In the UI
+
+The map section recomputes footprints and blind spots **in the browser using the
+production geometry package**, not a display-only reimplementation. Dragging a
+heading updates the coverage the system will actually have.
+
+A UI that draws its own approximation of a field of view will eventually disagree
+with the engine, and the disagreement is discovered by someone standing in a gap
+the map called covered.
+
+Running it against the shipped demo site immediately reported Restricted Zone A at
+50% coverage and the Perimeter Road at 35%. That scenario was laid out to exercise
+cross-camera correlation rather than to be well covered — but until this existed,
+nothing could have told us which it was.

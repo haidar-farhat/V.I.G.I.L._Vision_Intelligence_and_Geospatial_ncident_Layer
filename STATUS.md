@@ -17,7 +17,8 @@ been run against a physical IP camera, a GPU, or a multi-machine LAN. Everything
 below marked `TESTED` is tested against the simulator and unit fixtures, which is
 a real bar but not the same bar.
 
-Last updated with the operator-interface milestone. Current suite: **247 tests**,
+Last updated at the end of Phase 5 (map, geospatial placement, FOV). Current
+suite: **481 tests**,
 clean typecheck under `strict` + `noUncheckedIndexedAccess`, clean architectural
 lint.
 
@@ -59,6 +60,38 @@ lint.
 | Quiet-site behaviour | `TESTED` | An empty site raises nothing. |
 | Determinism across runs | `TESTED` | Same seed reproduces identical event and incident ids. |
 
+## Camera discovery and ingestion (Phase 2)
+
+| Capability | State | Notes |
+|---|---|---|
+| Bounded queues and backpressure | `TESTED` | Ring buffer with per-queue drop policy. Frames drop oldest; events refuse rather than lose evidence. |
+| Bounded exponential backoff | `TESTED` | Full jitter, so cameras that dropped together do not retry in lockstep. Abortable mid-wait. |
+| SDP parsing | `TESTED` | Bounded against hostile input; reports what it could not parse instead of failing a working camera. |
+| RTSP Digest/Basic authentication | `TESTED` | RFC 7616. Unimplemented algorithms refused rather than downgraded. Basic is opt-in. |
+| RTSP control client | `TESTED` | Full OPTIONS/DESCRIBE/SETUP/PLAY/TEARDOWN handshake with keep-alive, against a mock camera that misbehaves the way real ones do. |
+| ONVIF WS-Discovery | `TESTED` | Link-local multicast, probes every private interface. Parser tested; the multicast send path has no physical device to answer it. |
+| SOAP + WS-Security | `TESTED` | UsernameToken PasswordDigest. Bounded extractor rather than an XML parser; DTDs refused. |
+| ONVIF device/media client | `TESTED` | Device info, capabilities, profiles, stream URI. Credentials stripped from returned URIs. |
+| Camera connection test | `TESTED` | The onboarding wizard's verification step. Every failure carries a remedy, enforced by test. |
+| Camera persistence | `TESTED` | Cameras, profiles, topology edges. No column can hold a credential. |
+| Supervised video source | `TESTED` | Reconnect with backoff, flapping detection, honest DEGRADED vs OFFLINE, decoder boundary. |
+| Video decode (H.264/H.265) | `PLANNED` | The `Decoder` interface is defined and the supervisor is tested against a stub. No FFmpeg implementation is written - see the gaps below. |
+| Live view rendering | `PLANNED` | Requires decode. |
+
+## Map and geospatial placement (Phase 5)
+
+| Capability | State | Notes |
+|---|---|---|
+| PMTiles v3 reading | `TESTED` | Header and metadata, with every declared region checked against the real file length before any read. Tests build genuine archives, not stubs. |
+| Map style validation | `TESTED` | Every URL a style can carry, including ones buried in a layer property, checked against the private ranges and the package's own file listing. |
+| Map package import | `TESTED` | Content-addressed id, integrity hash, path-traversal refusal, warnings for coarse zoom and for style layers the archive lacks. |
+| Map package persistence | `TESTED` | Install, list, set default, remove. Removing the default promotes the most detailed remaining package. |
+| Camera coverage analysis | `TESTED` | Deterministic grid sampling against the real annular footprint. Reports covered, redundant, partial or blind, with the blind points themselves. |
+| Camera placement UI | `IMPLEMENTED` | Live pose editing with footprints and blind spots recomputed in the browser by the production geometry. Verified in a headless browser. Not persisted - no API. |
+| Map rendering | `IMPLEMENTED` | Cameras, footprints, zones, events and blind spots. Reports `OFFLINE MAP DATA NOT INSTALLED` and never fetches tiles. |
+| Tile rendering from a package | `PLANNED` | The reader and validator exist; wiring an imported archive into MapLibre as a source does not. |
+| Zone drawing on the map | `PLANNED` | Zones render and are analysed; drawing and editing them by hand is not built. |
+
 ## Not yet built
 
 Everything below is designed in [ARCHITECTURE.md](ARCHITECTURE.md) and has no
@@ -70,16 +103,13 @@ inferred from silence.
 | REST API + WebSocket hub (`services/api`) | `PLANNED` | Contracts specified in docs/PROTOCOL.md; no server yet. |
 | Desktop shell (Tauri, Rust) | `SKELETON` | Manifest, config and keychain command surface written. **Never compiled** - no Rust toolchain was available in this environment. |
 | Operator UI (React) | `IMPLEMENTED` | Command centre, map, timeline and analysis panels render real pipeline output; verified in a headless browser with zero console errors and zero network requests. Reads a generated snapshot, not a live API. |
-| RTSP ingestion | `PLANNED` | `VideoSource` abstraction defined; no decoder integration. |
-| ONVIF discovery + Profile T | `PLANNED` | Camera and profile models exist; no protocol implementation. |
+| ONVIF Profile T events | `PLANNED` | Discovery, device and media services are implemented; the event service is not. |
 | Real detector (YOLO-family, ONNX/TensorRT) | `PLANNED` | `Detector` interface and model registry exist; only the simulated detector is implemented. |
 | GPU device discovery | `SKELETON` | `selectDevice` chooses among reported devices; nothing enumerates real hardware yet. |
 | VLM integration | `PLANNED` | Interface defined; no runtime. |
 | Local LLM analyst | `PLANNED` | `AnalystEngine` interface is satisfied by the deterministic engine; no LLM client. |
 | Recording + segmentation | `PLANNED` | Schema and retention policy exist; no recorder. |
 | Evidence export + manifest | `PLANNED` | Format specified; not implemented. |
-| Offline map packages (PMTiles) | `PLANNED` | Import and validation flow specified; not implemented. |
-| MapLibre rendering | `IMPLEMENTED` | Renders cameras, true FOV footprints, zones and uncertainty-ringed events from local GeoJSON. Correctly reports `OFFLINE MAP DATA NOT INSTALLED` with no basemap and never fetches tiles. |
 | LAN discovery (mDNS) | `PLANNED` | Protocol chosen; not implemented. |
 | Node pairing + mTLS | `PLANNED` | Flow specified in ARCHITECTURE.md section 9.3; no implementation. |
 | Worker buffering + reconciliation | `PLANNED` | Deterministic event ids make replay idempotent, which is the hard half; the buffer itself is not written. |
@@ -99,10 +129,20 @@ inferred from silence.
 
 ## Honest gaps worth naming
 
-1. **No real video has ever passed through this system.** The pipeline consumes
-   detections, and the only detector implemented is the simulated one. RTSP,
-   decode, and hardware inference are the largest remaining unknowns, and the
-   performance targets in the specification are design targets, not measurements.
+1. **No real video has ever passed through this system, and no physical camera
+   has ever been contacted.** The RTSP and ONVIF protocol layers are implemented
+   and tested, but against mock devices written from the specifications - which
+   means they are tested against my reading of those specifications. Real cameras
+   deviate from both in ways no mock anticipates, and that gap will only close on
+   hardware.
+
+   Decode is not implemented at all. The `Decoder` interface is defined and the
+   supervisor is tested against a stub, but no FFmpeg integration exists, because
+   no FFmpeg was available in the environment where this was written and shipping
+   an unverifiable subprocess wrapper would be exactly the fake implementation
+   this file exists to prevent. Hardware inference is likewise untouched, and the
+   performance targets in the specification remain design targets rather than
+   measurements.
 
 2. **The Tauri shell has never been compiled.** No Rust toolchain was present, so
    the native layer - keychain access, tray, service supervision - has never been
@@ -123,3 +163,15 @@ inferred from silence.
    ground plane with a perfectly known camera pose. Real deployments have sloping
    ground, mis-surveyed masts and lens distortion. The uncertainty model is
    honest about its inputs; its inputs are currently ideal.
+
+   Coverage analysis inherits the same assumption, and one more: it models what a
+   camera can *geometrically* reach, not what it can usefully *see*. A person at
+   85 m may be four pixels tall and undetectable, and no wall, fence, vehicle or
+   tree occludes anything. Coverage is therefore an upper bound - real coverage is
+   never better than this and is usually worse.
+
+6. **No tiles have ever been rendered from an imported package.** The PMTiles
+   reader and the package validator are tested against archives built byte by
+   byte, but nothing has yet handed a real basemap to MapLibre. The map draws site
+   geometry over an empty background, which is the correct behaviour with no
+   package installed and also the only behaviour so far exercised.

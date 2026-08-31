@@ -11,8 +11,12 @@ npm run test:watch    # re-run on change
 node --test "packages/geometry/test/*.test.ts"   # one package
 ```
 
-**247 tests**, running in well under a second. That number matters: a suite fast
-enough to run on every save is a suite that actually gets run.
+**405 tests**, running in about a second and a half. That number matters: a suite
+fast enough to run on every save is a suite that actually gets run.
+
+Roughly a quarter of them drive real sockets - a mock RTSP camera and a mock ONVIF
+device, both on loopback, both bound to ephemeral ports so parallel runs never
+collide.
 
 ## What is tested, and why those things
 
@@ -37,6 +41,10 @@ than a code path:
 | a replayed event is not counted twice | worker reconnect is at-least-once |
 | the password never appears in any serialisation | credential containment |
 | a public host is refused with an explanatory error | zero WAN |
+| a discovered camera advertising an off-network address is discarded | a device cannot lure the system off the LAN |
+| a Digest algorithm we do not implement is refused, not downgraded | a silent downgrade looks exactly like a wrong password |
+| a stream URI's embedded credential is stripped | the most common way camera passwords reach log files |
+| every failed onboarding check carries a remedy | a diagnosis without an action is half a diagnosis |
 | no schema column can hold a credential | credential containment, structurally |
 | a position is never stored without its uncertainty | false precision, structurally |
 | an AI report citing unsupplied evidence is rejected | fabricated citations are the worst AI failure mode |
@@ -113,10 +121,13 @@ Named here rather than left to be discovered:
 - **Chaos and partition testing.** The simulator injects detector dropout and false
   positives. It does not yet kill workers, delay networks, corrupt streams, fill
   disks or restart the database.
-- **Security testing beyond unit level.** Authentication, malformed packets, path
-  traversal on import, and injection are specified in
-  [SECURITY.md](SECURITY.md) but have no integration coverage, because the
-  transport and API they would target are not built.
+- **Security testing beyond unit level.** Partly covered now. The camera layer is
+  exercised against mock devices that send malformed packets, oversized bodies,
+  DTDs and credentials embedded in stream URIs, and several tests assert the
+  fixture password appears in no serialisation, log line or error path. What
+  remains uncovered is everything targeting the API and node transport - login,
+  session handling, replay across a real connection, path traversal on import -
+  because neither is built.
 - **Performance.** The numbers in the specification are design targets, not
   measurements. Nothing has been benchmarked against real video.
 - **Cross-platform.** Developed and run on Windows. Nothing is platform-specific by

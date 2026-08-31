@@ -10,3 +10,5 @@ export * from './driver.ts';
 export * from './sqlite.ts';
 export * from './migrations.ts';
 export * from './schema.ts';
+export * from './repositories/cameras.ts';
+export * from './repositories/map-packages.ts';
