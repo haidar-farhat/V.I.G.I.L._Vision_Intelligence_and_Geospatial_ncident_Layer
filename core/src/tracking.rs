@@ -53,6 +53,16 @@ pub struct Track {
     pub heading_degrees: Option<f64>,
 }
 
+/// How much tighter the vertical half of the proximity gate is than the
+/// horizontal. An upright object is about a third as wide as it is tall, and
+/// vertical image motion is depth rather than lateral movement.
+const VERTICAL_GATE_RATIO: f64 = 0.35;
+
+/// The most the gate may grow for a track that has gone unobserved. Unbounded
+/// growth would let a track that vanished thirty seconds ago claim anything that
+/// appears anywhere.
+const MAX_GATE_WIDENING: f64 = 3.0;
+
 #[derive(Debug, Clone, Copy)]
 pub struct TrackerConfig {
     /// Minimum overlap for a detection to be considered the same object.
@@ -84,6 +94,7 @@ pub struct Tracker {
     pose: Option<CameraPose>,
     tracks: Vec<Track>,
     next_id: u64,
+    last_update_millis: Option<i64>,
 }
 
 /// What one frame produced.
@@ -94,7 +105,7 @@ pub struct TrackerUpdate {
 
 impl Tracker {
     pub fn new(config: TrackerConfig, pose: Option<CameraPose>) -> Self {
-        Self { config, pose, tracks: Vec::new(), next_id: 1 }
+        Self { config, pose, tracks: Vec::new(), next_id: 1, last_update_millis: None }
     }
 
     pub fn set_pose(&mut self, pose: Option<CameraPose>) {
@@ -131,23 +142,54 @@ impl Tracker {
     ///
     /// Two tiers so the ranking is unambiguous: a real overlap scores above 1 and
     /// always wins; a proximity match scores below 1.
-    fn association_score(&self, predicted: &BoundingBox, detected: &BoundingBox) -> Option<f64> {
+    ///
+    /// The proximity gate is an **ellipse, not a circle**, and that asymmetry is
+    /// the whole point. A camera looking at the ground maps horizontal image
+    /// motion to lateral movement and vertical image motion to *depth*, and those
+    /// are not interchangeable. An upright object is roughly three times taller
+    /// than it is wide, so a circular gate scaled by the larger dimension permits
+    /// a vertical jump of several body-heights — which in world terms is a leap
+    /// of tens of metres directly toward or away from the camera, in one frame.
+    /// That is how a track hands its identity to a different object that has just
+    /// appeared nearby.
+    ///
+    /// So the gate is generous across the frame and tight up and down. Measured
+    /// on the reference scene, this is the difference between a track that
+    /// abandons the person it was following to grab someone who walked into shot
+    /// 100 pixels above it, and one that does not.
+    ///
+    /// `elapsed_ratio` widens the gate for a track that has not been seen for
+    /// several frames: something unobserved for two seconds really could be
+    /// further away than something unobserved for one frame, and a gate that
+    /// ignores time is simultaneously too loose frame-to-frame and too tight
+    /// after an occlusion.
+    fn association_score(
+        &self,
+        predicted: &BoundingBox,
+        detected: &BoundingBox,
+        elapsed_ratio: f64,
+    ) -> Option<f64> {
         let overlap = predicted.iou(detected);
         if overlap >= self.config.iou_threshold {
             return Some(1.0 + overlap);
         }
 
-        let gate = self.config.gate_factor
-            * predicted.w.max(predicted.h).max(detected.w).max(detected.h);
-        if gate <= 0.0 {
+        let widen = elapsed_ratio.clamp(1.0, MAX_GATE_WIDENING);
+        let gate_x = self.config.gate_factor * predicted.w.max(detected.w) * widen;
+        let gate_y = self.config.gate_factor
+            * predicted.h.max(detected.h)
+            * VERTICAL_GATE_RATIO
+            * widen;
+
+        if gate_x <= 0.0 || gate_y <= 0.0 {
             return None;
         }
 
         let a = predicted.center();
         let b = detected.center();
-        let separation = ((b.x - a.x).powi(2) + (b.y - a.y).powi(2)).sqrt();
+        let normalized = ((b.x - a.x) / gate_x).powi(2) + ((b.y - a.y) / gate_y).powi(2);
 
-        if separation > gate { None } else { Some(1.0 - separation / gate) }
+        if normalized > 1.0 { None } else { Some(1.0 - normalized.sqrt()) }
     }
 
     /// Feed one frame's detections.
@@ -159,6 +201,15 @@ impl Tracker {
         let predicted: Vec<BoundingBox> =
             self.tracks.iter().map(|t| Self::predict(t, at_millis)).collect();
 
+        // The observed frame interval, used to judge how stale a track is. Taken
+        // from the stream rather than configured, because a camera's real rate is
+        // rarely the rate it advertises.
+        let interval = match self.last_update_millis {
+            Some(previous) if at_millis > previous => (at_millis - previous) as f64,
+            _ => 0.0,
+        };
+        self.last_update_millis = Some(at_millis);
+
         let mut candidates: Vec<(usize, usize, f64)> = Vec::new();
 
         for (track_index, track) in self.tracks.iter().enumerate() {
@@ -169,7 +220,12 @@ impl Tracker {
                 if detection.class_id != track.class_id {
                     continue;
                 }
-                if let Some(score) = self.association_score(&box_predicted, &detection.bbox) {
+                let gap = (at_millis - track.last_detected_millis).max(0) as f64;
+                let elapsed_ratio = if interval > 0.0 { gap / interval } else { 1.0 };
+
+                if let Some(score) =
+                    self.association_score(&box_predicted, &detection.bbox, elapsed_ratio)
+                {
                     candidates.push((track_index, detection_index, score));
                 }
             }
