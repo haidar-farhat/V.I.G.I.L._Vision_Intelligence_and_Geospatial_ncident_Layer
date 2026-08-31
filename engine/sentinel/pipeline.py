@@ -28,6 +28,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Iterator, Sequence
 
+import numpy as np
+
 from .core import CameraPose, Detection, Track, Tracker
 from .decode import Frame, VideoSource
 from .detect import Detector, DetectorInfo
@@ -51,6 +53,12 @@ class FrameResult:
     tracks: tuple[Track, ...]
     #: Track ids that closed on this frame.
     ended: tuple[int, ...]
+    #: The frame these conclusions were drawn from, when the caller asked for
+    #: it. Opt-in because a full-resolution image per result is tens of
+    #: megabytes over a short clip, and most callers want the conclusions only.
+    #: A viewer needs it, though: drawing a track box over a different frame
+    #: than the one it was computed from misrepresents what the system saw.
+    image: np.ndarray | None = None
 
 
 @dataclass
@@ -108,7 +116,8 @@ class Pipeline:
     in a group either.
     """
 
-    __slots__ = ("_source", "_detector", "_pose", "_tracker", "stats", "_config")
+    __slots__ = ("_source", "_detector", "_pose", "_tracker", "stats", "_config",
+                 "_keep_images")
 
     def __init__(
         self,
@@ -120,6 +129,7 @@ class Pipeline:
         gate_factor: float = 2.5,
         max_gap_millis: int = 2000,
         min_hits_to_confirm: int = 2,
+        keep_images: bool = False,
     ):
         """
         ``max_gap_millis`` is how long a track survives without a detection. It
@@ -132,6 +142,7 @@ class Pipeline:
         self._source = source
         self._detector = detector
         self._pose = pose
+        self._keep_images = keep_images
         self._config = dict(
             iou_threshold=iou_threshold,
             gate_factor=gate_factor,
@@ -200,6 +211,7 @@ class Pipeline:
             detections=tuple(detections),
             tracks=tuple(tracks),
             ended=tuple(ended),
+            image=frame.image if self._keep_images else None,
         )
 
     def _record(
