@@ -23,7 +23,7 @@ use crate::tracking::{Detection, Tracker, TrackerConfig};
 
 /// Version of this ABI. Python checks it on load and refuses a mismatch rather
 /// than calling functions whose signatures may have moved.
-pub const ABI_VERSION: u32 = 3;
+pub const ABI_VERSION: u32 = 4;
 
 #[no_mangle]
 pub extern "C" fn sentinel_abi_version() -> u32 {
@@ -355,6 +355,50 @@ pub unsafe extern "C" fn sentinel_point_in_zone(
     }
 }
 
+/// Zone membership accounting for the position's own uncertainty.
+///
+/// Returns `0` outside, `1` inside, `2` uncertain, or `-1` on a bad argument.
+///
+/// The three-way answer is the point. A rule that raises an intrusion alarm must
+/// demand `1`; treating `2` as inside produces alerts from objects that were
+/// never in the zone, and treating it as outside hides ones that were.
+///
+/// # Safety
+///
+/// Null is accepted and produces a defined failure. A **non-null** pointer,
+/// however, is taken at its word: it must point to a live, aligned,
+/// initialised value of the named type. Null-checking cannot establish that,
+/// which is why this is `unsafe` despite checking.
+/// `ring` must point to at least `count` contiguous `CPoint` values.
+#[no_mangle]
+pub unsafe extern "C" fn sentinel_zone_membership(
+    ring: *const CPoint,
+    count: u32,
+    lat: f64,
+    lon: f64,
+    uncertainty_meters: f64,
+) -> i32 {
+    if ring.is_null() || count < 3 {
+        return -1;
+    }
+
+    // SAFETY: checked non-null and the caller promises `count` elements.
+    let points = unsafe { std::slice::from_raw_parts(ring, count as usize) };
+    let polygon: Vec<LatLon> = points
+        .iter()
+        .map(|p| LatLon {
+            lat: p.lat,
+            lon: p.lon,
+        })
+        .collect();
+
+    match geometry::zone_membership(&polygon, LatLon { lat, lon }, uncertainty_meters) {
+        geometry::ZoneMembership::Outside => 0,
+        geometry::ZoneMembership::Inside => 1,
+        geometry::ZoneMembership::Uncertain => 2,
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn sentinel_haversine_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     geometry::haversine_distance(
@@ -447,6 +491,7 @@ pub unsafe extern "C" fn sentinel_tracker_create(
         max_gap_millis,
         min_hits_to_confirm,
         motion_window_millis: 3000,
+        min_motion_span_millis: 1200,
     };
 
     // A null pose is the normal state for a camera nobody has placed on the map.
@@ -749,6 +794,10 @@ mod tests {
             assert_eq!(sentinel_tracker_reset(std::ptr::null_mut()), -1);
             assert_eq!(sentinel_tracker_set_pose(std::ptr::null_mut(), &pose()), -1);
             assert_eq!(sentinel_struct_sizes(std::ptr::null_mut(), 5), -1);
+            assert_eq!(
+                sentinel_zone_membership(std::ptr::null(), 4, 0.0, 0.0, 1.0),
+                -1
+            );
 
             // Destroying null is a no-op, so a double free is survivable.
             sentinel_tracker_destroy(std::ptr::null_mut());
@@ -790,6 +839,53 @@ mod tests {
             );
 
             sentinel_tracker_destroy(handle);
+        }
+    }
+
+    #[test]
+    fn zone_membership_crosses_the_boundary_as_three_states() {
+        // Two states would be a lie: a position known to plus or minus 8 m,
+        // 3 m from a fence, is neither in nor out and the caller must be able
+        // to tell.
+        let ring = [
+            CPoint {
+                lat: 33.8930,
+                lon: 35.5010,
+            },
+            CPoint {
+                lat: 33.8930,
+                lon: 35.5026,
+            },
+            CPoint {
+                lat: 33.8946,
+                lon: 35.5026,
+            },
+            CPoint {
+                lat: 33.8946,
+                lon: 35.5010,
+            },
+        ];
+
+        unsafe {
+            let centre = (33.8938, 35.5018);
+            assert_eq!(
+                sentinel_zone_membership(ring.as_ptr(), 4, centre.0, centre.1, 1.0),
+                1
+            );
+            assert_eq!(
+                sentinel_zone_membership(ring.as_ptr(), 4, 33.9100, 35.5018, 1.0),
+                0
+            );
+            // Sitting on the northern edge with a large radius.
+            assert_eq!(
+                sentinel_zone_membership(ring.as_ptr(), 4, 33.8946, 35.5018, 25.0),
+                2
+            );
+            // Fewer than three points is not an area.
+            assert_eq!(
+                sentinel_zone_membership(ring.as_ptr(), 2, centre.0, centre.1, 1.0),
+                -1
+            );
         }
     }
 

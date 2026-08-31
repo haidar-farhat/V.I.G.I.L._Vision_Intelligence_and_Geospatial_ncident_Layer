@@ -75,6 +75,15 @@ pub struct TrackerConfig {
     pub min_hits_to_confirm: u32,
     /// Window over which ground speed and heading are averaged.
     pub motion_window_millis: i64,
+    /// The shortest span of observation from which a speed may be reported.
+    ///
+    /// Below this, speed is `None` rather than a number. Dividing a distance by
+    /// a very short interval amplifies position error by the reciprocal of that
+    /// interval: with a position known to ±1.3 m, two frames 200 ms apart give a
+    /// velocity uncertainty of about ±9 m/s, so a reported 53 m/s is a
+    /// measurement of the projection rather than of the object. Over two seconds
+    /// the same error contributes under 1 m/s.
+    pub min_motion_span_millis: i64,
 }
 
 impl Default for TrackerConfig {
@@ -85,6 +94,7 @@ impl Default for TrackerConfig {
             max_gap_millis: 2000,
             min_hits_to_confirm: 2,
             motion_window_millis: 3000,
+            min_motion_span_millis: 1200,
         }
     }
 }
@@ -395,7 +405,18 @@ fn record_ground(track: &mut Track, at_millis: i64, config: &TrackerConfig) {
         return;
     };
 
-    let seconds = (last.0 - first.0) as f64 / 1000.0;
+    let span_millis = last.0 - first.0;
+    if span_millis < config.min_motion_span_millis {
+        // Not yet measurable. `None` means "we do not know", which is a
+        // different statement from "it is not moving", and the two must not be
+        // confused: a rule that treats an unknown speed as zero misses a
+        // sprinting intruder, and one that treats it as a number invents one.
+        track.speed_mps = None;
+        track.heading_degrees = None;
+        return;
+    }
+
+    let seconds = span_millis as f64 / 1000.0;
     if seconds <= 0.0 {
         track.speed_mps = None;
         track.heading_degrees = None;
@@ -652,9 +673,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_stationary_object_reports_zero_speed_and_no_heading() {
-        let pose = CameraPose {
+    /// A camera on a 10 m mast looking north, tilted 45 degrees down.
+    fn pose() -> CameraPose {
+        CameraPose {
             position: LatLon {
                 lat: 33.8938,
                 lon: 35.5018,
@@ -666,12 +687,16 @@ mod tests {
             horizontal_fov: 60.0,
             vertical_fov: 34.0,
             range_meters: 200.0,
-        };
+        }
+    }
+
+    #[test]
+    fn a_stationary_object_reports_zero_speed_and_no_heading() {
         let config = TrackerConfig {
             min_hits_to_confirm: 1,
             ..Default::default()
         };
-        let mut tracker = Tracker::new(config, Some(pose));
+        let mut tracker = Tracker::new(config, Some(pose()));
 
         for step in 0..10 {
             tracker.update(
@@ -712,5 +737,88 @@ mod tests {
         let track = tracker.tracks().next().unwrap();
         assert!(track.position.is_none());
         assert!(track.speed_mps.is_none());
+    }
+    #[test]
+    fn a_speed_is_withheld_until_it_can_be_measured() {
+        // Two frames 200 ms apart amplify position error fivefold. A track that
+        // has only just appeared must report "unknown", not a number derived
+        // from its own settling.
+        let mut tracker = Tracker::new(TrackerConfig::default(), Some(pose()));
+
+        for step in 0..3 {
+            let detection = Detection {
+                bbox: BoundingBox {
+                    x: 0.4 + step as f64 * 0.02,
+                    y: 0.6,
+                    w: 0.05,
+                    h: 0.1,
+                },
+                confidence: 0.9,
+                class_id: 0,
+            };
+            tracker.update(&[detection], step * 200);
+        }
+
+        let track = tracker.tracks().next().expect("no track");
+        assert!(
+            track.speed_mps.is_none(),
+            "reported {:?} m/s from 400 ms of observation",
+            track.speed_mps
+        );
+    }
+
+    #[test]
+    fn a_speed_appears_once_the_span_is_long_enough() {
+        let mut tracker = Tracker::new(TrackerConfig::default(), Some(pose()));
+
+        for step in 0..14 {
+            let detection = Detection {
+                bbox: BoundingBox {
+                    x: 0.4 + step as f64 * 0.01,
+                    y: 0.6,
+                    w: 0.05,
+                    h: 0.1,
+                },
+                confidence: 0.9,
+                class_id: 0,
+            };
+            tracker.update(&[detection], step * 200);
+        }
+
+        let track = tracker.tracks().next().expect("no track");
+        assert!(
+            track.speed_mps.is_some(),
+            "2.6 s of observation still gave no speed"
+        );
+    }
+
+    #[test]
+    fn a_single_projection_jump_cannot_produce_an_absurd_speed() {
+        // The failure this guard exists for: a detector box that suddenly covers
+        // a whole body instead of a fragment moves the ground-contact point
+        // metres in one frame. Divided by 200 ms that is a sprinting cheetah.
+        let mut tracker = Tracker::new(TrackerConfig::default(), Some(pose()));
+
+        let mut boxes = vec![0.60_f64; 6];
+        boxes.push(0.40); // the jump
+
+        for (step, y) in boxes.iter().enumerate() {
+            let detection = Detection {
+                bbox: BoundingBox {
+                    x: 0.5,
+                    y: *y,
+                    w: 0.05,
+                    h: 0.1,
+                },
+                confidence: 0.9,
+                class_id: 0,
+            };
+            tracker.update(&[detection], step as i64 * 200);
+        }
+
+        let track = tracker.tracks().next().expect("no track");
+        if let Some(speed) = track.speed_mps {
+            assert!(speed < 25.0, "a single jump produced {speed} m/s");
+        }
     }
 }

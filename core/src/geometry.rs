@@ -482,6 +482,73 @@ pub fn point_to_segment(p: Vec2, a: Vec2, b: Vec2) -> f64 {
     ((p.x - cx).powi(2) + (p.y - cy).powi(2)).sqrt()
 }
 
+/// Where a point sits relative to a polygon, given how well the point is known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZoneMembership {
+    /// The whole uncertainty disc lies outside the zone.
+    Outside,
+    /// The whole uncertainty disc lies inside the zone.
+    Inside,
+    /// The disc straddles the boundary. The object may be in the zone or may
+    /// not, and the system does not know which.
+    Uncertain,
+}
+
+/// Zone membership that accounts for how well the position is actually known.
+///
+/// A plain point-in-polygon test answers a question nobody asked. The position
+/// it is given is an estimate with a 1σ radius that grows toward the horizon —
+/// at 40 m from a mast that radius is metres across — so "is this point inside"
+/// is not the same question as "is this object inside", and treating them as one
+/// produces intrusion alerts from an object that was never in the zone.
+///
+/// Three answers instead of two. `Uncertain` is the honest one, and it exists so
+/// a rule can decide what to do with it: an intrusion alarm should demand
+/// `Inside` and stay silent, while a coverage report should count `Uncertain` as
+/// a gap rather than as clear ground.
+///
+/// The boundary distance is computed in a local metric frame anchored at the
+/// point, so the comparison against a radius in metres is meaningful. Over a
+/// site-sized polygon that planar approximation agrees with the spherical
+/// distance to well under a centimetre.
+pub fn zone_membership(ring: &[LatLon], point: LatLon, uncertainty_meters: f64) -> ZoneMembership {
+    if ring.len() < 3 {
+        // Two points are a line, not an area. A half-drawn zone must not start
+        // producing intrusion events.
+        return ZoneMembership::Outside;
+    }
+
+    let frame = LocalFrame::new(point);
+    let local_point = Vec2 { x: 0.0, y: 0.0 };
+    let local_ring: Vec<Vec2> = ring.iter().map(|&p| frame.to_local(p)).collect();
+
+    let inside = point_in_polygon(local_point, &local_ring);
+
+    let radius = uncertainty_meters.max(0.0);
+    if radius <= 0.0 {
+        return if inside {
+            ZoneMembership::Inside
+        } else {
+            ZoneMembership::Outside
+        };
+    }
+
+    let mut nearest = f64::INFINITY;
+    for index in 0..local_ring.len() {
+        let a = local_ring[index];
+        let b = local_ring[(index + 1) % local_ring.len()];
+        nearest = nearest.min(point_to_segment(local_point, a, b));
+    }
+
+    if nearest <= radius {
+        ZoneMembership::Uncertain
+    } else if inside {
+        ZoneMembership::Inside
+    } else {
+        ZoneMembership::Outside
+    }
+}
+
 /// Proper segment intersection.
 ///
 /// Deliberately excludes collinear-touching and endpoint-grazing: a track whose
@@ -813,5 +880,120 @@ mod tests {
             a,
             b
         ));
+    }
+    #[test]
+    fn a_confident_position_well_inside_a_zone_is_inside() {
+        let site = LatLon {
+            lat: 33.8938,
+            lon: 35.5018,
+        };
+        let ring = square_zone(site, 40.0);
+
+        assert_eq!(zone_membership(&ring, site, 1.0), ZoneMembership::Inside);
+    }
+
+    #[test]
+    fn a_confident_position_well_outside_a_zone_is_outside() {
+        let site = LatLon {
+            lat: 33.8938,
+            lon: 35.5018,
+        };
+        let ring = square_zone(site, 40.0);
+        let far = destination_point(site, 0.0, 200.0);
+
+        assert_eq!(zone_membership(&ring, far, 1.0), ZoneMembership::Outside);
+    }
+
+    #[test]
+    fn a_position_whose_uncertainty_straddles_the_boundary_is_uncertain() {
+        // The object is 3 m outside the fence line, known to plus or minus 8 m.
+        // Reporting that as "outside" is a guess dressed as a measurement, and
+        // reporting it as "inside" is an intrusion alarm nobody can justify.
+        let site = LatLon {
+            lat: 33.8938,
+            lon: 35.5018,
+        };
+        let ring = square_zone(site, 40.0);
+        let near_edge = destination_point(site, 0.0, 43.0);
+
+        assert_eq!(
+            zone_membership(&ring, near_edge, 8.0),
+            ZoneMembership::Uncertain
+        );
+        assert_eq!(
+            zone_membership(&ring, near_edge, 1.0),
+            ZoneMembership::Outside
+        );
+    }
+
+    #[test]
+    fn uncertainty_reaching_out_from_inside_is_also_uncertain() {
+        let site = LatLon {
+            lat: 33.8938,
+            lon: 35.5018,
+        };
+        let ring = square_zone(site, 40.0);
+        let just_inside = destination_point(site, 0.0, 37.0);
+
+        assert_eq!(
+            zone_membership(&ring, just_inside, 8.0),
+            ZoneMembership::Uncertain
+        );
+        assert_eq!(
+            zone_membership(&ring, just_inside, 0.5),
+            ZoneMembership::Inside
+        );
+    }
+
+    #[test]
+    fn a_degenerate_zone_contains_nothing_however_uncertain_the_point() {
+        let site = LatLon {
+            lat: 33.8938,
+            lon: 35.5018,
+        };
+        let line = vec![site, destination_point(site, 0.0, 10.0)];
+
+        assert_eq!(zone_membership(&line, site, 50.0), ZoneMembership::Outside);
+    }
+
+    #[test]
+    fn membership_is_stable_as_uncertainty_shrinks() {
+        // A track walking into a zone must not oscillate between answers as its
+        // position estimate improves. Each state may only advance in one
+        // direction: outside -> uncertain -> inside.
+        let site = LatLon {
+            lat: 33.8938,
+            lon: 35.5018,
+        };
+        let ring = square_zone(site, 40.0);
+        let inside_point = destination_point(site, 0.0, 20.0);
+
+        let mut seen = Vec::new();
+        for step in 0..20 {
+            let radius = 40.0 - step as f64 * 2.0;
+            seen.push(zone_membership(&ring, inside_point, radius.max(0.0)));
+        }
+
+        // Only ever Uncertain then Inside, and never back.
+        let first_inside = seen.iter().position(|&m| m == ZoneMembership::Inside);
+        assert!(
+            first_inside.is_some(),
+            "a shrinking disc must eventually be inside"
+        );
+        assert!(
+            seen[first_inside.unwrap()..]
+                .iter()
+                .all(|&m| m == ZoneMembership::Inside),
+            "membership went back to uncertain after being inside"
+        );
+    }
+
+    fn square_zone(centre: LatLon, half_side: f64) -> Vec<LatLon> {
+        [45.0, 135.0, 225.0, 315.0]
+            .iter()
+            .map(|&bearing| {
+                destination_point(centre, bearing, half_side * std::f64::consts::SQRT_2)
+            })
+            .collect()
     }
 }

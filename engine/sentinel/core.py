@@ -21,10 +21,11 @@ import ctypes
 import os
 import sys
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Iterable, Sequence
 
-ABI_VERSION = 3
+ABI_VERSION = 4
 
 # --------------------------------------------------------------------- structs
 
@@ -270,6 +271,12 @@ def _bind(lib: ctypes.CDLL) -> None:
     ]
     lib.sentinel_point_in_zone.restype = ctypes.c_int32
 
+    lib.sentinel_zone_membership.argtypes = [
+        ctypes.POINTER(CPoint), ctypes.c_uint32,
+        ctypes.c_double, ctypes.c_double, ctypes.c_double,
+    ]
+    lib.sentinel_zone_membership.restype = ctypes.c_int32
+
     lib.sentinel_haversine_distance.argtypes = [ctypes.c_double] * 4
     lib.sentinel_haversine_distance.restype = ctypes.c_double
 
@@ -470,6 +477,44 @@ def point_in_zone(ring: Sequence[LatLon], point: LatLon) -> bool:
     lib = load_core()
     buffer = (CPoint * len(ring))(*[CPoint(p.lat, p.lon) for p in ring])
     return lib.sentinel_point_in_zone(buffer, len(ring), point.lat, point.lon) == 1
+
+
+class ZoneMembership(str, Enum):
+    """Where an object sits relative to a zone, given how well it is known.
+
+    Three states, not two, and the third is the important one. A position
+    estimate carries a 1-sigma radius that grows toward the horizon — metres
+    across at 40 m from a mast — so "is this point inside" and "is this object
+    inside" are different questions. Collapsing them produces intrusion alerts
+    for objects that were never in the zone.
+
+    A rule that raises an alarm must require :data:`INSIDE`. A rule that reports
+    coverage should treat :data:`UNCERTAIN` as a gap.
+    """
+
+    OUTSIDE = "OUTSIDE"
+    INSIDE = "INSIDE"
+    UNCERTAIN = "UNCERTAIN"
+
+
+_MEMBERSHIP = {0: ZoneMembership.OUTSIDE, 1: ZoneMembership.INSIDE, 2: ZoneMembership.UNCERTAIN}
+
+
+def zone_membership(
+    ring: Sequence[LatLon], point: LatLon, uncertainty_meters: float = 0.0
+) -> ZoneMembership:
+    """Whether an object is in a zone, accounting for its position uncertainty."""
+    if len(ring) < 3:
+        return ZoneMembership.OUTSIDE
+
+    lib = load_core()
+    buffer = (CPoint * len(ring))(*[CPoint(p.lat, p.lon) for p in ring])
+    result = lib.sentinel_zone_membership(
+        buffer, len(ring), point.lat, point.lon, uncertainty_meters
+    )
+    if result < 0:
+        raise CoreError("zone membership failed")
+    return _MEMBERSHIP[result]
 
 
 def haversine_distance(a: LatLon, b: LatLon) -> float:

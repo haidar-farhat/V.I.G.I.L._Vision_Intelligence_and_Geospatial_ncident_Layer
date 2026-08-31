@@ -1,6 +1,7 @@
 """The per-camera pipeline: decode, detect, track, place on the map.
 
-VIDEO -> DETECTION -> TRACKING -> SPATIAL CONTEXT
+VIDEO -> DETECTION -> TRACKING -> SPATIAL CONTEXT -> TEMPORAL CONTEXT
+      -> EVENT ANALYSIS
 
 Each stage answers a different question, and the value is in the sequence rather
 than any one of them:
@@ -17,6 +18,10 @@ than any one of them:
   new intruder every frame.
 - **Place** asks *where on the ground is this*. Projected through the camera
   pose, with an uncertainty that is part of the answer rather than a footnote.
+- **Zones and rules** ask *does any of this mean anything*. This is where
+  observation becomes assertion, and it is the first stage whose output is
+  intended to interrupt a person — so it is the first that has to justify
+  itself. Every event carries the evidence for it.
 
 The pipeline records what it did as well as what it found. A track's identity is
 only meaningful alongside how often the detector actually saw it, so the
@@ -33,6 +38,8 @@ import numpy as np
 from .core import CameraPose, Detection, Track, Tracker
 from .decode import Frame, VideoSource
 from .detect import Detector, DetectorInfo
+from .events import Event, EventEngine, Rule, utc_from_millis
+from .zones import Zone, ZoneEvaluator
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,6 +60,8 @@ class FrameResult:
     tracks: tuple[Track, ...]
     #: Track ids that closed on this frame.
     ended: tuple[int, ...]
+    #: Events raised on this frame. Usually empty — that is the point.
+    events: tuple[Event, ...] = ()
     #: The frame these conclusions were drawn from, when the caller asked for
     #: it. Opt-in because a full-resolution image per result is tens of
     #: megabytes over a short clip, and most callers want the conclusions only.
@@ -78,6 +87,12 @@ class PipelineStats:
     spans: dict[int, tuple[int, int]] = field(default_factory=dict)
     #: Frames where a track was held open with no detection supporting it.
     held_without_detection: int = 0
+    #: Zone presences opened and closed.
+    presences_started: int = 0
+    presences_ended: int = 0
+    #: Events raised. The number that matters most, and the one that should stay
+    #: small: this system is measured by how little it says.
+    events: int = 0
 
     @property
     def distinct_objects(self) -> int:
@@ -97,6 +112,8 @@ class PipelineStats:
             f"frames with detections{self.frames_with_detections:>6}",
             f"detections            {self.detections}",
             f"distinct objects      {self.distinct_objects}",
+            f"zone presences        {self.presences_started}",
+            f"events                {self.events}",
         ]
         for track_id in sorted(self.track_ids):
             seen = self.observations.get(track_id, 0)
@@ -117,7 +134,7 @@ class Pipeline:
     """
 
     __slots__ = ("_source", "_detector", "_pose", "_tracker", "stats", "_config",
-                 "_keep_images")
+                 "_keep_images", "_zones", "_evaluator", "_engine", "_epoch_millis")
 
     def __init__(
         self,
@@ -130,6 +147,10 @@ class Pipeline:
         max_gap_millis: int = 2000,
         min_hits_to_confirm: int = 2,
         keep_images: bool = False,
+        zones: Sequence[Zone] = (),
+        rules: Sequence[Rule] = (),
+        node_id: str = "local",
+        wall_clock_epoch_millis: int | None = None,
     ):
         """
         ``max_gap_millis`` is how long a track survives without a detection. It
@@ -151,6 +172,20 @@ class Pipeline:
         )
         self._tracker: Tracker | None = None
         self.stats = PipelineStats()
+
+        self._zones = {zone.id: zone for zone in zones}
+        self._evaluator = ZoneEvaluator(zones) if zones else None
+        self._engine = (
+            EventEngine(rules, node_id=node_id, camera_id=source.source_id)
+            if rules
+            else None
+        )
+        # Media time is relative to the start of the recording; rules that depend
+        # on the time of day need wall-clock time. Supplying the epoch explicitly
+        # keeps a replay reproducible: reading the system clock here would make
+        # the same footage produce different events on different days, which is
+        # exactly what an evidence trail must not do.
+        self._epoch_millis = wall_clock_epoch_millis
 
     @property
     def detector_info(self) -> DetectorInfo:
@@ -203,6 +238,7 @@ class Pipeline:
         ended = self._tracker.ended()
 
         self._record(frame, detections, tracks)
+        events = self._evaluate(frame, tracks)
 
         return FrameResult(
             index=frame.index,
@@ -211,8 +247,40 @@ class Pipeline:
             detections=tuple(detections),
             tracks=tuple(tracks),
             ended=tuple(ended),
+            events=tuple(events),
             image=frame.image if self._keep_images else None,
         )
+
+    def _evaluate(self, frame: Frame, tracks: Sequence[Track]) -> list[Event]:
+        """Zones and rules, if any are configured."""
+        if self._evaluator is None:
+            return []
+
+        moment = utc_from_millis((self._epoch_millis or 0) + frame.timestamp_millis)
+        changes = self._evaluator.update(tracks, frame.timestamp_millis, moment)
+
+        self.stats.presences_started += sum(1 for c in changes if c.kind == "ENTERED")
+        self.stats.presences_ended += sum(1 for c in changes if c.kind == "LEFT")
+
+        if self._engine is None:
+            return []
+
+        by_id = {track.id: track for track in tracks}
+        detector = self._detector.info
+
+        events = self._engine.on_presence_changes(
+            changes, self._zones, by_id,
+            at_millis=frame.timestamp_millis, moment=moment,
+            detector=detector, frame_index=frame.index,
+        )
+        events += self._engine.on_frame(
+            self._evaluator.open_presences(), self._zones, by_id,
+            at_millis=frame.timestamp_millis, moment=moment,
+            detector=detector, frame_index=frame.index,
+        )
+
+        self.stats.events += len(events)
+        return events
 
     def _record(
         self, frame: Frame, detections: Sequence[Detection], tracks: Sequence[Track]
