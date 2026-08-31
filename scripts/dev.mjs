@@ -47,7 +47,7 @@ const HELP = `
 Sentinel Vision - development commands
 
   up            start the local stack (api + worker + simulator) in standalone mode
-  down          stop anything started by 'up'
+  down          explains how to stop 'up' (it runs in the foreground)
   test          run the full test suite
   test:watch    re-run tests on change
   lint          static checks: layering rules, banned imports, secret scanning
@@ -90,7 +90,14 @@ const commands = {
   },
 
   async down() {
-    return node(['scripts/stack.mjs', 'down']);
+    // The stack runs in the foreground and stops with Ctrl+C. There is no
+    // detached process to signal, so pretending there is would be worse than
+    // saying so.
+    process.stdout.write(
+      'The stack runs in the foreground. Stop it with Ctrl+C in its own terminal.
+',
+    );
+    return 0;
   },
 
   async simulator() {
