@@ -25,6 +25,51 @@ Anything below that is not yet re-established after the rewrite says so.
 Current suite: **331 tests** — 44 Rust, 247 engine, 40 console. `cargo fmt` and
 `clippy -D warnings` clean. Run everything with `python tasks.py check`.
 
+A visual walk-through of everything below — the layers, the boundary, threading,
+projection, correlation, persistence and export — is in
+[docs/OVERVIEW.md](docs/OVERVIEW.md).
+
+## The map at a glance
+
+```mermaid
+flowchart LR
+    subgraph built["BUILT AND TESTED"]
+        direction TB
+        B1["decode · detect · track · project"]
+        B2["zones · schedules · rules · events"]
+        B3["correlation · object identity · risk"]
+        B4["persistence · audit · evidence export"]
+        B5["multi-camera Qt console"]
+    end
+
+    subgraph partial["CODE PATH ONLY"]
+        direction TB
+        P1["RTSP ingest<br/><i>no camera ever contacted</i>"]
+        P2["ONNX inference<br/><i>no trained weights ever run</i>"]
+    end
+
+    subgraph planned["DESIGNED, NOT BUILT"]
+        direction TB
+        N1["REST + WebSocket control plane"]
+        N2["node discovery · pairing · mTLS"]
+        N3["worker autonomy · reconciliation"]
+        N4["camera discovery (ONVIF/mDNS)"]
+        N5["continuous recording"]
+        N6["map package import"]
+        N7["authentication · keychain"]
+        N8["grounded AI analyst"]
+    end
+
+    built --> partial --> planned
+
+    style built fill:#1e3f2f,stroke:#4ade80,color:#e2e8f0
+    style partial fill:#4a3f1e,stroke:#fbbf24,color:#e2e8f0
+    style planned fill:#334155,stroke:#94a3b8,color:#e2e8f0
+```
+
+Nothing in the right two columns is described below as working. Where a document
+elsewhere in this repository describes one of them, it carries a banner saying so.
+
 ---
 
 ## Engine core (Rust)
@@ -83,22 +128,84 @@ Geometry, projection, zones and tracking, behind a C ABI.
 
 ## Measured behaviour
 
-Numbers from the reference scene, recorded so a regression is visible. The scene
-is synthetic (`engine/tests/scene.py`); see gap 1.
+Every number here is produced by re-running the reference scenes, not remembered.
+The scenes are rendered (`engine/tests/scene.py`, `engine/tests/world.py`); see
+gap 1 for what that does and does not establish. A visual walk-through of all of
+it is in [docs/OVERVIEW.md](docs/OVERVIEW.md).
+
+### The funnel — 180 frames to one incident
+
+```mermaid
+flowchart TD
+    A["<b>180 frames</b><br/>640×480 · 15 fps · real H.264"]
+    B["<b>379 detections</b><br/>in 169 of 180 frames"]
+    C["<b>5 tracks</b><br/>ground truth: 3 people"]
+    D["<b>5 presences</b><br/>after entry/exit hysteresis"]
+    E["<b>16 events</b><br/>entry · after-hours · loitering · speed"]
+    F["<b>1 incident</b><br/>HIGH · risk 75/100"]
+
+    A --> B --> C --> D --> E --> F
+    C -.->|"over-count — gap 8"| X["reports 5 objects<br/>for 3 people"]
+
+    style A fill:#334155,stroke:#94a3b8,color:#e2e8f0
+    style B fill:#334155,stroke:#94a3b8,color:#e2e8f0
+    style C fill:#334155,stroke:#94a3b8,color:#e2e8f0
+    style D fill:#4c1d24,stroke:#f87171,color:#e2e8f0
+    style E fill:#4c1d24,stroke:#f87171,color:#e2e8f0
+    style F fill:#1e3f2f,stroke:#4ade80,color:#e2e8f0
+    style X fill:#4c1d24,stroke:#f87171,color:#fca5a5
+```
+
+**16 events become 1 incident — 94% less for a person to read.** That reduction
+is the product, not a side effect.
+
+### Detection
 
 | Measurement | Value |
 |---|---|
-| Detection recall (IoU > 0.3) | 0.69 |
+| Recall (IoU > 0.3), overall | 0.69 |
+| — `approaching`, walks the full depth | 0.86 |
+| — `crossing`, crosses the scene | 0.68 |
+| — `loiterer`, **stops moving** | **0.49** |
 | Mean overlap with ground truth | 0.50 |
 | Fragments per frame | 0.42 |
-| Spurious detections not on an object | 0 |
-| Motion detector throughput | ~87 fps at 640×480 |
-| Whole pipeline throughput | ~68 fps at 640×480 |
+| Spurious detections not on any object | **0** |
+
+The per-walker split is the important part. The worst case is the object that
+stops, which is the loitering case — the one a security system most needs. That
+is not a bug to be tuned away; it is what background subtraction is.
+
+### Tracking and correlation
+
+| Measurement | Value |
+|---|---|
 | Distinct objects reported | **5**, for 3 people |
 | Identity switches | **8** over ~410 unambiguous observations |
-| Events raised on the reference scene | 16 |
+| Events raised | 16 |
 | Incidents after correlation | **1** |
 | Reduction in what a person must read | **94%** |
+
+The first two are honest failures, bounded by tests so they cannot quietly get
+worse. They are the appearance-free tracking limit: when two people cross, box
+geometry alone cannot tell which is which. An appearance model is the identified
+next step.
+
+### Spatial accuracy, against a world position
+
+Not against a box in a picture — against where the person actually was, in
+metres. The renderer projects world to image; the pipeline projects image back to
+world.
+
+| Distance from camera | Mean 1σ uncertainty reported |
+|---|---|
+| 0–8 m | 0.44 m |
+| 8–10 m | 0.59 m |
+| 10–12 m | 0.70 m |
+| 12–15 m | 1.02 m |
+| 15–25 m | 1.52 m |
+
+Distance and reported uncertainty correlate at **r = 0.991**, and uncertainty
+grows super-linearly, as `|dd/dθ| = h / sin²(θ)` requires.
 
 ### The central claim, measured
 
@@ -109,32 +216,78 @@ processed by two pipelines that know nothing of each other
 | Measurement | Value |
 |---|---|
 | Distinct objects per camera | 1 and 1 |
-| Position error against **world** ground truth | median **0.32 m**, p90 ~1.0 m |
-| True position inside the stated 2σ disc | > 80% |
+| Position error vs **world** ground truth | median **0.32 m** |
+| Position error, 90th percentile | 0.96 m (cam-08), 1.34 m (cam-07) |
+| True position inside the stated 2σ disc | **100%** |
 | Events from both cameras | 3 |
-| Incidents after correlation | **1** |
-| Distinct objects in that incident | **1** |
+| Cross-camera associations made | 2 |
+| **Incidents after correlation** | **1** |
+| **Distinct objects in that incident** | **1** |
+| Risk | 62.5/100 (HIGH) |
 
-This is the strongest available check short of hardware. The renderer projects
-world → image; the pipeline projects image → world. If the geometry were wrong
-anywhere in that loop the cameras would disagree about where the person was, the
-association would fail, and one person would be reported as two.
+This is the strongest available check short of hardware, and it is capable of
+failing: if the geometry were wrong anywhere in that loop the cameras would
+disagree about where the person was, the association would fail, and one person
+would be reported as two.
 
-The last two are honest failures, bounded by tests so they cannot quietly get
-worse. They are the appearance-free tracking limit: when two people cross, box
-geometry alone cannot tell which is which. An appearance model is the identified
-next step.
+The 2σ coverage matters as much as the error. A radius nobody verifies is
+decoration that invites false confidence; the stated disc has to actually contain
+the truth, and it does.
 
-Two changes with measured effect, kept here because both were counter-intuitive:
+### Throughput
 
-- **Vertical morphology kernel.** Every spurious detection turned out to be a
-  fragment of a real object, not noise. A tall narrow closing kernel rejoins an
-  upright body without merging two people side by side: recall 0.64 → 0.69, mean
-  overlap 0.40 → 0.50, fragments per frame 1.20 → 0.42.
-- **Elliptical association gate.** A circular gate scaled by an upright object's
-  height permits a one-frame vertical leap of tens of metres in world terms,
-  which is how a track hands its identity to an object that has just walked into
-  shot 100 px above it.
+Median of five runs on an **idle** machine, 640×480.
+
+| | fps | ms/frame |
+|---|---:|---:|
+| Motion detector, 16 threads | 385 | 2.60 |
+| Motion detector, **1 thread** | **230** | **4.34** |
+| Whole pipeline (decode → incident), 16 threads | 319 | 3.14 |
+
+The single-threaded figure is the one that matters for capacity: a worker runs
+one pipeline per camera and they compete for cores, so this is roughly **15
+cameras at 15 fps per core** — before any real detection model, which will
+dominate the budget entirely.
+
+> **Correction.** Earlier revisions of this file quoted 87 fps and 68 fps. Those
+> were measured while other test processes were running and were wrong by a
+> factor of four. A performance claim without its conditions is not a
+> measurement, so the conditions are stated above.
+
+### Two changes with measured effect
+
+Kept here because both were counter-intuitive and neither was predicted by
+design review — both were found by building the thing and measuring it.
+
+**The morphology kernel is tall and narrow, not square.** Every spurious
+detection turned out to be a fragment of a real object rather than noise, so the
+problem was never false positives — it was one person becoming three boxes.
+
+| | square 9×9 | vertical 3×31 |
+|---|---|---|
+| Recall @ IoU > 0.3 | 0.64 | **0.69** |
+| Mean overlap | 0.40 | **0.50** |
+| Fragments per frame | 1.20 | **0.42** |
+
+**The association gate is an ellipse, not a circle.** A camera looking at the
+ground maps vertical image motion to *depth*. A circular gate scaled by an
+upright object's height permits a one-frame leap of tens of metres in world
+terms, which is how a track hands its identity to somebody who has just walked
+into shot 100 px above it.
+
+### Defects that only appeared once it ran
+
+Each of these passed review and failed reality:
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| "An object moved at **53.2 m/s**" | Speed from two frames 200 ms apart amplifies position error fivefold | Withhold speed below 1.2 s of observation |
+| A track leapt 100 px to a newly-appeared object | Circular gate sized by an upright box's *height* | Elliptical gate; vertical axis is the tight one |
+| 30 s stall per unreachable camera | OpenCV's RTSP timeout is hard-coded; all four documented FFmpeg options measured to do nothing | Socket probe before the decoder is involved |
+| A failed migration could leave a partial schema | `executescript` commits the open transaction before running | Execute statement by statement inside the transaction |
+| `db-rollback` silently undone | Opening the store auto-migrated unconditionally | Auto-migrate for the application, off for maintenance |
+| A test hung forever | A modal dialog on camera failure — exactly what an operator would have experienced | Report faults in place, not modally |
+| A zone landed beyond everything the camera could see | Placed by *stated range*, which is not coverage | Place just past the near edge of the real footprint |
 
 ## Not yet rebuilt after the rewrite
 
@@ -153,6 +306,27 @@ exists for them in `docs/`.
 | Map package import | `PLANNED` | |
 | Authentication | `PLANNED` | The audit half is built; there is nobody to attribute an action to yet. |
 | Secret storage in the OS keychain | `PLANNED` | No secret is stored at all today. |
+
+## What each gap blocks
+
+```mermaid
+flowchart LR
+    G1["rendered footage only"] --> C1["no accuracy claim<br/>about the real world"]
+    G2["no trained model"] --> C2["detection quality<br/>entirely unmeasured"]
+    G3["no physical camera"] --> C3["RTSP is a code path,<br/>not a capability"]
+    G4["background subtraction<br/>loses a stationary object"] --> C4["loitering — the case that<br/>matters most — is weakest"]
+    G5["appearance-free tracking"] --> C5["5 objects reported<br/>for 3 people"]
+    G6["no authentication"] --> C6["nobody to attribute<br/>an action to"]
+    G7["no networking"] --> C7["single machine only"]
+
+    style C1 fill:#4c1d24,stroke:#f87171,color:#fca5a5
+    style C2 fill:#4c1d24,stroke:#f87171,color:#fca5a5
+    style C3 fill:#4c1d24,stroke:#f87171,color:#fca5a5
+    style C4 fill:#4c1d24,stroke:#f87171,color:#fca5a5
+    style C5 fill:#4a3f1e,stroke:#fbbf24,color:#e2e8f0
+    style C6 fill:#4a3f1e,stroke:#fbbf24,color:#e2e8f0
+    style C7 fill:#4a3f1e,stroke:#fbbf24,color:#e2e8f0
+```
 
 ## Honest gaps worth naming
 

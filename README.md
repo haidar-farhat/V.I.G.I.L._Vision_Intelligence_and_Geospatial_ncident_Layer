@@ -18,11 +18,22 @@ Its job is to extract signal from continuous video, attach spatial and temporal
 context to it, correlate it across cameras into a small number of reviewable
 incidents, and present each one with the evidence that produced it.
 
+```mermaid
+flowchart LR
+    V["VIDEO"] --> D["DETECTION"] --> T["TRACKING"] --> S["SPATIAL<br/>CONTEXT"]
+    S --> TC["TEMPORAL<br/>CONTEXT"] --> E["EVENT<br/>ANALYSIS"] --> M["MULTI-CAMERA<br/>CORRELATION"]
+    M --> R["RISK<br/>SCORING"] --> H["HUMAN<br/>REVIEW"] --> I["INCIDENT"]
+
+    style E fill:#4c1d24,stroke:#f87171,color:#e2e8f0
+    style M fill:#4c1d24,stroke:#f87171,color:#e2e8f0
+    style R fill:#4c1d24,stroke:#f87171,color:#e2e8f0
+    style H fill:#1e3a5f,stroke:#4a9eff,color:#e2e8f0
+    style I fill:#1e3f2f,stroke:#4ade80,color:#e2e8f0
 ```
-VIDEO -> DETECTION -> TRACKING -> SPATIAL CONTEXT -> TEMPORAL CONTEXT
-      -> EVENT ANALYSIS -> MULTI-CAMERA CORRELATION -> RISK SCORING
-      -> HUMAN REVIEW -> INCIDENT
-```
+
+Everything before the red stages *reports*. Everything from `EVENT ANALYSIS`
+onward makes a claim that will eventually interrupt a person, and has to justify
+itself.
 
 The measure of the system is how *few* incidents it raises, not how many
 detections it makes. Three cameras seeing the same person produce **one**
@@ -76,47 +87,99 @@ In short:
 
 **The whole spine runs, end to end, on real video today.**
 
-```
-VIDEO -> DETECTION -> TRACKING -> SPATIAL CONTEXT -> TEMPORAL CONTEXT
-      -> EVENT ANALYSIS -> MULTI-CAMERA CORRELATION -> RISK SCORING
-      -> INCIDENT -> EVIDENCE
-```
-
 A file is decoded through a real H.264 decoder, run through a real detector,
 tracked in the Rust core, projected onto the ground with an uncertainty that
 travels with it, tested against zones and schedules, turned into events that
 carry their own evidence, and correlated into incidents — then persisted,
 displayed in a native Qt console, and exportable as a verifiable package.
 
-**The central claim is measured, not asserted.** One person, two cameras
-rendered from one world through their real poses, two pipelines that know
-nothing of each other:
+### What happens to 180 frames
+
+```mermaid
+flowchart LR
+    A["<b>180</b><br/>frames"] --> B["<b>379</b><br/>detections"] --> C["<b>5</b><br/>tracks"]
+    C --> D["<b>5</b><br/>presences"] --> E["<b>16</b><br/>events"] --> F["<b>1</b><br/>incident"]
+
+    style A fill:#334155,stroke:#94a3b8,color:#e2e8f0
+    style B fill:#334155,stroke:#94a3b8,color:#e2e8f0
+    style C fill:#334155,stroke:#94a3b8,color:#e2e8f0
+    style D fill:#4c1d24,stroke:#f87171,color:#e2e8f0
+    style E fill:#4c1d24,stroke:#f87171,color:#e2e8f0
+    style F fill:#1e3f2f,stroke:#4ade80,color:#e2e8f0
+```
+
+**16 events become 1 incident — 94% less for a person to read.** That reduction
+is the product. Three people walked past; the tracker fragments them into five
+tracks, and the incident says so rather than hiding it.
+
+### The central claim is measured, not asserted
+
+One person, two cameras rendered from **one world** through their real poses, two
+pipelines that know nothing of each other:
 
 | | |
 |---|---|
-| Position error against world ground truth | median **0.32 m** |
-| True position inside the stated 2σ disc | > 80% |
+| Distinct objects per camera | 1 and 1 |
+| Position error vs world ground truth | median **0.32 m** |
+| True position inside the stated 2σ disc | **100%** |
 | Events raised by the two cameras | 3 |
-| Incidents an operator sees | **1** |
-| Distinct objects in that incident | **1** |
+| **Incidents an operator sees** | **1** |
+| **Distinct objects in that incident** | **1** |
 
-On a single-camera scene, 16 events become 1 incident — a 94% reduction in what
-a person has to read. That reduction is the product.
+The renderer projects world → image; the pipeline projects image → world. They
+are exact inverses, so the test is capable of failing: bad geometry anywhere in
+that loop makes the cameras disagree and reports one person as two.
 
-**331 tests**: 44 Rust, 247 engine, 40 console. `cargo fmt` and
-`clippy -D warnings` clean.
+### The layers
 
-**Not yet true, and stated as such.** No physical camera has been contacted. No
-trained detection model has been run — the ONNX path executes against a model
-built locally for the purpose, which tests the machinery around a model and
-nothing about detection quality. All footage is rendered, so none of this is an
-accuracy claim about the real world. There is no authentication, no keychain
-storage, and no networking between machines.
+```mermaid
+flowchart TB
+    C["<b>apps/console</b> · PySide6 · native widgets, no browser<br/><i>camera wall · plan view · incidents · tracks</i>"]
+    E["<b>engine/</b> · Python · per event, per second, per operator action<br/><i>decode · detect · zones · events · correlation · store · export</i>"]
+    R["<b>core/</b> · Rust · per detection, per frame, per camera · zero dependencies<br/><i>projection · field of view · zones · tracking</i>"]
+
+    C -->|"pulls on a 30 Hz timer"| E
+    E -->|"ctypes over a C ABI — not PyO3"| R
+
+    style C fill:#3f2f1e,stroke:#fbbf24,color:#e2e8f0
+    style E fill:#1e3f2f,stroke:#4ade80,color:#e2e8f0
+    style R fill:#1e3a5f,stroke:#4a9eff,color:#e2e8f0
+```
+
+The dividing line is **rate**, not importance.
+
+### Scale
+
+**331 tests** — 44 Rust, 247 engine, 40 console. `cargo fmt` and
+`clippy -D warnings` clean. 15,789 lines across 40 files; tests are 34% of them.
+
+| Throughput, 640×480, idle machine | fps | ms/frame |
+|---|---:|---:|
+| Motion detector, 16 threads | 385 | 2.60 |
+| Motion detector, 1 thread | 230 | 4.34 |
+| Whole pipeline, 16 threads | 319 | 3.14 |
+
+The single-thread figure is the honest one for capacity — roughly 15 cameras at
+15 fps per core, before any real detection model.
+
+### Not yet true, and stated as such
+
+No physical camera has been contacted. No *trained* detection model has been run
+— the ONNX path executes against a model built locally for the purpose, which
+tests the machinery around a model and nothing about detection quality. All
+footage is rendered, so none of this is an accuracy claim about the real world.
+There is no authentication, no keychain storage, and no networking between
+machines.
 
 The system reports **5 distinct objects where 3 people walked past** on the
-single-camera scene, inheriting the tracker's over-count. That and every other
-known failure is bounded by a test so it cannot quietly get worse, and recorded
-in [STATUS.md](STATUS.md).
+single-camera scene, inheriting the tracker's over-count. Background subtraction
+finds the object that *stops moving* only 49% of the time — the loitering case,
+the one a security system most needs.
+
+Every known failure is bounded by a test so it cannot quietly get worse, and
+recorded in [STATUS.md](STATUS.md). A visual walk-through of the whole system,
+with the measurements behind each claim, is in
+[docs/OVERVIEW.md](docs/OVERVIEW.md).
 
 ---
 
@@ -217,6 +280,7 @@ list is part of the attack surface, and everything in it is arithmetic.
 
 | Document | Covers |
 |---|---|
+| [docs/OVERVIEW.md](docs/OVERVIEW.md) | **Start here.** Diagrams of every layer, the spine, the boundary, threading, zones, projection, correlation, risk, persistence, export and test topology — with the measurements behind each |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Components, processes, ERD, protocol, security model, data flow, AI and map architecture |
 | [STATUS.md](STATUS.md) | What is actually built, per capability |
 | [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) | Working on the codebase |

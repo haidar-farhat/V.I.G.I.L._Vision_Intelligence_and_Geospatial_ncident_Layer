@@ -150,6 +150,32 @@ frames until the process died. The interface therefore takes the newest result o
 a timer, and frames skipped for *drawing* are counted and shown. Nothing is
 skipped from the analysis.
 
+```mermaid
+sequenceDiagram
+    participant UI as UI thread<br/>(30 Hz QTimer)
+    participant S as latest slot<br/>(mutex, capacity 1)
+    participant W as worker thread<br/>(one per camera)
+
+    loop every decoded frame
+        W->>W: decode → detect → track → project → events
+        W->>S: publish(update)
+        Note right of S: slot full? increment skipped,<br/>overwrite with the newer one
+    end
+
+    loop every 33 ms
+        UI->>S: take_latest()
+        S-->>UI: newest update, or None
+        UI->>UI: repaint wall, map, tables
+    end
+
+    Note over UI,W: analysis never skips — only drawing does,<br/>and the count is displayed
+```
+
+Correlation runs **above** the sessions, on a slower timer, over every camera's
+events at once. A camera that correlated its own events in isolation would raise
+one incident per camera for one intrusion, which is precisely the duplication
+this system exists to remove.
+
 ### 5.2 LAN distributed mode
 
 Designed; not built in the current codebase. See STATUS.md.
@@ -180,6 +206,24 @@ engine has no Qt dependency and the pipeline is usable without one.
 ---
 
 ## 6. Data flow -- the spine
+
+```mermaid
+flowchart LR
+    V["VIDEO"] --> D["DETECTION"] --> T["TRACKING"] --> S["SPATIAL<br/>CONTEXT"]
+    S --> TC["TEMPORAL<br/>CONTEXT"] --> E["EVENT<br/>ANALYSIS"] --> M["MULTI-CAMERA<br/>CORRELATION"]
+    M --> R["RISK<br/>SCORING"] --> H["HUMAN<br/>REVIEW"] --> I["INCIDENT"]
+
+    style E fill:#4c1d24,stroke:#f87171,color:#e2e8f0
+    style M fill:#4c1d24,stroke:#f87171,color:#e2e8f0
+    style R fill:#4c1d24,stroke:#f87171,color:#e2e8f0
+    style H fill:#1e3a5f,stroke:#4a9eff,color:#e2e8f0
+    style I fill:#1e3f2f,stroke:#4ade80,color:#e2e8f0
+```
+
+Everything left of the red stages **reports**. Everything from `EVENT ANALYSIS`
+onward **asserts**, and an assertion is what eventually interrupts a person — so
+that is where the burden of justification begins, and why every event from there
+on carries its own evidence.
 
 ```
  CAMERA                                                       [worker node]
@@ -244,6 +288,56 @@ and is treated as one.
 ---
 
 ## 7. Domain model (ERD)
+
+What is implemented today is the subset below; the full model follows it.
+
+```mermaid
+erDiagram
+    cameras ||--o{ events : "observed by"
+    zones ||--o{ events : "occurred in"
+    incidents ||--o{ incident_events : contains
+    events ||--o{ incident_events : "belongs to"
+
+    cameras {
+        TEXT id PK
+        TEXT source "redacted before it arrives"
+        TEXT credentials_ref "keychain handle, NEVER a password"
+        REAL latitude_longitude
+        REAL mount_height_heading_pitch
+        REAL fov_and_range
+    }
+    zones {
+        TEXT id PK
+        TEXT kind "RESTRICTED PERIMETER ENTRY EXCLUSION INTEREST"
+        TEXT ring "JSON polygon"
+        TEXT schedule "start end days"
+        INTEGER enter_exit_after_millis
+    }
+    events {
+        TEXT id PK "deterministic - replay upserts"
+        INTEGER occurred_at "the observing node says"
+        INTEGER recorded_at "this node accepted - NEVER reconciled"
+        REAL latitude_longitude
+        REAL uncertainty_meters "always travels with the position"
+        TEXT model_digest "which weights said this"
+        REAL speed_mps "NULL unknown, 0.0 still"
+    }
+    incidents {
+        TEXT id PK "deterministic"
+        INTEGER distinct_object_count "objects, NOT track segments"
+        REAL risk_score
+        TEXT risk_factors "the reasoning, stored"
+        TEXT associations "why cameras were merged"
+    }
+    audit_logs {
+        INTEGER id PK
+        INTEGER at
+        TEXT actor
+        TEXT action "append-only - nothing edits this"
+    }
+```
+
+
 
 ```
  +----------+        +----------+        +-----------+
@@ -424,6 +518,44 @@ control, modify node, change rules) require explicit confirmation and are always
 ---
 
 ## 12. Event, correlation and incident engine
+
+### Presence, and why both edges have hysteresis
+
+```mermaid
+stateDiagram-v2
+    [*] --> Absent
+    Absent --> Pending: membership accepted
+    Pending --> Absent: lost before enter_after_millis
+    Pending --> Present: held long enough<br/><b>→ ENTERED</b>
+    Present --> Fading: membership lost
+    Fading --> Present: seen again<br/><i>no new event</i>
+    Fading --> [*]: absent for exit_after_millis<br/><b>→ LEFT</b>
+    Present --> [*]: zone schedule ended
+```
+
+Exit is deliberately slower than entry. A detector that loses an object for two
+frames has not seen it leave, and treating it as though it had turns one person
+loitering for four minutes into eight separate two-minute intrusions.
+
+### Object identity is transitive, or the count is wrong
+
+```mermaid
+flowchart LR
+    A["cam-07 #1"] <-->|associated| B["cam-08 #4"]
+    B <-->|associated| C["cam-09 #2"]
+    A -.->|never directly compared| C
+    D(("union-find<br/>root")) --- A
+    D --- B
+    D --- C
+
+    style D fill:#1e3f2f,stroke:#4ade80,color:#e2e8f0
+```
+
+A pairwise implementation reports **two** objects here, and the failure is
+silent. The symptom is an incident titled "three people" about one — a visible
+error that would undermine trust in everything else on the screen.
+
+
 
 ### 12.1 Events
 
