@@ -40,133 +40,176 @@ events and model version.
 
 ## Non-negotiables
 
+These are design rules, not aspirations. Where one is currently enforced by
+something other than intention, that is stated; where it is not yet, that is
+stated too, because a rule everybody believes is enforced and isn't is worse than
+no rule.
+
 - **Zero WAN.** No feature requires the Internet. No cloud services, no telemetry,
-  no external map tiles, no CDN assets, no auto-updater. Block all outbound WAN
-  traffic and the system keeps working. Enforced by a runtime egress guard and a
-  build-time lint, not by intention.
-- **Credentials never leak.** Camera passwords live in the OS keychain and travel
-  in a wrapper that renders `[redacted]` through every serialisation path.
-- **No AI claim without evidence.** Reports that cite evidence they were not given
-  are rejected before an operator ever sees them.
+  no external map tiles, no CDN assets, no auto-updater, no model downloads.
+  Block all outbound traffic and the system keeps working.
+  *Enforced by:* the CI offline job, which drops all outbound traffic, proves the
+  drop actually took effect, and then runs every suite; plus a test asserting the
+  map view references no URL or HTTP client of any kind.
+- **Credentials never leak.** A camera password must not appear in logs, UI
+  payloads, URLs, error reports or analytics.
+  *Enforced by:* tests asserting a password is unreachable through `repr`, `str`,
+  display URL, source id and every error message — including its length.
+  *Not yet:* keychain storage. No secret is persisted at all today.
+- **No AI claim without evidence.** Every conclusion carries its timestamp,
+  camera, evidence, confidence, triggering conditions and model version.
+  *Enforced by:* the detector's own honesty — a motion blob is emitted as
+  `UNCLASSIFIED` and the console will not label it with a class, asserted by test.
+  *Not yet:* the analyst guardrail, which is designed but not rebuilt.
 - **Privacy by default.** No facial recognition, no biometric identification, no
   identity database. Objects are tracked; people are not identified.
+  *Enforced by:* absence. Nothing in the codebase does any of these things.
 - **Graceful degradation.** Losing the GPU, the AI, the database, the map or the
-  control node never stops recording.
+  control node never stops recording. *Not yet:* recording does not exist.
 
 ---
 
 ## Current state
 
-See **[STATUS.md](STATUS.md)** for a per-capability breakdown. In short: the
-domain core, geometry, tracking, correlation, incident engine, security controls,
-database, an end-to-end vertical slice, the ONVIF and RTSP protocol layers, and
-offline map packages with camera coverage analysis are implemented and tested.
-Video decode, real inference, the Tauri shell and distributed mode are designed
-but not built.
+See **[STATUS.md](STATUS.md)** for a per-capability breakdown, honestly stated.
+In short:
 
-Nothing here has been run against a physical camera. The camera protocols are
-tested against mock devices written from the specifications, which is a real bar
-and not the same one.
+**The whole spine runs, end to end, on real video today.**
 
-**481 tests.** Clean typecheck under `strict` + `noUncheckedIndexedAccess`. Clean
-architectural lint.
+```
+VIDEO -> DETECTION -> TRACKING -> SPATIAL CONTEXT -> TEMPORAL CONTEXT
+      -> EVENT ANALYSIS -> MULTI-CAMERA CORRELATION -> RISK SCORING
+      -> INCIDENT -> EVIDENCE
+```
+
+A file is decoded through a real H.264 decoder, run through a real detector,
+tracked in the Rust core, projected onto the ground with an uncertainty that
+travels with it, tested against zones and schedules, turned into events that
+carry their own evidence, and correlated into incidents — then persisted,
+displayed in a native Qt console, and exportable as a verifiable package.
+
+**The central claim is measured, not asserted.** One person, two cameras
+rendered from one world through their real poses, two pipelines that know
+nothing of each other:
+
+| | |
+|---|---|
+| Position error against world ground truth | median **0.32 m** |
+| True position inside the stated 2σ disc | > 80% |
+| Events raised by the two cameras | 3 |
+| Incidents an operator sees | **1** |
+| Distinct objects in that incident | **1** |
+
+On a single-camera scene, 16 events become 1 incident — a 94% reduction in what
+a person has to read. That reduction is the product.
+
+**331 tests**: 44 Rust, 247 engine, 40 console. `cargo fmt` and
+`clippy -D warnings` clean.
+
+**Not yet true, and stated as such.** No physical camera has been contacted. No
+trained detection model has been run — the ONNX path executes against a model
+built locally for the purpose, which tests the machinery around a model and
+nothing about detection quality. All footage is rendered, so none of this is an
+accuracy claim about the real world. There is no authentication, no keychain
+storage, and no networking between machines.
+
+The system reports **5 distinct objects where 3 people walked past** on the
+single-camera scene, inheriting the tracker's over-count. That and every other
+known failure is bounded by a test so it cannot quietly get worse, and recorded
+in [STATUS.md](STATUS.md).
 
 ---
 
 ## Quick start
 
-Requires **Node 22.6+** (Node 24 recommended). Nothing else — the core has zero
-third-party runtime dependencies, and the embedded database ships inside Node.
+Requires **Python 3.12+** and a **Rust toolchain** (stable). Nothing else is
+fetched at runtime, ever.
 
 ```bash
-npm install          # dev dependencies only: TypeScript and Node types
-npm test             # 481 tests, no network
-npm run lint         # architectural invariants
-npm run typecheck    # strict TypeScript across the workspace
+python -m pip install -e "engine[dev]" PySide6
+
+python tasks.py build      # build the Rust engine core
+python tasks.py test       # 331 tests, no network
+python tasks.py lint       # rustfmt + clippy
+python tasks.py check      # all of the above — what CI runs
 ```
 
 ### See it work
 
 ```bash
-npm run slice        # run the full pipeline end to end and print the incident
-npm run slice quiet  # the same pipeline on an empty site: raises nothing
+python tasks.py console    # the operator console
 ```
 
-`npm run slice` runs a scripted scenario — three people walk a perimeter road
-after hours, cross a restricted zone, pass through a gap in camera coverage, and
-are reacquired near a substation — through the **production** pipeline. Only the
-camera and the detector are simulated. It prints the detections, the tracks, the
-measured spatial error against ground truth, the scored cross-camera hand-offs,
-the single incident produced, its risk breakdown, its timeline, and the
-evidence-bound analyst report.
+Add one or more video files, place each camera, draw a zone, and press Start. The console shows the
+frame with its overlay, the ground beside it, and one table row per tracked
+object carrying class, confidence, duration, speed, heading, position,
+uncertainty and provenance.
 
-Typical output:
+Until a camera is placed, objects are tracked and reported as **not placed** —
+there is deliberately no default position, because a nominal origin produces
+coordinates indistinguishable from measured ones, and somebody gets sent to them.
 
-```
-tracks per camera        3 / 3 / 3          (three people, three cameras)
-mean position error      0.52 m
-within stated 2-sigma    100.0 %
-associations             6 hand-offs, 93-98%
-events                   9
-incidents                1                  <- the whole point
-  INC-53CB4075B8  [CRITICAL]  3 people in Restricted Zone A (2 cameras)
-```
-
-### Database
-
-```bash
-npm run db status
-npm run db migrate
-npm run db rollback
-```
+The placement dialog tells you what a pose can actually see as you type it: a 6 m
+mast tilted 22° with a 36° vertical field covers 7 m to 86 m and is **blind
+closer than 7 m**, whatever range the camera claims.
 
 ---
 
 ## Development commands
 
-Identical on Windows, Linux and macOS — everything routes through Node, so there
-is one set of instructions and no shell-script pair to drift apart.
+Identical on Windows, Linux and macOS — everything routes through Python, so
+there is one set of instructions and no shell-script pair to drift apart.
 
 | Command | Does |
 |---|---|
-| `npm test` | Full test suite |
-| `npm run lint` | Layering, zero-WAN, secrets, placeholders, erasable syntax |
-| `npm run typecheck` | Strict TypeScript across the workspace |
-| `npm run slice` | End-to-end vertical slice with printed results |
-| `npm run simulator` | Camera simulator on its own |
-| `npm run db <cmd>` | `migrate` / `rollback` / `status` |
-| `npm run build` | Typecheck, then build the desktop bundle |
+| `python tasks.py build` | Build the Rust engine core |
+| `python tasks.py test` | Rust, engine and console suites |
+| `python tasks.py lint` | `cargo fmt --check` and `clippy -D warnings` |
+| `python tasks.py check` | Lint, build, test |
+| `python tasks.py console` | Run the operator console |
+| `python tasks.py db` | Report the database's migration state |
+| `python tasks.py db-migrate` | Apply pending migrations |
+| `python tasks.py db-rollback` | Undo the most recent migration |
 
 ---
 
 ## Repository layout
 
 ```
-apps/desktop/       Tauri shell + React operator UI
-services/
-  api/              REST + WebSocket control plane
-  worker/           headless edge: ingest -> infer -> track -> observe
-  inference/        model runtimes and device discovery
-  recorder/         segmented recording and retention
-  event-engine/     rules, correlation, risk, incidents
-packages/
-  shared-types/     the domain model
-  protocol/         versioned wire schemas
-  geometry/         geodesy, polygons, projection, FOV, zones
-  tracking/         track lifecycle and cross-camera association
-  ai/               model abstraction, registry, analyst guardrails
-  maps/             PMTiles reading, style validation, package integrity
-  database/         driver, migrations, schema
-  security/         Secret<T>, redaction, egress guard, authz
-  test-utils/       deterministic clock, seeded RNG, fixtures
-simulator/          synthetic cameras, actors, scenarios
-models/             operator-imported models (never committed)
+core/               Rust engine core: geometry, projection, zones, tracking
+  src/geometry.rs     geodesy, ground projection, field of view, polygons
+  src/tracking.rs     track lifecycle, association, motion
+  src/ffi.rs          the C ABI
+engine/             Python engine
+  sentinel/core.py       ctypes bindings to the core
+  sentinel/decode.py     decode, credential redaction, live streams
+  sentinel/detect.py     motion and ONNX detectors
+  sentinel/zones.py      zones, schedules, presence with hysteresis
+  sentinel/events.py     rules and events, each carrying its evidence
+  sentinel/incidents.py  correlation, object identity, risk scoring
+  sentinel/store.py      SQLite persistence, migrations, audit
+  sentinel/evidence.py   verifiable evidence export
+  sentinel/pipeline.py   the whole spine, per camera
+apps/console/       PySide6 operator console — native widgets, no webview
+models/             operator-imported models (never committed, never downloaded)
 map-data/           operator-imported map packages (never committed)
 ```
 
-`packages/*` have **zero third-party runtime dependencies**. For a security
-product the supply chain is part of the threat model, and it keeps the domain
-auditable by reading and testable in milliseconds.
+### Why Rust behind a C ABI rather than PyO3
+
+The hot path runs per detection, per frame, per camera, so it lives in Rust. It
+sits behind a plain C ABI rather than Python-specific bindings for two reasons:
+the core is built with the GNU toolchain while CPython on Windows is built with
+MSVC, and PyO3 across that boundary is an ABI hazard; and a C ABI keeps the
+engine loadable from anything, so nothing above it is welded to one runtime.
+
+The cost is that struct layouts are maintained by hand on both sides. That is
+guarded rather than trusted: the core exports its struct sizes and the Python
+binding refuses to load on a mismatch, because a drifted layout does not crash —
+it reads the wrong bytes and produces plausible, wrong geometry.
+
+The Rust core has **no dependencies**. For a security appliance the dependency
+list is part of the attack surface, and everything in it is arithmetic.
 
 ---
 

@@ -1,8 +1,13 @@
 # Database
 
+> **Status:** this describes a design that has not been rebuilt since the move to
+> Python and Rust. The reasoning is intact and is what the implementation will
+> follow; the code it refers to no longer exists. See [STATUS.md](../STATUS.md).
+
 ## Choice of engine
 
-**Standalone mode uses `node:sqlite`.** It ships inside Node, so a single-machine
+**Standalone mode uses SQLite in WAL mode.** It is in Python's standard
+library, so a single-machine
 installation needs no database service, no daemon to supervise, and no
 third-party dependency in the supply chain. All three matter for something
 expected to run unattended on an isolated network for months.
@@ -18,7 +23,7 @@ SQL.
             |   SqlDriver    |   exec . query . transaction . script
             +---+--------+---+
                 |        |
-        node:sqlite   PostgreSQL
+          sqlite3     PostgreSQL
 ```
 
 ## Conventions
@@ -82,9 +87,9 @@ everything else on the screen.
 ## Migrations
 
 ```bash
-npm run db status     # applied, pending, and any integrity problems
-npm run db migrate    # apply everything pending
-npm run db rollback   # undo the most recent migration
+python tasks.py db status     # applied, pending, and any integrity problems
+python tasks.py db migrate    # apply everything pending
+python tasks.py db rollback   # undo the most recent migration
 ```
 
 Rules:
@@ -136,5 +141,5 @@ was installed.
   frame of metadata.
 - Indexes cover the queries the UI actually makes: events by time, by camera and
   time, by type and time; incidents by status and time.
-- Result rows have a **null prototype** (a `node:sqlite` property, deliberately
+- Result rows are returned as plain mappings, deliberately
   retained), which closes a prototype-pollution path.

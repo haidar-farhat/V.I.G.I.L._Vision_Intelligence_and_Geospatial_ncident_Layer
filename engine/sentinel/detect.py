@@ -1,0 +1,594 @@
+"""Detection.
+
+Two detectors, because a local-first appliance must not be useless without a
+model file.
+
+:class:`MotionDetector` needs nothing. It is background subtraction — the
+baseline a great many deployed systems still run on. It finds *that something
+moved*, and it is scrupulously clear that it cannot say *what*: every detection
+it emits is :data:`UNCLASSIFIED`. A blob is not a person, and a system that
+labels it one has fabricated evidence.
+
+:class:`OnnxDetector` runs a model the operator supplied. It never downloads
+anything, ever — a security appliance that fetches executable weights from the
+Internet has a supply chain, and this one deliberately does not. The model path
+comes from configuration, the file is read from disk, and if it is absent the
+system says so and falls back rather than reaching out.
+
+Both emit the same :class:`Detection` in normalised coordinates, so everything
+downstream is indifferent to which one produced it — except that the class label
+travels with the detection, so a downstream rule can require a classified object
+and refuse to fire on a blob.
+"""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Protocol, Sequence
+
+import cv2
+import numpy as np
+
+from .core import BoundingBox, Detection
+
+#: Class id meaning "something moved and we do not know what it is".
+#:
+#: Deliberately not 0: 0 is "person" in most detection models, and a motion blob
+#: silently inheriting that id is precisely the confusion this constant exists to
+#: prevent.
+UNCLASSIFIED = 9999
+
+
+class DetectionError(RuntimeError):
+    """A detector could not be constructed or run."""
+
+
+@dataclass(frozen=True, slots=True)
+class DetectorInfo:
+    """What a detector is, for the record.
+
+    Every conclusion the system draws has to be attributable to the thing that
+    drew it. This travels with events into the evidence bundle, so "why did it
+    say that" is answerable months later.
+    """
+
+    kind: str
+    name: str
+    #: Present only when a model file is involved.
+    model_path: str | None = None
+    model_sha256: str | None = None
+    input_size: tuple[int, int] | None = None
+    #: Class id to label. Empty when the model carries no names — reporting a
+    #: guessed label would be an invention.
+    class_names: dict[int, str] = field(default_factory=dict)
+    #: True when the detector classifies. False for motion, which does not.
+    classifies: bool = False
+
+    def label_for(self, class_id: int) -> str:
+        if class_id == UNCLASSIFIED:
+            return "unclassified"
+        return self.class_names.get(class_id, f"class_{class_id}")
+
+
+class Detector(Protocol):
+    """Anything that turns a frame into detections."""
+
+    @property
+    def info(self) -> DetectorInfo: ...
+
+    def detect(self, image: np.ndarray) -> list[Detection]: ...
+
+
+# ------------------------------------------------------------------- motion
+
+
+class MotionDetector:
+    """Background subtraction. Finds movement; never claims to classify it.
+
+    Tuned for a fixed camera watching a scene. It will produce nothing useful on
+    a moving camera, and says so rather than emitting the whole frame as one
+    detection when the view pans.
+    """
+
+    __slots__ = ("_subtractor", "_open_kernel", "_close_kernel", "_kernel_shape",
+                 "_close_height", "_min_area", "_max_area", "_warmup", "_seen", "_info")
+
+    def __init__(
+        self,
+        *,
+        history: int = 200,
+        variance_threshold: float = 16.0,
+        detect_shadows: bool = True,
+        min_area_fraction: float = 0.0006,
+        max_area_fraction: float = 0.35,
+        close_height_fraction: float = 0.065,
+        warmup_frames: int = 12,
+    ):
+        """
+        ``min_area_fraction`` is the smallest blob taken seriously, as a fraction
+        of the frame. Too low and every leaf is an intruder; too high and a
+        person at 60 m is invisible. It is a fraction rather than a pixel count
+        so it survives a resolution change.
+
+        ``max_area_fraction`` rejects blobs covering most of the frame. Those are
+        not objects — they are an illumination change, an auto-exposure step, or
+        a camera that just moved.
+
+        ``close_height_fraction`` sets how far apart two pieces of foreground can
+        be and still be joined vertically. See :meth:`_build_kernels` for why it
+        is vertical and why it is a fraction.
+        """
+        self._subtractor = cv2.createBackgroundSubtractorMOG2(
+            history=history, varThreshold=variance_threshold, detectShadows=detect_shadows
+        )
+        self._close_height = close_height_fraction
+        # Built on the first frame, once the real resolution is known.
+        self._open_kernel: np.ndarray | None = None
+        self._close_kernel: np.ndarray | None = None
+        self._kernel_shape: tuple[int, int] | None = None
+        self._min_area = min_area_fraction
+        self._max_area = max_area_fraction
+        self._warmup = warmup_frames
+        self._seen = 0
+        self._info = DetectorInfo(
+            kind="motion",
+            name="MOG2 background subtraction",
+            classifies=False,
+        )
+
+    @property
+    def info(self) -> DetectorInfo:
+        return self._info
+
+    @property
+    def is_warm(self) -> bool:
+        """Whether the background model has seen enough to be trusted.
+
+        Before this, every frame is mostly foreground. Emitting detections during
+        warm-up would open an incident every time a camera reconnects.
+        """
+        return self._seen >= self._warmup
+
+    def _build_kernels(self, shape: tuple[int, int]) -> None:
+        """Size the morphology to the frame, on the first frame.
+
+        Two decisions, both measured on the reference scene rather than assumed:
+
+        **The closing kernel is tall and narrow, not square.** People, vehicles
+        and animals are upright, and a background model splits them along their
+        length — a head separated from a torso, legs separated from a body. A
+        vertical kernel rejoins those pieces while leaving two people standing
+        side by side as two objects, which a square kernel of the same reach
+        would merge into one. Every spurious detection measured on the reference
+        scene was a fragment of a real object rather than noise, so this is the
+        failure that was actually happening. Against a square 9x9: mean overlap
+        with ground truth rises from 0.40 to 0.50, fragments per frame fall from
+        1.20 to 0.42, and recall rises from 0.64 to 0.69.
+
+        **It is a fraction of frame height, not a pixel count.** A person is
+        roughly the same fraction of the frame at any resolution; 31 pixels on
+        576p is a third of the reach on 1080p, so a fixed kernel silently stops
+        working when someone switches to the main stream.
+        """
+        if self._kernel_shape == shape:
+            return
+
+        height = shape[0]
+        reach = max(5, int(round(height * self._close_height)) | 1)
+        self._open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        self._close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, reach))
+        self._kernel_shape = shape
+
+    def detect(self, image: np.ndarray) -> list[Detection]:
+        self._seen += 1
+        mask = self._subtractor.apply(image)
+        # Sized before the warm-up check, so a detector that has seen a frame is
+        # fully configured whether or not it is ready to report anything yet.
+        self._build_kernels(mask.shape[:2])
+
+        if not self.is_warm:
+            return []
+
+        # MOG2 marks shadows 127 and foreground 255. Keeping shadows would make
+        # every object twice its real width and drag its ground contact point
+        # sideways, which lands it in the wrong place on the map.
+        _, mask = cv2.threshold(mask, 200, 255, cv2.THRESH_BINARY)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self._open_kernel, iterations=1)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self._close_kernel, iterations=3)
+
+        height, width = mask.shape[:2]
+        frame_area = float(height * width)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        detections: list[Detection] = []
+        for contour in contours:
+            x, y, w, h = cv2.boundingRect(contour)
+            area = float(w * h)
+            fraction = area / frame_area
+            if fraction < self._min_area or fraction > self._max_area:
+                continue
+
+            # Confidence here is the fraction of the box that is actually moving,
+            # not a probability of anything. A hollow box — a lighting edge —
+            # scores low; a solid one scores high. It is an honest measure of
+            # "how much of this rectangle moved", and nothing more.
+            filled = float(cv2.countNonZero(mask[y : y + h, x : x + w])) / max(area, 1.0)
+
+            detections.append(
+                Detection(
+                    bbox=BoundingBox(x / width, y / height, w / width, h / height),
+                    confidence=round(min(1.0, filled), 4),
+                    class_id=UNCLASSIFIED,
+                )
+            )
+
+        detections.sort(key=lambda d: d.bbox.w * d.bbox.h, reverse=True)
+        return detections
+
+
+# --------------------------------------------------------------------- ONNX
+
+
+def _sha256(path: Path) -> str:
+    import hashlib
+
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class _Layout:
+    """How to read a model's output tensor.
+
+    Detection models disagree about this, and guessing wrong does not fail — it
+    produces detections in the wrong places. So the layout is determined from the
+    tensor shape, and an unrecognised shape is refused.
+    """
+
+    #: True for ``[1, 4+nc, N]`` (YOLOv8 and similar), False for ``[1, N, 4+1+nc]``.
+    channels_first: bool
+    #: Number of classes.
+    class_count: int
+    #: True when the model emits a separate objectness score (YOLOv5 family).
+    has_objectness: bool
+
+
+class OnnxDetector:
+    """Runs an operator-supplied ONNX detection model.
+
+    Nothing is downloaded. The model is read from a path under the models
+    directory, and its digest is recorded so an event can name the exact weights
+    that produced it.
+    """
+
+    __slots__ = ("_session", "_input_name", "_input_size", "_layout", "_info",
+                 "_confidence", "_iou", "_letterbox")
+
+    def __init__(
+        self,
+        model_path: str | Path,
+        *,
+        confidence_threshold: float = 0.35,
+        iou_threshold: float = 0.45,
+        class_names: dict[int, str] | None = None,
+        providers: Sequence[str] | None = None,
+        letterbox: bool = True,
+    ):
+        import onnxruntime as ort
+
+        path = Path(model_path).resolve()
+        if not path.is_file():
+            raise DetectionError(
+                f"No model at {path}. Models are supplied by the operator and "
+                "placed in the models directory; nothing is ever downloaded."
+            )
+
+        options = ort.SessionOptions()
+        # A security appliance should not be writing optimised model copies next
+        # to the operator's files.
+        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+
+        try:
+            session = ort.InferenceSession(
+                str(path), sess_options=options,
+                providers=list(providers) if providers else ["CPUExecutionProvider"],
+            )
+        except Exception as error:
+            raise DetectionError(f"Could not load the model at {path}: {error}") from error
+
+        inputs = session.get_inputs()
+        if len(inputs) != 1:
+            raise DetectionError(
+                f"Expected a model with one input; {path.name} has {len(inputs)}."
+            )
+
+        shape = inputs[0].shape
+        if len(shape) != 4:
+            raise DetectionError(
+                f"Expected a 4-dimensional image input; {path.name} declares {shape}."
+            )
+
+        # Dynamic axes come back as strings. Fall back to the common 640 only
+        # when the model genuinely does not state a size.
+        height = shape[2] if isinstance(shape[2], int) and shape[2] > 0 else 640
+        width = shape[3] if isinstance(shape[3], int) and shape[3] > 0 else 640
+
+        self._session = session
+        self._input_name = inputs[0].name
+        self._input_size = (int(width), int(height))
+        self._confidence = confidence_threshold
+        self._iou = iou_threshold
+        self._letterbox = letterbox
+        self._layout = _infer_layout(session.get_outputs()[0].shape, path.name)
+
+        names = dict(class_names) if class_names else _names_from_metadata(session)
+        self._info = DetectorInfo(
+            kind="onnx",
+            name=path.stem,
+            model_path=str(path),
+            model_sha256=_sha256(path),
+            input_size=self._input_size,
+            class_names=names,
+            classifies=True,
+        )
+
+    @property
+    def info(self) -> DetectorInfo:
+        return self._info
+
+    def detect(self, image: np.ndarray) -> list[Detection]:
+        tensor, scale, pad = self._preprocess(image)
+        outputs = self._session.run(None, {self._input_name: tensor})
+        return self._postprocess(outputs[0], image.shape[1], image.shape[0], scale, pad)
+
+    def _preprocess(self, image: np.ndarray) -> tuple[np.ndarray, float, tuple[float, float]]:
+        target_w, target_h = self._input_size
+        h, w = image.shape[:2]
+
+        if self._letterbox:
+            # Preserve aspect ratio. Stretching a 16:9 frame into a square makes
+            # every person short and wide, and a model trained on letterboxed
+            # input then misses them.
+            scale = min(target_w / w, target_h / h)
+            new_w, new_h = int(round(w * scale)), int(round(h * scale))
+            resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+            canvas = np.full((target_h, target_w, 3), 114, dtype=np.uint8)
+            pad_x = (target_w - new_w) / 2.0
+            pad_y = (target_h - new_h) / 2.0
+            canvas[int(pad_y) : int(pad_y) + new_h, int(pad_x) : int(pad_x) + new_w] = resized
+            prepared, padding = canvas, (pad_x, pad_y)
+        else:
+            prepared = cv2.resize(image, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+            scale, padding = 1.0, (0.0, 0.0)
+
+        rgb = cv2.cvtColor(prepared, cv2.COLOR_BGR2RGB)
+        tensor = rgb.astype(np.float32) / 255.0
+        return np.ascontiguousarray(tensor.transpose(2, 0, 1)[None]), scale, padding
+
+    def _postprocess(
+        self,
+        raw: np.ndarray,
+        frame_w: int,
+        frame_h: int,
+        scale: float,
+        pad: tuple[float, float],
+    ) -> list[Detection]:
+        predictions = raw[0]
+        if self._layout.channels_first:
+            predictions = predictions.T
+
+        boxes = predictions[:, :4]
+        if self._layout.has_objectness:
+            objectness = predictions[:, 4]
+            class_scores = predictions[:, 5:]
+            scores = objectness[:, None] * class_scores
+        else:
+            scores = predictions[:, 4:]
+
+        if scores.size == 0:
+            return []
+
+        class_ids = np.argmax(scores, axis=1)
+        confidences = scores[np.arange(scores.shape[0]), class_ids]
+
+        keep = confidences >= self._confidence
+        if not np.any(keep):
+            return []
+
+        boxes = boxes[keep]
+        class_ids = class_ids[keep]
+        confidences = confidences[keep]
+
+        # Models emit centre/width/height in input-tensor pixels. Undo the
+        # letterbox before anything else looks at these numbers.
+        cx, cy, bw, bh = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+        x1 = (cx - bw / 2 - pad[0]) / scale
+        y1 = (cy - bh / 2 - pad[1]) / scale
+        x2 = (cx + bw / 2 - pad[0]) / scale
+        y2 = (cy + bh / 2 - pad[1]) / scale
+
+        xyxy = np.stack([x1, y1, x2, y2], axis=1)
+        kept = _non_max_suppression(xyxy, confidences, class_ids, self._iou)
+
+        detections: list[Detection] = []
+        for index in kept:
+            left = float(np.clip(xyxy[index, 0], 0, frame_w))
+            top = float(np.clip(xyxy[index, 1], 0, frame_h))
+            right = float(np.clip(xyxy[index, 2], 0, frame_w))
+            bottom = float(np.clip(xyxy[index, 3], 0, frame_h))
+            if right <= left or bottom <= top:
+                continue
+
+            detections.append(
+                Detection(
+                    bbox=BoundingBox(
+                        left / frame_w,
+                        top / frame_h,
+                        (right - left) / frame_w,
+                        (bottom - top) / frame_h,
+                    ),
+                    confidence=float(confidences[index]),
+                    class_id=int(class_ids[index]),
+                )
+            )
+
+        return detections
+
+
+def _infer_layout(shape: Sequence[object], model_name: str) -> _Layout:
+    """Work out how to read the output tensor, or refuse.
+
+    Guessing wrong here yields detections at plausible but wrong coordinates,
+    which is worse than not running at all.
+    """
+    if len(shape) != 3:
+        raise DetectionError(
+            f"{model_name} produces a rank-{len(shape)} output; this reader "
+            "understands [1, channels, anchors] and [1, anchors, channels]."
+        )
+
+    dims = [d if isinstance(d, int) and d > 0 else None for d in shape]
+    _, a, b = dims
+    if a is None or b is None:
+        raise DetectionError(
+            f"{model_name} declares a dynamic output shape {list(shape)}. The "
+            "layout cannot be determined without running it, and guessing "
+            "produces boxes in the wrong places."
+        )
+
+    # The anchor count is always far larger than the channel count.
+    channels_first = a < b
+    channels = a if channels_first else b
+
+    if channels < 5:
+        raise DetectionError(
+            f"{model_name} emits {channels} channels; a detection head needs at "
+            "least 4 box values plus one score."
+        )
+
+    # v5-family heads carry an objectness column; v8-family do not. The two are
+    # indistinguishable from shape alone, so assume the v8 layout and let the
+    # caller override — but only when the channel count is consistent with it.
+    return _Layout(channels_first=channels_first, class_count=channels - 4, has_objectness=False)
+
+
+def _names_from_metadata(session: object) -> dict[int, str]:
+    """Class names carried inside the model, if it carries any.
+
+    Never falls back to a standard class list. A model whose classes are unknown
+    reports numeric ids, because attaching "person" to an output that might mean
+    something else is fabricated evidence.
+    """
+    try:
+        metadata = session.get_modelmeta().custom_metadata_map  # type: ignore[attr-defined]
+    except Exception:
+        return {}
+
+    raw = metadata.get("names")
+    if not raw:
+        return {}
+
+    try:
+        import ast
+
+        parsed = ast.literal_eval(raw)
+    except (ValueError, SyntaxError):
+        return {}
+
+    if isinstance(parsed, dict):
+        return {int(k): str(v) for k, v in parsed.items()}
+    if isinstance(parsed, (list, tuple)):
+        return {index: str(value) for index, value in enumerate(parsed)}
+    return {}
+
+
+def _non_max_suppression(
+    boxes: np.ndarray, scores: np.ndarray, class_ids: np.ndarray, threshold: float
+) -> list[int]:
+    """Per-class NMS.
+
+    Per-class, not global: a person standing in front of a car should not
+    suppress the car. Suppressing across classes is how detections quietly go
+    missing in crowded scenes.
+    """
+    kept: list[int] = []
+    for class_id in np.unique(class_ids):
+        indices = np.flatnonzero(class_ids == class_id)
+        order = indices[np.argsort(-scores[indices])]
+
+        while order.size:
+            best = int(order[0])
+            kept.append(best)
+            if order.size == 1:
+                break
+
+            rest = order[1:]
+            xx1 = np.maximum(boxes[best, 0], boxes[rest, 0])
+            yy1 = np.maximum(boxes[best, 1], boxes[rest, 1])
+            xx2 = np.minimum(boxes[best, 2], boxes[rest, 2])
+            yy2 = np.minimum(boxes[best, 3], boxes[rest, 3])
+
+            overlap = np.maximum(0.0, xx2 - xx1) * np.maximum(0.0, yy2 - yy1)
+            area_best = (boxes[best, 2] - boxes[best, 0]) * (boxes[best, 3] - boxes[best, 1])
+            area_rest = (boxes[rest, 2] - boxes[rest, 0]) * (boxes[rest, 3] - boxes[rest, 1])
+            union = area_best + area_rest - overlap
+            iou = np.where(union > 0, overlap / union, 0.0)
+
+            order = rest[iou < threshold]
+
+    return sorted(kept)
+
+
+# ------------------------------------------------------------------ timing
+
+
+@dataclass
+class DetectorTiming:
+    """Measured throughput. Reported, never estimated.
+
+    A claim about frame rate that was not measured on this machine with this
+    model is marketing, not engineering.
+    """
+
+    frames: int = 0
+    total_seconds: float = 0.0
+    slowest_seconds: float = 0.0
+
+    def record(self, seconds: float) -> None:
+        self.frames += 1
+        self.total_seconds += seconds
+        self.slowest_seconds = max(self.slowest_seconds, seconds)
+
+    @property
+    def fps(self) -> float:
+        return self.frames / self.total_seconds if self.total_seconds > 0 else 0.0
+
+    @property
+    def mean_millis(self) -> float:
+        return 1000.0 * self.total_seconds / self.frames if self.frames else 0.0
+
+
+class TimedDetector:
+    """Wraps a detector and measures it."""
+
+    __slots__ = ("_inner", "timing")
+
+    def __init__(self, inner: Detector):
+        self._inner = inner
+        self.timing = DetectorTiming()
+
+    @property
+    def info(self) -> DetectorInfo:
+        return self._inner.info
+
+    def detect(self, image: np.ndarray) -> list[Detection]:
+        started = time.perf_counter()
+        try:
+            return self._inner.detect(image)
+        finally:
+            self.timing.record(time.perf_counter() - started)

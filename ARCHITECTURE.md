@@ -35,8 +35,8 @@ These are non-negotiable. Any change that violates one is a defect, not a trade-
 
 | # | Invariant | Enforced by |
 |---|-----------|-------------|
-| I1 | **Zero WAN.** No feature may require Internet access. No silent online fallback. | `packages/security` egress guard; `NETWORK ISOLATION` diagnostic; acceptance test with WAN blocked |
-| I2 | **Secrets never leave the vault.** Camera/node credentials never appear in logs, DB tables, API payloads, URLs, or errors. | `packages/security` `Secret<T>` wrapper + redaction; credential-leak tests |
+| I1 | **Zero WAN.** No feature may require Internet access. No silent online fallback. | CI offline job: drops all outbound traffic, proves the drop took effect, runs every suite; test asserting the map view references no URL or HTTP client |
+| I2 | **Secrets never leave the vault.** Camera/node credentials never appear in logs, DB tables, API payloads, URLs, or errors. | A URL's password is held in one place and redacted for every other purpose; tests assert it is unreachable through `repr`, `str`, display URL, source id and every error message, including its length |
 | I3 | **No AI claim without evidence.** Every AI statement carries evidence IDs, model ID, prompt version, confidence. | evidence-bound analyst contract; `OBSERVED / INFERRED / UNKNOWN` partition |
 | I4 | **Graceful degradation.** Loss of GPU, AI, DB, control node, or map never stops recording. | failure matrix (section 16); chaos tests |
 | I5 | **Bounded resources.** Every queue is bounded; every retry is backed off; no unbounded growth. | `BoundedQueue` with explicit drop policy; backoff utility |
@@ -83,48 +83,44 @@ Nothing crosses the WAN boundary. Ever. See section 13.
 
 ```
 +-----------------------------------------------------------------------------+
-|                            apps/desktop  (Tauri)                            |
-|  +------------------------------+   +------------------------------------+  |
-|  |  React + TypeScript UI       |   |  Rust shell                        |  |
-|  |  command . cameras . map     |<->|  keychain . fs . tray . notify     |  |
-|  |  events . incidents . nodes  |IPC|  service lifecycle . single-inst.   |  |
-|  +------------------------------+   +------------------------------------+  |
+|                        apps/console   (PySide6, native)                     |
+|   camera view . plan view . track table . placement . no embedded browser    |
 +-------------------------------+---------------------------------------------+
-                                | REST (config) + WebSocket (realtime)
+                                | in-process today; REST + WebSocket when the
+                                | control plane is rebuilt
 +-------------------------------v---------------------------------------------+
-|                             services/api                                    |
-|   authn/authz . versioned REST . WS hub . rate limits . audit sink          |
-+---+--------------+---------------+------------------+----------------------+
-    |              |               |                  |
-+---v------+  +----v--------+  +---v----------+  +----v---------+
-| database |  |event-engine |  |  recorder    |  | node registry|
-|migrations|  |rules.correl.|  |segmented mp4 |  | pairing.hb   |
-|repos     |  |risk.incident|  |retention     |  |              |
-+---^------+  +----^--------+  +---^----------+  +----^---------+
-    |              |               |                  |
-    +--------------+-------+-------+------------------+
-                           |  worker protocol (mTLS, versioned)
-                  +--------v---------+
-                  | services/worker  |   headless, runs without the UI
-                  |  +------------+  |
-                  |  | ingestion  |  |  RTSP/ONVIF/USB/file -> frames
-                  |  | inference  |  |  detector (GPU/CPU) -> detections
-                  |  | tracking   |  |  detections -> tracks
-                  |  | zone eval  |  |  tracks + zones -> observations
-                  |  | buffer     |  |  survives control-node loss
-                  |  +------------+  |
-                  +------------------+
-
-pure, dependency-free, deterministic packages used by everything above:
-  shared-types . protocol . geometry . tracking . ai . maps . security . database . test-utils
+|                         engine  (Python)                                    |
+|   decode . detect . pipeline . orchestration . policy . persistence         |
++-------------------------------+---------------------------------------------+
+                                | C ABI (ctypes) - see 18.1
++-------------------------------v---------------------------------------------+
+|                       core  (Rust, zero dependencies)                       |
+|   geometry . ground projection . field of view . zones . tracking           |
++-----------------------------------------------------------------------------+
 ```
+
+### The split, and why it falls where it does
+
+**Rust holds what runs per detection, per frame, per camera** — projection,
+field-of-view geometry, polygon tests, and the tracker. It is the only code whose
+cost multiplies by camera count and frame rate, and it is also the code where a
+subtle error is hardest to see: bad geometry produces plausible numbers.
+
+**Python holds everything that runs per event, per second, or per operator
+action** — decode orchestration, model execution, rules, correlation,
+persistence, the interface. This is where the system changes most often, and
+where the libraries that matter (OpenCV, onnxruntime, Qt) live.
+
+The dividing line is *rate*, not importance. Anything called at frame rate goes
+below the boundary; anything called at human rate stays above it.
 
 ### Layering rule
 
-Dependencies point **inward**. `packages/*` never import from `services/*` or `apps/*`.
-`services/*` never import from `apps/*`. The pure packages (`geometry`, `tracking`,
-`shared-types`, `protocol`) have **zero third-party runtime dependencies**, so the core
-domain is testable in milliseconds and auditable by reading.
+Dependencies point **downward and never back up**. `core` knows nothing about
+Python. `engine` knows nothing about Qt. The console imports the engine; the
+engine never imports the console. `core` has **no dependencies at all** — for a
+security appliance the dependency list is part of the attack surface, and
+everything in it is arithmetic.
 
 ---
 
@@ -132,27 +128,37 @@ domain is testable in milliseconds and auditable by reading.
 
 ### 5.1 Standalone local mode
 
-One machine, one supervised process tree. Co-located but not merged: components still talk
-over the same protocol they would use across a LAN, on loopback.
+One machine. The console owns the process; analysis runs on its own thread, one
+per camera, and the interface pulls results from it rather than being pushed to.
 
 ```
- sentinel-desktop (Tauri)
-   +-- supervises --> sentinel-api        127.0.0.1:8787   (REST + WS)
-                        +-- database        node:sqlite (embedded, WAL)
-                        +-- event-engine    in-process
-                        +-- recorder        in-process
-                        +-- worker (local)  in-process or child process
+ sentinel-console  (Python + Qt)
+   +-- analysis thread per camera
+   |     decode -> detect -> track -> project        [engine]
+   |                          |
+   |                          +-- sentinel_core      [Rust, in-process]
+   +-- UI thread: repaint timer pulls the newest result
 ```
 
-Works with the network cable physically removed.
+Works with the network cable physically removed. Nothing in this path opens a
+socket except a camera stream.
+
+The threading direction matters and is an architectural decision rather than an
+implementation detail: Qt's queued signal delivery is unbounded, so a pipeline
+producing faster than the display consumes would build a backlog of already-stale
+frames until the process died. The interface therefore takes the newest result on
+a timer, and frames skipped for *drawing* are counted and shown. Nothing is
+skipped from the analysis.
 
 ### 5.2 LAN distributed mode
+
+Designed; not built in the current codebase. See STATUS.md.
 
 ```
                        CONTROL NODE
                  +-----------------------+
-                 | desktop . api . db    |
-                 | event-engine . UI     |
+                 | console . api . db    |
+                 | event-engine          |
                  +-----------+-----------+
                              | mTLS 1.3, pinned node identities
         +--------------------+--------------------+
@@ -163,10 +169,13 @@ Works with the network cable physically removed.
    local buffer         local buffer         local buffer
 ```
 
-Workers are autonomous. If the control node disappears they keep decoding, detecting,
-tracking, recording and generating events into a local durable buffer, and reconcile on
-reconnect (section 9.4). Scale is horizontal: add worker nodes, not bigger constants. There
-is no hard-coded camera limit anywhere in the codebase.
+Workers are autonomous. If the control node disappears they keep decoding,
+detecting, tracking, recording and generating events into a local durable buffer,
+and reconcile on reconnect (section 9.4). Scale is horizontal: add worker nodes,
+not bigger constants. There is no hard-coded camera limit anywhere.
+
+A worker is the `engine` package with no console attached — which is why the
+engine has no Qt dependency and the pipeline is usable without one.
 
 ---
 
@@ -295,14 +304,18 @@ Rules:
             |  SqlDriver     |  interface: exec . query . transaction . migrate
             +---+--------+---+
                 |        |
-     node:sqlite|        |PostgreSQL
+        sqlite3|        |PostgreSQL
      (standalone|        |(multi-node / large deployments)
-      zero deps)|        |
+      stdlib)   |        |
 ```
 
-Standalone uses `node:sqlite` -- embedded, WAL, no daemon, no install, shipped inside Node.
-Serious multi-node deployments point the same driver interface at PostgreSQL. Repository
-code never sees the difference; migrations are authored once in portable SQL.
+Standalone uses SQLite in WAL mode — embedded, transactional, no daemon, no
+install, and in Python's standard library, so a single-machine deployment adds
+nothing to the dependency list. Serious multi-node deployments point the same
+driver interface at PostgreSQL. Repository code never sees the difference;
+migrations are authored once in portable SQL.
+
+Neither is built yet. See STATUS.md.
 
 ---
 
@@ -601,15 +614,49 @@ when, with which software and models -- is preserved and audited.
 
 | Decision | Choice | Why |
 |---|---|---|
-| Desktop shell | Tauri (Rust) + React + TS | native keychain/tray/fs/process control; small offline bundle; Rust for privileged operations |
-| Core language | TypeScript, strict, erasable-syntax-only | one language across UI and services; runs directly on Node's type-stripping loader, so services need no build step |
-| Core dependencies | **zero** third-party runtime deps in pure packages | auditable supply chain for a security product; nothing to phone home; instant tests |
-| Embedded DB | `node:sqlite` | real SQL, WAL, transactional, built into Node -- standalone mode needs no install and no daemon |
+| Hot path | Rust, no dependencies | runs per detection per frame per camera; also the code where an error is hardest to see, because bad geometry produces plausible numbers |
+| Binding | **C ABI via ctypes, not PyO3** | see 18.1 |
+| Orchestration | Python 3.12+ | where the libraries that matter live — OpenCV, onnxruntime — and where the system changes most often |
+| Console | PySide6, native widgets | no embedded browser: a control-room console that ships a browser engine inherits its update cadence, memory profile and network assumptions, for a machine expected to run for months offline |
+| Decode | OpenCV with bundled FFmpeg | one dependency covering files, RTSP and USB, with no subprocess to supervise |
+| Inference | onnxruntime, operator-supplied models | one runtime across CPU and several accelerators; **nothing is ever downloaded** |
+| Baseline detector | MOG2 background subtraction | the system must not be useless without a model file; it is explicit that it cannot classify |
+| Embedded DB | SQLite (`sqlite3`, WAL) | real SQL, transactional, in the standard library — standalone mode needs no install and no daemon |
 | Scale-out DB | PostgreSQL behind the same driver interface | multi-node deployments without rewriting repositories |
-| Map | MapLibre GL + PMTiles, local files | the only mainstream stack that is genuinely offline-capable |
+| Map | local raster/vector packages, no tile server | the only genuinely offline-capable option; the plan view works with no package at all |
 | Realtime | WebSocket, versioned envelopes | the operator UI must reflect state changes immediately |
 | Transport security | mTLS 1.3, pinned node identities | the LAN is hostile |
-| Tests | `node:test` | zero-dependency, runs offline, no runner to configure |
+| Tests | pytest, `cargo test` | offline, no runner to configure |
+
+### 18.1 Why a C ABI rather than PyO3
+
+PyO3 is the obvious choice and it is the wrong one here, for two reasons.
+
+**The build boundary.** The core is built with the GNU toolchain; CPython on
+Windows is built with MSVC. PyO3 links against CPython's ABI, so it inherits that
+mismatch. The C ABI is the C ABI, and it crosses cleanly.
+
+**The runtime lock-in.** A PyO3 module is a Python module and nothing else. A
+cdylib with a C ABI is loadable from anything — a future worker written in
+another language, a diagnostic tool, a test harness. The engine is deliberately
+not welded to one runtime.
+
+The cost is real: struct layouts are maintained by hand on both sides of the
+boundary. That cost is *guarded* rather than absorbed. The core exports the size
+of every struct that crosses, and the Python binding compares each against its
+own declaration and refuses to load on a mismatch. This matters more than it
+sounds: a drifted layout does not crash. It reads the wrong bytes and produces
+geometry that looks entirely reasonable.
+
+Three further rules hold the boundary:
+
+- **Every pointer is checked** before it is dereferenced. A caller's bug must
+  produce a defined failure, not a segfault inside a security appliance.
+- **Every entry point taking a pointer is `unsafe` and carries a `# Safety`
+  contract.** Null-checking cannot establish that a non-null pointer is live, and
+  a function that implies otherwise is lying to its callers.
+- **Panics cannot cross.** The crate is built `panic = "abort"`; unwinding into C
+  is undefined behaviour.
 
 ---
 
@@ -617,54 +664,66 @@ when, with which software and models -- is preserved and audited.
 
 ```
 sentinel-vision/
-+-- apps/desktop/          Tauri shell + React operator UI
-+-- services/
-|   +-- api/               REST + WebSocket, authn/authz, audit sink
-|   +-- worker/            headless edge: ingest -> infer -> track -> observe
-|   +-- inference/         model runtimes + device discovery
-|   +-- recorder/          segmented recording + retention
-|   +-- event-engine/      rules . correlation . risk . incidents
-+-- packages/
-|   +-- shared-types/      domain model, single source of truth
-|   +-- protocol/          versioned wire schemas + validation
-|   +-- geometry/          vectors . polygons . geodesy . FOV . projection . zones
-|   +-- tracking/          track lifecycle + association
-|   +-- ai/                model abstraction, registry, analyst contract
-|   +-- database/          driver interface . migrations . repositories
-|   +-- security/          Secret<T> . redaction . egress guard . authz . audit
-|   +-- test-utils/        deterministic clock, seeded RNG, fixtures
-+-- simulator/             synthetic cameras, actors, scenarios, chaos
++-- core/                  Rust engine core - the hot path, zero dependencies
+|   +-- src/geometry.rs      geodesy . projection . field of view . polygons
+|   +-- src/tracking.rs      track lifecycle . association . motion
+|   +-- src/ffi.rs           the C ABI
++-- engine/                Python engine
+|   +-- sentinel/core.py     ctypes bindings; struct-layout guard
+|   +-- sentinel/decode.py   decode . credential redaction . live streams
+|   +-- sentinel/detect.py   motion + ONNX detectors
+|   +-- sentinel/pipeline.py decode -> detect -> track -> project
++-- apps/console/          PySide6 operator console - native, no webview
 +-- models/                operator-imported model artifacts (never committed)
 +-- map-data/              operator-imported offline map packages (never committed)
-+-- scripts/               dev up/down/test/lint/typecheck/build/simulator
 +-- infrastructure/        packaging + deployment
 +-- docs/                  DEVELOPMENT SECURITY PROTOCOL DATABASE AI MAPS DEPLOYMENT TESTING
++-- tasks.py               build . lint . test . run, identical on every platform
 ```
+
+Components described in sections 9 through 15 but absent from this tree — the
+API, worker protocol, event engine, recorder, map import — are designed and
+documented, not built. STATUS.md is the authority on which is which.
 
 ---
 
 ## 20. Implementation phases
 
-| Phase | Scope |
-|---|---|
-| 1 | repo, CI, domain models, database, API, desktop shell |
-| 2 | camera discovery, RTSP ingestion, camera management, live view |
-| 3 | detector, tracking, GPU pipeline |
-| 4 | zones, rules, events |
-| 5 | map, geospatial placement, FOV |
-| 6 | multi-camera correlation, topology graph |
-| 7 | incident engine, replay, evidence |
-| 8 | LAN workers, node pairing, distributed inference |
-| 9 | local LLM/VLM, AI incident analyst |
-| 10 | hardening, tests, offline packaging, documentation |
+| Phase | Scope | State |
+|---|---|---|
+| 1 | engine core, bindings, build, CI | done |
+| 2 | decode, detection, tracking, projection on real video | done |
+| 3 | native console: camera view, plan view, evidence table | done |
+| 4 | real detection model, measured on real footage | next |
+| 5 | zones, rules, events, persistence | |
+| 6 | multi-camera correlation, topology graph | |
+| 7 | incident engine, replay, evidence export | |
+| 8 | camera discovery, RTSP against physical hardware | |
+| 9 | LAN workers, node pairing, distributed inference | |
+| 10 | AI incident analyst | |
+| 11 | hardening, offline packaging, deployment | |
 
-The first executable milestone is the **vertical slice** -- one thin path through every layer:
+The first executable milestone was the **vertical slice** — one thin path through
+every layer that existed:
 
 ```
- synthetic camera -> decode -> detect -> track -> zone crossing -> event
- -> correlation -> incident -> notification -> map marker -> evidence replay -> export
+ real video file -> decode -> detect -> track -> ground projection -> map
 ```
 
-The slice exists to prove the seams between subsystems, not to be feature-complete.
-Per-subsystem implementation state is tracked honestly in [STATUS.md](STATUS.md); a UI
-existing never counts as a feature being complete.
+That slice runs today, on a real encoded file through a real decoder, with no
+mocks in the path. Its purpose was to prove the seams between subsystems rather
+than to be feature-complete, and what it proved most usefully was where the seams
+leaked: the vertical morphology kernel, the elliptical association gate, the
+three-state motion model, and OpenCV's unbypassable RTSP timeout were all found
+by building it rather than by designing it.
+
+The full spine — correlation, risk, incident, evidence — remains the target:
+
+```
+ VIDEO -> DETECTION -> TRACKING -> SPATIAL CONTEXT -> TEMPORAL CONTEXT
+       -> EVENT ANALYSIS -> MULTI-CAMERA CORRELATION -> RISK SCORING
+       -> HUMAN REVIEW -> INCIDENT
+```
+
+Per-subsystem implementation state is tracked honestly in [STATUS.md](STATUS.md);
+a UI existing never counts as a feature being complete.

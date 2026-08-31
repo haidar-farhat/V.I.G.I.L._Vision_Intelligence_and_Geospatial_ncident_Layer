@@ -1,13 +1,7 @@
-# dependencies
-node_modules/
-.pnpm-store/
-
 # build output
 dist/
 build/
 out/
-*.tsbuildinfo
-apps/desktop/src-tauri/target/
 
 # runtime data - never commit operational data or evidence
 data/
@@ -49,3 +43,14 @@ Thumbs.db
 
 # desktop build output
 apps/desktop/dist/
+
+# Rust build output
+core/target/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/

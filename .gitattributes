@@ -11,3 +11,6 @@
 *.gguf binary
 *.mp4 binary
 *.mkv binary
+*.dll binary
+*.so binary
+*.dylib binary

@@ -1,0 +1,20 @@
+[project]
+name = "sentinel-console"
+version = "0.1.0"
+description = "Sentinel Vision operator console. Native Qt widgets, no embedded browser."
+requires-python = ">=3.12"
+dependencies = [
+    "PySide6>=6.7",
+    "sentinel-engine",
+]
+
+# PySide6 only. No QtWebEngine, and nothing that would pull one in: shipping a
+# browser engine in a control-room console means inheriting its update cadence,
+# its memory profile and its network assumptions.
+
+[project.scripts]
+sentinel-console = "sentinel_console.app:run"
+
+[build-system]
+requires = ["setuptools>=70"]
+build-backend = "setuptools.build_meta"

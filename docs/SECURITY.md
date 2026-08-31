@@ -1,5 +1,12 @@
 # Security
 
+> **Status:** the controls implemented today are credential redaction (tested
+> through every escape route, including leaking a password's length) and the
+> zero-WAN guarantee (enforced by the CI offline job, which proves the network is
+> actually blocked before running). Authentication, authorisation, audit, mTLS
+> pairing, keychain storage and the egress guard are designed here and not built —
+> **no secret is persisted at all today**. See [STATUS.md](../STATUS.md).
+
 ## Threat model
 
 The system holds continuous video of a physical site, the credentials to every
@@ -84,7 +91,7 @@ anything outside the private ranges. Notably, a public DNS name is reported as
 because resolution itself would require the Internet. Both are refused; they are
 simply not conflated.
 
-`npm run lint` fails the build on a cloud SDK import, an analytics package, or a
+The CI offline job fails the build on a cloud SDK import, an analytics package, or a
 hard-coded external URL anywhere in the source.
 
 The error message when a connection is refused explains the design decision

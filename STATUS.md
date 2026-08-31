@@ -13,165 +13,210 @@ this one operates in. Every capability carries one of five states:
 | `PRODUCTION-READY` | Tested, hardened, documented, and exercised against real hardware. |
 
 **Nothing in this repository is `PRODUCTION-READY`.** No part of this system has
-been run against a physical IP camera, a GPU, or a multi-machine LAN. Everything
-below marked `TESTED` is tested against the simulator and unit fixtures, which is
-a real bar but not the same bar.
+been run against a physical IP camera, a GPU, a real detection model, or a
+multi-machine LAN. Everything marked `TESTED` is tested against generated
+fixtures, which is a real bar but not the same bar.
 
-Last updated at the end of Phase 5 (map, geospatial placement, FOV). Current
-suite: **481 tests**,
-clean typecheck under `strict` + `noUncheckedIndexedAccess`, clean architectural
-lint.
+**The codebase was rewritten in Python and Rust.** The previous TypeScript
+implementation was removed in `582d0a8`; its architecture documents were kept
+because the thinking in them carried over, and are being brought up to date.
+Anything below that is not yet re-established after the rewrite says so.
 
----
-
-## Core domain
-
-| Capability | State | Notes |
-|---|---|---|
-| Domain model (`shared-types`) | `TESTED` | Branded ids, closed vocabularies, geo types. Compiler rejects a `CameraId` where an `IncidentId` is wanted. |
-| Local tangent-plane geodesy | `TESTED` | Agrees with haversine to under a centimetre at site scale. |
-| Polygon predicates | `TESTED` | Point-in-polygon, area, centroid, segment intersection, corridor distance. |
-| Ground projection + uncertainty | `TESTED` | Uncertainty derived from the real error derivative; unprojectable rays return null rather than a guess. |
-| Inverse projection (world to image) | `TESTED` | Round-trips to sub-centimetre. Lets the simulator drive production code. |
-| Field-of-view footprint | `TESTED` | Annular sector, excluding the blind foreground under a tilted camera. |
-| Zone engine | `TESTED` | Polygon, rectangle, circle, corridor, tripwire. Enter/exit/dwell/cross without boundary chatter. |
-| Tracker | `TESTED` | Survives detection gaps; IoU plus a size-scaled proximity gate. Deterministic. |
-| Cross-camera association | `TESTED` | Topology-aware scoring with reasons. Physically impossible hand-offs rejected outright. |
-| Rule engine | `TESTED` | Structured rules only, never executable code. Rejections report why. |
-| Risk scoring | `TESTED` | Additive, every point attributable to a stated reason. |
-| Event correlation and incidents | `TESTED` | Three cameras seeing one person produce one incident. Transitive association chains. |
-| AI analyst contract + guardrails | `TESTED` | Citations validated against the supplied bundle; prohibited claims refused. |
-| Deterministic analyst | `TESTED` | Grounded by construction. Works with no model installed. |
-| Secret handling | `TESTED` | `Secret<T>` redacts through every serialisation path; 24 tests assert no leak. |
-| Egress guard (zero WAN) | `TESTED` | Address classification and refusal. Public DNS names refused, not resolved. |
-| Authorization + rate limits + replay guard | `TESTED` | Permission-based checks; per-key limits; nonce + timestamp window. |
-| Database driver + migrations | `TESTED` | `node:sqlite`, savepoint nesting, checksummed reversible migrations. |
-| Schema | `TESTED` | Full ERD. Tests assert no credential column and no position without uncertainty. |
-| Simulator (cameras, actors, scenarios) | `TESTED` | Seeded and reproducible. Drives the production pipeline, not a mock. |
-| Worker camera pipeline | `TESTED` | Detections to tracks to zone observations. |
-| Architectural lint | `TESTED` | Layering, zero-WAN, secrets, placeholders, erasable syntax. |
-
-## Vertical slice
-
-| Capability | State | Notes |
-|---|---|---|
-| Synthetic camera to incident, end to end | `TESTED` | 1 CRITICAL incident from 9 events across 3 cameras; mean position error 0.52 m; 100% of errors inside the stated uncertainty. |
-| Evidence-bound incident report | `TESTED` | Generated and validated within the slice run. |
-| Quiet-site behaviour | `TESTED` | An empty site raises nothing. |
-| Determinism across runs | `TESTED` | Same seed reproduces identical event and incident ids. |
-
-## Camera discovery and ingestion (Phase 2)
-
-| Capability | State | Notes |
-|---|---|---|
-| Bounded queues and backpressure | `TESTED` | Ring buffer with per-queue drop policy. Frames drop oldest; events refuse rather than lose evidence. |
-| Bounded exponential backoff | `TESTED` | Full jitter, so cameras that dropped together do not retry in lockstep. Abortable mid-wait. |
-| SDP parsing | `TESTED` | Bounded against hostile input; reports what it could not parse instead of failing a working camera. |
-| RTSP Digest/Basic authentication | `TESTED` | RFC 7616. Unimplemented algorithms refused rather than downgraded. Basic is opt-in. |
-| RTSP control client | `TESTED` | Full OPTIONS/DESCRIBE/SETUP/PLAY/TEARDOWN handshake with keep-alive, against a mock camera that misbehaves the way real ones do. |
-| ONVIF WS-Discovery | `TESTED` | Link-local multicast, probes every private interface. Parser tested; the multicast send path has no physical device to answer it. |
-| SOAP + WS-Security | `TESTED` | UsernameToken PasswordDigest. Bounded extractor rather than an XML parser; DTDs refused. |
-| ONVIF device/media client | `TESTED` | Device info, capabilities, profiles, stream URI. Credentials stripped from returned URIs. |
-| Camera connection test | `TESTED` | The onboarding wizard's verification step. Every failure carries a remedy, enforced by test. |
-| Camera persistence | `TESTED` | Cameras, profiles, topology edges. No column can hold a credential. |
-| Supervised video source | `TESTED` | Reconnect with backoff, flapping detection, honest DEGRADED vs OFFLINE, decoder boundary. |
-| Video decode (H.264/H.265) | `PLANNED` | The `Decoder` interface is defined and the supervisor is tested against a stub. No FFmpeg implementation is written - see the gaps below. |
-| Live view rendering | `PLANNED` | Requires decode. |
-
-## Map and geospatial placement (Phase 5)
-
-| Capability | State | Notes |
-|---|---|---|
-| PMTiles v3 reading | `TESTED` | Header and metadata, with every declared region checked against the real file length before any read. Tests build genuine archives, not stubs. |
-| Map style validation | `TESTED` | Every URL a style can carry, including ones buried in a layer property, checked against the private ranges and the package's own file listing. |
-| Map package import | `TESTED` | Content-addressed id, integrity hash, path-traversal refusal, warnings for coarse zoom and for style layers the archive lacks. |
-| Map package persistence | `TESTED` | Install, list, set default, remove. Removing the default promotes the most detailed remaining package. |
-| Camera coverage analysis | `TESTED` | Deterministic grid sampling against the real annular footprint. Reports covered, redundant, partial or blind, with the blind points themselves. |
-| Camera placement UI | `IMPLEMENTED` | Live pose editing with footprints and blind spots recomputed in the browser by the production geometry. Verified in a headless browser. Not persisted - no API. |
-| Map rendering | `IMPLEMENTED` | Cameras, footprints, zones, events and blind spots. Reports `OFFLINE MAP DATA NOT INSTALLED` and never fetches tiles. |
-| Tile rendering from a package | `PLANNED` | The reader and validator exist; wiring an imported archive into MapLibre as a source does not. |
-| Zone drawing on the map | `PLANNED` | Zones render and are analysed; drawing and editing them by hand is not built. |
-
-## Not yet built
-
-Everything below is designed in [ARCHITECTURE.md](ARCHITECTURE.md) and has no
-working implementation. Listed explicitly so the gap is visible rather than
-inferred from silence.
-
-| Capability | State | Notes |
-|---|---|---|
-| REST API + WebSocket hub (`services/api`) | `PLANNED` | Contracts specified in docs/PROTOCOL.md; no server yet. |
-| Desktop shell (Tauri, Rust) | `SKELETON` | Manifest, config and keychain command surface written. **Never compiled** - no Rust toolchain was available in this environment. |
-| Operator UI (React) | `IMPLEMENTED` | Command centre, map, timeline and analysis panels render real pipeline output; verified in a headless browser with zero console errors and zero network requests. Reads a generated snapshot, not a live API. |
-| ONVIF Profile T events | `PLANNED` | Discovery, device and media services are implemented; the event service is not. |
-| Real detector (YOLO-family, ONNX/TensorRT) | `PLANNED` | `Detector` interface and model registry exist; only the simulated detector is implemented. |
-| GPU device discovery | `SKELETON` | `selectDevice` chooses among reported devices; nothing enumerates real hardware yet. |
-| VLM integration | `PLANNED` | Interface defined; no runtime. |
-| Local LLM analyst | `PLANNED` | `AnalystEngine` interface is satisfied by the deterministic engine; no LLM client. |
-| Recording + segmentation | `PLANNED` | Schema and retention policy exist; no recorder. |
-| Evidence export + manifest | `PLANNED` | Format specified; not implemented. |
-| LAN discovery (mDNS) | `PLANNED` | Protocol chosen; not implemented. |
-| Node pairing + mTLS | `PLANNED` | Flow specified in ARCHITECTURE.md section 9.3; no implementation. |
-| Worker buffering + reconciliation | `PLANNED` | Deterministic event ids make replay idempotent, which is the hard half; the buffer itself is not written. |
-| OS keychain integration | `PLANNED` | `CredentialsRef` indirection exists throughout; no platform binding. |
-| Authentication (login, sessions) | `PLANNED` | Password hash column and permission model exist; no auth flow. |
-| Audit log writes | `SKELETON` | Table and record type exist; nothing writes to them yet. |
-| PTZ control | `PLANNED` | Permission and confirmation model exist; no ONVIF PTZ. |
-| Alerting (desktop, audible, webhook) | `PLANNED` | |
-| Incident replay (synchronised playback) | `PLANNED` | Timeline data exists and is ordered; no player. |
-| Search + natural-language retrieval | `PLANNED` | |
-| Backup / restore | `PLANNED` | |
-| Packaging + offline updates | `PLANNED` | |
-| Internationalisation (EN/FR/AR, RTL) | `PLANNED` | The React UI hard-codes English throughout and would need extracting before any of this starts. Domain code emits structured codes rather than prose, so the event and risk vocabularies are already translatable. |
-| Chaos + network partition tests | `PLANNED` | Simulator hooks exist for camera dropout only. |
+Current suite: **331 tests** — 44 Rust, 247 engine, 40 console. `cargo fmt` and
+`clippy -D warnings` clean. Run everything with `python tasks.py check`.
 
 ---
+
+## Engine core (Rust)
+
+Geometry, projection, zones and tracking, behind a C ABI.
+
+| Capability | State | Notes |
+|---|---|---|
+| Ground projection with uncertainty | `TESTED` | `d = h/tan(θ)`. Uncertainty is 1σ and grows super-linearly toward the horizon. An unprojectable ray returns nothing — never a clamped guess. |
+| Field-of-view footprint | `TESTED` | An annular sector. A tilted camera is blind at its own mast, and the geometry says so rather than drawing a pie slice. |
+| Coverage test (`camera_sees`) | `TESTED` | Bounded by the vertical field of view, not only the stated range — a camera claiming 90 m may cover 7 m to 19 m. |
+| Point-in-polygon zones | `TESTED` | Does not chatter on an edge; a degenerate ring contains nothing. |
+| Multi-object tracking | `TESTED` | Constant-velocity prediction, globally-sorted greedy association, two-tier scoring. |
+| Anisotropic association gate | `TESTED` | An ellipse, not a circle: vertical image motion is depth, so the vertical axis is the tight one. See "measured behaviour" below. |
+| Motion (speed, heading) | `TESTED` | Three states, not two: unknown, standing still, moving. Speed is withheld until it spans 1.2 s, because dividing a distance by one frame interval amplifies position error fivefold. |
+| Uncertainty-aware zones | `TESTED` | Three states again: inside, outside, and *uncertain* when the position's own error disc straddles the boundary. |
+| C ABI | `TESTED` | Every entry point checks its pointers, is marked `unsafe`, and carries a `# Safety` contract. `panic = "abort"`, so no unwind crosses the boundary. |
+| Inverse projection | `TESTED` | Where a world point appears in an image. Round-trips with the forward projection to within 1e-6. |
+| Struct-layout guard | `TESTED` | The core exports its struct sizes; the Python binding refuses to load on a mismatch. |
+
+## Engine (Python)
+
+| Capability | State | Notes |
+|---|---|---|
+| ctypes bindings | `TESTED` | ABI version and every struct size checked at load. |
+| Video decode (file) | `TESTED` | Real H.264 through OpenCV/FFmpeg. Timestamps come from container PTS, never from a nominal frame rate. |
+| Video decode (RTSP) | `SKELETON` | The code path exists and is shaped correctly. **No camera has ever been contacted.** |
+| Reachability pre-check | `TESTED` | A socket probe bounds the connect. OpenCV's own RTSP timeout is a hard-coded 30 s that its documented FFmpeg options do not change — measured, not assumed. |
+| Live-stream frame dropping | `TESTED` | Newest-wins with a count of what was dropped. Refuses to wrap a file, because that would make replay non-deterministic. |
+| Credential redaction | `TESTED` | A password is unreachable through `repr`, `str`, display URL, source id, or any error message — including its length. |
+| Motion detection | `TESTED` | MOG2 with a resolution-scaled vertical morphology kernel. Emits `UNCLASSIFIED` and never claims otherwise. |
+| ONNX detection | `TESTED` | Letterboxing, per-class NMS, layout inference, model digest recorded — all now executed against a real ONNX graph. **No trained weights have been run** — see gap 2. |
+| Zones, schedules, presence | `TESTED` | Hysteresis on both edges; exit slower than entry. Schedules wrap midnight. |
+| Rules and events | `TESTED` | Deterministic ids for idempotent replay. Every event carries its own evidence and the conditions that fired. |
+| Correlation and incidents | `TESTED` | Union-find object identity, transitive across cameras. Exercised through two independent pipelines over two rendered views of one world — see "the central claim" below. |
+| Pipeline | `TESTED` | decode → detect → track → project → zones → events → incidents. Deterministic: the same file twice gives identical output. |
+| Persistence | `TESTED` | SQLite in WAL, forward migrations with a reversal each, idempotent upserts on deterministic ids. No column holds a credential — asserted by walking the schema. |
+| Audit log | `TESTED` | Append-only. There is deliberately no method to edit one, and a test fails if somebody adds it. |
+| Evidence export | `TESTED` | A folder per incident: the full record, a report a person can read without tooling, and a SHA-256 for every file. Verifiable by somebody who has only the folder. |
+
+## Operator console (PySide6)
+
+| Capability | State | Notes |
+|---|---|---|
+| Native window, no webview | `TESTED` | Asserted by test: no module may reference QtWebEngine. |
+| Camera view with overlay | `TESTED` | Detections, confirmed tracks and coasting tracks drawn distinctly. |
+| Plan view | `TESTED` | Metric grid, annular footprint, per-object uncertainty discs, trails, zoom and pan. Fetches nothing — asserted by test. |
+| Track table | `TESTED` | One row per object with class, confidence, duration, motion, position, uncertainty and provenance. |
+| Camera placement | `TESTED` | Reports the ground band a pose actually covers as it is typed. No default placement exists. Persisted, so it survives a restart. |
+| Off-thread analysis | `TESTED` | Asserted by test that `run()` executes on the worker's own thread. |
+| Fault reporting | `TESTED` | In place, not modal — twenty cameras drop together when a switch loses power. |
+| Incident panel | `TESTED` | One row per incident, expandable into its risk factors, cross-camera links and timeline. Sorted by severity, not arrival. |
+| Zones on the plan view | `TESTED` | Drawn distinctly from evidence: a zone is a rule someone wrote, not something observed. |
+| Multi-camera wall | `TESTED` | A pane per camera, a pipeline per camera, and correlation above them — never inside one. |
+| Incident replay and export | `PLANNED` | |
+
+## Measured behaviour
+
+Numbers from the reference scene, recorded so a regression is visible. The scene
+is synthetic (`engine/tests/scene.py`); see gap 1.
+
+| Measurement | Value |
+|---|---|
+| Detection recall (IoU > 0.3) | 0.69 |
+| Mean overlap with ground truth | 0.50 |
+| Fragments per frame | 0.42 |
+| Spurious detections not on an object | 0 |
+| Motion detector throughput | ~87 fps at 640×480 |
+| Whole pipeline throughput | ~68 fps at 640×480 |
+| Distinct objects reported | **5**, for 3 people |
+| Identity switches | **8** over ~410 unambiguous observations |
+| Events raised on the reference scene | 16 |
+| Incidents after correlation | **1** |
+| Reduction in what a person must read | **94%** |
+
+### The central claim, measured
+
+One person, one world, two cameras rendered from it through their real poses and
+processed by two pipelines that know nothing of each other
+(`engine/tests/test_multicamera.py`).
+
+| Measurement | Value |
+|---|---|
+| Distinct objects per camera | 1 and 1 |
+| Position error against **world** ground truth | median **0.32 m**, p90 ~1.0 m |
+| True position inside the stated 2σ disc | > 80% |
+| Events from both cameras | 3 |
+| Incidents after correlation | **1** |
+| Distinct objects in that incident | **1** |
+
+This is the strongest available check short of hardware. The renderer projects
+world → image; the pipeline projects image → world. If the geometry were wrong
+anywhere in that loop the cameras would disagree about where the person was, the
+association would fail, and one person would be reported as two.
+
+The last two are honest failures, bounded by tests so they cannot quietly get
+worse. They are the appearance-free tracking limit: when two people cross, box
+geometry alone cannot tell which is which. An appearance model is the identified
+next step.
+
+Two changes with measured effect, kept here because both were counter-intuitive:
+
+- **Vertical morphology kernel.** Every spurious detection turned out to be a
+  fragment of a real object, not noise. A tall narrow closing kernel rejoins an
+  upright body without merging two people side by side: recall 0.64 → 0.69, mean
+  overlap 0.40 → 0.50, fragments per frame 1.20 → 0.42.
+- **Elliptical association gate.** A circular gate scaled by an upright object's
+  height permits a one-frame vertical leap of tens of metres in world terms,
+  which is how a track hands its identity to an object that has just walked into
+  shot 100 px above it.
+
+## Not yet rebuilt after the rewrite
+
+These existed in the TypeScript and have not been re-established. They are listed
+separately from `PLANNED` because the design is settled and tested thinking
+exists for them in `docs/`.
+
+| Capability | State | Notes |
+|---|---|---|
+| Grounded AI analyst | `PLANNED` | |
+| REST and WebSocket control plane | `PLANNED` | |
+| Node discovery and pairing | `PLANNED` | |
+| Worker autonomy and reconciliation | `PLANNED` | |
+| Camera discovery (ONVIF/mDNS) | `PLANNED` | |
+| Continuous recording | `PLANNED` | Export exists; there is no recorded video to attach to it yet. |
+| Map package import | `PLANNED` | |
+| Authentication | `PLANNED` | The audit half is built; there is nobody to attribute an action to yet. |
+| Secret storage in the OS keychain | `PLANNED` | No secret is stored at all today. |
 
 ## Honest gaps worth naming
 
-1. **No real video has ever passed through this system, and no physical camera
-   has ever been contacted.** The RTSP and ONVIF protocol layers are implemented
-   and tested, but against mock devices written from the specifications - which
-   means they are tested against my reading of those specifications. Real cameras
-   deviate from both in ways no mock anticipates, and that gap will only close on
-   hardware.
+1. **The scene is synthetic, so nothing here establishes real-world behaviour.**
+   The *file* is real — a genuine container written by a real encoder and read
+   back by a real decoder, so the decode path under test is the one a camera
+   exercises. The *content* is generated geometry. A synthetic scene is easy on a
+   detector; every measurement above should be read as "the pipeline carries
+   frames, detections, tracks and positions end to end without lying about them",
+   not as an accuracy claim. Nothing stronger is possible without footage.
 
-   Decode is not implemented at all. The `Decoder` interface is defined and the
-   supervisor is tested against a stub, but no FFmpeg integration exists, because
-   no FFmpeg was available in the environment where this was written and shipping
-   an unverifiable subprocess wrapper would be exactly the fake implementation
-   this file exists to prevent. Hardware inference is likewise untouched, and the
-   performance targets in the specification remain design targets rather than
-   measurements.
+2. **No *trained* detection model has been run.** The ONNX path now executes
+   end to end against a real model — `engine/tests/onnx_fixture.py` builds one
+   locally with genuine ONNX operators, since none may be downloaded. It is a
+   brightness detector: it reduces the image to luminance, pools it into a 20×20
+   grid, and emits one candidate per cell scored by that cell's brightness.
+   Crude, but its output is a real function of its input, so the tests can fail —
+   move the object and the box must move, which is what catches a transposed
+   output or a dropped letterbox offset.
 
-2. **The Tauri shell has never been compiled.** No Rust toolchain was present, so
-   the native layer - keychain access, tray, service supervision - has never been
-   built or run. The React interface *has* been built and verified in a headless
-   browser, but it reads a generated snapshot rather than a live API, because
-   there is no API yet.
+   That establishes the machinery *around* a model: preprocessing, session
+   execution, layout inference, coordinate un-letterboxing, per-class NMS,
+   provenance, and that the two detectors are interchangeable everywhere
+   downstream. It establishes **nothing** about detection quality, classes, or
+   real-world behaviour. Trained weights remain untried.
 
-3. **The AI analyst is not a language model.** It is a deterministic, grounded
-   report generator that satisfies the same contract an LLM would have to satisfy.
-   That is deliberate - it is the reference implementation and the offline
-   fallback - but nobody should read "AI analyst: TESTED" as "a local LLM works".
+3. **No physical camera has ever been contacted.** RTSP support is a code path,
+   not a verified capability. Real cameras deviate from the specifications in
+   ways no amount of local testing anticipates.
 
-4. **Distributed mode is designed, not built.** Deterministic event identity and
-   idempotent correlation - the parts that make reconciliation correct - are
-   implemented and tested. The transport, pairing and buffering are not.
+4. **Background subtraction cannot see a stationary object.** This is not a bug
+   to be tuned away; it is what background subtraction is. On the reference
+   scene the object that stops moving has the worst recall of the three — 0.49
+   against 0.74 and 0.65 — and that is the loitering case, the one a security
+   system most needs. The tracker's gap budget bridges it partially. A real
+   detector is the actual answer.
 
-5. **Spatial accuracy is measured against simulated ground truth**, on a flat
-   ground plane with a perfectly known camera pose. Real deployments have sloping
-   ground, mis-surveyed masts and lens distortion. The uncertainty model is
-   honest about its inputs; its inputs are currently ideal.
+5. **Spatial accuracy assumes flat ground and a perfectly known pose.** Real
+   deployments have slopes, mis-surveyed masts and lens distortion. The
+   uncertainty model is honest about its inputs; its inputs are currently ideal.
+   Coverage is a geometric upper bound — it models what a camera can *reach*, not
+   what it can usefully *see*, and nothing occludes anything.
 
-   Coverage analysis inherits the same assumption, and one more: it models what a
-   camera can *geometrically* reach, not what it can usefully *see*. A person at
-   85 m may be four pixels tall and undetectable, and no wall, fence, vehicle or
-   tree occludes anything. Coverage is therefore an upper bound - real coverage is
-   never better than this and is usually worse.
+6. **CI has never run.** The workflow is written for Rust and Python across three
+   platforms and keeps the offline acceptance job, but no push has exercised it.
+   The suites it runs all pass locally on Windows with Python 3.14; CI targets
+   3.12, which has not been tried.
 
-6. **No tiles have ever been rendered from an imported package.** The PMTiles
-   reader and the package validator are tested against archives built byte by
-   byte, but nothing has yet handed a real basemap to MapLibre. The map draws site
-   geometry over an empty background, which is the correct behaviour with no
-   package installed and also the only behaviour so far exercised.
+7. **Multi-camera correlation works, on rendered footage.** Two pipelines over
+   two views of one world produce one incident containing one object, and the
+   console shows it: two panes, two footprints overlapping on one plan view, and
+   a single incident row reading "1 object in Restricted Area A (2 cameras)".
+   What has still never happened is two *physical* cameras — the geometry is
+   exercised, the optics and the disagreements real hardware brings are not.
+
+   The association itself is deliberately weak and says so. Without appearance
+   features, position and time are all there is, so it will merge two people who
+   crossed the same spot ten seconds apart and will fail to merge one person
+   whose two cameras disagree about where they were. Both failures are visible in
+   the association's own score and reasons rather than buried in a threshold.
+
+8. **The object count inherits the tracker's over-count.** On the reference scene
+   the single incident correctly collapses 16 events into one — but reports **5
+   objects where 3 people walked past**, because that is what the tracker
+   believes. Correlation deliberately does not second-guess a tracker within one
+   camera: doing so from positions alone would discard the tracker's own stronger
+   evidence. The fix belongs upstream, in appearance-based association.

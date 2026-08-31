@@ -1,5 +1,11 @@
 # AI
 
+> **Status:** nothing in this document is built in the current codebase. The
+> grounded analyst and its guardrails were implemented and tested in the
+> TypeScript prototype and removed with it. What survives today is the principle
+> the detectors already follow: a motion blob is emitted as `UNCLASSIFIED` and
+> nothing downstream may label it otherwise. See [STATUS.md](../STATUS.md).
+
 ## Position
 
 The AI is an analyst, not an authority. It may summarise, correlate, explain and
