@@ -50,11 +50,18 @@ class MapView(QWidget):
         self.setMinimumSize(280, 280)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
-        self._pose: CameraPose | None = None
-        self._footprint: list[LatLon] = []
+        # A site has cameras, plural. One is the common case and keeps its own
+        # convenience accessor, but the view is built around the general one:
+        # the whole point of a plan view is seeing where coverage overlaps and
+        # where it does not, and that needs more than one camera on it.
+        self._cameras: dict[str, CameraPose] = {}
+        self._footprints: dict[str, list[LatLon]] = {}
         self._tracks: tuple[Track, ...] = ()
-        self._trails: dict[int, list[tuple[float, float]]] = {}
-        self._footprint_local: list[tuple[float, float]] = []
+        # Trails are keyed by camera and track, because a track id is only
+        # unique within one camera. Merging them would draw one path jumping
+        # between two different people.
+        self._trails: dict[tuple[str, int], list[tuple[float, float]]] = {}
+        self._origin: LatLon | None = None
         # East, north, and metres-per-pixel of the current view. Recomputed from
         # the content rather than fixed on the camera: a camera looking south
         # puts its whole footprint in one half of the widget, so centring on the
@@ -63,6 +70,8 @@ class MapView(QWidget):
         self._span_meters = 60.0
         self._drag_from: QPoint | None = None
         self._zones: list = []
+        #: Live tracks per camera, so one camera's update does not erase another's.
+        self._live: dict[str, tuple[Track, ...]] = {}
 
         self.setMouseTracking(False)
         self.setCursor(Qt.CursorShape.OpenHandCursor)
@@ -133,13 +142,31 @@ class MapView(QWidget):
 
     # ------------------------------------------------------------------ inputs
 
-    def set_pose(self, pose: CameraPose | None) -> None:
-        self._pose = pose
+    @property
+    def _pose(self) -> CameraPose | None:
+        """The first camera, for the single-camera case."""
+        return next(iter(self._cameras.values()), None)
+
+    @property
+    def _footprint(self) -> list[LatLon]:
+        return next(iter(self._footprints.values()), [])
+
+    def set_pose(self, pose: CameraPose | None, camera_id: str = "camera") -> None:
+        """Show exactly one camera. Convenience for the single-camera case."""
+        self.set_cameras({camera_id: pose} if pose is not None else {})
+
+    def set_cameras(self, cameras: dict[str, CameraPose]) -> None:
+        """Show every placed camera and its ground footprint."""
+        self._cameras = dict(cameras)
         self._trails.clear()
-        self._footprint = field_of_view(pose, arc_segments=28) if pose else []
-        self._footprint_local = (
-            [self._to_local(p) for p in self._footprint] if pose else []
-        )
+        self._footprints = {
+            camera_id: field_of_view(pose, arc_segments=28)
+            for camera_id, pose in self._cameras.items()
+        }
+        # The local frame is anchored on the first camera, so every camera is
+        # drawn in one consistent metric space rather than each relative to
+        # itself.
+        self._origin = self._pose.position if self._pose else None
         self._fit_view()
         self.update()
 
@@ -153,26 +180,34 @@ class MapView(QWidget):
         self._zones = list(zones)
         self.update()
 
-    def set_tracks(self, tracks: tuple[Track, ...]) -> None:
-        self._tracks = tracks
+    def set_tracks(self, tracks: tuple[Track, ...], camera_id: str = "camera") -> None:
+        """Replace the tracks belonging to one camera.
 
-        if self._pose is not None:
+        Per camera, because the console runs a pipeline per source and their
+        updates arrive independently. Replacing everything from one camera's
+        update would erase the others between frames.
+        """
+        self._live[camera_id] = tuple(tracks)
+        self._tracks = tuple(t for group in self._live.values() for t in group)
+
+        if self._origin is not None:
             for track in tracks:
                 if track.position is None:
                     continue
-                trail = self._trails.setdefault(track.id, [])
+                key = (camera_id, track.id)
+                trail = self._trails.setdefault(key, [])
                 point = self._to_local(track.position.point)
                 if not trail or _distance(trail[-1], point) > 0.25:
                     trail.append(point)
-                # Bounded: a trail is context, not a recording. The database
-                # holds the history; this is what happened just now.
+                # Bounded: a trail is context, not a recording. Persistence holds
+                # the history; this is what happened just now.
                 if len(trail) > 160:
                     del trail[0]
 
-            live = {t.id for t in tracks}
-            for track_id in list(self._trails):
-                if track_id not in live:
-                    del self._trails[track_id]
+            seen = {(camera_id, t.id) for t in tracks}
+            stale = [k for k in self._trails if k[0] == camera_id and k not in seen]
+            for key in stale:
+                del self._trails[key]
 
         self.update()
 
@@ -184,7 +219,12 @@ class MapView(QWidget):
         appear to breathe, and an operator judging distance by eye would be
         judging against a moving ruler.
         """
-        points = list(self._footprint_local) + [(0.0, 0.0)]
+        points = [
+            self._to_local(point)
+            for footprint in self._footprints.values()
+            for point in footprint
+        ]
+        points += [self._to_local(pose.position) for pose in self._cameras.values()]
         if len(points) < 2:
             self._view_centre = (0.0, 0.0)
             self._span_meters = 60.0
@@ -200,16 +240,18 @@ class MapView(QWidget):
 
     def clear(self) -> None:
         self._tracks = ()
+        self._live.clear()
         self._trails.clear()
         self.update()
 
     # -------------------------------------------------------------- projection
 
     def _to_local(self, point: LatLon) -> tuple[float, float]:
-        """Metres east and north of the camera."""
-        assert self._pose is not None
-        distance = haversine_distance(self._pose.position, point)
-        bearing = math.radians(bearing_degrees(self._pose.position, point))
+        """Metres east and north of the view origin."""
+        if self._origin is None:
+            return 0.0, 0.0
+        distance = haversine_distance(self._origin, point)
+        bearing = math.radians(bearing_degrees(self._origin, point))
         return distance * math.sin(bearing), distance * math.cos(bearing)
 
     def _scale(self) -> float:
@@ -233,7 +275,7 @@ class MapView(QWidget):
 
         self._paint_grid(painter)
 
-        if self._pose is None:
+        if not self._cameras:
             painter.setPen(QPen(theme.TEXT_FAINT))
             painter.drawText(
                 self.rect(),
@@ -256,9 +298,16 @@ class MapView(QWidget):
         scale = self._scale()
         step = _nice_step(self._span_meters)
 
-        # Range rings are centred on the camera, not on the view, because their
-        # whole purpose is reading distance from the camera.
-        origin = self._to_screen(0.0, 0.0)
+        # Range rings are centred on the first camera rather than on the view,
+        # because their whole purpose is reading distance from a camera. With
+        # several cameras a full set each would become a moire, so only the
+        # first carries them and the scale bar covers the rest.
+        first = self._pose
+        origin = (
+            self._to_screen(*self._to_local(first.position))
+            if first
+            else self._to_screen(0.0, 0.0)
+        )
         rings = int(self._span_meters / step) + 2
         for index in range(1, rings + 1):
             radius = index * step * scale
@@ -285,13 +334,22 @@ class MapView(QWidget):
             painter.drawText(QPointF(origin.x() + 3, origin.y() - radius - 2), f"{index * step:g}")
 
     def _paint_footprint(self, painter: QPainter) -> None:
-        if len(self._footprint) < 3:
-            return
+        """Every camera's ground coverage.
 
-        polygon = QPolygonF([self._to_screen(*self._to_local(p)) for p in self._footprint])
+        Drawn with the same translucent fill, so where two footprints overlap
+        the ground is visibly brighter. That overlap is not decoration: it is
+        where a hand-off between cameras can happen, and so where an operator
+        should expect one object rather than two.
+        """
         painter.setPen(QPen(theme.FOOTPRINT_EDGE, 1.5))
         painter.setBrush(QBrush(theme.FOOTPRINT))
-        painter.drawPolygon(polygon)
+
+        for footprint in self._footprints.values():
+            if len(footprint) < 3:
+                continue
+            painter.drawPolygon(
+                QPolygonF([self._to_screen(*self._to_local(p)) for p in footprint])
+            )
 
     def _paint_zones(self, painter: QPainter) -> None:
         font = QFont(painter.font())
@@ -310,20 +368,29 @@ class MapView(QWidget):
             painter.drawText(centroid, zone.name)
 
     def _paint_camera(self, painter: QPainter) -> None:
-        assert self._pose is not None
-        centre = self._to_screen(0.0, 0.0)
+        font = QFont(painter.font())
+        font.setPointSize(8)
+        painter.setFont(font)
 
-        painter.setPen(QPen(theme.CAMERA, 2))
-        painter.setBrush(QBrush(theme.PANEL))
-        painter.drawEllipse(centre, 5, 5)
+        for camera_id, pose in self._cameras.items():
+            centre = self._to_screen(*self._to_local(pose.position))
 
-        # A short stalk showing where it is pointed.
-        heading = math.radians(self._pose.heading)
-        painter.setPen(QPen(theme.CAMERA, 2))
-        painter.drawLine(
-            centre,
-            QPointF(centre.x() + math.sin(heading) * 16, centre.y() - math.cos(heading) * 16),
-        )
+            painter.setPen(QPen(theme.CAMERA, 2))
+            painter.setBrush(QBrush(theme.PANEL))
+            painter.drawEllipse(centre, 5, 5)
+
+            # A short stalk showing where it is pointed.
+            heading = math.radians(pose.heading)
+            painter.drawLine(
+                centre,
+                QPointF(
+                    centre.x() + math.sin(heading) * 16,
+                    centre.y() - math.cos(heading) * 16,
+                ),
+            )
+
+            painter.setPen(QPen(theme.TEXT_MUTED))
+            painter.drawText(QPointF(centre.x() + 8, centre.y() + 12), camera_id)
 
     def _paint_trails(self, painter: QPainter) -> None:
         painter.setBrush(Qt.BrushStyle.NoBrush)

@@ -22,7 +22,7 @@ implementation was removed in `582d0a8`; its architecture documents were kept
 because the thinking in them carried over, and are being brought up to date.
 Anything below that is not yet re-established after the rewrite says so.
 
-Current suite: **266 tests** — 44 Rust, 196 engine, 26 console. `cargo fmt` and
+Current suite: **273 tests** — 44 Rust, 196 engine, 33 console. `cargo fmt` and
 `clippy -D warnings` clean. Run everything with `python tasks.py check`.
 
 ---
@@ -75,7 +75,7 @@ Geometry, projection, zones and tracking, behind a C ABI.
 | Fault reporting | `TESTED` | In place, not modal — twenty cameras drop together when a switch loses power. |
 | Incident panel | `TESTED` | One row per incident, expandable into its risk factors, cross-camera links and timeline. Sorted by severity, not arrival. |
 | Zones on the plan view | `TESTED` | Drawn distinctly from evidence: a zone is a rule someone wrote, not something observed. |
-| Multi-camera wall | `PLANNED` | One source at a time today. |
+| Multi-camera wall | `TESTED` | A pane per camera, a pipeline per camera, and correlation above them — never inside one. |
 | Incident replay and export | `PLANNED` | |
 
 ## Measured behaviour
@@ -200,10 +200,11 @@ exists for them in `docs/`.
    3.12, which has not been tried.
 
 7. **Multi-camera correlation works, on rendered footage.** Two pipelines over
-   two views of one world produce one incident containing one object. What has
-   still never happened is two *physical* cameras: the geometry is exercised, the
-   optics and the disagreements real hardware brings are not. The console also
-   still runs one source at a time, so an operator cannot yet see this.
+   two views of one world produce one incident containing one object, and the
+   console shows it: two panes, two footprints overlapping on one plan view, and
+   a single incident row reading "1 object in Restricted Area A (2 cameras)".
+   What has still never happened is two *physical* cameras — the geometry is
+   exercised, the optics and the disagreements real hardware brings are not.
 
    The association itself is deliberately weak and says so. Without appearance
    features, position and time are all there is, so it will merge two people who

@@ -36,9 +36,12 @@ from sentinel_console.placement import PlacementDialog  # noqa: E402
 from sentinel_console.video_view import VideoView  # noqa: E402
 from sentinel_console.worker import AnalysisWorker  # noqa: E402
 
-POSITION_COLUMN = 7
-UNCERTAINTY_COLUMN = 8
-SOURCE_COLUMN = 9
+# The track table leads with the camera, because a track id is only unique
+# within one camera and a table without it shows two objects as if they were one.
+CAMERA_COLUMN = 0
+POSITION_COLUMN = 8
+UNCERTAINTY_COLUMN = 9
+SOURCE_COLUMN = 10
 
 
 @pytest.fixture(scope="session")
@@ -62,7 +65,7 @@ def window(qt_app):
 def pump(app, window, seconds: float) -> None:
     """Run the event loop as a real session would."""
     deadline = time.perf_counter() + seconds
-    while time.perf_counter() < deadline and window._worker is not None:
+    while time.perf_counter() < deadline and window._running:
         app.processEvents(QEventLoop.ProcessEventsFlag.AllEvents, 20)
 
 
@@ -75,8 +78,7 @@ def test_a_new_console_has_no_camera_placement(window):
 
 
 def test_an_unplaced_camera_reports_no_position(qt_app, window, reference_video: Path):
-    window._source_path = reference_video
-    window.start_button.setEnabled(True)
+    window.add_camera(reference_video, "cam-07")
     window._start()
     pump(qt_app, window, 4.0)
 
@@ -90,12 +92,11 @@ def test_an_unplaced_camera_reports_no_position(qt_app, window, reference_video:
 
 
 def test_placing_a_camera_mid_run_produces_positions(qt_app, window, reference_video: Path):
-    window._source_path = reference_video
-    window.start_button.setEnabled(True)
+    session = window.add_camera(reference_video, "cam-07")
     window._start()
     pump(qt_app, window, 3.0)
 
-    window._pose = CameraPose(
+    session.pose = CameraPose(
         position=LatLon(33.8938, 35.5018),
         mount_height=6.0,
         heading=180.0,
@@ -104,8 +105,8 @@ def test_placing_a_camera_mid_run_produces_positions(qt_app, window, reference_v
         vertical_fov=36.0,
         range_meters=90.0,
     )
-    window.map.set_pose(window._pose)
-    window._worker.set_pose(window._pose)
+    window._refresh_placement()
+    session.worker.set_pose(session.pose)
     pump(qt_app, window, 4.0)
 
     row = window.tracks.topLevelItem(0)
@@ -278,12 +279,11 @@ def test_the_newest_result_wins_rather_than_a_backlog_building(qt_app, reference
 
 def test_closing_the_window_stops_the_analysis(qt_app, reference_video: Path):
     win = ConsoleWindow()
-    win._source_path = reference_video
-    win.start_button.setEnabled(True)
+    session = win.add_camera(reference_video, "cam-07")
     win._start()
     pump(qt_app, win, 2.0)
 
-    worker = win._worker
+    worker = session.worker
     assert worker is not None and worker.isRunning()
 
     win.close()
@@ -321,8 +321,7 @@ def test_a_new_run_clears_a_previous_fault(qt_app, window, reference_video: Path
     window._on_failed("something went wrong earlier")
     assert window.fault_label.isVisible()
 
-    window._source_path = reference_video
-    window.start_button.setEnabled(True)
+    window.add_camera(reference_video, "cam-07")
     window._start()
     assert not window.fault_label.isVisible()
     window._stop()
@@ -476,3 +475,124 @@ def test_a_zone_needs_a_placed_camera(qt_app, window):
     # can act on.
     assert window._pose is None
     assert window._zones == []
+
+# ------------------------------------------------------------- several cameras
+
+
+def test_several_cameras_each_get_their_own_pane(qt_app, window, reference_video: Path):
+    for index in range(3):
+        window.add_camera(reference_video, f"cam-{index:02d}")
+
+    assert len(window._sessions) == 3
+    panes = [window.wall_layout.itemAt(i).widget() for i in range(window.wall_layout.count())]
+    assert len({id(pane) for pane in panes}) == 3
+
+
+def test_a_camera_id_is_never_reused(qt_app, window, reference_video: Path):
+    # Two files with the same stem must not become one camera, silently
+    # discarding half the site's coverage.
+    first = window.add_camera(reference_video, "cam-07")
+    second = window.add_camera(reference_video, "cam-07")
+
+    assert first.camera_id != second.camera_id
+    assert len(window._sessions) == 2
+
+
+def test_each_camera_runs_its_own_pipeline(qt_app, window, reference_video: Path):
+    window.add_camera(reference_video, "cam-07")
+    window.add_camera(reference_video, "cam-08")
+    window._start()
+    pump(qt_app, window, 3.0)
+
+    workers = [s.worker for s in window._sessions.values()]
+    assert len(workers) == 2
+    assert workers[0] is not workers[1], "two cameras shared one pipeline"
+
+    window._stop()
+
+
+def test_the_track_table_says_which_camera_saw_what(qt_app, window, reference_video: Path):
+    # Track ids are only unique within a camera. A table without the camera
+    # column shows two different objects as if they were one.
+    window.add_camera(reference_video, "cam-07")
+    window.add_camera(reference_video, "cam-08")
+    window._start()
+    pump(qt_app, window, 4.0)
+
+    cameras = {
+        window.tracks.topLevelItem(i).text(0)
+        for i in range(window.tracks.topLevelItemCount())
+    }
+    window._stop()
+
+    assert cameras <= {"cam-07", "cam-08"}
+    assert cameras, "no tracks were listed at all"
+
+
+def test_correlation_runs_across_cameras_not_within_one(qt_app, window, reference_video: Path):
+    # The claim the console exists to present. A camera correlating its own
+    # events would raise one incident per camera for one intrusion.
+    from sentinel.core import CameraPose, LatLon
+
+    for camera_id in ("cam-07", "cam-08"):
+        session = window.add_camera(reference_video, camera_id)
+        session.pose = CameraPose(
+            position=LatLon(33.8938, 35.5018),
+            mount_height=6.0,
+            heading=180.0,
+            pitch=-22.0,
+            horizontal_fov=62.0,
+            vertical_fov=36.0,
+            range_meters=90.0,
+        )
+    window._refresh_placement()
+    window.zone_radius.setValue(10.0)
+    window._add_zone()
+
+    window._start()
+    pump(qt_app, window, 16.0)
+    window._stop()
+
+    events = sum(len(s.events) for s in window._sessions.values())
+    assert events > 0, "no events were raised, so correlation was never exercised"
+    assert window.incidents.topLevelItemCount() <= 2, (
+        "two cameras watching one scene produced an incident each"
+    )
+
+
+def test_the_map_shows_every_placed_camera(qt_app, window, reference_video: Path):
+    from sentinel.core import CameraPose, LatLon, destination_point
+
+    site = LatLon(33.8938, 35.5018)
+    for index, camera_id in enumerate(("cam-07", "cam-08")):
+        session = window.add_camera(reference_video, camera_id)
+        session.pose = CameraPose(
+            position=destination_point(site, 90.0 * index, 20.0),
+            mount_height=6.0,
+            heading=180.0,
+            pitch=-22.0,
+            horizontal_fov=62.0,
+            vertical_fov=36.0,
+            range_meters=90.0,
+        )
+    window._refresh_placement()
+
+    assert len(window.map._cameras) == 2
+    assert len(window.map._footprints) == 2
+
+
+def test_an_unplaced_camera_is_named_as_unplaced(qt_app, window, reference_video: Path):
+    from sentinel.core import CameraPose, LatLon
+
+    placed = window.add_camera(reference_video, "cam-07")
+    placed.pose = CameraPose(
+        position=LatLon(33.8938, 35.5018),
+        mount_height=6.0,
+        heading=180.0,
+        pitch=-22.0,
+    )
+    window.add_camera(reference_video, "cam-08")
+    window._refresh_placement()
+
+    assert "1 of 2" in window.placement_label.text()
+    assert "will not locate" in window.placement_label.text()
