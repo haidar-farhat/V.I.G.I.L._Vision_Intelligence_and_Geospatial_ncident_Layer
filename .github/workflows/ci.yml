@@ -25,6 +25,11 @@ jobs:
       - name: No route off the site
         run: python tools/offline_audit.py
 
+      # A broken diagram renders as raw text with no error anywhere, and every
+      # architectural claim here is carried by one.
+      - name: Every diagram parses
+        run: python tools/docs_lint.py
+
   core:
     name: engine core (${{ matrix.os }})
     needs: offline-source

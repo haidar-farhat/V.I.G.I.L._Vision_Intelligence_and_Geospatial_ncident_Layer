@@ -556,34 +556,54 @@ What the export refuses to do:
 
 ## 14. Test topology
 
-**365 tests.** Where they sit and what only they can catch:
+**428 tests**, plus two static checks that run before any of them. Where they
+sit and what only they can catch:
 
 ```mermaid
 flowchart TB
-    subgraph rust["core · 56 tests"]
-        G["geometry.rs · 25<br/><i>the mathematics</i>"]
+    subgraph gate["BEFORE ANY TEST — static"]
+        AU["tools/offline_audit.py<br/><i>26 files scanned for cloud SDKs,<br/>telemetry packages, external hosts</i>"]
+        DL["tools/docs_lint.py<br/><i>32 diagrams; a broken one renders<br/>as raw text with no error</i>"]
+    end
+    subgraph rust["core · 57 tests"]
+        G["geometry.rs · 26<br/><i>the mathematics</i>"]
         T["tracking.rs · 20<br/><i>identity and motion</i>"]
         F["ffi.rs · 11<br/><i>null tolerance, layout, truncation</i>"]
     end
-    subgraph eng["engine · 269 tests"]
-        C["test_core · 32<br/><i>does the boundary lie?</i>"]
-        DE["test_decode · 20<br/><i>credentials, timestamps</i>"]
-        DT["test_detect · 22 · test_onnx · 16"]
-        Z["test_zones · 20 · test_events · 23"]
+    subgraph eng["engine · 331 tests"]
+        C["test_core · 36<br/><i>does the boundary lie?</i>"]
+        DE["test_decode · 41<br/><i>credentials, timestamps, thread death</i>"]
+        OG["test_offline_guarantee · 29<br/><i>watches the guard fail</i>"]
+        DC["test_docs · 12<br/><i>watches the lint fail</i>"]
+        DT["test_detect · 25 · test_onnx · 18"]
+        Z["test_zones · 20 · test_events · 26"]
         IN["test_incidents · 29"]
-        P["test_pipeline · 23 · test_multicamera · 11"]
-        ST["test_store · 27 · test_evidence · 24"]
+        P["test_pipeline · 25 · test_multicamera · 11"]
+        ST["test_store · 33 · test_evidence · 26"]
     end
     subgraph con["console · 40 tests"]
         CO["placement · honesty · threading<br/>redaction · persistence · export"]
     end
 
-    rust --> eng --> con
+    gate --> rust --> eng --> con
 
+    style gate fill:#3f1e3f,stroke:#c084fc,color:#e2e8f0
     style rust fill:#1e3a5f,stroke:#4a9eff,color:#e2e8f0
     style eng fill:#1e3f2f,stroke:#4ade80,color:#e2e8f0
     style con fill:#3f2f1e,stroke:#fbbf24,color:#e2e8f0
 ```
+
+### Tests that watch their own guard fail
+
+Three suites exist not to test a feature but to test a *check*, because a check
+nobody has watched fail is a check nobody knows works:
+
+| Suite | Feeds it | Requires |
+|---|---|---|
+| `test_offline_guarantee` | source naming `boto3`, `sentry_sdk`, `https://api.some-vendor.com`, an OTLP exporter | each is caught — **and** `rtsp://admin:pw@192.168.1.64`, `https://node.local`, `http://[::1]:9000`, `https://[fd00::1]` all pass, because a guard that cries wolf gets switched off |
+| `test_decode` (redaction) | nine URLs that each caused a real leak — a password containing `@`, a password with no username, an IPv6 literal, a non-numeric port, a credential in the query, no scheme at all | the secret is unreachable through `repr`, `str`, source id, display URL and every error message, asserted with `contains_credential`, which extracts the secrets from *that* URL rather than matching one hard-coded sentinel |
+| `test_core` (loader) | a library that loads but exports no `sentinel_abi_version`; one that reports the wrong version | `CoreError` naming the rebuild — never `AttributeError` naming whichever symbol was looked up first |
+| `test_docs` | a label split across lines, a literal `\n`, an unbalanced bracket, a `style` naming a node that does not exist | each is caught — **and** an ER diagram's `\|\|--o{` cardinality and a state diagram's composite braces pass, because both are unbalanced per line and both are correct |
 
 The mathematics is tested in Rust, where it lives. The Python tests over the same
 area deliberately do **not** re-test it — they test what only a caller can break:
@@ -595,15 +615,17 @@ than *"is the maths right?"*.
 
 | Component | Files | Lines |
 |---|---:|---:|
-| `core/src` (Rust) | 4 | 3,600 |
-| `engine/sentinel` (Python) | 10 | 5,049 |
-| `engine/tests` | 15 | 4,551 |
-| `apps/console/sentinel_console` | 9 | 2,371 |
-| `apps/console/tests` | 2 | 785 |
-| **Total** | **40** | **15,789** |
+| `core/src` (Rust) | 4 | 3,621 |
+| `engine/sentinel` (Python) | 10 | 5,526 |
+| `engine/tests` | 19 | 5,865 |
+| `apps/console/sentinel_console` | 9 | 2,494 |
+| `apps/console/tests` | 2 | 836 |
+| `tools` (offline audit, docs lint) | 2 | 419 |
+| **Total** | **46** | **18,761** |
 
-Tests are 34% of the tree. For a system whose output is evidence, that ratio is
-the point rather than a statistic.
+Tests are **36%** of the tree, and the two guards in `tools/` are themselves
+tested. For a system whose output is evidence, that ratio is the point rather
+than a statistic.
 
 ---
 
@@ -704,7 +726,43 @@ The framework that would have helped is the one that was not needed. That is
 worth recording, because the next person to ask this question deserves the
 measurements rather than the conclusion.
 
-## 16. What this does not establish
+## 16. Bounded, and how
+
+Four collections grew for as long as the process ran. On a demonstration that is
+invisible; on a node left running for a month it is the reason it dies.
+
+```mermaid
+flowchart LR
+    F["frame N"] --> R["_record(frame, detections, tracks)"]
+    R --> CH{"len(track_ids)<br/>> 4096?"}
+    CH -- "no" --> UP["count each new id once,<br/>bump observations and spans"]
+    CH -- "yes" --> LV["take the ids NOT live<br/>on this frame"]
+    LV --> TR["drop the oldest half<br/>from all three together"]
+    TR --> UP
+    UP --> OUT["objects_seen<br/><b>exact, never trimmed</b>"]
+
+    LV -.->|"why"| WHY["dropping a live id would<br/>re-count a loiterer as new<br/>once per frame, forever"]
+
+    style CH fill:#334155,stroke:#94a3b8,color:#e2e8f0
+    style OUT fill:#1e3f2f,stroke:#4ade80,color:#e2e8f0
+    style WHY fill:#4c1d24,stroke:#f87171,color:#e2e8f0
+```
+
+The distinct-object count is the number that matters — it is what a fragmenting
+tracker inflates and what the whole funnel is measured against — so it is counted
+as ids arrive rather than derived from `len()` of a set that gets trimmed.
+Trimming can then be as aggressive as it needs to be without touching the answer.
+
+The fourth was on the other side of the FFI boundary: `field_of_view` sized its
+output buffer from the segment count it was *asked* for, while the core clamps to
+a minimum of two. Below that the ring was truncated to fit and the truncation
+status discarded — measured at `arc_segments=0`, 4 of 6 points came back. An open
+polygon drawn on the map claims coverage that does not exist, which is the same
+class of error as an invented position.
+
+---
+
+## 17. What this does not establish
 
 Every measurement above comes from **rendered footage**. The files are real —
 genuine containers written by a real encoder and read by a real decoder, so the

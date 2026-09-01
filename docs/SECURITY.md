@@ -72,21 +72,17 @@ and one moment it is used:
 
 ```mermaid
 flowchart TD
-    U["operator supplies
-rtsp://admin:pw@10.0.0.5/s"] --> V["VideoSource.__init__"]
+    U["operator supplies<br/>rtsp://admin:pw@10.0.0.5/s"] --> V["VideoSource.__init__"]
     V --> P["self._url  (private, __slots__)"]
-    V --> D["self._display = redact_url(...)
-rtsp://admin:***@10.0.0.5/s"]
+    V --> D["self._display = redact_url(...)<br/>rtsp://admin:***@10.0.0.5/s"]
 
-    P -.->|"the only read,
-at the moment of connection"| O["cv2.VideoCapture(self._url)"]
+    P -.->|"the only read,<br/>at the moment of connection"| O["cv2.VideoCapture(self._url)"]
 
     D --> R["__repr__ / __str__"]
     D --> S["source_id"]
     D --> I["SourceInfo.display_url"]
     D --> E["every DecodeError message"]
-    D --> B["events, incidents, exports,
-the database, the console"]
+    D --> B["events, incidents, exports,<br/>the database, the console"]
 
     style P fill:#8a1f1f,color:#fff
     style D fill:#1f6f3f,color:#fff
@@ -152,21 +148,13 @@ catches what the others cannot.
 
 ```mermaid
 flowchart LR
-    A["source committed"] --> B{"1 · static audit
-cloud SDK?
-analytics package?
-external host?"}
-    B -- "found" --> BX["build fails
-before anything is built"]
-    B -- "clean" --> C{"3 · offline job
-iptables OUTPUT DROP
-run the whole suite"}
+    A["source committed"] --> B{"1 · static audit<br/>cloud SDK?<br/>analytics package?<br/>external host?"}
+    B -- "found" --> BX["build fails<br/>before anything is built"]
+    B -- "clean" --> C{"3 · offline job<br/>iptables OUTPUT DROP<br/>run the whole suite"}
     C -- "a test needed the net" --> CX["build fails"]
     C -- "clean" --> D["shipped"]
     D --> E["operator types a camera URL"]
-    E --> F{"2 · egress guard
-resolves to RFC 1918 / 4193
-or loopback?"}
+    E --> F{"2 · egress guard<br/>resolves to RFC 1918 / 4193<br/>or loopback?"}
     F -- "no" --> FX["refused, address named"]
     F -- "yes" --> G["connect"]
 

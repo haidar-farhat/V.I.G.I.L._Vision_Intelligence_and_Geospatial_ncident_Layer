@@ -4,7 +4,8 @@
     python tasks.py build      build the Rust engine core
     python tasks.py test       everything: Rust, engine, console
     python tasks.py lint       rustfmt and clippy
-    python tasks.py audit      prove the source contains no route off the site
+    python tasks.py audit      prove the source has no route off the site,
+                               and that every diagram in the docs parses
     python tasks.py console    run the operator console
     python tasks.py db         report the database's migration state
     python tasks.py db-migrate apply pending migrations
@@ -69,13 +70,19 @@ def lint() -> None:
 
 
 def audit() -> None:
-    """The zero-WAN guarantee, checked statically.
+    """The two claims that fail silently.
 
-    The offline CI job proves the *tests* need no network. This proves the
-    *source* has nowhere to go, which is the stronger claim and the one an
-    operator is actually relying on: an untested code path can still call home.
+    The offline CI job proves the *tests* need no network. `offline_audit`
+    proves the *source* has nowhere to go, which is the stronger claim and the
+    one an operator is actually relying on: an untested code path can still call
+    home.
+
+    `docs_lint` is here for the same reason. A mermaid diagram that fails to
+    parse renders as raw text or as nothing, with no error anywhere — and every
+    architectural claim in this repository is carried by one.
     """
     run([sys.executable, str(ROOT / "tools" / "offline_audit.py")], ROOT)
+    run([sys.executable, str(ROOT / "tools" / "docs_lint.py")], ROOT)
 
 
 def test() -> None:
