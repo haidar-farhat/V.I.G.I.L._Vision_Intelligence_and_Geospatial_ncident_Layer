@@ -434,10 +434,15 @@ class ConsoleWindow(QMainWindow):
             return
 
         dialog = PlacementDialog(session.pose, self)
-        if dialog.exec() != PlacementDialog.DialogCode.Accepted:
+        # Parented to the window, so without this every placement leaves another
+        # dialog alive for the life of the console.
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        accepted = dialog.exec() == PlacementDialog.DialogCode.Accepted
+        pose = dialog.pose() if accepted else None
+        if not accepted:
             return
 
-        session.pose = dialog.pose()
+        session.pose = pose
         if session.worker is not None:
             session.worker.set_pose(session.pose)
 
@@ -646,10 +651,17 @@ class ConsoleWindow(QMainWindow):
                 node_id="local",
                 parent=self,
             )
+            # The worker is captured alongside the session so the slot can check
+            # that the signal came from the worker the session currently holds.
+            # Without that check a worker dropped on a previous Start/Stop cycle
+            # can still deliver a queued `failed` and disown the worker that
+            # replaced it, stopping a camera that is running perfectly well.
             worker.finished_run.connect(
-                lambda reason, s=session: self._on_finished(reason, s)
+                lambda reason, s=session, w=worker: self._on_finished(reason, s, w)
             )
-            worker.failed.connect(lambda message, s=session: self._on_failed(message, s))
+            worker.failed.connect(
+                lambda message, s=session, w=worker: self._on_failed(message, s, w)
+            )
 
             session.worker = worker
             worker.start()
@@ -669,10 +681,27 @@ class ConsoleWindow(QMainWindow):
         self._set_status(f"Running {started} camera(s).")
 
     def _stop(self) -> None:
+        """Stop every camera.
+
+        Signalled first, waited on second. Doing both per camera in one pass
+        blocks the interface for up to the full timeout *per camera*, so a wall
+        of sixteen could freeze for the better part of a minute — while the
+        operator watches a window that has stopped responding.
+        """
         for session in self._sessions.values():
-            session.stop()
+            if session.worker is not None:
+                session.worker.stop()
+
+        stubborn = [s.camera_id for s in self._sessions.values() if not s.stop()]
+
         self._teardown()
-        self._set_status("Stopped.")
+        if stubborn:
+            self._set_status(
+                f"Stopped. {', '.join(stubborn)} did not stop cleanly and is "
+                "still running."
+            )
+        else:
+            self._set_status("Stopped.")
 
     def _teardown(self) -> None:
         self._timer.stop()
@@ -805,20 +834,43 @@ class ConsoleWindow(QMainWindow):
             f"{events} events -> {len(self._incidents)} incidents"
         )
 
-    def _on_finished(self, reason: str, session: CameraSession | None = None) -> None:
-        if session is not None:
-            session.worker = None
-        # One last collection before the timers stop. Without it the final
-        # frames — and the incidents correlated from them — are produced and
-        # then thrown away, so a file ending on an intrusion shows nothing.
+    def _on_finished(
+        self,
+        reason: str,
+        session: CameraSession | None = None,
+        worker: AnalysisWorker | None = None,
+    ) -> None:
+        """A camera's run ended by itself.
+
+        Order matters here and an earlier version had it backwards: it cleared
+        `session.worker` first and then called `_collect()`, which skips
+        sessions with no worker — so the last frames of every run, and any
+        incident correlated from them, were produced and immediately discarded.
+        A file ending on an intrusion showed nothing.
+
+        Collect first, then release.
+        """
         self._collect()
         self._correlate()
+
+        if session is not None and session.worker is not None:
+            if worker is not None and session.worker is not worker:
+                return
+            # The thread has finished; detaching hands ownership back to Python
+            # rather than leaving Qt holding a QThread nobody will start again.
+            session.worker.setParent(None)
+            session.worker = None
 
         if not self._running:
             self._teardown()
             self._set_status(reason)
 
-    def _on_failed(self, message: str, session: CameraSession | None = None) -> None:
+    def _on_failed(
+        self,
+        message: str,
+        session: CameraSession | None = None,
+        worker: AnalysisWorker | None = None,
+    ) -> None:
         """A running camera failed.
 
         Reported in place rather than as a modal. A modal is right for something
@@ -832,6 +884,11 @@ class ConsoleWindow(QMainWindow):
         it is safe to put in front of a person.
         """
         if session is not None:
+            # A worker dropped on an earlier Start/Stop cycle can still deliver
+            # a queued signal. Without this check it would disown the worker
+            # that replaced it and stop a camera that is running fine.
+            if worker is not None and session.worker is not worker:
+                return
             session.fault = message
             session.worker = None
             session.view.set_placeholder(f"{session.camera_id} — {message}")
@@ -858,8 +915,34 @@ class ConsoleWindow(QMainWindow):
         )
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt naming
+        """Shut down in the order that cannot leave something writing.
+
+        An earlier version closed the database while both timers were still
+        armed and worker signals were still queued, so the next 33 ms tick — or
+        the last `finished_run` to arrive — ran `_correlate()` against a closed
+        connection and raised inside an event handler.
+
+        Timers first, then threads, then the database. And the threads are
+        signalled together before any of them is waited on: stopping them one at
+        a time blocked the interface for up to three seconds *per camera*, so
+        closing a wall of sixteen could hang for the better part of a minute.
+        """
+        self._timer.stop()
+        self._correlate_timer.stop()
+
         for session in self._sessions.values():
-            session.stop()
+            if session.worker is not None:
+                session.worker.stop()
+
+        stubborn = [s.camera_id for s in self._sessions.values() if not s.stop()]
+        if stubborn:
+            # Recorded rather than hidden: a thread that would not stop is a
+            # fact about this run worth keeping.
+            self.store.audit(
+                "console", "analysis.thread_stuck", ", ".join(stubborn),
+                "left running to avoid destroying a live QThread",
+            )
+
         self.store.audit("console", "console.stopped")
         self.store.close()
         event.accept()
