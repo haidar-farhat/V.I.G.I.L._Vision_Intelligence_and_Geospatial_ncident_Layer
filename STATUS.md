@@ -22,7 +22,7 @@ implementation was removed in `582d0a8`; its architecture documents were kept
 because the thinking in them carried over, and are being brought up to date.
 Anything below that is not yet re-established after the rewrite says so.
 
-Current suite: **331 tests** — 44 Rust, 247 engine, 40 console. `cargo fmt` and
+Current suite: **365 tests** — 56 Rust, 269 engine, 40 console. `cargo fmt` and
 `clippy -D warnings` clean. Run everything with `python tasks.py check`.
 
 A visual walk-through of everything below — the layers, the boundary, threading,
@@ -138,14 +138,14 @@ it is in [docs/OVERVIEW.md](docs/OVERVIEW.md).
 ```mermaid
 flowchart TD
     A["<b>180 frames</b><br/>640×480 · 15 fps · real H.264"]
-    B["<b>379 detections</b><br/>in 169 of 180 frames"]
-    C["<b>5 tracks</b><br/>ground truth: 3 people"]
-    D["<b>5 presences</b><br/>after entry/exit hysteresis"]
-    E["<b>16 events</b><br/>entry · after-hours · loitering · speed"]
+    B["<b>356 detections</b><br/>in 169 of 180 frames"]
+    C["<b>4 tracks</b><br/>ground truth: 3 people"]
+    D["<b>4 presences</b><br/>after entry/exit hysteresis"]
+    E["<b>13 events</b><br/>entry · after-hours · loitering"]
     F["<b>1 incident</b><br/>HIGH · risk 75/100"]
 
     A --> B --> C --> D --> E --> F
-    C -.->|"over-count — gap 8"| X["reports 5 objects<br/>for 3 people"]
+    C -.->|"over-count — gap 8"| X["reports 4 objects<br/>for 3 people"]
 
     style A fill:#334155,stroke:#94a3b8,color:#e2e8f0
     style B fill:#334155,stroke:#94a3b8,color:#e2e8f0
@@ -156,18 +156,18 @@ flowchart TD
     style X fill:#4c1d24,stroke:#f87171,color:#fca5a5
 ```
 
-**16 events become 1 incident — 94% less for a person to read.** That reduction
+**13 events become 1 incident — 92% less for a person to read.** That reduction
 is the product, not a side effect.
 
 ### Detection
 
 | Measurement | Value |
 |---|---|
-| Recall (IoU > 0.3), overall | 0.69 |
-| — `approaching`, walks the full depth | 0.86 |
-| — `crossing`, crosses the scene | 0.68 |
+| Recall (IoU > 0.3), overall | 0.71 |
+| — `approaching`, walks the full depth | 0.89 |
+| — `crossing`, crosses the scene | 0.70 |
 | — `loiterer`, **stops moving** | **0.49** |
-| Mean overlap with ground truth | 0.50 |
+| Mean overlap with ground truth | 0.51 |
 | Fragments per frame | 0.42 |
 | Spurious detections not on any object | **0** |
 
@@ -179,11 +179,11 @@ is not a bug to be tuned away; it is what background subtraction is.
 
 | Measurement | Value |
 |---|---|
-| Distinct objects reported | **5**, for 3 people |
-| Identity switches | **8** over ~410 unambiguous observations |
-| Events raised | 16 |
+| Distinct objects reported | **4**, for 3 people |
+| Identity switches | **7** over 388 unambiguous observations |
+| Events raised | 13 |
 | Incidents after correlation | **1** |
-| Reduction in what a person must read | **94%** |
+| Reduction in what a person must read | **92%** |
 
 The first two are honest failures, bounded by tests so they cannot quietly get
 worse. They are the appearance-free tracking limit: when two people cross, box
@@ -216,11 +216,11 @@ processed by two pipelines that know nothing of each other
 | Measurement | Value |
 |---|---|
 | Distinct objects per camera | 1 and 1 |
-| Position error vs **world** ground truth | median **0.32 m** |
-| Position error, 90th percentile | 0.96 m (cam-08), 1.34 m (cam-07) |
+| Position error vs **world** ground truth | median **0.08 m** (cam-08), **0.11 m** (cam-07) |
+| Position error, 90th percentile | 0.24 m and 0.51 m |
 | True position inside the stated 2σ disc | **100%** |
-| Events from both cameras | 3 |
-| Cross-camera associations made | 2 |
+| Events from both cameras | 4 |
+| Cross-camera associations made | 4 |
 | **Incidents after correlation** | **1** |
 | **Distinct objects in that incident** | **1** |
 | Risk | 62.5/100 (HIGH) |
@@ -240,14 +240,21 @@ Median of five runs on an **idle** machine, 640×480.
 
 | | fps | ms/frame |
 |---|---:|---:|
-| Motion detector, 16 threads | 385 | 2.60 |
-| Motion detector, **1 thread** | **230** | **4.34** |
-| Whole pipeline (decode → incident), 16 threads | 319 | 3.14 |
+| Motion detector, 0.75 scale | 433 | 2.31 |
+| Whole pipeline, one camera | ~190 | ~5.2 |
+| Aggregate across 4 cameras | ~380 | — |
+| Aggregate across 16 cameras | ~370 | — |
 
-The single-threaded figure is the one that matters for capacity: a worker runs
-one pipeline per camera and they compete for cores, so this is roughly **15
-cameras at 15 fps per core** — before any real detection model, which will
-dominate the budget entirely.
+**One node handles 16 cameras** at the 15 fps a camera delivers, with roughly
+1.7× headroom each.
+
+What limits it is not what anyone would guess. Per frame, detection is 93.6% of
+the cost, decode 6.0%, and **the Rust core 0.4%**. Aggregate throughput plateaus
+at about 2× a single camera however many are added — and it plateaus identically
+whether they are threads or separate OS processes, so the GIL is not the
+constraint either. It is MOG2's per-pixel model state evicting itself from cache.
+The full measurement, and the six frameworks it rules out, are in
+[docs/OVERVIEW.md §15](docs/OVERVIEW.md).
 
 > **Correction.** Earlier revisions of this file quoted 87 fps and 68 fps. Those
 > were measured while other test processes were running and were wrong by a
@@ -268,6 +275,18 @@ problem was never false positives — it was one person becoming three boxes.
 | Recall @ IoU > 0.3 | 0.64 | **0.69** |
 | Mean overlap | 0.40 | **0.50** |
 | Fragments per frame | 1.20 | **0.42** |
+
+**Detecting at 0.75 scale.** The background model's per-pixel state is what stops
+this system scaling across cameras, and it shrinks quadratically with the frame.
+0.75 is better on both axes at once — 1.7× the throughput *and* better detection,
+because the downscale is a mild denoise:
+
+| | full scale | 0.75 scale |
+|---|---|---|
+| Recall @ IoU > 0.3 | 0.690 | **0.707** |
+| Mean overlap | 0.503 | **0.511** |
+| Throughput, 8 cameras | 455 fps | **784 fps** |
+| Objects reported for 3 people | 5 | **4** |
 
 **The association gate is an ellipse, not a circle.** A camera looking at the
 ground maps vertical image motion to *depth*. A circular gate scaled by an
@@ -389,7 +408,7 @@ flowchart LR
    the association's own score and reasons rather than buried in a threshold.
 
 8. **The object count inherits the tracker's over-count.** On the reference scene
-   the single incident correctly collapses 16 events into one — but reports **5
+   the single incident correctly collapses 13 events into one — but reports **4
    objects where 3 people walked past**, because that is what the tracker
    believes. Correlation deliberately does not second-guess a tracker within one
    camera: doing so from positions alone would discard the tracker's own stronger

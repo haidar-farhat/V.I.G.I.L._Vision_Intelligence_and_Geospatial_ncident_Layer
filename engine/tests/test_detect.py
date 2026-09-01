@@ -73,9 +73,9 @@ def test_the_motion_detector_finds_the_objects_that_are_there(detections_over_sc
             hits += best > 0.3
 
     recall = hits / total
-    # Measured at 0.69. The floor is well below that: this guards against a
+    # Measured at 0.71. The floor is well below that: this guards against a
     # regression, not against machine-to-machine variation.
-    assert recall > 0.55, f"recall fell to {recall:.2f}"
+    assert recall > 0.60, f"recall fell to {recall:.2f}"
 
 
 def test_the_boxes_it_produces_are_roughly_the_right_boxes(detections_over_scene):
@@ -88,7 +88,7 @@ def test_the_boxes_it_produces_are_roughly_the_right_boxes(detections_over_scene
         for actual in truth.values():
             overlaps.append(max((iou(box, actual) for box in boxes), default=0.0))
 
-    # Measured at 0.50. A detector whose recall holds while its boxes degrade
+    # Measured at 0.51. A detector whose recall holds while its boxes degrade
     # still ruins ground projection, because the position comes from the bottom
     # edge of the box.
     assert float(np.mean(overlaps)) > 0.40
@@ -116,9 +116,9 @@ def test_it_does_not_invent_objects_where_there_are_none(detections_over_scene):
 def test_it_runs_faster_than_the_video_it_is_watching(detections_over_scene):
     _, timing = detections_over_scene
 
-    # Measured at ~87 fps on 640x480. The assertion is that it keeps up with the
-    # 15 fps source with room to spare, because a detector that cannot is not a
-    # detector, it is a backlog.
+    # Measured at ~430 fps on 640x480 at the default 0.75 detection scale. The
+    # assertion is only that it keeps up with the 15 fps source with room to
+    # spare, because a detector that cannot is not a detector, it is a backlog.
     assert timing.fps > scene.FPS * 2, f"only {timing.fps:.0f} fps"
 
 
@@ -297,3 +297,52 @@ def test_timing_is_recorded_even_when_detection_fails():
         timed.detect(np.zeros((10, 10, 3), dtype=np.uint8))
 
     assert timed.timing.frames == 1, "a detector that fails slowly must still show as slow"
+
+
+# ------------------------------------------------------------ detection scale
+
+
+def test_the_detection_scale_does_not_change_what_a_box_means():
+    """Shrinking the frame the model sees must not move anything downstream.
+
+    Every threshold in the detector is a fraction of the frame and every box it
+    emits is normalised, so a detection at 0.5 scale has to mean the same thing
+    as one at full scale. If it did not, `detect_scale` would be a capacity
+    knob that silently moved every object on the map.
+    """
+    image = np.zeros((480, 640, 3), dtype=np.uint8)
+
+    boxes_by_scale = {}
+    for scale in (1.0, 0.75, 0.5):
+        detector = MotionDetector(detect_scale=scale, warmup_frames=4)
+        found = []
+        for step in range(24):
+            image[:] = 40
+            top = 150
+            left = 200 + step * 6
+            image[top : top + 120, left : left + 40] = 210
+            found = detector.detect(image)
+        boxes_by_scale[scale] = found
+
+    full = boxes_by_scale[1.0]
+    assert full, "the fixture produced no detections at full scale"
+
+    for scale, boxes in boxes_by_scale.items():
+        assert boxes, f"nothing detected at {scale} scale"
+        # Same object, same normalised place, within the coarser grid's own
+        # resolution.
+        assert abs(boxes[0].bbox.x - full[0].bbox.x) < 0.08, (
+            f"the box moved at {scale} scale"
+        )
+
+
+def test_an_impossible_detection_scale_is_refused():
+    with pytest.raises(DetectionError, match="detect_scale"):
+        MotionDetector(detect_scale=0.01)
+
+
+def test_the_scale_is_part_of_the_detector_identity():
+    # Two runs at different scales are not the same detector, and an event's
+    # provenance has to be able to say which one produced it.
+    assert MotionDetector(detect_scale=1.0).info.name != MotionDetector(detect_scale=0.5).info.name
+    assert "0.5" in MotionDetector(detect_scale=0.5).info.name

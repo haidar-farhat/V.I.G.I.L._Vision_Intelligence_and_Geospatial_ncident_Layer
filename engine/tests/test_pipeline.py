@@ -98,7 +98,11 @@ def test_the_object_count_is_not_wildly_inflated(run_over_reference):
     _, stats = run_over_reference
 
     assert stats.distinct_objects >= TRUE_OBJECT_COUNT
-    assert stats.distinct_objects <= TRUE_OBJECT_COUNT + 3, (
+    # Measured at 4 for 3 people. The bound was +3 while the detector ran at
+    # full resolution; detecting at 0.75 scale improved both recall and
+    # fragmentation, so the bound tightens with it — a threshold left loose
+    # after the thing it measures improved stops being a test.
+    assert stats.distinct_objects <= TRUE_OBJECT_COUNT + 2, (
         f"{stats.distinct_objects} tracks for {TRUE_OBJECT_COUNT} objects — "
         "fragmentation has regressed"
     )
@@ -490,7 +494,8 @@ def test_the_object_count_is_the_tracker_s_count_not_a_segment_count(spine):
     incident = incidents[0]
 
     assert incident.distinct_objects >= 3
-    assert incident.distinct_objects <= 6, (
+    # Measured at 4. See the note on the same bound above.
+    assert incident.distinct_objects <= 5, (
         f"{incident.distinct_objects} objects for 3 people — fragmentation "
         "has regressed"
     )
