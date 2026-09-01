@@ -77,15 +77,34 @@ def test_a_source_never_reveals_its_password_anywhere():
 
 
 def test_a_failure_to_open_a_camera_does_not_name_the_password():
-    # 203.0.113.x is TEST-NET-3: reserved for documentation, routed nowhere.
+    """Whichever way opening fails, the message must not carry the credential.
+
+    203.0.113.x is TEST-NET-3 — reserved for documentation and routed nowhere —
+    which means it is also *not* an RFC 1918 address, so this now trips the
+    egress guard before it ever reaches the connect. That is the right
+    behaviour and the assertion holds either way: the test is about what the
+    message may contain, not about which check produced it.
+    """
     url = "rtsp://admin:s3cr3t-value@203.0.113.99:554/none"
-    source = VideoSource(url)
 
     with pytest.raises(DecodeError) as caught:
-        source.open()
+        VideoSource(url).open()
 
     assert "s3cr3t-value" not in str(caught.value)
     assert "203.0.113.99" in str(caught.value), "the operator still needs to know which camera"
+
+
+def test_the_unreachable_path_also_keeps_the_credential(monkeypatch):
+    # The same guarantee on the other branch: a private address gets past the
+    # egress guard and fails on the connect instead.
+    url = "rtsp://admin:s3cr3t-value@10.255.255.1:554/none"
+
+    with pytest.raises(DecodeError) as caught:
+        VideoSource(url).open()
+
+    message = str(caught.value)
+    assert "s3cr3t-value" not in message
+    assert "outside the local network" not in message, "this should be the connect path"
 
 
 # ---------------------------------------------------------------------- files

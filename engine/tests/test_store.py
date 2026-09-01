@@ -108,19 +108,49 @@ def test_no_column_in_the_schema_is_credential_shaped(store: Store):
 
 
 def test_a_camera_stores_a_handle_not_a_password(store: Store):
+    """The credential must not survive the trip into the database.
+
+    An earlier version of this test asserted `"hunter2" not in joined` while
+    never putting "hunter2" anywhere — it checked for the absence of a string it
+    had not introduced, which is true of almost any database and proves nothing.
+    It now pushes a real credential through the real redactor and looks for that
+    credential, so a redactor that stopped working would fail here.
+    """
+    from sentinel.decode import contains_credential, redact_url
+
+    raw = "rtsp://admin:hunter2-not-a-real-password@10.20.30.40:554/Streaming/Channels/101"
     store.save_camera(
         "cam-07",
         "North gate",
-        source="rtsp://admin:***@10.20.30.40:554/Streaming/Channels/101",
+        source=redact_url(raw),
         credentials_ref="keychain://sentinel/cam-07",
     )
 
     row = store.cameras()[0]
     joined = " ".join(str(value) for value in tuple(row))
 
-    assert "***" in row["source"], "the source must already be redacted before it gets here"
+    assert not contains_credential(joined, raw), (
+        "the camera row carries a secret from the source URL"
+    )
+    assert "10.20.30.40:554" in row["source"], "the row must still identify the camera"
     assert row["credentials_ref"].startswith("keychain://")
-    assert "hunter2" not in joined
+
+
+def test_the_store_refuses_nothing_and_that_is_the_point(store: Store):
+    """`save_camera` cannot validate what it is given, so the boundary is above it.
+
+    This is recorded as a test because it is a real design decision rather than
+    an oversight: the store takes a string. Redaction happens at the one place
+    that has the raw URL — decode.py — and every caller is expected to have gone
+    through it. The test above proves the console's path does; this one states
+    plainly that the store itself is not a second line of defence.
+    """
+    store.save_camera("cam-99", "Careless", source="rtsp://admin:leaked@10.0.0.1/s")
+
+    assert "leaked" in store.cameras()[-1]["source"], (
+        "if this ever starts passing by redaction inside the store, the comment "
+        "above is wrong and the boundary has moved"
+    )
 
 
 def test_every_stored_position_carries_its_uncertainty(store: Store):
