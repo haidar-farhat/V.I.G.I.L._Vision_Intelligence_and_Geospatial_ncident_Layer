@@ -30,7 +30,9 @@ statistics are collected here rather than inferred later.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Iterator, Sequence
 
 import numpy as np
@@ -136,7 +138,8 @@ class Pipeline:
 
     __slots__ = ("_source", "_detector", "_pose", "_tracker", "stats", "_config",
                  "_keep_images", "_zones", "_evaluator", "_engine", "_epoch_millis",
-                 "_correlator", "_recent_events", "_event_retention")
+                 "_correlator", "_recent_events", "_event_retention",
+                 "_resolved_epoch", "_epoch_basis")
 
     def __init__(
         self,
@@ -191,6 +194,8 @@ class Pipeline:
         self._epoch_millis = wall_clock_epoch_millis
 
         self._event_retention = event_retention
+        self._resolved_epoch: int | None = None
+        self._epoch_basis = "not yet determined"
         self._correlator = Correlator(
             zone_kinds={zone.id: zone.kind for zone in zones}
         )
@@ -263,12 +268,82 @@ class Pipeline:
             image=frame.image if self._keep_images else None,
         )
 
+    def _wall_clock_epoch(self) -> int:
+        """When media time zero happened, in real-world milliseconds.
+
+        This exists because the obvious fallback — treat a missing epoch as
+        zero — silently dated every event, incident and evidence package in the
+        shipping console to January 1970, and made `clock_skew()` report
+        fifty-six years of camera drift. A wrong absolute time is worse than an
+        absent one: an after-hours rule evaluates against it, and an evidence
+        package carries it in front of somebody who will believe it.
+
+        Three cases, each a real fact rather than a default:
+
+        - **An explicit epoch** wins. A replay must reproduce the original
+          wall-clock reasoning exactly, and only the caller knows when the
+          footage was taken.
+        - **A live source** already timestamps frames with the wall clock, so
+          the epoch is zero — adding anything would double-count.
+        - **A file** is dated from its own modification time, less its duration:
+          the file was last written when the recording ended, so the recording
+          began that much earlier. Derived, and derived from something real.
+
+        Computed once and cached, so every frame in a run shares one basis and
+        the run stays internally consistent.
+        """
+        if self._resolved_epoch is not None:
+            return self._resolved_epoch
+
+        if self._epoch_millis is not None:
+            self._resolved_epoch = self._epoch_millis
+            self._epoch_basis = "supplied by the caller"
+            return self._resolved_epoch
+
+        if self._source.is_live:
+            # decode.py stamps live frames with time.time(); they are already
+            # absolute.
+            self._resolved_epoch = 0
+            self._epoch_basis = "live source, frames are already wall-clock"
+            return 0
+
+        try:
+            path = Path(self._source.display_url)
+            ended_at = int(path.stat().st_mtime * 1000)
+        except (OSError, ValueError):
+            # Nothing real to derive from. Zero would date the run to 1970, so
+            # fall back to now: an approximate time that is at least in the
+            # right century, and recorded as approximate.
+            self._resolved_epoch = int(time.time() * 1000)
+            self._epoch_basis = "unknown; defaulted to the time of analysis"
+            return self._resolved_epoch
+
+        info = self._source.info
+        duration = 0
+        if info.frame_count and info.fps:
+            duration = int(1000 * info.frame_count / info.fps)
+
+        self._resolved_epoch = ended_at - duration
+        self._epoch_basis = "derived from the file's modification time"
+        return self._resolved_epoch
+
+    @property
+    def wall_clock_basis(self) -> str:
+        """How the wall-clock time of this run was established.
+
+        Provenance, not decoration. An operator reading an incident dated three
+        weeks ago should be able to find out whether that date was measured,
+        supplied, or inferred from a file's metadata.
+        """
+        self._wall_clock_epoch()
+        return self._epoch_basis
+
     def _evaluate(self, frame: Frame, tracks: Sequence[Track]) -> list[Event]:
         """Zones and rules, if any are configured."""
         if self._evaluator is None:
             return []
 
-        moment = utc_from_millis((self._epoch_millis or 0) + frame.timestamp_millis)
+        moment = utc_from_millis(self._wall_clock_epoch() + frame.timestamp_millis)
         changes = self._evaluator.update(tracks, frame.timestamp_millis, moment)
 
         self.stats.presences_started += sum(1 for c in changes if c.kind == "ENTERED")

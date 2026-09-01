@@ -59,7 +59,7 @@ from sentinel.core import (
     field_of_view,
     haversine_distance,
 )
-from sentinel.decode import DecodeError, VideoSource
+from sentinel.decode import DecodeError, VideoSource, redact_url
 from sentinel.detect import MotionDetector
 from sentinel.events import (
     AfterHoursRule,
@@ -444,8 +444,11 @@ class ConsoleWindow(QMainWindow):
         self.store.save_camera(
             session.camera_id,
             session.camera_id,
-            # Already redacted: a source's display URL never carries a password.
-            source=str(session.source_path),
+            # Redacted here, at the boundary. The comment this replaced claimed
+            # the value was "already redacted" and it was not — it was the raw
+            # source, which for an RTSP camera is the password, written into a
+            # database column whose whole point is never to hold one.
+            source=redact_url(str(session.source_path)),
             pose=session.pose,
         )
         self.store.audit(

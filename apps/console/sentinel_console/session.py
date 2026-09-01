@@ -48,11 +48,48 @@ class CameraSession:
     def is_placed(self) -> bool:
         return self.pose is not None
 
-    def stop(self) -> None:
-        if self.worker is not None:
-            self.worker.stop()
-            self.worker.wait(3000)
-            self.worker = None
+    def stop(self, timeout_millis: int = 3000) -> bool:
+        """Ask this camera's analysis to end, and wait for it to actually end.
+
+        Returns whether the thread finished. The return value is the point: an
+        earlier version called ``wait()`` and discarded the result, then dropped
+        the reference regardless. If the thread had not finished — a decode
+        blocked on a stalled camera is the ordinary way that happens — Python
+        would garbage-collect a running QThread, and Qt aborts the process for
+        that with "QThread: Destroyed while thread is still running".
+
+        A thread that will not stop is therefore kept referenced rather than
+        released. It is left running and marked as faulted, because leaking one
+        thread is recoverable and killing the process in front of an operator is
+        not. `terminate()` is deliberately not called: it stops the thread at an
+        arbitrary instruction, which for one holding a decoder and a database
+        handle risks far worse than a leak.
+        """
+        worker = self.worker
+        if worker is None:
+            return True
+
+        worker.stop()
+        if not worker.wait(timeout_millis):
+            self.fault = (
+                f"{self.camera_id}: the analysis thread did not stop within "
+                f"{timeout_millis / 1000:.0f}s and is still running"
+            )
+            # Deliberately keeps `self.worker` set. Dropping it here is what
+            # destroys a running QThread and aborts the process.
+            return False
+
+        # Unparented rather than deleteLater()'d. The worker is parented to the
+        # window so it cannot outlive it, but leaving it parented once it has
+        # finished means Qt owns a QThread nobody will ever start again — one
+        # per Start/Stop cycle, for the life of the console. Detaching hands
+        # ownership back to Python, whose refcount drops to zero the moment this
+        # assignment lands. `deleteLater()` was tried and is wrong here: it
+        # destroys the C++ object while queued signals from this worker may
+        # still be in flight, and Qt aborts the process for that.
+        worker.setParent(None)
+        self.worker = None
+        return True
 
     def absorb(self, update: Update) -> None:
         """Take an update from this camera's worker.

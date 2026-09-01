@@ -22,6 +22,7 @@ from sentinel.decode import (
     DecodeError,
     LiveStream,
     VideoSource,
+    contains_credential,
     redact_url,
 )
 
@@ -204,3 +205,129 @@ def test_a_live_stream_drops_rather_than_queues(reference_video: Path):
 
         assert stream.dropped_frames > 0, "a backlog was allowed to build"
         assert stream._queue.qsize() <= 1
+
+
+# ------------------------------------------- redaction against awkward URLs
+#
+# Each of these was a real leak. They are asserted with `contains_credential`,
+# which extracts the secrets from *that* URL rather than matching one hard-coded
+# sentinel — so a leak through a path nobody anticipated still fails the test.
+
+AWKWARD = [
+    ("a password containing an @", "rtsp://admin:p@ss:w0rd@10.0.0.5/s"),
+    ("a password but no username", "rtsp://:onlypass@10.0.0.5/s"),
+    ("an IPv6 literal", "rtsp://user:pw0rd@[2001:db8::1]:554/s"),
+    ("a non-numeric port", "rtsp://user:pw0rd@host:notaport/s"),
+    ("a credential in the query", "http://cam/stream?user=admin&password=hunter2xyz&x=1"),
+    ("a token in the query", "rtsp://cam/s?token=abc123def"),
+    ("an uppercase query key", "rtsp://cam/s?Password=abc123def"),
+    ("a scheme decode does not know", "srt://admin:pw0rd@10.0.0.5:9000"),
+    ("no scheme at all, with an @", "admin:pw0rd@10.0.0.5/s"),
+]
+
+
+@pytest.mark.parametrize("description,url", AWKWARD, ids=[d for d, _ in AWKWARD])
+def test_redaction_survives(description: str, url: str):
+    redacted = redact_url(url)
+    assert not contains_credential(redacted, url), (
+        f"{description}: {redacted!r} still carries a secret from {url!r}"
+    )
+
+
+def test_redaction_keeps_the_url_useful():
+    # A redactor that returns "<redacted>" for everything leaks nothing and
+    # helps nobody. The host, port, path and non-secret query must survive.
+    redacted = redact_url("rtsp://admin:hunter2@10.20.30.40:554/Streaming/Channels/101?x=1")
+
+    assert "10.20.30.40:554" in redacted
+    assert "/Streaming/Channels/101" in redacted
+    assert "admin" in redacted
+    assert "x=1" in redacted
+
+
+def test_an_ipv6_literal_keeps_its_brackets():
+    # Rebuilding the host from urlsplit().hostname drops them and produces a
+    # display URL nobody can paste back.
+    assert "[2001:db8::1]:554" in redact_url("rtsp://user:pw@[2001:db8::1]:554/s")
+
+
+def test_a_malformed_port_does_not_raise():
+    # urlsplit().port raises ValueError here. An earlier version let that
+    # escape out of VideoSource.__init__, outside any caller's error handling.
+    VideoSource("rtsp://user:pw@host:notaport/s")
+
+
+def test_a_windows_path_is_left_alone():
+    assert redact_url(r"C:\media\clip.mp4") == r"C:\media\clip.mp4"
+
+
+def test_an_unknown_shape_fails_closed(monkeypatch):
+    # When redaction cannot be sure, it must return a marker rather than echo
+    # the input. Echoing a string that might hold a password is the one outcome
+    # that must never happen.
+    assert redact_url("") == "<no source>"
+    assert "@" not in redact_url("some/path/with@sign")
+
+
+# ------------------------------------------------- the missing-file leak
+
+
+def test_a_missing_file_error_never_carries_the_credential():
+    """The path an earlier version leaked through.
+
+    `live` is a caller override and `_looks_live` only knows six schemes, so a
+    credentialed srt:// or rtmp:// URL lands in the file branch — where the
+    error was built from the raw path and shown to the operator.
+    """
+    url = "srt://admin:hunter2secret@10.0.0.5:9000/live"
+    source = VideoSource(url, live=False)
+
+    with pytest.raises(DecodeError) as caught:
+        source.open()
+
+    assert not contains_credential(str(caught.value), url)
+    assert "10.0.0.5" in str(caught.value), "the operator still needs to know which source"
+
+
+def test_a_directory_error_never_carries_the_credential(tmp_path: Path):
+    url = f"{tmp_path}?password=hunter2secret"
+    with pytest.raises(DecodeError) as caught:
+        VideoSource(url, live=False).open()
+
+    assert "hunter2secret" not in str(caught.value)
+
+
+# ------------------------------------------------------------- egress guard
+
+
+def test_a_camera_outside_the_local_network_is_refused():
+    """The zero-WAN promise, enforced where it can actually be broken.
+
+    A camera URL is the one string an operator types that the software then
+    connects to. 8.8.8.8 is routable and public; refusing it is what stops a
+    typo or a poisoned DNS entry from turning this system into one that reaches
+    the Internet.
+    """
+    with pytest.raises(DecodeError) as caught:
+        VideoSource("rtsp://8.8.8.8:554/stream").open()
+
+    message = str(caught.value)
+    assert "outside the local network" in message
+    assert "8.8.8.8" in message, "an operator must be told what was refused"
+    assert "SENTINEL_ALLOW_PUBLIC_SOURCES" in message, "and how to override it deliberately"
+
+
+def test_a_private_address_is_allowed_through_to_the_connect():
+    # 10.x is RFC 1918. It must fail on reachability, not on the egress guard —
+    # otherwise the guard would block every real deployment.
+    with pytest.raises(DecodeError) as caught:
+        VideoSource("rtsp://10.255.255.1:554/stream").open()
+
+    assert "outside the local network" not in str(caught.value)
+
+
+def test_loopback_is_allowed():
+    with pytest.raises(DecodeError) as caught:
+        VideoSource("rtsp://127.0.0.1:1/stream").open()
+
+    assert "outside the local network" not in str(caught.value)
