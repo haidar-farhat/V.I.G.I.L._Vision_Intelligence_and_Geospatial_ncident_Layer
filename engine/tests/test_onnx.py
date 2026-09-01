@@ -280,3 +280,31 @@ def test_the_detector_reports_it_classifies_unlike_the_motion_detector(
 
     assert detector.info.classifies is True
     assert MotionDetector().info.classifies is False
+
+
+# ------------------------------------------------------------------- zero-WAN
+
+
+def test_onnxruntime_telemetry_is_switched_off(model_path: Path, monkeypatch):
+    # This system tells the operator to their face that it sends nothing
+    # anywhere. That claim has to hold for every dependency, not just for the
+    # code written here, and onnxruntime collects telemetry by default on some
+    # builds. The call is guarded in the source, so this asserts the wiring
+    # rather than the presence of the API.
+    import onnxruntime as ort
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        ort, "disable_telemetry_events", lambda: calls.append("off"), raising=False
+    )
+
+    OnnxDetector(model_path)
+
+    assert calls == ["off"], "telemetry was left at the library's default"
+
+
+def test_the_detector_never_reaches_for_a_model_it_does_not_have(tmp_path: Path):
+    # Nothing is downloaded, ever. A missing model is an error that names the
+    # operator as the source of models — not a cue to go and find one.
+    with pytest.raises(DetectionError, match="nothing is ever downloaded"):
+        OnnxDetector(tmp_path / "absent.onnx")

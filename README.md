@@ -204,10 +204,18 @@ python tasks.py check      # all of the above — what CI runs
 python tasks.py console    # the operator console
 ```
 
-Add one or more video files, place each camera, draw a zone, and press Start. The console shows the
-frame with its overlay, the ground beside it, and one table row per tracked
-object carrying class, confidence, duration, speed, heading, position,
-uncertainty and provenance.
+Add one or more video files, place each camera, add a zone, and press Start. The
+console shows the frame with its overlay, the ground beside it, and one table row
+per tracked object carrying class, confidence, duration, speed, heading,
+position, uncertainty and provenance.
+
+**"Add a zone" is not yet "draw a zone."** *Add zone* places a square of the
+radius you choose on the ground just beyond the near edge of what that camera can
+actually see — the near end, because projection uncertainty grows
+super-linearly, so a zone there is one the system can genuinely adjudicate rather
+than one it will mostly report `UNCERTAIN`. Drawing an arbitrary polygon on the
+plan view is `PLANNED`; the zone engine underneath already takes any polygon, so
+what is missing is the editor, not the geometry.
 
 Until a camera is placed, objects are tracked and reported as **not placed** —
 there is deliberately no default position, because a nominal origin produces

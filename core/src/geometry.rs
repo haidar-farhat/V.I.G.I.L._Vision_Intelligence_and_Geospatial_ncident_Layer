@@ -787,6 +787,50 @@ mod tests {
     }
 
     #[test]
+    fn a_ray_below_nadir_does_not_project_behind_the_camera() {
+        // A camera tilted steeply enough that the bottom of the frame passes
+        // *under* the mast. Those rays have a depression above 90 degrees, so
+        // `h / tan(theta)` is negative — they meet the ground plane behind the
+        // camera, which the forward-looking model cannot represent.
+        //
+        // The refusal is what is being pinned. A negative distance walked along
+        // the bearing would place the object 180 degrees from where it is, and
+        // a clamp to zero would place it at the operator's feet. Both are
+        // confident lies; `None` is the truth.
+        let steep = CameraPose {
+            pitch: -80.0,
+            vertical_fov: 40.0,
+            ..pose()
+        };
+
+        // Bottom edge of the frame: depression 100 degrees, past straight down.
+        assert!(
+            ray_angles(&steep, 0.5, 1.0).1 < -90.0,
+            "not actually past nadir"
+        );
+        assert!(project_to_ground(&steep, 0.5, 1.0, 1.5, false).is_none());
+
+        // And the caller degrades to the camera's own position rather than
+        // dropping the object, with the uncertainty saying how little is known.
+        let estimate = project_detection(
+            &steep,
+            &BoundingBox {
+                x: 0.45,
+                y: 0.9,
+                w: 0.1,
+                h: 0.1,
+            },
+        );
+        assert_eq!(estimate.source, PositionSource::CameraFallback);
+        close(
+            estimate.radius_meters,
+            steep.range_meters,
+            1e-9,
+            "below-nadir fallback radius",
+        );
+    }
+
+    #[test]
     fn detection_falls_back_rather_than_inventing_a_position() {
         let level = CameraPose {
             pitch: 5.0,

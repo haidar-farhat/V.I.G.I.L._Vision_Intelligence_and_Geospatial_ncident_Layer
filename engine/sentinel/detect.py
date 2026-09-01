@@ -345,6 +345,15 @@ class OnnxDetector:
         # to the operator's files.
         options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
+        # Telemetry off, explicitly. onnxruntime collects it by default on some
+        # builds, and this system tells the operator to their face that it sends
+        # nothing anywhere — a claim that has to be true of every dependency, not
+        # just of the code written here. Guarded because the call is absent on
+        # builds that never had telemetry to begin with.
+        disable = getattr(ort, "disable_telemetry_events", None)
+        if callable(disable):
+            disable()
+
         try:
             session = ort.InferenceSession(
                 str(path), sess_options=options,

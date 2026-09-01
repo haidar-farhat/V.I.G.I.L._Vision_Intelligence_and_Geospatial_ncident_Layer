@@ -499,3 +499,97 @@ def test_the_object_count_is_the_tracker_s_count_not_a_segment_count(spine):
         f"{incident.distinct_objects} objects for 3 people — fragmentation "
         "has regressed"
     )
+
+
+# ---------------------------------------------- the statistics do not grow forever
+
+
+def test_per_track_detail_is_bounded_but_the_object_count_is_not(
+    reference_video: Path, reference_pose: CameraPose
+):
+    # These three collections held one entry per track ever seen. A node left
+    # running accumulates one per object that ever crossed the frame and
+    # releases none of them, so the process grows without limit for as long as
+    # it is useful. Trimming them must not cost the one number that matters.
+    from sentinel.decode import Frame
+    from sentinel.pipeline import _MAX_TRACKED_DETAIL
+
+    import numpy as np
+
+    from sentinel.core import BoundingBox, PositionEstimate, Track
+
+    source = VideoSource(reference_video, source_id="cam-01")
+    pipeline = Pipeline(source, MotionDetector(), pose=reference_pose)
+
+    blank = Frame(
+        image=np.zeros((4, 4, 3), dtype=np.uint8),
+        timestamp_millis=0,
+        index=0,
+        source_id="cam-01",
+    )
+
+    def synthetic(track_id: int, millis: int) -> Track:
+        return Track(
+            id=track_id,
+            class_id=0,
+            bbox=BoundingBox(0.1, 0.1, 0.1, 0.1),
+            confidence=0.9,
+            hits=1,
+            first_seen_millis=millis,
+            last_seen_millis=millis,
+            position=None,
+            speed_mps=None,
+            heading_degrees=None,
+        )
+
+    total = _MAX_TRACKED_DETAIL * 3
+    for track_id in range(1, total + 1):
+        pipeline._record(blank, (), (synthetic(track_id, track_id * 40),))
+
+    stats = pipeline.stats
+    assert stats.distinct_objects == total, "the object count must survive trimming"
+    assert len(stats.track_ids) <= _MAX_TRACKED_DETAIL + 1
+    assert len(stats.observations) <= _MAX_TRACKED_DETAIL + 1
+    assert len(stats.spans) <= _MAX_TRACKED_DETAIL + 1
+
+    # What is retained is the most recent, and it is retained consistently:
+    # `summary()` walks the ids and looks up the other two by them.
+    assert total in stats.track_ids
+    for track_id in stats.track_ids:
+        assert track_id in stats.observations
+        assert track_id in stats.spans
+    assert str(total) in stats.summary()
+
+
+def test_a_live_track_is_never_trimmed_out_from_under_itself(
+    reference_video: Path, reference_pose: CameraPose
+):
+    # Trimming the *oldest* ids would drop a long-lived track that is still on
+    # screen, and the next frame would then count it as a new object — a
+    # stationary loiterer inflating the object count once per frame forever.
+    from sentinel.decode import Frame
+    from sentinel.pipeline import _MAX_TRACKED_DETAIL
+
+    import numpy as np
+
+    from sentinel.core import BoundingBox, Track
+
+    source = VideoSource(reference_video, source_id="cam-01")
+    pipeline = Pipeline(source, MotionDetector(), pose=reference_pose)
+    blank = Frame(np.zeros((4, 4, 3), dtype=np.uint8), 0, 0, "cam-01")
+
+    def synthetic(track_id: int, millis: int) -> Track:
+        return Track(track_id, 0, BoundingBox(0.1, 0.1, 0.1, 0.1), 0.9, 1,
+                     0, millis, None, None, None)
+
+    loiterer = 1
+    for track_id in range(2, _MAX_TRACKED_DETAIL * 2 + 2):
+        pipeline._record(
+            blank, (), (synthetic(loiterer, track_id * 40), synthetic(track_id, track_id * 40))
+        )
+
+    stats = pipeline.stats
+    assert loiterer in stats.track_ids, "a track still on screen was forgotten"
+    assert stats.observations[loiterer] == _MAX_TRACKED_DETAIL * 2
+    # The loiterer plus one new object per frame, each counted exactly once.
+    assert stats.distinct_objects == _MAX_TRACKED_DETAIL * 2 + 1

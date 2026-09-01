@@ -350,3 +350,36 @@ def test_loopback_is_allowed():
         VideoSource("rtsp://127.0.0.1:1/stream").open()
 
     assert "outside the local network" not in str(caught.value)
+
+
+# ------------------------------------------- the decode thread cannot die quietly
+
+
+def test_an_unexpected_failure_is_reported_rather_than_killing_the_thread(
+    reference_video: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # Only `DecodeError` was caught. Anything else — an OpenCV type error, a
+    # numpy failure, a bug in this code — unwound the decode thread and left the
+    # stream permanently empty while the interface went on showing a camera that
+    # had stopped existing, with no error anywhere to explain it.
+    import time
+
+    def explode(self: LiveStream) -> None:
+        raise RuntimeError(f"decoder blew up reading {CAMERA_URL}")
+
+    monkeypatch.setattr(LiveStream, "_pump", explode)
+
+    source = VideoSource(reference_video, live=True)
+    with LiveStream(source) as stream:
+        with pytest.raises(DecodeError) as caught:
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                stream.read(timeout=0.1)
+            pytest.fail("the failure was swallowed and never surfaced")
+
+    message = str(caught.value)
+    assert "RuntimeError" in message, "the failure should name what went wrong"
+    # The report carries the exception *type*, never its text: an arbitrary
+    # exception's message may have been built from the URL that raised it.
+    assert not contains_credential(message, CAMERA_URL)
+    assert SECRET not in message

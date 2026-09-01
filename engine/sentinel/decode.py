@@ -635,6 +635,16 @@ class LiveStream:
                 # Redacted by construction: DecodeError never carries a URL that
                 # still has its credential in it.
                 self._state.error = error
+            except Exception as error:  # noqa: BLE001
+                # Anything else killed this thread silently, leaving the capture
+                # open and the stream permanently empty while the interface went
+                # on showing a camera that had stopped existing. The type is
+                # reported rather than the message, because an arbitrary
+                # exception's text may have come from a URL.
+                self._state.error = DecodeError(
+                    f"{self._source.display_url} stopped unexpectedly "
+                    f"({type(error).__name__}). The stream will be reconnected."
+                )
 
             if self._state.stop.is_set():
                 return
