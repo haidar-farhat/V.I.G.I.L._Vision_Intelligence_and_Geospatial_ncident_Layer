@@ -327,3 +327,55 @@ def test_exporting_the_same_incident_twice_produces_the_same_content(tmp_path: P
 
     assert [f.sha256 for f in first.files] == [f.sha256 for f in second.files]
     assert first.manifest_sha256 == second.manifest_sha256
+
+
+# ------------------------------------------------------- attachments collide
+
+
+def test_two_attachments_with_the_same_name_both_survive(tmp_path: Path):
+    """Two clips from two cameras are routinely both called clip.mp4.
+
+    Copying the second over the first loses evidence *and still verifies clean*,
+    because the manifest is written afterwards from whatever survived — the
+    worst possible failure for a package whose purpose is to be trustworthy.
+    """
+    first_dir = tmp_path / "cam-07"
+    second_dir = tmp_path / "cam-08"
+    first_dir.mkdir()
+    second_dir.mkdir()
+    (first_dir / "clip.mp4").write_bytes(b"footage from camera seven")
+    (second_dir / "clip.mp4").write_bytes(b"footage from camera eight")
+
+    export = export_incident(
+        incident_with(),
+        tmp_path / "exports",
+        exported_by=EXPORTED_BY,
+        attachments=[first_dir / "clip.mp4", second_dir / "clip.mp4"],
+        at=MOMENT,
+    )
+
+    names = {entry.name for entry in export.files}
+    assert "clip.mp4" in names
+    assert len([n for n in names if n.startswith("clip")]) == 2, (
+        "one attachment silently overwrote the other"
+    )
+
+    contents = {(export.directory / n).read_bytes() for n in names if n.startswith("clip")}
+    assert len(contents) == 2, "both attachments are present but hold the same bytes"
+    assert verify_export(export.directory) == []
+
+
+def test_an_attachment_cannot_overwrite_the_record_itself(tmp_path: Path):
+    # An attachment named incident.json would have destroyed the very thing the
+    # package exists to carry, and the manifest would have hashed the imposter.
+    source = tmp_path / "incident.json"
+    source.write_text('{"not": "the real record"}', encoding="utf-8")
+
+    export = export_incident(
+        incident_with(), tmp_path / "exports", exported_by=EXPORTED_BY,
+        attachments=[source], at=MOMENT,
+    )
+
+    real = json.loads((export.directory / "incident.json").read_text(encoding="utf-8"))
+    assert real["id"] == export.incident_id, "the attachment overwrote the record"
+    assert verify_export(export.directory) == []

@@ -11,6 +11,12 @@ name = "sentinel_core"
 # link it directly.
 crate-type = ["cdylib", "rlib"]
 
+# Release only, and deliberately. `panic = "abort"` cannot be set for the dev
+# profile without breaking `cargo test`, which needs unwinding to catch a
+# `#[should_panic]`. The asymmetry is safe because every `extern "C"` export
+# already gets an abort-on-unwind shim from the compiler, so a panic can never
+# unwind across the FFI boundary into Python under either profile — abort here is
+# a smaller binary and a faster one, not the thing that makes the boundary sound.
 [profile.release]
 opt-level = 3
 lto = true

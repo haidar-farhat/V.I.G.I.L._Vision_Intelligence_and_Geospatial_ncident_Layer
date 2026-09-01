@@ -11,8 +11,23 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Cheapest job, no toolchain, no dependencies: if the source names a cloud
+  # SDK, an analytics package or an external host, nothing else is worth
+  # running.
+  offline-source:
+    name: offline source audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: No route off the site
+        run: python tools/offline_audit.py
+
   core:
     name: engine core (${{ matrix.os }})
+    needs: offline-source
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

@@ -4,11 +4,12 @@
     python tasks.py build      build the Rust engine core
     python tasks.py test       everything: Rust, engine, console
     python tasks.py lint       rustfmt and clippy
+    python tasks.py audit      prove the source contains no route off the site
     python tasks.py console    run the operator console
     python tasks.py db         report the database's migration state
     python tasks.py db-migrate apply pending migrations
     python tasks.py db-rollback undo the most recent migration
-    python tasks.py check      lint, build and test — what CI runs
+    python tasks.py check      audit, lint, build and test — what CI runs
 
 Python rather than a Makefile or a shell script, because the product ships on
 Windows, macOS and Linux and the developer commands should not be the one part
@@ -67,6 +68,16 @@ def lint() -> None:
     run(["cargo", "clippy", "--all-targets", "--", "-D", "warnings"], CORE)
 
 
+def audit() -> None:
+    """The zero-WAN guarantee, checked statically.
+
+    The offline CI job proves the *tests* need no network. This proves the
+    *source* has nowhere to go, which is the stronger claim and the one an
+    operator is actually relying on: an untested code path can still call home.
+    """
+    run([sys.executable, str(ROOT / "tools" / "offline_audit.py")], ROOT)
+
+
 def test() -> None:
     # The core is built first, because the Python suites load it. Testing
     # against a stale library is how a green run hides a broken change.
@@ -81,6 +92,7 @@ def test() -> None:
 
 
 def check() -> None:
+    audit()
     lint()
     test()
 
@@ -156,6 +168,7 @@ def console() -> None:
 TASKS = {
     "build": build,
     "lint": lint,
+    "audit": audit,
     "test": test,
     "check": check,
     "console": console,

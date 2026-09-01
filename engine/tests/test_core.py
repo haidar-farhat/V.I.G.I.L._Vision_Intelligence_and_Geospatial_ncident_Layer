@@ -399,3 +399,87 @@ def test_the_projection_agrees_with_hand_arithmetic():
     assert result.ground_distance_meters == pytest.approx(
         6.0 / math.tan(math.radians(30.0)), abs=1e-9
     )
+
+
+# ------------------------------------------------- the loader's refusal to guess
+#
+# Both of these are about the same failure: a library that is present but is not
+# the core this build expects. Loading it and calling into it produces corrupted
+# geometry — plausible numbers, silently wrong — which is far worse than a
+# refusal at start-up.
+
+
+class _NotTheCore:
+    """A library that loads but exports none of the symbols wanted."""
+
+    def __getattr__(self, name: str):
+        raise AttributeError(name)
+
+
+class _WrongVersionCore(_NotTheCore):
+    """A real core, from an older build."""
+
+    def __getattr__(self, name: str):
+        if name == "sentinel_abi_version":
+            function = lambda: ABI_VERSION + 1  # noqa: E731
+            function.restype = None
+            return function
+        raise AttributeError(name)
+
+
+def _load_with(monkeypatch, library, tmp_path):
+    """Run `load_core` against a stand-in library, with the cache cleared."""
+    from sentinel import core as core_module
+
+    stand_in = tmp_path / "sentinel_core.dll"
+    stand_in.write_bytes(b"not really a library")
+
+    monkeypatch.setattr(core_module, "_lib", None)
+    monkeypatch.setattr(core_module, "_candidate_paths", lambda: [stand_in])
+    monkeypatch.setattr(core_module.ctypes, "CDLL", lambda _: library)
+    return core_module.load_core
+
+
+def test_a_library_without_the_version_symbol_is_refused_by_name(monkeypatch, tmp_path):
+    # `_bind` touches every exported symbol, so binding before checking the
+    # version meant a stale core died on a bare AttributeError naming whichever
+    # symbol happened to be looked up first — a message that says nothing about
+    # what is wrong or what to do about it.
+    load = _load_with(monkeypatch, _NotTheCore(), tmp_path)
+
+    with pytest.raises(CoreError, match="sentinel_abi_version"):
+        load()
+
+
+def test_a_core_from_an_older_build_is_refused_before_it_is_called(monkeypatch, tmp_path):
+    load = _load_with(monkeypatch, _WrongVersionCore(), tmp_path)
+
+    with pytest.raises(CoreError, match=f"expects {ABI_VERSION}"):
+        load()
+
+
+# --------------------------------------------------- the footprint is not partial
+
+
+def test_a_tiny_segment_count_still_returns_a_whole_footprint():
+    # The core clamps the arc to a minimum of two segments. Sizing the buffer
+    # from the *requested* count instead under-allocated, the core truncated the
+    # ring to fit, and the truncation status was discarded — so an open,
+    # incomplete polygon came back and would have been drawn on the map as real
+    # coverage.
+    camera = pose()
+
+    clamped = field_of_view(camera, arc_segments=0)
+    explicit = field_of_view(camera, arc_segments=2)
+
+    assert len(clamped) == len(explicit)
+    assert [(p.lat, p.lon) for p in clamped] == [(p.lat, p.lon) for p in explicit]
+
+
+def test_every_segment_count_returns_a_closed_ring():
+    camera = pose()
+
+    for segments in (0, 1, 2, 3, 8, 24, 64):
+        ring = field_of_view(camera, arc_segments=segments)
+        # far arc + near arc, both of `max(2, segments) + 1` points.
+        assert len(ring) == 2 * (max(2, segments) + 1)

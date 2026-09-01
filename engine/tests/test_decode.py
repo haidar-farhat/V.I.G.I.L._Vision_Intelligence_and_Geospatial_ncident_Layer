@@ -77,15 +77,34 @@ def test_a_source_never_reveals_its_password_anywhere():
 
 
 def test_a_failure_to_open_a_camera_does_not_name_the_password():
-    # 203.0.113.x is TEST-NET-3: reserved for documentation, routed nowhere.
+    """Whichever way opening fails, the message must not carry the credential.
+
+    203.0.113.x is TEST-NET-3 — reserved for documentation and routed nowhere —
+    which means it is also *not* an RFC 1918 address, so this now trips the
+    egress guard before it ever reaches the connect. That is the right
+    behaviour and the assertion holds either way: the test is about what the
+    message may contain, not about which check produced it.
+    """
     url = "rtsp://admin:s3cr3t-value@203.0.113.99:554/none"
-    source = VideoSource(url)
 
     with pytest.raises(DecodeError) as caught:
-        source.open()
+        VideoSource(url).open()
 
     assert "s3cr3t-value" not in str(caught.value)
     assert "203.0.113.99" in str(caught.value), "the operator still needs to know which camera"
+
+
+def test_the_unreachable_path_also_keeps_the_credential(monkeypatch):
+    # The same guarantee on the other branch: a private address gets past the
+    # egress guard and fails on the connect instead.
+    url = "rtsp://admin:s3cr3t-value@10.255.255.1:554/none"
+
+    with pytest.raises(DecodeError) as caught:
+        VideoSource(url).open()
+
+    message = str(caught.value)
+    assert "s3cr3t-value" not in message
+    assert "outside the local network" not in message, "this should be the connect path"
 
 
 # ---------------------------------------------------------------------- files
@@ -331,3 +350,36 @@ def test_loopback_is_allowed():
         VideoSource("rtsp://127.0.0.1:1/stream").open()
 
     assert "outside the local network" not in str(caught.value)
+
+
+# ------------------------------------------- the decode thread cannot die quietly
+
+
+def test_an_unexpected_failure_is_reported_rather_than_killing_the_thread(
+    reference_video: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # Only `DecodeError` was caught. Anything else — an OpenCV type error, a
+    # numpy failure, a bug in this code — unwound the decode thread and left the
+    # stream permanently empty while the interface went on showing a camera that
+    # had stopped existing, with no error anywhere to explain it.
+    import time
+
+    def explode(self: LiveStream) -> None:
+        raise RuntimeError(f"decoder blew up reading {CAMERA_URL}")
+
+    monkeypatch.setattr(LiveStream, "_pump", explode)
+
+    source = VideoSource(reference_video, live=True)
+    with LiveStream(source) as stream:
+        with pytest.raises(DecodeError) as caught:
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                stream.read(timeout=0.1)
+            pytest.fail("the failure was swallowed and never surfaced")
+
+    message = str(caught.value)
+    assert "RuntimeError" in message, "the failure should name what went wrong"
+    # The report carries the exception *type*, never its text: an arbitrary
+    # exception's message may have been built from the URL that raised it.
+    assert not contains_credential(message, CAMERA_URL)
+    assert SECRET not in message

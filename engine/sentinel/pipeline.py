@@ -45,6 +45,14 @@ from .incidents import Correlator, Incident
 from .zones import Zone, ZoneEvaluator
 
 
+#: How many tracks' per-track detail the statistics keep. Everything that grows
+#: per track — the id set, the observation counts, the spans — is trimmed to
+#: this, because a node that runs for a month sees an unbounded number of
+#: objects and none of that detail is read once the track has ended. The count
+#: of distinct objects is NOT derived from those, so trimming cannot change it.
+_MAX_TRACKED_DETAIL = 4096
+
+
 @dataclass(frozen=True, slots=True)
 class FrameResult:
     """Everything the pipeline concluded about one frame.
@@ -80,10 +88,14 @@ class PipelineStats:
     frames: int = 0
     frames_with_detections: int = 0
     detections: int = 0
-    #: Track ids ever seen. Its size is how many distinct objects the system
-    #: believes it saw — the number that matters, and the number a fragmenting
-    #: tracker inflates.
+    #: Track ids seen recently, trimmed to ``_MAX_TRACKED_DETAIL``. This is a
+    #: window for reporting, not a census: read ``distinct_objects`` for the
+    #: count, which is counted on arrival and never trimmed.
     track_ids: set[int] = field(default_factory=set)
+    #: Distinct objects the system believes it saw — the number that matters,
+    #: and the number a fragmenting tracker inflates. Counted as ids arrive so
+    #: that bounding the sets above cannot quietly deflate it.
+    objects_seen: int = 0
     #: Per track: how many frames it was confirmed by a detection.
     observations: dict[int, int] = field(default_factory=dict)
     #: Per track: first and last timestamp.
@@ -99,7 +111,7 @@ class PipelineStats:
 
     @property
     def distinct_objects(self) -> int:
-        return len(self.track_ids)
+        return self.objects_seen
 
     @property
     def mean_detections_per_frame(self) -> float:
@@ -406,8 +418,24 @@ class Pipeline:
             # observation and how much is inference.
             stats.held_without_detection += 1
 
+        # Bounded. These three held an entry for every track ever seen, so a
+        # node running for a month accumulated one per object that ever crossed
+        # the frame and released none of them. Half the oldest detail is dropped
+        # at the ceiling, skipping ids still live this frame: an id the tracker
+        # has issued is never issued again, so a dropped one cannot come back
+        # and be miscounted as a new object.
+        if len(stats.track_ids) > _MAX_TRACKED_DETAIL:
+            live = {track.id for track in tracks}
+            stale = [id for id in sorted(stats.track_ids) if id not in live]
+            for id in stale[: len(stale) // 2]:
+                stats.track_ids.discard(id)
+                stats.observations.pop(id, None)
+                stats.spans.pop(id, None)
+
         for track in tracks:
-            stats.track_ids.add(track.id)
+            if track.id not in stats.track_ids:
+                stats.objects_seen += 1
+                stats.track_ids.add(track.id)
             stats.observations[track.id] = stats.observations.get(track.id, 0) + 1
             span = stats.spans.get(track.id)
             if span is None:

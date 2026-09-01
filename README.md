@@ -97,8 +97,8 @@ displayed in a native Qt console, and exportable as a verifiable package.
 
 ```mermaid
 flowchart LR
-    A["<b>180</b><br/>frames"] --> B["<b>379</b><br/>detections"] --> C["<b>5</b><br/>tracks"]
-    C --> D["<b>5</b><br/>presences"] --> E["<b>16</b><br/>events"] --> F["<b>1</b><br/>incident"]
+    A["<b>180</b><br/>frames"] --> B["<b>356</b><br/>detections"] --> C["<b>4</b><br/>tracks"]
+    C --> D["<b>4</b><br/>presences"] --> E["<b>13</b><br/>events"] --> F["<b>1</b><br/>incident"]
 
     style A fill:#334155,stroke:#94a3b8,color:#e2e8f0
     style B fill:#334155,stroke:#94a3b8,color:#e2e8f0
@@ -108,8 +108,8 @@ flowchart LR
     style F fill:#1e3f2f,stroke:#4ade80,color:#e2e8f0
 ```
 
-**16 events become 1 incident — 94% less for a person to read.** That reduction
-is the product. Three people walked past; the tracker fragments them into five
+**13 events become 1 incident — 92% less for a person to read.** That reduction
+is the product. Three people walked past; the tracker fragments them into four
 tracks, and the incident says so rather than hiding it.
 
 ### The central claim is measured, not asserted
@@ -120,9 +120,9 @@ pipelines that know nothing of each other:
 | | |
 |---|---|
 | Distinct objects per camera | 1 and 1 |
-| Position error vs world ground truth | median **0.32 m** |
+| Position error vs world ground truth | median **0.08–0.11 m** |
 | True position inside the stated 2σ disc | **100%** |
-| Events raised by the two cameras | 3 |
+| Events raised by the two cameras | 4 |
 | **Incidents an operator sees** | **1** |
 | **Distinct objects in that incident** | **1** |
 
@@ -150,17 +150,18 @@ The dividing line is **rate**, not importance.
 
 ### Scale
 
-**331 tests** — 44 Rust, 247 engine, 40 console. `cargo fmt` and
-`clippy -D warnings` clean. 15,789 lines across 40 files; tests are 34% of them.
+**365 tests** — 56 Rust, 269 engine, 40 console. `cargo fmt` and `clippy -D warnings` clean.
 
 | Throughput, 640×480, idle machine | fps | ms/frame |
 |---|---:|---:|
-| Motion detector, 16 threads | 385 | 2.60 |
-| Motion detector, 1 thread | 230 | 4.34 |
-| Whole pipeline, 16 threads | 319 | 3.14 |
+| Motion detector (0.75 scale) | 433 | 2.31 |
+| Whole pipeline, one camera | ~190 | ~5.2 |
+| Aggregate, 16 cameras | ~370 | — |
 
-The single-thread figure is the honest one for capacity — roughly 15 cameras at
-15 fps per core, before any real detection model.
+**One node handles 16 cameras** at the 15 fps a camera delivers, with headroom.
+What limits that is not the GIL, not Python and not the Rust boundary — it is the
+background model's per-pixel state, measured and written up in
+[docs/OVERVIEW.md §15](docs/OVERVIEW.md). The Rust core is 0.4% of a frame.
 
 ### Not yet true, and stated as such
 
@@ -171,7 +172,7 @@ footage is rendered, so none of this is an accuracy claim about the real world.
 There is no authentication, no keychain storage, and no networking between
 machines.
 
-The system reports **5 distinct objects where 3 people walked past** on the
+The system reports **4 distinct objects where 3 people walked past** on the
 single-camera scene, inheriting the tracker's over-count. Background subtraction
 finds the object that *stops moving* only 49% of the time — the loitering case,
 the one a security system most needs.
@@ -192,7 +193,7 @@ fetched at runtime, ever.
 python -m pip install -e "engine[dev]" PySide6
 
 python tasks.py build      # build the Rust engine core
-python tasks.py test       # 331 tests, no network
+python tasks.py test       # 365 tests, no network
 python tasks.py lint       # rustfmt + clippy
 python tasks.py check      # all of the above — what CI runs
 ```
@@ -203,10 +204,18 @@ python tasks.py check      # all of the above — what CI runs
 python tasks.py console    # the operator console
 ```
 
-Add one or more video files, place each camera, draw a zone, and press Start. The console shows the
-frame with its overlay, the ground beside it, and one table row per tracked
-object carrying class, confidence, duration, speed, heading, position,
-uncertainty and provenance.
+Add one or more video files, place each camera, add a zone, and press Start. The
+console shows the frame with its overlay, the ground beside it, and one table row
+per tracked object carrying class, confidence, duration, speed, heading,
+position, uncertainty and provenance.
+
+**"Add a zone" is not yet "draw a zone."** *Add zone* places a square of the
+radius you choose on the ground just beyond the near edge of what that camera can
+actually see — the near end, because projection uncertainty grows
+super-linearly, so a zone there is one the system can genuinely adjudicate rather
+than one it will mostly report `UNCERTAIN`. Drawing an arbitrary polygon on the
+plan view is `PLANNED`; the zone engine underneath already takes any polygon, so
+what is missing is the editor, not the geometry.
 
 Until a camera is placed, objects are tracked and reported as **not placed** —
 there is deliberately no default position, because a nominal origin produces

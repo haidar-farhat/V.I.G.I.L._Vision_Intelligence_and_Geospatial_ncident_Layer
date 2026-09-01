@@ -108,19 +108,49 @@ def test_no_column_in_the_schema_is_credential_shaped(store: Store):
 
 
 def test_a_camera_stores_a_handle_not_a_password(store: Store):
+    """The credential must not survive the trip into the database.
+
+    An earlier version of this test asserted `"hunter2" not in joined` while
+    never putting "hunter2" anywhere — it checked for the absence of a string it
+    had not introduced, which is true of almost any database and proves nothing.
+    It now pushes a real credential through the real redactor and looks for that
+    credential, so a redactor that stopped working would fail here.
+    """
+    from sentinel.decode import contains_credential, redact_url
+
+    raw = "rtsp://admin:hunter2-not-a-real-password@10.20.30.40:554/Streaming/Channels/101"
     store.save_camera(
         "cam-07",
         "North gate",
-        source="rtsp://admin:***@10.20.30.40:554/Streaming/Channels/101",
+        source=redact_url(raw),
         credentials_ref="keychain://sentinel/cam-07",
     )
 
     row = store.cameras()[0]
     joined = " ".join(str(value) for value in tuple(row))
 
-    assert "***" in row["source"], "the source must already be redacted before it gets here"
+    assert not contains_credential(joined, raw), (
+        "the camera row carries a secret from the source URL"
+    )
+    assert "10.20.30.40:554" in row["source"], "the row must still identify the camera"
     assert row["credentials_ref"].startswith("keychain://")
-    assert "hunter2" not in joined
+
+
+def test_the_store_refuses_nothing_and_that_is_the_point(store: Store):
+    """`save_camera` cannot validate what it is given, so the boundary is above it.
+
+    This is recorded as a test because it is a real design decision rather than
+    an oversight: the store takes a string. Redaction happens at the one place
+    that has the raw URL — decode.py — and every caller is expected to have gone
+    through it. The test above proves the console's path does; this one states
+    plainly that the store itself is not a second line of defence.
+    """
+    store.save_camera("cam-99", "Careless", source="rtsp://admin:leaked@10.0.0.1/s")
+
+    assert "leaked" in store.cameras()[-1]["source"], (
+        "if this ever starts passing by redaction inside the store, the comment "
+        "above is wrong and the boundary has moved"
+    )
 
 
 def test_every_stored_position_carries_its_uncertainty(store: Store):
@@ -151,16 +181,51 @@ def test_migrating_twice_changes_nothing(store: Store):
 
 
 def test_a_migration_can_be_undone(store: Store):
-    # An upgrade that cannot be reversed on a machine with no Internet and no
-    # spare hardware is a gamble, not an upgrade.
+    """An upgrade that cannot be reversed on an air-gapped machine is a gamble.
+
+    Asserted as the general property rather than against one migration's
+    contents. An earlier version checked that rolling back removed the `events`
+    table, which was only true while `events` happened to be in the newest
+    migration — it broke the moment a second one was added, which is exactly
+    when a rollback test matters most.
+    """
+    before = store.applied_versions()
+    assert before, "nothing was applied, so nothing was checked"
+
     undone = store.rollback()
 
     assert undone is not None
-    assert "events" not in store.table_names()
+    assert undone.version == before[-1], "rollback must undo the most recent"
+    assert store.applied_versions() == before[:-1]
+
+    store.migrate()
+    assert store.applied_versions() == before, "re-applying did not restore the schema"
+
+
+def test_every_migration_can_be_undone_and_reapplied(store: Store):
+    # All the way down and all the way back, so a `down` that was never run is
+    # not discovered to be broken during an actual downgrade.
+    original = store.applied_versions()
+
+    while store.rollback() is not None:
+        pass
     assert store.applied_versions() == []
 
     store.migrate()
-    assert "events" in store.table_names()
+    assert store.applied_versions() == original
+
+
+def test_a_camera_pose_keeps_its_roll(store: Store):
+    # Roll was accepted, dropped on the way in, and defaulted to 0.0 on the way
+    # out — so the store handed back a different pose than it was given.
+    pose = CameraPose(
+        position=SITE, mount_height=6.0, heading=90.0, pitch=-20.0, roll=-3.5,
+    )
+    store.save_camera("cam-tilt", "Tilted", "file:///media/tilt.mp4", pose)
+
+    restored = store.camera_pose("cam-tilt")
+    assert restored is not None
+    assert restored.roll == pytest.approx(-3.5)
 
 
 def test_migrations_are_applied_in_version_order(store: Store):
@@ -438,3 +503,96 @@ def test_a_failed_transaction_leaves_nothing_behind(store: Store):
 
     assert store.audit_trail() == []
     assert store.event_count() == 1, "the earlier write was rolled back too"
+
+
+# --------------------------------------------------- correlation is not stable
+
+
+def test_merging_two_incidents_does_not_leave_the_old_ones_behind(store: Store):
+    """Correlation is not stable across runs, and the database has to survive that.
+
+    A later batch can merge two incidents into one, and that one has a different
+    deterministic id. Without cleanup the superseded rows survive forever and
+    the same event is linked to two incidents — double-counting on every screen
+    that reads them.
+    """
+    from sentinel.core import destination_point
+
+    far = make_event(camera="cam-07", track=1, at_millis=0)
+    near = make_event(camera="cam-08", track=1, at_millis=200_000)
+
+    # Two separate incidents first: far apart in time.
+    separate = Correlator().correlate([far])
+    separate += Correlator().correlate([near])
+    assert len(separate) == 2
+    for incident in separate:
+        store.save_incident(incident)
+    assert store.incident_count() == 2
+
+    # Now a run that sees both together and merges them.
+    merged = Correlator(window_millis=10_000_000).correlate([far, near])
+    assert len(merged) == 1, "the fixture did not actually merge them"
+    store.save_incident(merged[0])
+
+    assert store.incident_count() == 1, "a superseded incident survived the merge"
+    assert len(store.incident_events(merged[0].id)) == 2
+
+    # And no event belongs to two incidents.
+    rows = store._connection.execute(
+        "SELECT event_id, COUNT(*) AS n FROM incident_events GROUP BY event_id"
+    ).fetchall()
+    assert all(row["n"] == 1 for row in rows), "an event is linked to two incidents"
+
+
+def test_an_updated_event_refreshes_everything_that_can_change(store: Store):
+    """A re-sent event must replace the row, not blend with it.
+
+    The upsert used to refresh two columns and leave the position, motion,
+    class, zone and frames from the earlier pass — producing a row that was true
+    of neither observation and was then exported as evidence.
+    """
+    from dataclasses import replace
+
+    first = make_event(track=1, at_millis=1000)
+    store.save_events([first])
+
+    revised = replace(
+        first,
+        zone_name="Restricted Area B",
+        evidence=replace(
+            first.evidence,
+            observations=99,
+            latitude=34.0,
+            longitude=36.0,
+            position_uncertainty_meters=9.5,
+            speed_mps=None,
+            heading_degrees=None,
+            class_label="person",
+            detector_classifies=True,
+            frame_indices=(99,),
+        ),
+    )
+    store.save_events([revised])
+
+    stored = store.events()[0]
+    assert store.event_count() == 1
+    assert stored.zone_name == "Restricted Area B"
+    assert stored.evidence.observations == 99
+    assert stored.evidence.latitude == pytest.approx(34.0)
+    assert stored.evidence.position_uncertainty_meters == pytest.approx(9.5)
+    assert stored.evidence.speed_mps is None, "stale motion survived the update"
+    assert stored.evidence.class_label == "person"
+    assert stored.evidence.frame_indices == (99,)
+
+
+def test_recorded_at_is_not_rewritten_by_a_re_send(store: Store):
+    # `recorded_at` is when this node FIRST durably accepted the event. A worker
+    # replaying its buffer after an outage must not move it.
+    event = make_event()
+    store.save_events([event])
+    first = store._connection.execute("SELECT recorded_at FROM events").fetchone()[0]
+
+    store.save_events([event])
+    second = store._connection.execute("SELECT recorded_at FROM events").fetchone()[0]
+
+    assert first == second, "a re-send rewrote when the event was first accepted"

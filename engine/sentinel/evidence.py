@@ -368,11 +368,29 @@ def export_incident(
     report.write_text(_readable_report(incident, exported_by, moment), encoding="utf-8")
     written.append(report)
 
+    reserved = {"manifest.json", "incident.json", "report.txt"}
+    used: set[str] = set(reserved)
+
     for source in attachments:
         source = Path(source)
         if not source.is_file():
             raise ExportError(f"Attachment not found: {source}")
-        target = _resolve_within(package, source.name)
+
+        # Two clips from two cameras are routinely both called `clip.mp4`, and
+        # copying the second over the first loses evidence *and still verifies
+        # clean*, because the manifest is written afterwards from what survived.
+        # An attachment named `incident.json` would have destroyed the record
+        # itself. Names are made unique here rather than trusted.
+        name = source.name
+        if name in used:
+            stem, suffix = source.stem, source.suffix
+            index = 2
+            while f"{stem}-{index}{suffix}" in used:
+                index += 1
+            name = f"{stem}-{index}{suffix}"
+        used.add(name)
+
+        target = _resolve_within(package, name)
         shutil.copy2(source, target)
         written.append(target)
 

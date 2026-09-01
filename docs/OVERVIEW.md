@@ -106,13 +106,13 @@ restricted zone, after-hours schedule active.
 
 ```mermaid
 flowchart TD
-    A["<b>180 frames</b><br/>640×480 · 15 fps · real H.264"] --> B["<b>379 detections</b><br/>in 169 of 180 frames"]
-    B --> C["<b>5 tracks</b><br/>ground truth: 3 people"]
-    C --> D["<b>5 zone presences</b><br/>after hysteresis"]
-    D --> E["<b>16 events</b><br/>entry · after-hours · loitering · speed"]
+    A["<b>180 frames</b><br/>640×480 · 15 fps · real H.264"] --> B["<b>356 detections</b><br/>in 169 of 180 frames"]
+    B --> C["<b>4 tracks</b><br/>ground truth: 3 people"]
+    C --> D["<b>4 zone presences</b><br/>after hysteresis"]
+    D --> E["<b>13 events</b><br/>entry · after-hours · loitering"]
     E --> F["<b>1 incident</b><br/>HIGH · risk 75/100"]
 
-    C -.->|"over-count<br/>see STATUS gap 8"| C2["reports 5 objects<br/>for 3 people"]
+    C -.->|"over-count<br/>see STATUS gap 8"| C2["reports 4 objects<br/>for 3 people"]
 
     style A fill:#334155,stroke:#94a3b8,color:#e2e8f0
     style B fill:#334155,stroke:#94a3b8,color:#e2e8f0
@@ -123,12 +123,12 @@ flowchart TD
     style C2 fill:#4c1d24,stroke:#f87171,color:#fca5a5
 ```
 
-**16 events become 1 incident — 94% less for a person to read.** That reduction
+**13 events become 1 incident — 92% less for a person to read.** That reduction
 is the product. An operator who receives six alerts for one intrusion learns to
 skim, and the skimming is what loses the seventh alert that mattered.
 
 The dotted branch is an honest failure, bounded by a test so it cannot silently
-worsen: the tracker fragments 3 people into 5 tracks, and correlation
+worsen: the tracker fragments 3 people into 4 tracks, and correlation
 deliberately does not second-guess a tracker within one camera.
 
 ---
@@ -158,7 +158,7 @@ sequenceDiagram
     C8->>C8: decode → detect → track → project
 
     C7->>X: 2 events (track #1)
-    C8->>X: 1 event (track #1)
+    C8->>X: 2 events (track #1)
 
     Note over X: union-find over associated tracks<br/>separation 10 m ≤ allowance from<br/>both position uncertainties
 
@@ -168,11 +168,11 @@ sequenceDiagram
 | Measurement | Value |
 |---|---|
 | Distinct objects, per camera | 1 and 1 |
-| Position error vs **world** ground truth | median **0.32 m** |
-| Position error, 90th percentile | 0.96 m and 1.34 m |
+| Position error vs **world** ground truth | median **0.08–0.11 m** |
+| Position error, 90th percentile | 0.24 m and 0.51 m |
 | True position inside the stated 2σ disc | **100%** |
-| Events raised by both cameras | 3 |
-| Cross-camera associations made | 2 |
+| Events raised by both cameras | 4 |
+| Cross-camera associations made | 4 |
 | **Incidents an operator sees** | **1** |
 | **Distinct objects in that incident** | **1** |
 | Risk | 62.5/100 (HIGH) |
@@ -371,8 +371,8 @@ side by side as two objects.
 
 | | square 9×9 | vertical 3×31 |
 |---|---|---|
-| Recall @ IoU > 0.3 | 0.64 | **0.69** |
-| Mean overlap with truth | 0.40 | **0.50** |
+| Recall @ IoU > 0.3 | 0.64 | **0.71** |
+| Mean overlap with truth | 0.40 | **0.51** |
 | Fragments per frame | 1.20 | **0.42** |
 
 **The association gate is an ellipse, not a circle.** A camera looking at the
@@ -385,8 +385,8 @@ shot 100 px above it.
 
 | Reference walker | Recall |
 |---|---|
-| `approaching` — walks the full depth | 0.86 |
-| `crossing` — crosses the scene | 0.68 |
+| `approaching` — walks the full depth | 0.89 |
+| `crossing` — crosses the scene | 0.70 |
 | `loiterer` — **stops moving** | **0.49** |
 
 This is not a bug to be tuned away; it is what background subtraction *is*. The
@@ -556,16 +556,16 @@ What the export refuses to do:
 
 ## 14. Test topology
 
-**331 tests.** Where they sit and what only they can catch:
+**365 tests.** Where they sit and what only they can catch:
 
 ```mermaid
 flowchart TB
-    subgraph rust["core · 44 tests"]
-        G["geometry.rs · 20<br/><i>the mathematics</i>"]
-        T["tracking.rs · 13<br/><i>identity and motion</i>"]
+    subgraph rust["core · 56 tests"]
+        G["geometry.rs · 25<br/><i>the mathematics</i>"]
+        T["tracking.rs · 20<br/><i>identity and motion</i>"]
         F["ffi.rs · 11<br/><i>null tolerance, layout, truncation</i>"]
     end
-    subgraph eng["engine · 247 tests"]
+    subgraph eng["engine · 269 tests"]
         C["test_core · 32<br/><i>does the boundary lie?</i>"]
         DE["test_decode · 20<br/><i>credentials, timestamps</i>"]
         DT["test_detect · 22 · test_onnx · 16"]
@@ -595,7 +595,7 @@ than *"is the maths right?"*.
 
 | Component | Files | Lines |
 |---|---:|---:|
-| `core/src` (Rust) | 4 | 3,033 |
+| `core/src` (Rust) | 4 | 3,600 |
 | `engine/sentinel` (Python) | 10 | 5,049 |
 | `engine/tests` | 15 | 4,551 |
 | `apps/console/sentinel_console` | 9 | 2,371 |
@@ -607,27 +607,102 @@ the point rather than a statistic.
 
 ---
 
-## 15. Throughput
+## 15. Throughput, and what actually limits it
 
-Measured on the reference scene, 640×480, median of five runs on an idle machine.
+"Make it scale" is a question that cannot be answered by adding a framework and
+hoping. It needs two measurements first: what fraction of a frame each stage
+costs, and what happens when cameras run side by side.
+
+### Where the time goes
+
+Per frame, 640×480, measured separately:
+
+| Stage | Cost | Share |
+|---|---:|---:|
+| decode | 0.198 ms | 6.0% |
+| **detect** | **3.117 ms** | **93.6%** |
+| track + project (the Rust core) | 0.015 ms | 0.4% |
+
+**The Rust core is 0.4% of the budget.** Any effort spent making it faster —
+`rayon`, SIMD, a batched FFI — would be effort spent on four thousandths of the
+problem. This is why the C ABI's per-call overhead has never mattered and why no
+async runtime appears anywhere in this codebase.
+
+### What happens with several cameras
+
+Eight workers, each running the stage in its own thread, `cv2` limited to one
+thread each so they compete for cores the way a real node would:
+
+| Workload | Speedup with 8 workers | |
+|---|---:|---|
+| memory-only loop | **14.5×** | `██████████████` |
+| Gaussian blur | **6.8×** | `███████` |
+| **MOG2 detection** | **2.1×** | `██` |
+| decode | 1.1× | `█` |
+
+A Gaussian blur scales 6.8×. A memory-only loop scales 14.5×. **MOG2 plateaus at
+2.1×** — and the plateau is the same whether the cameras are threads or separate
+OS processes (measured: processes were 0.75–0.87× as fast, start-up included).
+
+So the constraint is **not** the GIL, not Python, and not the FFI boundary. It is
+MOG2's per-pixel mixture-of-Gaussians state, read and written every frame. Four
+detectors at 640×480 keep tens of megabytes of model hot, and they evict each
+other from cache.
+
+### The lever that actually applies
+
+Shrinking the frame the background model sees shrinks that state quadratically:
+
+| `detect_scale` | 1 worker | 8 workers | recall | mean IoU |
+|---|---:|---:|---:|---:|
+| 1.00 | 236 fps | 455 fps | 0.690 | 0.503 |
+| **0.75 (default)** | **349 fps** | **784 fps** | **0.707** | **0.511** |
+| 0.50 | 1018 fps | 1927 fps | 0.652 | 0.460 |
+| 0.35 | 900 fps | 4189 fps | 0.616 | 0.419 |
+
+**0.75 is better on both axes** — 1.7× the throughput *and* slightly better
+detection, because the downscale is a mild denoise. It also reduced fragmentation
+on the reference scene from 5 tracks to 4 for three people. 0.5 buys 4.2× for a
+real cost in recall, and is the right choice for a node carrying more cameras
+than it has cores.
+
+Nothing downstream needed changing: every threshold in the detector is a fraction
+of the frame and every box is normalised, so a detection means the same thing at
+any scale. A test pins that.
+
+### Capacity, stated honestly
 
 | | fps | ms/frame |
 |---|---:|---:|
-| Motion detector, 16 threads | 385 | 2.60 |
-| Motion detector, **1 thread** | **230** | **4.34** |
-| Whole pipeline (decode → incident), 16 threads | 319 | 3.14 |
+| Motion detector, 16 threads, 0.75 scale | 433 | 2.31 |
+| Whole pipeline, 1 camera | ~190 | ~5.2 |
+| Aggregate, 4 cameras | ~380 | — |
+| Aggregate, 16 cameras | ~370 | — |
 
-**The single-threaded number is the one that matters for capacity.** A worker
-node runs one pipeline per camera and they compete for cores, so 230 fps on one
-core is roughly **15 cameras at 15 fps per core** — before any real detection
-model, which will dominate this budget entirely.
+At 16 cameras each pipeline still runs at ~25 fps, comfortably above the 15 fps a
+camera delivers. **One node handles 16 cameras today** — with one caveat that
+dominates everything above: a real detection model will take far more than 3 ms
+a frame, and will become the entire budget. Optimising MOG2 further would be
+optimising something that is about to be replaced.
 
-> Earlier revisions of this document quoted 87 fps. That figure was measured
-> while other test processes were running and was wrong. Numbers here are
-> re-measured on an idle machine and stated with their conditions, because a
-> performance claim without its conditions is not a measurement.
+> Reproduce all of this with `python engine/tests/bench_scaling.py`. It prints
+> its own conditions, because a throughput claim without them is not a
+> measurement.
 
----
+### Why no framework was added
+
+| Candidate | Verdict |
+|---|---|
+| `rayon` in the Rust core | The core is 0.4% of the frame. Nothing to win. |
+| `tokio` | No network path exists yet; when one does, it is per-event, not per-frame. |
+| Batched FFI across cameras | Per-call overhead is already invisible inside 0.015 ms. |
+| `multiprocessing` per camera | **Measured**: 0.75–0.87× of threads. The GIL was not the constraint. |
+| Free-threaded Python (PEP 703) | Would remove a limit that measurement shows is not binding. |
+| Downscaling the background model | **Adopted.** 1.7× throughput, better recall, no dependency. |
+
+The framework that would have helped is the one that was not needed. That is
+worth recording, because the next person to ask this question deserves the
+measurements rather than the conclusion.
 
 ## 16. What this does not establish
 

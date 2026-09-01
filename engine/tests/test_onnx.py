@@ -195,17 +195,34 @@ def test_letterboxing_and_stretching_agree_horizontally(model_path: Path):
 # ------------------------------------------------------------------------ NMS
 
 
-def test_overlapping_candidates_collapse(model_path: Path):
-    # With a low IoU threshold the adjacent cells covering one object should
-    # reduce; with a high one they should not. This is NMS running on real
-    # model output rather than on a hand-built array.
+def test_nms_leaves_genuinely_separate_detections_alone(model_path: Path):
+    """The fixture's candidates tile the frame, so none of them overlap.
+
+    An earlier version of this test compared a strict and a loose IoU threshold
+    with `<=` and called that evidence of suppression. The two counts are
+    measurably identical — this model emits one box per grid cell and grid cells
+    do not overlap — so the assertion held no matter what NMS did, including
+    nothing.
+
+    What this model *can* prove is the opposite and equally important property:
+    NMS must not destroy separate detections that happen to be adjacent. The
+    suppression path itself is tested directly, on hand-built overlapping boxes,
+    in `test_detect.py`.
+    """
     strict = OnnxDetector(model_path, confidence_threshold=0.4, iou_threshold=0.01)
     loose = OnnxDetector(model_path, confidence_threshold=0.4, iou_threshold=0.99)
 
     image = np.zeros((INPUT_SIZE, INPUT_SIZE, 3), dtype=np.uint8)
     image[200:300, 300:400] = 255
 
-    assert len(strict.detect(image)) <= len(loose.detect(image))
+    aggressive = strict.detect(image)
+    permissive = loose.detect(image)
+
+    assert aggressive, "nothing was detected, so nothing was checked"
+    assert len(aggressive) == len(permissive), (
+        "this model's candidates are disjoint grid cells; if suppression is now "
+        "removing some of them it is removing distinct objects"
+    )
 
 
 def test_the_detector_is_deterministic(detector: OnnxDetector):
@@ -263,3 +280,31 @@ def test_the_detector_reports_it_classifies_unlike_the_motion_detector(
 
     assert detector.info.classifies is True
     assert MotionDetector().info.classifies is False
+
+
+# ------------------------------------------------------------------- zero-WAN
+
+
+def test_onnxruntime_telemetry_is_switched_off(model_path: Path, monkeypatch):
+    # This system tells the operator to their face that it sends nothing
+    # anywhere. That claim has to hold for every dependency, not just for the
+    # code written here, and onnxruntime collects telemetry by default on some
+    # builds. The call is guarded in the source, so this asserts the wiring
+    # rather than the presence of the API.
+    import onnxruntime as ort
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        ort, "disable_telemetry_events", lambda: calls.append("off"), raising=False
+    )
+
+    OnnxDetector(model_path)
+
+    assert calls == ["off"], "telemetry was left at the library's default"
+
+
+def test_the_detector_never_reaches_for_a_model_it_does_not_have(tmp_path: Path):
+    # Nothing is downloaded, ever. A missing model is an error that names the
+    # operator as the source of models — not a cue to go and find one.
+    with pytest.raises(DetectionError, match="nothing is ever downloaded"):
+        OnnxDetector(tmp_path / "absent.onnx")

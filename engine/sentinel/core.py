@@ -342,6 +342,13 @@ def _check_struct_layout(lib: ctypes.CDLL, path: Path) -> None:
     plausible and wrong geometry. Cheap to check once at load; nearly impossible
     to diagnose later.
     """
+    # Sizes only. This catches a struct that grew or shrank, which is the
+    # common drift, and it does NOT catch two fields of the same width being
+    # swapped — that keeps the total identical and reads plausible, wrong
+    # values. Ordering is held instead by the round-trip tests in
+    # `test_core.py`, which push a known value through each field and read it
+    # back: a swap moves the value and the assertion fails. Both are needed and
+    # neither is sufficient alone.
     count = len(_BOUNDARY_STRUCTS)
     buffer = (ctypes.c_uint32 * count)()
     written = lib.sentinel_struct_sizes(buffer, count)
@@ -385,14 +392,29 @@ def load_core() -> ctypes.CDLL:
         except OSError as error:
             raise CoreError(f"Found {path} but could not load it: {error}") from error
 
-        _bind(lib)
-        version = lib.sentinel_abi_version()
+        # The version is read before anything else is bound. `_bind` touches
+        # every exported symbol, so binding first meant a core older than this
+        # build died on a bare AttributeError about a missing symbol instead of
+        # the CoreError that explains what to do about it.
+        try:
+            version = lib.sentinel_abi_version
+        except AttributeError as error:
+            raise CoreError(
+                f"{path} does not export sentinel_abi_version, so it is either "
+                "not the engine core or is far older than this build. Rebuild "
+                "it with 'cargo build --release'."
+            ) from error
+
+        version.restype = ctypes.c_uint32
+        version = version()
+
         if version != ABI_VERSION:
             raise CoreError(
                 f"{path} reports ABI version {version}; this build expects "
                 f"{ABI_VERSION}. Rebuild the core with 'cargo build --release'."
             )
 
+        _bind(lib)
         _check_struct_layout(lib, path)
         _lib = lib
         return lib
@@ -450,7 +472,13 @@ def field_of_view(pose: CameraPose, arc_segments: int = 24) -> list[LatLon]:
     lib = load_core()
     c_pose = pose.to_c()
 
-    capacity = arc_segments * 2 + 4
+    # The core clamps arc_segments to a minimum of 2, so the buffer has to be
+    # sized for what the core will actually produce rather than for what was
+    # asked. Sizing it from the raw argument under-allocated for anything below
+    # 2 and then discarded the truncation status, silently returning a partial
+    # footprint that would have been drawn as real coverage.
+    segments = max(2, int(arc_segments))
+    capacity = segments * 2 + 4
     buffer = (CPoint * capacity)()
     written = ctypes.c_uint32(0)
 
@@ -459,6 +487,12 @@ def field_of_view(pose: CameraPose, arc_segments: int = 24) -> list[LatLon]:
     )
     if status < 0:
         raise CoreError(f"field of view failed with status {status}")
+    if status == 1:
+        raise CoreError(
+            "the field-of-view buffer was too small and the footprint was "
+            "truncated. A partial footprint drawn as a complete one claims "
+            "coverage that does not exist."
+        )
 
     return [LatLon(buffer[i].lat, buffer[i].lon) for i in range(written.value)]
 

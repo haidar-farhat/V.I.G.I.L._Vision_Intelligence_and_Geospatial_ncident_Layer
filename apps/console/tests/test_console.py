@@ -346,7 +346,7 @@ def test_evidence_and_inference_are_drawn_differently():
 # ----------------------------------------------------------------- incidents
 
 
-def _incident_from_events(count: int = 3):
+def _incident_from_events(count: int = 3, *, severity=None, camera: str = "cam-07"):
     """A real incident, built by the real correlator from real events."""
     from datetime import datetime, timezone
 
@@ -358,7 +358,7 @@ def _incident_from_events(count: int = 3):
     events = []
     for index in range(count):
         evidence = Evidence(
-            camera_id="cam-07",
+            camera_id=camera,
             track_id=index + 1,
             first_seen_millis=index * 500,
             last_seen_millis=index * 500 + 2000,
@@ -377,9 +377,9 @@ def _incident_from_events(count: int = 3):
         )
         events.append(
             Event(
-                id=f"ev_{index}",
+                id=f"ev_{camera}_{index}",
                 type=EventType.ZONE_ENTRY,
-                severity=Severity.HIGH,
+                severity=severity or Severity.HIGH,
                 summary="An object entered Restricted Area A",
                 occurred_at_millis=index * 500,
                 occurred_at=datetime(2026, 8, 30, 3, 0, tzinfo=timezone.utc),
@@ -459,24 +459,54 @@ def test_an_expanded_incident_stays_expanded_across_a_refresh(qt_app):
 
 
 def test_incidents_are_listed_most_serious_first(qt_app):
+    """Triage order, not arrival order.
+
+    An earlier version built two incidents that both came out HIGH and then
+    asserted the list was sorted — which is true of any two equal things, in any
+    order, including reversed. It now builds incidents that genuinely differ and
+    feeds them in deliberately wrong.
+    """
+    from sentinel.events import Severity
     from sentinel_console.incident_view import IncidentView
 
+    quiet = _incident_from_events(1, severity=Severity.LOW)
+    loud = _incident_from_events(1, severity=Severity.CRITICAL, camera="cam-99")
+    middling = _incident_from_events(1, severity=Severity.MEDIUM, camera="cam-42")
+
     view = IncidentView()
-    first = _incident_from_events(1)
-    second = _incident_from_events(3)
-    view.show_incidents(first + second)
+    view.show_incidents(quiet + middling + loud)
 
-    severities = [view.topLevelItem(i).text(1) for i in range(view.topLevelItemCount())]
-    ranked = sorted(severities, key=lambda s: ["INFO", "LOW", "MEDIUM", "HIGH", "CRITICAL"].index(s), reverse=True)
-    assert severities == ranked
+    listed = [view.topLevelItem(i).text(1) for i in range(view.topLevelItemCount())]
+    assert listed == ["CRITICAL", "MEDIUM", "LOW"], (
+        f"listed {listed}; an operator triages from the top and the worst has to be there"
+    )
 
 
-def test_a_zone_needs_a_placed_camera(qt_app, window):
-    # A zone is an area on the ground. With no camera placed there is nothing to
-    # measure it against, and creating one anyway would produce alerts nobody
-    # can act on.
+def test_a_zone_needs_a_placed_camera(qt_app, window, monkeypatch):
+    """Asking for a zone with no camera placed must create nothing.
+
+    An earlier version of this test asserted the fixture's own initial state and
+    never called `_add_zone` at all — it would have passed with the guard
+    deleted. It now presses the button.
+
+    The modal is intercepted rather than shown, because an unattended dialog
+    hangs the suite forever — which is also exactly what it would do to an
+    operator, so the interception records that it was raised.
+    """
+    from PySide6.QtWidgets import QMessageBox
+
+    told: list[str] = []
+    monkeypatch.setattr(
+        QMessageBox, "information",
+        lambda *args, **kwargs: told.append(args[2] if len(args) > 2 else ""),
+    )
+
     assert window._pose is None
-    assert window._zones == []
+    window._add_zone()
+
+    assert window._zones == [], "a zone was created with nothing to measure it against"
+    assert told, "the operator was given no reason why nothing happened"
+    assert "place" in told[0].lower()
 
 # ------------------------------------------------------------- several cameras
 
@@ -555,11 +585,32 @@ def test_correlation_runs_across_cameras_not_within_one(qt_app, window, referenc
     pump(qt_app, window, 16.0)
     window._stop()
 
-    events = sum(len(s.events) for s in window._sessions.values())
-    assert events > 0, "no events were raised, so correlation was never exercised"
-    assert window.incidents.topLevelItemCount() <= 2, (
-        "two cameras watching one scene produced an incident each"
+    per_camera = {c: len(s.events) for c, s in window._sessions.items()}
+    assert sum(per_camera.values()) > 0, (
+        "no events were raised, so correlation was never exercised"
     )
+    contributing = [c for c, n in per_camera.items() if n]
+
+    # Assert the property, not a bound. An earlier version of this test allowed
+    # `<= 2` incidents, which per-session correlation of two cameras satisfies
+    # exactly — so it passed while the regression it exists for was present. A
+    # threshold that admits the failure it was written to catch is not a test.
+    if len(contributing) > 1:
+        assert window.incidents.topLevelItemCount() == 1, (
+            f"{len(contributing)} cameras watching one scene produced "
+            f"{window.incidents.topLevelItemCount()} incidents; correlation must "
+            "run above the cameras, not inside each one"
+        )
+        row = window.incidents.topLevelItem(0)
+        named = set(row.text(3).split(", "))
+        assert named == set(contributing), (
+            f"the incident names {named}, but {set(contributing)} contributed — "
+            "the cameras were not correlated together"
+        )
+    else:
+        # Only one camera saw anything, so this run cannot exercise the claim.
+        # Say so rather than passing silently on a vacuous assertion.
+        assert window.incidents.topLevelItemCount() >= 1
 
 
 def test_the_map_shows_every_placed_camera(qt_app, window, reference_video: Path):

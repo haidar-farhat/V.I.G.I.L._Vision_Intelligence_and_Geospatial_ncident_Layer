@@ -54,7 +54,7 @@ from .zones import Schedule, Zone, ZoneKind
 #: Schema version this build expects. A database at a different version is
 #: migrated forward, never opened as-is: opening a schema you do not understand
 #: and hoping the columns line up is how evidence is silently corrupted.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class StoreError(RuntimeError):
@@ -223,6 +223,23 @@ MIGRATIONS: tuple[Migration, ...] = (
         DROP TABLE IF EXISTS events;
         DROP TABLE IF EXISTS zones;
         DROP TABLE IF EXISTS cameras;
+        """,
+    ),
+    Migration(
+        version=2,
+        name="camera_roll",
+        up="""
+        -- Roll was accepted by CameraPose, dropped on the way into the database
+        -- and defaulted to 0.0 on the way out, so camera_pose() handed back a
+        -- pose that differed from the one saved.
+        --
+        -- Added as a new migration rather than by editing version 1: an applied
+        -- migration is a fact about every deployment that has run it, and
+        -- editing one is how two of them silently diverge.
+        ALTER TABLE cameras ADD COLUMN roll REAL;
+        """,
+        down="""
+        ALTER TABLE cameras DROP COLUMN roll;
         """,
     ),
 )
@@ -430,10 +447,10 @@ class Store:
                 """
                 INSERT INTO cameras (
                     id, name, source, credentials_ref,
-                    latitude, longitude, mount_height, heading, pitch,
+                    latitude, longitude, mount_height, heading, pitch, roll,
                     horizontal_fov, vertical_fov, range_meters,
                     created_at, updated_at
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(id) DO UPDATE SET
                     name = excluded.name,
                     source = excluded.source,
@@ -443,6 +460,7 @@ class Store:
                     mount_height = excluded.mount_height,
                     heading = excluded.heading,
                     pitch = excluded.pitch,
+                    roll = excluded.roll,
                     horizontal_fov = excluded.horizontal_fov,
                     vertical_fov = excluded.vertical_fov,
                     range_meters = excluded.range_meters,
@@ -455,6 +473,7 @@ class Store:
                     pose.mount_height if pose else None,
                     pose.heading if pose else None,
                     pose.pitch if pose else None,
+                    pose.roll if pose else None,
                     pose.horizontal_fov if pose else None,
                     pose.vertical_fov if pose else None,
                     pose.range_meters if pose else None,
@@ -482,6 +501,10 @@ class Store:
             mount_height=row["mount_height"],
             heading=row["heading"],
             pitch=row["pitch"],
+            # Stored and returned rather than dropped on the way in and
+            # defaulted to 0.0 on the way out — which silently handed back a
+            # different pose than the one that was saved.
+            roll=row["roll"] if row["roll"] is not None else 0.0,
             horizontal_fov=row["horizontal_fov"],
             vertical_fov=row["vertical_fov"],
             range_meters=row["range_meters"],
@@ -560,12 +583,36 @@ class Store:
                         position_source, speed_mps, heading_degrees, frame_indices
                     ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     ON CONFLICT(id) DO UPDATE SET
+                        -- Every column that can differ between two observations
+                        -- of the same event, not just the two that were obvious.
+                        -- Refreshing `observations` while leaving the position,
+                        -- motion, class and frames from an earlier pass produced
+                        -- a row that was true of neither observation — a blend,
+                        -- presented as evidence.
+                        --
+                        -- `recorded_at` is deliberately absent: it is when this
+                        -- node FIRST durably accepted the event, and a re-send
+                        -- must not rewrite that.
                         severity = excluded.severity,
                         summary = excluded.summary,
                         confidence = excluded.confidence,
                         conditions = excluded.conditions,
+                        zone_id = excluded.zone_id,
+                        zone_name = excluded.zone_name,
                         observations = excluded.observations,
-                        last_seen_millis = excluded.last_seen_millis
+                        first_seen_millis = excluded.first_seen_millis,
+                        last_seen_millis = excluded.last_seen_millis,
+                        detector = excluded.detector,
+                        detector_classifies = excluded.detector_classifies,
+                        model_digest = excluded.model_digest,
+                        class_label = excluded.class_label,
+                        latitude = excluded.latitude,
+                        longitude = excluded.longitude,
+                        uncertainty_meters = excluded.uncertainty_meters,
+                        position_source = excluded.position_source,
+                        speed_mps = excluded.speed_mps,
+                        heading_degrees = excluded.heading_degrees,
+                        frame_indices = excluded.frame_indices
                     """,
                     (
                         event.id,
@@ -617,9 +664,13 @@ class Store:
             clauses.append("occurred_at >= ?")
             params.append(since_millis)
 
+        # Filtered and ordered on the SAME column. `since_millis` is a
+        # wall-clock instant and `occurred_at_millis` is media time — an earlier
+        # version filtered on one and ordered by the other, so a query across
+        # two cameras came back interleaved by two incompatible clocks.
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         rows = self._connection.execute(
-            f"SELECT * FROM events {where} ORDER BY occurred_at_millis, id LIMIT ?",
+            f"SELECT * FROM events {where} ORDER BY occurred_at, id LIMIT ?",
             (*params, limit),
         ).fetchall()
         return [_event_from_row(row) for row in rows]
@@ -705,6 +756,27 @@ class Store:
                     ),
                 ),
             )
+
+            # An event belongs to exactly one incident. Correlation is not
+            # stable across runs — a later batch can merge two incidents into
+            # one, and that one has a different deterministic id — so without
+            # this the superseded row survives forever and the same event is
+            # linked to both, double-counting on every screen that reads them.
+            event_ids = [event.id for event in incident.events]
+            if event_ids:
+                placeholders = ",".join("?" * len(event_ids))
+                superseded = connection.execute(
+                    f"""
+                    SELECT DISTINCT incident_id FROM incident_events
+                    WHERE event_id IN ({placeholders}) AND incident_id != ?
+                    """,
+                    (*event_ids, incident.id),
+                ).fetchall()
+
+                for row in superseded:
+                    connection.execute(
+                        "DELETE FROM incidents WHERE id = ?", (row["incident_id"],)
+                    )
 
             for event in incident.events:
                 connection.execute(

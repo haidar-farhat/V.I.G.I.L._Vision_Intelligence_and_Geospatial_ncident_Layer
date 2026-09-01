@@ -31,6 +31,7 @@ from sentinel.events import (
     EventType,
     LoiteringRule,
     RapidMovementRule,
+    Rule,
     Severity,
     ZoneEntryRule,
     event_id,
@@ -374,3 +375,63 @@ def test_the_engine_counts_what_it_produced():
 
 def test_media_time_converts_to_wall_clock():
     assert utc_from_millis(0) == datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+# ------------------------------------------------ produced kinds versus reserved
+#
+# `EventType` has members no rule raises. They cannot simply be deleted: a stored
+# event names its type as a string, so removing one makes an old database
+# unreadable and re-using one for something else silently reinterprets history.
+# What they can be is *labelled* — and a label nothing checks is a label that
+# rots, so this is the check.
+
+#: The kinds a rule in this module actually raises today.
+PRODUCED = {
+    EventType.ZONE_ENTRY,
+    EventType.LOITERING,
+    EventType.AFTER_HOURS_PRESENCE,
+    EventType.RAPID_MOVEMENT,
+}
+
+#: Declared, documented as not built, and asserted to stay that way.
+RESERVED = {EventType.ZONE_EXIT, EventType.PERIMETER_BREACH}
+
+
+def _rule_classes() -> list[type]:
+    import inspect
+
+    from sentinel import events as module
+
+    return [
+        value
+        for value in vars(module).values()
+        if inspect.isclass(value)
+        and issubclass(value, Rule)
+        and value is not Rule
+    ]
+
+
+def test_every_event_type_is_either_produced_or_declared_reserved():
+    # A new member added without deciding which it is fails here rather than
+    # appearing in the documentation as a capability nobody wrote.
+    assert PRODUCED | RESERVED == set(EventType)
+    assert not (PRODUCED & RESERVED)
+
+
+def test_the_produced_set_is_exactly_what_the_rules_raise():
+    raised = {rule.event_type for rule in _rule_classes()}
+
+    assert raised == PRODUCED, (
+        "the rules and the documented set disagree; update EventType's comment "
+        "and this set together"
+    )
+
+
+def test_no_rule_raises_a_reserved_kind():
+    # The other direction: writing the rule without removing the RESERVED label
+    # would leave the documentation understating what the system does.
+    for rule in _rule_classes():
+        assert rule.event_type not in RESERVED, (
+            f"{rule.__name__} now raises {rule.event_type}; move it out of "
+            "RESERVED and out of the 'not built' comment on EventType"
+        )

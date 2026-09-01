@@ -40,12 +40,30 @@ from .zones import Presence, PresenceChange, Zone, ZoneKind
 
 
 class EventType(str, Enum):
-    ZONE_ENTRY = "ZONE_ENTRY"
+    """What kind of thing happened.
+
+    Not every member is produced. A stored event names its type as a string, so
+    removing a member would make an old database unreadable and re-using one for
+    something else would silently reinterpret history — which is why the unused
+    ones stay and are labelled instead of being deleted.
+
+    Which is which is asserted in `test_events.py`, against the rules that
+    actually exist, so this comment cannot quietly stop being true.
+    """
+
+    #: Produced today, each by the rule named beside it.
+    ZONE_ENTRY = "ZONE_ENTRY"  # ZoneEntryRule
+    LOITERING = "LOITERING"  # LoiteringRule
+    AFTER_HOURS_PRESENCE = "AFTER_HOURS_PRESENCE"  # AfterHoursRule
+    RAPID_MOVEMENT = "RAPID_MOVEMENT"  # RapidMovementRule
+
+    #: Reserved. No rule raises these yet. `ZONE_EXIT` waits on a rule that is
+    #: worth having — an exit is only interesting in context, and one per
+    #: departure is exactly the alert fatigue this system exists to avoid.
+    #: `PERIMETER_BREACH` waits on a line-crossing test, which is a different
+    #: predicate from polygon containment and is not written.
     ZONE_EXIT = "ZONE_EXIT"
-    LOITERING = "LOITERING"
-    AFTER_HOURS_PRESENCE = "AFTER_HOURS_PRESENCE"
     PERIMETER_BREACH = "PERIMETER_BREACH"
-    RAPID_MOVEMENT = "RAPID_MOVEMENT"
 
 
 class Severity(str, Enum):

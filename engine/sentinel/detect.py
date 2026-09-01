@@ -93,7 +93,8 @@ class MotionDetector:
     """
 
     __slots__ = ("_subtractor", "_open_kernel", "_close_kernel", "_kernel_shape",
-                 "_close_height", "_min_area", "_max_area", "_warmup", "_seen", "_info")
+                 "_close_height", "_min_area", "_max_area", "_warmup", "_seen",
+                 "_info", "_scale")
 
     def __init__(
         self,
@@ -105,6 +106,7 @@ class MotionDetector:
         max_area_fraction: float = 0.35,
         close_height_fraction: float = 0.065,
         warmup_frames: int = 12,
+        detect_scale: float = 0.75,
     ):
         """
         ``min_area_fraction`` is the smallest blob taken seriously, as a fraction
@@ -119,11 +121,44 @@ class MotionDetector:
         ``close_height_fraction`` sets how far apart two pieces of foreground can
         be and still be joined vertically. See :meth:`_build_kernels` for why it
         is vertical and why it is a fraction.
+
+        ``detect_scale`` shrinks the frame before the background model sees it,
+        and it is the single most consequential number here for capacity.
+
+        MOG2 keeps a mixture of Gaussians *per pixel*, read and written every
+        frame, and that working set — not the GIL, not Python, not the FFI — is
+        what stops this system scaling across cameras. Measured on this machine
+        with eight detectors running side by side: a Gaussian blur scales 6.8x
+        and a memory-only loop scales 14.5x, but MOG2 plateaus at 2.1x. Shrinking
+        the frame it models shrinks that state quadratically:
+
+        | scale | 1 worker | 8 workers | recall | mean IoU |
+        |-------|----------|-----------|--------|----------|
+        | 1.00  |  236 fps |   455 fps |  0.690 |    0.503 |
+        | 0.75  |  349 fps |   784 fps |  0.707 |    0.511 |
+        | 0.50  | 1018 fps |  1927 fps |  0.652 |    0.460 |
+        | 0.35  |  900 fps |  4189 fps |  0.616 |    0.419 |
+
+        0.75 is the default because it is better on **both** axes — 1.7x the
+        throughput and slightly *better* detection, because the downscale is a
+        mild denoise. 0.5 buys 4.2x for a real cost in recall, and is the right
+        choice for a node carrying more cameras than cores.
+
+        Nothing downstream needs to know. Boxes are normalised and every
+        threshold here is a fraction of the frame, so the detector's output is
+        identical in meaning at any scale.
         """
         self._subtractor = cv2.createBackgroundSubtractorMOG2(
             history=history, varThreshold=variance_threshold, detectShadows=detect_shadows
         )
         self._close_height = close_height_fraction
+        self._scale = float(detect_scale)
+        if not 0.1 <= self._scale <= 1.0:
+            raise DetectionError(
+                f"detect_scale must be between 0.1 and 1.0, not {detect_scale}. "
+                "Below 0.1 a person is a handful of pixels and the detector is "
+                "measuring noise."
+            )
         # Built on the first frame, once the real resolution is known.
         self._open_kernel: np.ndarray | None = None
         self._close_kernel: np.ndarray | None = None
@@ -134,7 +169,14 @@ class MotionDetector:
         self._seen = 0
         self._info = DetectorInfo(
             kind="motion",
-            name="MOG2 background subtraction",
+            # The scale is part of the detector's identity: two runs at
+            # different scales are not the same detector, and an event's
+            # provenance should say which one produced it.
+            name=(
+                "MOG2 background subtraction"
+                if self._scale == 1.0
+                else f"MOG2 background subtraction at {self._scale:g} scale"
+            ),
             classifies=False,
         )
 
@@ -183,6 +225,16 @@ class MotionDetector:
 
     def detect(self, image: np.ndarray) -> list[Detection]:
         self._seen += 1
+
+        # Shrunk before the background model sees it. INTER_AREA because it
+        # averages the pixels it discards rather than sampling one of them,
+        # which is what keeps a small distant object from disappearing between
+        # sample points.
+        if self._scale != 1.0:
+            image = cv2.resize(
+                image, None, fx=self._scale, fy=self._scale, interpolation=cv2.INTER_AREA
+            )
+
         mask = self._subtractor.apply(image)
         # Sized before the warm-up check, so a detector that has seen a frame is
         # fully configured whether or not it is ready to report anything yet.
@@ -292,6 +344,15 @@ class OnnxDetector:
         # A security appliance should not be writing optimised model copies next
         # to the operator's files.
         options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+
+        # Telemetry off, explicitly. onnxruntime collects it by default on some
+        # builds, and this system tells the operator to their face that it sends
+        # nothing anywhere — a claim that has to be true of every dependency, not
+        # just of the code written here. Guarded because the call is absent on
+        # builds that never had telemetry to begin with.
+        disable = getattr(ort, "disable_telemetry_events", None)
+        if callable(disable):
+            disable()
 
         try:
             session = ort.InferenceSession(
