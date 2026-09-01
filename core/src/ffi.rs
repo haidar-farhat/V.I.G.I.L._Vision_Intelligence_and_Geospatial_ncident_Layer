@@ -291,7 +291,14 @@ pub unsafe extern "C" fn sentinel_camera_sees(pose: *const CPose, lat: f64, lon:
     let point = LatLon { lat, lon };
 
     let distance = geometry::haversine_distance(pose.position, point);
-    let near = geometry::near_ground_distance(&pose);
+
+    // No near edge means this camera sees no ground at all, so it sees nothing.
+    // Treating the absence as 0.0 would have answered "yes" for every point in
+    // front of a camera pointed at the sky.
+    let Some(near) = geometry::near_ground_distance(&pose) else {
+        return 0;
+    };
+
     let far = geometry::far_ground_distance(&pose)
         .map(|f| f.min(pose.range_meters))
         .unwrap_or(pose.range_meters);

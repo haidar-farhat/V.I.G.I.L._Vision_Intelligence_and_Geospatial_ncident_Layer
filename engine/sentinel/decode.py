@@ -33,7 +33,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urlsplit
 
 import cv2
 import numpy as np
@@ -55,6 +55,16 @@ OPEN_TIMEOUT_SECONDS = 5.0
 #: setting them has to be serialised against other threads opening sources.
 _FFMPEG_OPTIONS_LOCK = threading.Lock()
 
+#: Whether a camera outside the local network may be opened at all.
+#:
+#: Off by default, and deliberately an environment variable rather than a
+#: setting in the interface: reaching a routable address contradicts the
+#: product's central promise, so it should require a deliberate act by whoever
+#: runs the process rather than a checkbox an operator can tick by accident.
+_ALLOW_PUBLIC_SOURCES = os.environ.get("SENTINEL_ALLOW_PUBLIC_SOURCES", "").strip() not in (
+    "", "0", "false", "no",
+)
+
 #: Default ports, so a URL that omits one can still be probed.
 _DEFAULT_PORTS = {"rtsp": 554, "rtsps": 322, "http": 80, "https": 443}
 
@@ -72,31 +82,122 @@ class DecodeError(RuntimeError):
     """
 
 
+#: Query parameters whose value is a credential. Cameras and NVRs routinely put
+#: one here instead of in the userinfo, and a redactor that only strips userinfo
+#: passes the password through untouched while looking like it worked.
+_CREDENTIAL_QUERY_KEYS = frozenset(
+    {
+        "password", "passwd", "pwd", "pass", "secret", "token", "auth",
+        "key", "apikey", "api_key", "access_token", "accesstoken",
+        "signature", "sig", "credential", "credentials", "session",
+    }
+)
+
+#: Substituted for every removed secret. A fixed marker, never one character per
+#: character: the length of a password is information an attacker can use.
+REDACTED = "***"
+
+
 def redact_url(url: str) -> str:
-    """Strip credentials from a URL so it is safe to log or display.
+    """Strip every credential from a URL so it is safe to log or display.
 
     ``rtsp://admin:hunter2@10.0.0.5/stream`` becomes
     ``rtsp://admin:***@10.0.0.5/stream``. The username survives because
     operators identify cameras by it and it is not a secret; the password never
     appears in any form, including its length.
+
+    Written defensively, because this function is the only thing standing between
+    a camera password and every log line, error message and database row in the
+    system. Three ways an earlier version leaked, all now covered:
+
+    - **It parsed before it redacted.** ``urlsplit`` succeeds but ``.port``
+      raises ``ValueError`` on a non-numeric port, and ``.hostname`` returns
+      ``None`` for shapes it does not recognise. Both paths returned the input
+      verbatim. Nothing here depends on a successful parse: the userinfo is
+      removed by string surgery on the netloc, which cannot fail.
+    - **It only ever looked at the userinfo.** A credential in the query string
+      survived untouched.
+    - **It rebuilt the host from ``.hostname``**, which strips the brackets from
+      an IPv6 literal and produced an unparseable display URL.
+
+    When anything is uncertain the function fails *closed* — it returns a marker
+    rather than the input, because echoing a string that might contain a
+    password is the one outcome that must never happen.
     """
-    try:
-        parts = urlsplit(url)
-    except ValueError:
-        return "<unparseable url>"
+    if not isinstance(url, str) or not url:
+        return "<no source>"
 
-    if not parts.hostname:
+    # A local path is not a URL and has no credential to strip. Recognised
+    # before any parsing, so a Windows path like C:\media\clip.mp4 is never
+    # mangled by scheme detection.
+    if "://" not in url:
+        # A path, not a URL — returned intact so an operator can find the file.
+        # The query pass still runs: "?" is illegal in a Windows filename and
+        # vanishingly rare in a POSIX one, so redacting a credential-shaped
+        # parameter here costs nothing and covers a schemeless "host/s?token=x".
+        return _redact_query(url if "@" not in url else "<redacted path>")
+
+    scheme, _, remainder = url.partition("://")
+    netloc, slash, tail = remainder.partition("/")
+
+    # Userinfo removal by string surgery. rpartition, not partition: a password
+    # may itself contain an "@", and only the last one separates host from
+    # userinfo.
+    if "@" in netloc:
+        userinfo, _, host = netloc.rpartition("@")
+        username = userinfo.split(":", 1)[0]
+        netloc = (f"{username}:{REDACTED}@" if username else f"{REDACTED}@") + host
+
+    rebuilt = f"{scheme}://{netloc}"
+    if slash:
+        rebuilt += "/" + tail
+
+    return _redact_query(rebuilt)
+
+
+def _redact_query(url: str) -> str:
+    """Replace credential-shaped query values, leaving the rest legible."""
+    head, sep, query = url.partition("?")
+    if not sep or not query:
         return url
 
-    if parts.password is None:
-        return url
+    query, hash_sep, fragment = query.partition("#")
 
-    host = parts.hostname
-    if parts.port:
-        host = f"{host}:{parts.port}"
+    redacted = []
+    for pair in query.split("&"):
+        name, has_value, _ = pair.partition("=")
+        if has_value and name.lower() in _CREDENTIAL_QUERY_KEYS:
+            redacted.append(f"{name}={REDACTED}")
+        else:
+            redacted.append(pair)
 
-    userinfo = f"{parts.username}:***@" if parts.username else "***@"
-    return urlunsplit((parts.scheme, userinfo + host, parts.path, parts.query, parts.fragment))
+    return head + "?" + "&".join(redacted) + (hash_sep + fragment if hash_sep else "")
+
+
+def contains_credential(text: str, url: str) -> bool:
+    """Whether ``text`` leaks any secret held in ``url``.
+
+    Used by the tests rather than by the runtime. It exists so a test can assert
+    the absence of *this URL's* secrets rather than of one hard-coded sentinel,
+    which is what lets it catch a leak through a path nobody thought of.
+    """
+    secrets = []
+    if "://" in url:
+        netloc = url.partition("://")[2].partition("/")[0]
+        if "@" in netloc:
+            userinfo = netloc.rpartition("@")[0]
+            _, has_password, password = userinfo.partition(":")
+            if has_password and password:
+                secrets.append(password)
+
+    _, sep, query = url.partition("?")
+    if sep:
+        for pair in query.partition("#")[0].split("&"):
+            name, has_value, value = pair.partition("=")
+            if has_value and value and name.lower() in _CREDENTIAL_QUERY_KEYS:
+                secrets.append(value)
+
+    return any(secret in text for secret in secrets)
 
 
 @dataclass(frozen=True, slots=True)
@@ -207,10 +308,15 @@ class VideoSource:
 
         if not self._is_live:
             path = Path(self._url)
+            # Reported through the redacted display string, never the raw path.
+            # `live` is a caller-supplied override and `_looks_live` only knows
+            # six schemes, so a credentialed rtmp:// or srt:// URL reaches this
+            # branch — and an earlier version put it, password and all, straight
+            # into an error the operator reads.
             if not path.exists():
-                raise DecodeError(f"No such video file: {path}")
+                raise DecodeError(f"No such video file: {self._display}")
             if not path.is_file():
-                raise DecodeError(f"Not a file: {path}")
+                raise DecodeError(f"Not a file: {self._display}")
 
         if self._is_live:
             self._require_reachable()
@@ -271,6 +377,8 @@ class VideoSource:
         if port is None:
             return
 
+        self._require_private(host)
+
         try:
             with socket.create_connection((host, port), timeout=OPEN_TIMEOUT_SECONDS):
                 return
@@ -285,6 +393,49 @@ class VideoSource:
             # came from a URL that carries a credential.
             reason = error.strerror or type(error).__name__
             raise DecodeError(f"{self._display} is not reachable: {reason}") from None
+
+    def _require_private(self, host: str) -> None:
+        """Refuse a camera address outside the local network.
+
+        The product's central promise is that it works with the network cable
+        unplugged and never reaches the Internet. A camera URL is the one string
+        an operator types that the software then *connects to*, which makes it
+        the natural way for that promise to be broken — by a typo, by a
+        misconfigured DNS entry resolving to a public address, or deliberately.
+
+        Loopback and the RFC 1918 / RFC 4193 ranges are allowed. Anything else is
+        refused with the address named, so an operator who genuinely means to
+        reach a routable host knows exactly what to override and why it stopped
+        them.
+        """
+        import ipaddress
+
+        try:
+            addresses = {
+                info[4][0]
+                for info in socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+            }
+        except OSError:
+            # Cannot resolve. Left to the connect below, which reports it with a
+            # better message than anything that could be said here.
+            return
+
+        public = []
+        for address in addresses:
+            try:
+                parsed = ipaddress.ip_address(address)
+            except ValueError:
+                continue
+            if not (parsed.is_private or parsed.is_loopback or parsed.is_link_local):
+                public.append(address)
+
+        if public and not _ALLOW_PUBLIC_SOURCES:
+            raise DecodeError(
+                f"{self._display} resolves to {', '.join(sorted(public))}, which is "
+                "outside the local network. This system does not reach the "
+                "Internet; if that address is genuinely a camera on a routed "
+                "network, set SENTINEL_ALLOW_PUBLIC_SOURCES=1."
+            )
 
     def _open_capture(self) -> cv2.VideoCapture:
         """Hand the URL to OpenCV.
@@ -308,9 +459,19 @@ class VideoSource:
         if not self._url.lower().startswith(("rtsp://", "rtsps://")):
             return cv2.VideoCapture(self._url)
 
+        # A protocol allowlist, because the reachability probe checks the address
+        # the operator typed and FFmpeg is free to follow the stream somewhere
+        # else. Without this, an SDP or a redirect from a camera on the LAN can
+        # send the process to a host on the Internet — which would defeat the
+        # zero-WAN guarantee through a door nobody was watching.
+        options = (
+            "rtsp_transport;tcp"
+            "|protocol_whitelist;file,rtp,udp,tcp,rtsps,tls,crypto"
+        )
+
         with _FFMPEG_OPTIONS_LOCK:
             previous = os.environ.get("OPENCV_FFMPEG_CAPTURE_OPTIONS")
-            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
+            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = options
             try:
                 return cv2.VideoCapture(self._url, cv2.CAP_FFMPEG)
             finally:

@@ -342,10 +342,14 @@ pub fn project_detection(pose: &CameraPose, bbox: &BoundingBox) -> PositionEstim
 
 /// Nearest ground distance the camera sees: the bottom edge of the frame, which
 /// points most steeply down and therefore lands closest to the mast.
-pub fn near_ground_distance(pose: &CameraPose) -> f64 {
+pub fn near_ground_distance(pose: &CameraPose) -> Option<f64> {
+    // `None` when even the bottom of the frame misses the ground, which means
+    // the camera sees no ground at all. An earlier version answered 0.0 there,
+    // and `field_of_view_wedge` read that as "coverage starts at the mast" and
+    // drew the solid pie slice its own documentation forbids — claiming the
+    // whole foreground for a camera pointed at the sky.
     project_to_ground(pose, 0.5, 1.0, DEFAULT_ANGULAR_UNCERTAINTY_DEG, false)
         .map(|p| p.ground_distance_meters)
-        .unwrap_or(0.0)
 }
 
 /// Farthest ground distance: the top edge. `None` when it is above the horizon,
@@ -365,10 +369,17 @@ pub fn field_of_view_wedge(pose: &CameraPose, arc_segments: usize) -> Vec<LatLon
     let segments = arc_segments.max(2);
     let half_fov = pose.horizontal_fov / 2.0;
 
+    // No near edge means no ground in view at all, so there is no footprint to
+    // draw. An empty ring is the honest answer and every caller already handles
+    // one: the map skips it, and point-in-polygon rejects it.
+    let Some(near) = near_ground_distance(pose) else {
+        return Vec::new();
+    };
+
     let far_range = far_ground_distance(pose)
         .map(|far| far.min(pose.range_meters))
         .unwrap_or(pose.range_meters);
-    let near_range = near_ground_distance(pose).min(far_range);
+    let near_range = near.min(far_range);
 
     let bearing_at = |t: f64| normalize_degrees(pose.heading - half_fov + t * pose.horizontal_fov);
 
@@ -421,6 +432,13 @@ pub fn image_coordinates(
     let pitch_offset_deg = elevation_deg - pose.pitch;
     let half_v = pose.vertical_fov / 2.0;
     if pitch_offset_deg.abs() >= 90.0 {
+        return None;
+    }
+
+    // A zero or negative field of view has no image plane to project onto.
+    // Dividing by tan(0) returned Some((NaN, inf, ..)), which propagates
+    // silently through every consumer instead of failing here.
+    if half_h <= 0.0 || half_v <= 0.0 {
         return None;
     }
 
@@ -494,6 +512,25 @@ pub enum ZoneMembership {
     Uncertain,
 }
 
+/// The smallest area a ring must enclose to be treated as a zone at all.
+///
+/// A square 30 cm on a side. Below this a "zone" is a drawing accident — three
+/// clicks in nearly the same place — and treating it as an area produces
+/// intrusion events from a shape nobody meant to draw.
+const MINIMUM_ZONE_AREA_M2: f64 = 0.09;
+
+/// Twice the signed area of a polygon, halved and made positive: the shoelace
+/// formula. Used only to reject degenerate rings.
+fn polygon_area(ring: &[Vec2]) -> f64 {
+    let mut sum = 0.0;
+    for index in 0..ring.len() {
+        let a = ring[index];
+        let b = ring[(index + 1) % ring.len()];
+        sum += a.x * b.y - b.x * a.y;
+    }
+    (sum / 2.0).abs()
+}
+
 /// Zone membership that accounts for how well the position is actually known.
 ///
 /// A plain point-in-polygon test answers a question nobody asked. The position
@@ -521,6 +558,13 @@ pub fn zone_membership(ring: &[LatLon], point: LatLon, uncertainty_meters: f64) 
     let frame = LocalFrame::new(point);
     let local_point = Vec2 { x: 0.0, y: 0.0 };
     let local_ring: Vec<Vec2> = ring.iter().map(|&p| frame.to_local(p)).collect();
+
+    // Checked before containment. A ring whose vertices are all within a few
+    // centimetres has three points but no area, and the zero-uncertainty path
+    // below would otherwise report Inside for the point at its own centre.
+    if polygon_area(&local_ring) < MINIMUM_ZONE_AREA_M2 {
+        return ZoneMembership::Outside;
+    }
 
     let inside = point_in_polygon(local_point, &local_ring);
 
@@ -771,7 +815,7 @@ mod tests {
     #[test]
     fn the_footprint_excludes_the_blind_foreground() {
         // A tilted camera cannot see the ground at its own mast.
-        let near = near_ground_distance(&pose());
+        let near = near_ground_distance(&pose()).expect("this camera does see ground");
         assert!(near > 0.0);
 
         let wedge = field_of_view_wedge(&pose(), 8);
@@ -995,5 +1039,87 @@ mod tests {
                 destination_point(centre, bearing, half_side * std::f64::consts::SQRT_2)
             })
             .collect()
+    }
+    #[test]
+    fn a_camera_that_sees_no_ground_has_no_footprint() {
+        // Level or upward. near_ground_distance previously answered 0.0 here,
+        // and field_of_view_wedge read that as "coverage starts at the mast" —
+        // drawing the solid pie slice its own documentation forbids, claiming
+        // the entire foreground for a camera pointed at the sky.
+        let skyward = CameraPose {
+            pitch: 20.0,
+            vertical_fov: 34.0,
+            ..pose()
+        };
+
+        assert_eq!(near_ground_distance(&skyward), None);
+        assert!(
+            field_of_view_wedge(&skyward, 12).is_empty(),
+            "a camera with no ground in view was given a footprint"
+        );
+    }
+
+    #[test]
+    fn a_camera_pointed_at_the_sky_has_no_near_edge_to_measure_from() {
+        // `camera_sees` lives behind the FFI, where the same absence is turned
+        // into "no". Here the property it depends on is asserted directly.
+        let skyward = CameraPose {
+            pitch: 20.0,
+            vertical_fov: 34.0,
+            ..pose()
+        };
+
+        assert_eq!(near_ground_distance(&skyward), None);
+        assert_eq!(far_ground_distance(&skyward), None);
+    }
+
+    #[test]
+    fn a_zero_field_of_view_has_no_image_plane() {
+        // Dividing by tan(0) returned Some((NaN, inf, ..)), which then
+        // propagated silently through every consumer.
+        let degenerate = CameraPose {
+            horizontal_fov: 0.0,
+            ..pose()
+        };
+        let ahead = destination_point(degenerate.position, 0.0, 20.0);
+
+        assert_eq!(image_coordinates(&degenerate, ahead, 0.0), None);
+    }
+
+    #[test]
+    fn a_ring_that_encloses_nothing_is_not_a_zone() {
+        // Three clicks in nearly the same place. It has three vertices and no
+        // area, and previously returned Uncertain — which an uncertain-accepting
+        // zone would have turned into presences.
+        let centre = LatLon {
+            lat: 33.8938,
+            lon: 35.5018,
+        };
+        let collapsed = vec![
+            centre,
+            destination_point(centre, 0.0, 0.05),
+            destination_point(centre, 90.0, 0.05),
+        ];
+
+        assert_eq!(
+            zone_membership(&collapsed, centre, 0.0),
+            ZoneMembership::Outside
+        );
+        assert_eq!(
+            zone_membership(&collapsed, centre, 25.0),
+            ZoneMembership::Outside
+        );
+    }
+
+    #[test]
+    fn a_real_zone_is_still_a_zone() {
+        // The degeneracy guard must not reject anything an operator would draw.
+        let centre = LatLon {
+            lat: 33.8938,
+            lon: 35.5018,
+        };
+        let small = square_zone(centre, 0.5);
+
+        assert_eq!(zone_membership(&small, centre, 0.0), ZoneMembership::Inside);
     }
 }

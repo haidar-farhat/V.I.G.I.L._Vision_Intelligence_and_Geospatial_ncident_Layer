@@ -53,10 +53,23 @@ pub struct Track {
     pub heading_degrees: Option<f64>,
 }
 
-/// How much tighter the vertical half of the proximity gate is than the
-/// horizontal. An upright object is about a third as wide as it is tall, and
-/// vertical image motion is depth rather than lateral movement.
+/// How much the vertical half of the proximity gate is tightened, relative to
+/// the object's own height.
+///
+/// A measurement rather than a principle. On the reference scene 0.35 gives 5
+/// tracks for three people, 0.25 gives 6, 0.20 gives 7 and 0.15 gives 8.
+/// Tightening does refuse more identity hand-offs, but it refuses legitimate
+/// depth motion faster than it helps.
 const VERTICAL_GATE_RATIO: f64 = 0.35;
+
+/// The coarsest speed resolution at which reporting "stationary" is still
+/// honest.
+///
+/// Below a slow walk. When the position is so uncertain that the smallest
+/// detectable movement would exceed this, "not moving" and "walking" are
+/// indistinguishable, and the tracker says it does not know rather than
+/// choosing one.
+const STATIONARY_RESOLUTION_MPS: f64 = 0.5;
 
 /// The most the gate may grow for a track that has gone unobserved. Unbounded
 /// growth would let a track that vanished thirty seconds ago claim anything that
@@ -71,7 +84,15 @@ pub struct TrackerConfig {
     pub gate_factor: f64,
     /// How long a track coasts without detections before it is closed.
     pub max_gap_millis: i64,
-    /// Consecutive detections required before a track is reported at all.
+    /// Detections required before a track is reported at all.
+    ///
+    /// Cumulative, not consecutive, and that is deliberate — an earlier comment
+    /// here said "consecutive" and the code never enforced it. Making the code
+    /// match the comment was tried and measured: on the reference scene it took
+    /// the object count from 5 to 8 for three people, because requiring an
+    /// unbroken run is brittle exactly when the detector is unreliable, which at
+    /// 0.69 recall is the normal case. A track seen twice has been seen twice,
+    /// whether or not there was a miss in between.
     pub min_hits_to_confirm: u32,
     /// Window over which ground speed and heading are averaged.
     pub motion_window_millis: i64,
@@ -191,6 +212,28 @@ impl Tracker {
         }
 
         let widen = elapsed_ratio.clamp(1.0, MAX_GATE_WIDENING);
+
+        // Each axis is scaled by the object's extent ON THAT AXIS, and the
+        // vertical one is then tightened. **The per-axis scaling is what does
+        // the work**, not the ratio. What this replaced used
+        // `gate_factor * max(w, h)` as a single radius — for an upright box
+        // that is its height — so a track could leap most of a body-height in
+        // depth and pick up whoever had just walked into shot. Measured on the
+        // case that prompted it (a 25x71 px box, an 82 px vertical jump): the
+        // single-radius gate scored 0.17 against a 0.37 limit and accepted; this
+        // one scores 1.82 against 1.0 and refuses.
+        //
+        // The resulting gate is close to circular in pixels, because an upright
+        // object is about three times taller than it is wide and 3 x 0.35 is
+        // roughly 1. That is an honest description of the arithmetic, and an
+        // earlier comment here — "generous across the frame and tight up and
+        // down" — was not.
+        //
+        // Scaling the vertical half by the width instead, to make that stated
+        // asymmetry real, was tried and measured. It still refuses the leap, but
+        // it takes the reference scene from 5 tracks to 8 for three people: a
+        // person walking toward the camera genuinely moves down the frame, and
+        // the gate has to allow it.
         let gate_x = self.config.gate_factor * predicted.w.max(detected.w) * widen;
         let gate_y =
             self.config.gate_factor * predicted.h.max(detected.h) * VERTICAL_GATE_RATIO * widen;
@@ -313,7 +356,13 @@ impl Tracker {
         let config = self.config;
 
         for (index, track) in self.tracks.iter_mut().enumerate() {
-            if claimed_tracks.get(index).copied().unwrap_or(false) {
+            // `unwrap_or(true)`, not false: tracks created from this frame's
+            // unmatched detections were pushed above and have no entry in
+            // `claimed_tracks`, but they were matched by definition — a
+            // detection is what created them. Treating them as missed zeroes
+            // the hit count on the very frame the track is born, so nothing
+            // ever reaches min_hits_to_confirm.
+            if claimed_tracks.get(index).copied().unwrap_or(true) {
                 continue;
             }
             if at_millis - track.last_detected_millis > config.max_gap_millis {
@@ -321,13 +370,21 @@ impl Tracker {
                 continue;
             }
             if track.confirmed {
-                // Coast along the velocity so the track keeps a plausible position
-                // through the occlusion.
+                // Coast along the velocity so the track keeps a plausible
+                // position through the occlusion.
                 let coasted = Self::predict(track, at_millis);
                 track.bbox = clamp_box(coasted);
                 track.last_seen_millis = at_millis;
                 track.position = pose.map(|p| project_detection(&p, &track.bbox));
-                record_ground(track, at_millis, &config);
+
+                // Deliberately NOT recorded into ground_history. A coasted box
+                // is extrapolation, and clamp_box pins it to the frame edge once
+                // the object has left the scene — so feeding it in would let an
+                // object that walked out of shot be reported as standing at a
+                // confident map position, indefinitely. The position is still
+                // published, because the tracker does believe the object is
+                // near there; what it must not do is treat its own guess as a
+                // new measurement of speed.
             }
         }
 
@@ -371,6 +428,8 @@ fn apply_detection(
     track.last_seen_millis = at_millis;
     track.last_detected_millis = at_millis;
     track.confidence = track.confidence * 0.7 + detection.confidence * 0.3;
+    // Cumulative. See TrackerConfig::min_hits_to_confirm for why a miss does not
+    // reset this.
     track.hits += 1;
     if track.hits >= config.min_hits_to_confirm {
         track.confirmed = true;
@@ -385,18 +444,46 @@ fn apply_detection(
 /// Camera-fallback positions are excluded: they are the mast's location, not the
 /// object's, so feeding them in would compute the speed of a stationary pole and
 /// report it as the target's.
+/// Forget a motion estimate that no longer has evidence behind it.
+///
+/// `None` means "not known", which is the only honest answer once the
+/// observations that produced a speed have stopped arriving.
+fn forget_motion(track: &mut Track) {
+    track.speed_mps = None;
+    track.heading_degrees = None;
+}
+
 fn record_ground(track: &mut Track, at_millis: i64, config: &TrackerConfig) {
+    // Both of these were bare `return`s, and that was a real defect: the moment
+    // a track's position stopped being a ground projection — the object walked
+    // beyond `range_meters`, its ground contact rose toward the horizon, or the
+    // operator un-placed the camera — the last speed and heading computed
+    // minutes earlier were frozen in place and re-emitted every frame for the
+    // life of the track. An evidence package could then read "position NOT
+    // DETERMINED" directly above "motion 4.38 m/s, heading 0 degrees".
     let Some(position) = track.position else {
+        forget_motion(track);
+        track.ground_history.clear();
         return;
     };
     if position.source != PositionSource::GroundProjection {
+        forget_motion(track);
+        // The history goes too, so samples from before the blackout cannot
+        // later be paired with samples from after it and averaged into a speed
+        // that nothing observed.
+        track.ground_history.clear();
         return;
     }
 
     track.ground_history.push((at_millis, position.point));
 
+    // Prune to the window, keeping at most one sample older than the cutoff so
+    // there is still a pair to measure across. An earlier `len() > 2` floor
+    // stopped pruning while two stale samples remained, so after a long gap the
+    // speed could be averaged over a span far longer than motion_window_millis
+    // — reporting a minutes-old average as if it were current.
     let cutoff = at_millis - config.motion_window_millis;
-    while track.ground_history.len() > 2 && track.ground_history[0].0 < cutoff {
+    while track.ground_history.len() > 2 && track.ground_history[1].0 < cutoff {
         track.ground_history.remove(0);
     }
 
@@ -425,10 +512,23 @@ fn record_ground(track: &mut Track, at_millis: i64, config: &TrackerConfig) {
 
     let distance = haversine_distance(first.1, last.1);
 
-    // A heading derived from projection noise is worse than no heading, because
-    // correlation would weigh it as evidence.
-    if distance < position.radius_meters.max(1.0) {
-        track.speed_mps = Some(0.0);
+    // Below the noise floor. A heading derived from projection noise is worse
+    // than no heading, because correlation would weigh it as evidence.
+    //
+    // Whether that also means "stationary" depends on how coarse the floor is.
+    // Reporting Some(0.0) asserts the object is not moving; that is only
+    // defensible when the measurement could have detected it moving. At 40 m
+    // from a mast the floor can exceed a walking pace, and there Some(0.0)
+    // would be a claim the geometry cannot support — so the answer is None,
+    // "not known", which is a different statement and the true one.
+    let floor = position.radius_meters.max(1.0);
+    if distance < floor {
+        let resolvable_mps = floor / seconds;
+        track.speed_mps = if resolvable_mps <= STATIONARY_RESOLUTION_MPS {
+            Some(0.0)
+        } else {
+            None
+        };
         track.heading_degrees = None;
         return;
     }
@@ -820,5 +920,316 @@ mod tests {
         if let Some(speed) = track.speed_mps {
             assert!(speed < 25.0, "a single jump produced {speed} m/s");
         }
+    }
+    #[test]
+    fn motion_is_forgotten_when_the_projection_is_lost() {
+        // The defect: an object walks beyond the camera's range, its position
+        // degrades to the mast, and the last speed measured while it was still
+        // projectable stays frozen and is re-emitted for the life of the track.
+        // An evidence package could read "position NOT DETERMINED" directly
+        // above "motion 4.38 m/s".
+        let camera = CameraPose {
+            range_meters: 40.0,
+            ..pose()
+        };
+        let mut tracker = Tracker::new(TrackerConfig::default(), Some(camera));
+
+        // Walk up the frame, well inside range, long enough to earn a speed.
+        for step in 0..16 {
+            let y = 0.80 - step as f64 * 0.01;
+            tracker.update(
+                &[detection(
+                    BoundingBox {
+                        x: 0.5,
+                        y,
+                        w: 0.05,
+                        h: 0.10,
+                    },
+                    0,
+                )],
+                step * 200,
+            );
+        }
+        let moving = tracker.tracks().next().unwrap();
+        assert!(
+            moving.speed_mps.is_some(),
+            "the setup never produced a speed"
+        );
+
+        // Now step to a row whose ray lands beyond the range: the projection
+        // falls back to the camera and there is no ground measurement any more.
+        for step in 16..24 {
+            tracker.update(
+                &[detection(
+                    BoundingBox {
+                        x: 0.5,
+                        y: 0.30,
+                        w: 0.05,
+                        h: 0.10,
+                    },
+                    0,
+                )],
+                step * 200,
+            );
+        }
+
+        let track = tracker.tracks().next().unwrap();
+        if track
+            .position
+            .map(|p| p.source != PositionSource::GroundProjection)
+            .unwrap_or(true)
+        {
+            assert!(
+                track.speed_mps.is_none(),
+                "a track with no ground projection still reports {:?} m/s",
+                track.speed_mps
+            );
+            assert!(track.heading_degrees.is_none());
+        }
+    }
+
+    #[test]
+    fn un_placing_the_camera_forgets_the_motion_it_measured() {
+        let mut tracker = Tracker::new(TrackerConfig::default(), Some(pose()));
+
+        for step in 0..16 {
+            let y = 0.60 + step as f64 * 0.005;
+            tracker.update(
+                &[detection(
+                    BoundingBox {
+                        x: 0.5,
+                        y,
+                        w: 0.05,
+                        h: 0.10,
+                    },
+                    0,
+                )],
+                step * 200,
+            );
+        }
+        assert!(tracker.tracks().next().unwrap().speed_mps.is_some());
+
+        tracker.set_pose(None);
+        tracker.update(
+            &[detection(
+                BoundingBox {
+                    x: 0.5,
+                    y: 0.68,
+                    w: 0.05,
+                    h: 0.10,
+                },
+                0,
+            )],
+            16 * 200,
+        );
+
+        let track = tracker.tracks().next().unwrap();
+        assert!(track.position.is_none());
+        assert!(
+            track.speed_mps.is_none(),
+            "a track with no position reported {:?} m/s",
+            track.speed_mps
+        );
+    }
+
+    #[test]
+    fn the_gate_scales_each_axis_by_that_axis_extent() {
+        // The property that matters, and the one the bug violated: the gate is
+        // an ellipse sized per axis, not a circle sized by the larger dimension.
+        //
+        // A single radius of `gate_factor * max(w, h)` is, for an upright box,
+        // `gate_factor * height` — which lets a track jump more than a whole
+        // body-height in DEPTH and adopt whoever just walked into shot. That is
+        // the failure this replaced, reproduced here at the shape that produced
+        // it.
+        //
+        // Asserted on `association_score` directly, because for any vertical
+        // displacement small enough to keep two upright boxes touching the
+        // overlap tier answers first — a test routed through `update` would be
+        // measuring IoU rather than the gate.
+        let tracker = Tracker::new(TrackerConfig::default(), None);
+        let from = BoundingBox {
+            x: 0.50,
+            y: 0.50,
+            w: 0.04,
+            h: 0.11,
+        };
+
+        // A leap in depth: clear of the box vertically, so the gate decides.
+        let leap = BoundingBox {
+            x: 0.52,
+            y: 0.63,
+            ..from
+        };
+        // The circular gate this replaced would have accepted it comfortably.
+        let single_radius = TrackerConfig::default().gate_factor * from.w.max(from.h);
+        let separation = ((0.02f64).powi(2) + (0.13f64).powi(2)).sqrt();
+        assert!(
+            separation < single_radius,
+            "the fixture no longer reproduces the original bug"
+        );
+
+        assert!(
+            tracker.association_score(&from, &leap, 1.0).is_none(),
+            "a leap of more than a body-height in depth was accepted"
+        );
+
+        // The same object drifting sideways is still the same object.
+        let sideways = BoundingBox { x: 0.56, ..from };
+        assert!(
+            tracker.association_score(&from, &sideways, 1.0).is_some(),
+            "a lateral drift within the gate must still associate"
+        );
+    }
+
+    #[test]
+    fn a_speed_too_coarse_to_resolve_is_unknown_rather_than_zero() {
+        // At range the position uncertainty can exceed a walking pace. Saying
+        // "stationary" there asserts something the geometry cannot support:
+        // still and slow are indistinguishable, so the answer is "not known".
+        let far = CameraPose {
+            pitch: -3.0,
+            range_meters: 400.0,
+            ..pose()
+        };
+        let mut tracker = Tracker::new(TrackerConfig::default(), Some(far));
+
+        for step in 0..16 {
+            tracker.update(
+                &[detection(
+                    BoundingBox {
+                        x: 0.5,
+                        y: 0.55,
+                        w: 0.02,
+                        h: 0.04,
+                    },
+                    0,
+                )],
+                step * 200,
+            );
+        }
+
+        let track = tracker.tracks().next().unwrap();
+        let radius = track.position.map(|p| p.radius_meters).unwrap_or(0.0);
+        if radius > 2.0 {
+            assert!(
+                track.speed_mps.is_none(),
+                "reported {:?} m/s as 'stationary' from a position known only to +/-{radius:.1} m",
+                track.speed_mps
+            );
+        }
+    }
+
+    #[test]
+    fn a_confident_stationary_object_still_reports_zero() {
+        // The other half of the rule: close to the camera the floor is small,
+        // so "not moving" is a conclusion the measurement supports and must
+        // still be stated as 0.0 rather than as unknown.
+        let mut tracker = Tracker::new(TrackerConfig::default(), Some(pose()));
+
+        for step in 0..16 {
+            tracker.update(
+                &[detection(
+                    BoundingBox {
+                        x: 0.5,
+                        y: 0.85,
+                        w: 0.06,
+                        h: 0.12,
+                    },
+                    0,
+                )],
+                step * 200,
+            );
+        }
+
+        let track = tracker.tracks().next().unwrap();
+        assert_eq!(
+            track.speed_mps,
+            Some(0.0),
+            "standing still is zero, not unknown"
+        );
+        assert_eq!(track.heading_degrees, None);
+    }
+
+    #[test]
+    fn a_coasted_track_does_not_accumulate_a_speed_from_its_own_guesses() {
+        // clamp_box pins a coasted box to the frame edge once the object has
+        // left the scene. Feeding those extrapolations back in as ground
+        // measurements let an object that walked out of shot be reported as
+        // standing at a confident map position, forever.
+        let config = TrackerConfig {
+            max_gap_millis: 30_000,
+            ..Default::default()
+        };
+        let mut tracker = Tracker::new(config, Some(pose()));
+
+        for step in 0..14 {
+            let x = 0.50 + step as f64 * 0.02;
+            tracker.update(
+                &[detection(
+                    BoundingBox {
+                        x,
+                        y: 0.70,
+                        w: 0.05,
+                        h: 0.10,
+                    },
+                    0,
+                )],
+                step * 200,
+            );
+        }
+        let before = tracker.tracks().next().unwrap().speed_mps;
+
+        // Now nothing at all, for a long time. The track coasts.
+        for step in 14..80 {
+            tracker.update(&[], step * 200);
+        }
+
+        let track = tracker
+            .tracks()
+            .next()
+            .expect("the track should still be coasting");
+        assert_eq!(
+            track.speed_mps, before,
+            "coasting changed the measured speed, so extrapolation was recorded as evidence"
+        );
+    }
+
+    #[test]
+    fn confirmation_survives_a_detector_that_misses() {
+        // `min_hits_to_confirm` is cumulative, and this pins that down because
+        // the field was once documented as "consecutive".
+        //
+        // Enforcing consecutiveness was tried and measured: it took the
+        // reference scene from 5 tracks to 8 for three people. An unbroken run
+        // is the wrong requirement when the detector's recall is 0.69 — the
+        // misses are the normal case, not the exception, and demanding a clean
+        // streak just means the same person keeps being rediscovered as
+        // somebody new.
+        let config = TrackerConfig {
+            min_hits_to_confirm: 3,
+            max_gap_millis: 30_000,
+            ..Default::default()
+        };
+        let mut tracker = Tracker::new(config, None);
+        let box_ = BoundingBox {
+            x: 0.5,
+            y: 0.5,
+            w: 0.05,
+            h: 0.10,
+        };
+
+        // Seen, missed, seen, missed, seen. Three sightings of one object.
+        tracker.update(&[detection(box_, 0)], 0);
+        tracker.update(&[], 1000);
+        tracker.update(&[detection(box_, 0)], 2000);
+        tracker.update(&[], 3000);
+        tracker.update(&[detection(box_, 0)], 4000);
+
+        assert_eq!(
+            tracker.tracks().count(),
+            1,
+            "three sightings of one object should confirm it, misses notwithstanding"
+        );
     }
 }
