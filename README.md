@@ -65,8 +65,9 @@ no rule.
   offline job drops all outbound traffic, *proves* the drop took effect, and then
   runs every suite. At runtime, every address a camera host resolves to must be
   loopback or RFC 1918 / 4193, or the connection is refused with the address
-  named. onnxruntime's telemetry is switched off explicitly, because the promise
-  has to hold for every dependency and not just for this code.
+  named. A test asserts the plan view references no URL and no HTTP client of any
+  kind, and onnxruntime's telemetry is switched off explicitly — the promise has
+  to hold for every dependency, not just for this code.
   *Not yet:* a process-wide egress guard. Decode is the only path that opens an
   outbound socket today; each new one will need the same check at its own
   boundary.
