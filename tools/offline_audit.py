@@ -46,6 +46,9 @@ SCANNED = [
     ROOT / "core" / "src",
     ROOT / "tasks.py",
     ROOT / "tools",
+    # The packaged build's entry point and spec ship inside the executable and
+    # decide what it loads, so they are shipped source like any other.
+    ROOT / "packaging",
 ]
 
 SUFFIXES = {".py", ".rs", ".toml"}

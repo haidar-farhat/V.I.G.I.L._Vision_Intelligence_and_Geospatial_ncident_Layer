@@ -8,6 +8,7 @@ eventually disagree with the code that generates it.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -44,3 +45,22 @@ def reference_pose() -> CameraPose:
         vertical_fov=36.0,
         range_meters=90.0,
     )
+
+
+@pytest.fixture(autouse=True, scope="session")
+def isolated_data_directory(tmp_path_factory: pytest.TempPathFactory):
+    """Keep the suite out of the operator's real application data directory.
+
+    Without this, running the tests writes a log — and, for anything that
+    touches the default database path, a database — into the same folder a real
+    installation uses. A test suite that pollutes the thing it is testing is a
+    test suite that eventually destroys somebody's evidence.
+    """
+    directory = tmp_path_factory.mktemp("appdata")
+    previous = os.environ.get("SENTINEL_DATA_DIR")
+    os.environ["SENTINEL_DATA_DIR"] = str(directory)
+    yield directory
+    if previous is None:
+        os.environ.pop("SENTINEL_DATA_DIR", None)
+    else:
+        os.environ["SENTINEL_DATA_DIR"] = previous

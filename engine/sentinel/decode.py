@@ -20,7 +20,9 @@ process dies.
 
 No credential ever leaves this module. An RTSP URL carrying a password is held
 in one place, redacted for every other purpose, and never logged, formatted, or
-raised in an exception.
+raised in an exception. The redaction itself lives in `redact.py` — it has no
+dependencies, because the logger needs it too and must not import OpenCV to be
+safe — and is re-exported here.
 """
 
 from __future__ import annotations
@@ -37,6 +39,16 @@ from urllib.parse import urlsplit
 
 import cv2
 import numpy as np
+
+from .redact import (
+    CREDENTIAL_QUERY_KEYS,
+    REDACTED,
+    contains_credential,
+    redact_url,
+)
+from .logs import get as _get_logger
+
+_log = _get_logger(__name__)
 
 #: How long to wait for a live frame before treating the stream as stalled.
 LIVE_FRAME_TIMEOUT_SECONDS = 10.0
@@ -82,122 +94,22 @@ class DecodeError(RuntimeError):
     """
 
 
-#: Query parameters whose value is a credential. Cameras and NVRs routinely put
-#: one here instead of in the userinfo, and a redactor that only strips userinfo
-#: passes the password through untouched while looking like it worked.
-_CREDENTIAL_QUERY_KEYS = frozenset(
-    {
-        "password", "passwd", "pwd", "pass", "secret", "token", "auth",
-        "key", "apikey", "api_key", "access_token", "accesstoken",
-        "signature", "sig", "credential", "credentials", "session",
-    }
-)
+# Redaction lives in `redact.py`, which imports nothing beyond the standard
+# library, because the logger needs it and must not have to import OpenCV to be
+# safe. Re-exported here so the public spelling stays
+# `from sentinel.decode import redact_url`.
+_CREDENTIAL_QUERY_KEYS = CREDENTIAL_QUERY_KEYS
 
-#: Substituted for every removed secret. A fixed marker, never one character per
-#: character: the length of a password is information an attacker can use.
-REDACTED = "***"
-
-
-def redact_url(url: str) -> str:
-    """Strip every credential from a URL so it is safe to log or display.
-
-    ``rtsp://admin:hunter2@10.0.0.5/stream`` becomes
-    ``rtsp://admin:***@10.0.0.5/stream``. The username survives because
-    operators identify cameras by it and it is not a secret; the password never
-    appears in any form, including its length.
-
-    Written defensively, because this function is the only thing standing between
-    a camera password and every log line, error message and database row in the
-    system. Three ways an earlier version leaked, all now covered:
-
-    - **It parsed before it redacted.** ``urlsplit`` succeeds but ``.port``
-      raises ``ValueError`` on a non-numeric port, and ``.hostname`` returns
-      ``None`` for shapes it does not recognise. Both paths returned the input
-      verbatim. Nothing here depends on a successful parse: the userinfo is
-      removed by string surgery on the netloc, which cannot fail.
-    - **It only ever looked at the userinfo.** A credential in the query string
-      survived untouched.
-    - **It rebuilt the host from ``.hostname``**, which strips the brackets from
-      an IPv6 literal and produced an unparseable display URL.
-
-    When anything is uncertain the function fails *closed* — it returns a marker
-    rather than the input, because echoing a string that might contain a
-    password is the one outcome that must never happen.
-    """
-    if not isinstance(url, str) or not url:
-        return "<no source>"
-
-    # A local path is not a URL and has no credential to strip. Recognised
-    # before any parsing, so a Windows path like C:\media\clip.mp4 is never
-    # mangled by scheme detection.
-    if "://" not in url:
-        # A path, not a URL — returned intact so an operator can find the file.
-        # The query pass still runs: "?" is illegal in a Windows filename and
-        # vanishingly rare in a POSIX one, so redacting a credential-shaped
-        # parameter here costs nothing and covers a schemeless "host/s?token=x".
-        return _redact_query(url if "@" not in url else "<redacted path>")
-
-    scheme, _, remainder = url.partition("://")
-    netloc, slash, tail = remainder.partition("/")
-
-    # Userinfo removal by string surgery. rpartition, not partition: a password
-    # may itself contain an "@", and only the last one separates host from
-    # userinfo.
-    if "@" in netloc:
-        userinfo, _, host = netloc.rpartition("@")
-        username = userinfo.split(":", 1)[0]
-        netloc = (f"{username}:{REDACTED}@" if username else f"{REDACTED}@") + host
-
-    rebuilt = f"{scheme}://{netloc}"
-    if slash:
-        rebuilt += "/" + tail
-
-    return _redact_query(rebuilt)
-
-
-def _redact_query(url: str) -> str:
-    """Replace credential-shaped query values, leaving the rest legible."""
-    head, sep, query = url.partition("?")
-    if not sep or not query:
-        return url
-
-    query, hash_sep, fragment = query.partition("#")
-
-    redacted = []
-    for pair in query.split("&"):
-        name, has_value, _ = pair.partition("=")
-        if has_value and name.lower() in _CREDENTIAL_QUERY_KEYS:
-            redacted.append(f"{name}={REDACTED}")
-        else:
-            redacted.append(pair)
-
-    return head + "?" + "&".join(redacted) + (hash_sep + fragment if hash_sep else "")
-
-
-def contains_credential(text: str, url: str) -> bool:
-    """Whether ``text`` leaks any secret held in ``url``.
-
-    Used by the tests rather than by the runtime. It exists so a test can assert
-    the absence of *this URL's* secrets rather than of one hard-coded sentinel,
-    which is what lets it catch a leak through a path nobody thought of.
-    """
-    secrets = []
-    if "://" in url:
-        netloc = url.partition("://")[2].partition("/")[0]
-        if "@" in netloc:
-            userinfo = netloc.rpartition("@")[0]
-            _, has_password, password = userinfo.partition(":")
-            if has_password and password:
-                secrets.append(password)
-
-    _, sep, query = url.partition("?")
-    if sep:
-        for pair in query.partition("#")[0].split("&"):
-            name, has_value, value = pair.partition("=")
-            if has_value and value and name.lower() in _CREDENTIAL_QUERY_KEYS:
-                secrets.append(value)
-
-    return any(secret in text for secret in secrets)
+__all__ = [
+    "REDACTED",
+    "DecodeError",
+    "Frame",
+    "LiveStream",
+    "SourceInfo",
+    "VideoSource",
+    "contains_credential",
+    "redact_url",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -635,6 +547,7 @@ class LiveStream:
                 # Redacted by construction: DecodeError never carries a URL that
                 # still has its credential in it.
                 self._state.error = error
+                _log.warning("%s: stream failed — %s", self._source.source_id, error)
             except Exception as error:  # noqa: BLE001
                 # Anything else killed this thread silently, leaving the capture
                 # open and the stream permanently empty while the interface went
@@ -645,6 +558,14 @@ class LiveStream:
                     f"{self._source.display_url} stopped unexpectedly "
                     f"({type(error).__name__}). The stream will be reconnected."
                 )
+                # `exc_info` is safe: the log filter redacts the traceback too,
+                # and a developer chasing this needs the frames.
+                _log.error(
+                    "%s: decode thread raised %s",
+                    self._source.source_id,
+                    type(error).__name__,
+                    exc_info=True,
+                )
 
             if self._state.stop.is_set():
                 return
@@ -654,6 +575,12 @@ class LiveStream:
                 self._reconnects += 1
 
             delay = _BACKOFF_SECONDS[min(attempt, len(_BACKOFF_SECONDS) - 1)]
+            _log.info(
+                "%s: reconnecting in %.0fs (attempt %d)",
+                self._source.source_id,
+                delay,
+                attempt + 1,
+            )
             attempt += 1
             self._state.stop.wait(delay)
 

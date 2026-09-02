@@ -47,9 +47,14 @@ from pathlib import Path
 from typing import Iterable, Iterator, Sequence
 
 from .core import LatLon
-from .events import Event, Evidence, EventType, Severity
-from .incidents import Incident, Risk, RiskFactor
+from .events import Event, Evidence, EventType, Severity, utc_from_millis
+from .incidents import Association, Incident, Risk, RiskFactor
 from .zones import Schedule, Zone, ZoneKind
+
+from . import paths
+from .logs import get as _get_logger
+
+_log = _get_logger(__name__)
 
 #: Schema version this build expects. A database at a different version is
 #: migrated forward, never opened as-is: opening a schema you do not understand
@@ -69,22 +74,11 @@ def default_database_path() -> Path:
     they do not own, must still get a working system. ``SENTINEL_DATA_DIR``
     overrides it for a deployment that keeps its data on a specific volume —
     which is the normal case for a security appliance with a dedicated disk.
+
+    The directory logic lives in `paths.py` so the database, the log and the
+    evidence export cannot disagree about where this deployment keeps its files.
     """
-    import os
-    import sys
-
-    override = os.environ.get("SENTINEL_DATA_DIR")
-    if override:
-        return Path(override) / "sentinel.db"
-
-    if sys.platform == "win32":
-        base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
-    elif sys.platform == "darwin":
-        base = Path.home() / "Library" / "Application Support"
-    else:
-        base = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
-
-    return base / "SentinelVision" / "sentinel.db"
+    return paths.database_path()
 
 
 # ------------------------------------------------------------------ migrations
@@ -789,6 +783,55 @@ class Store:
         return self._connection.execute(
             "SELECT * FROM incidents ORDER BY opened_at DESC LIMIT ?", (limit,)
         ).fetchall()
+
+    def incident(self, incident_id: str) -> Incident | None:
+        """Rebuild one stored incident, events and reasoning included.
+
+        Until this existed, an incident could only be exported while the process
+        that raised it was still running — which makes an evidence package a
+        thing you must remember to produce at the time, rather than a thing you
+        can produce when somebody asks. Every field is on the row or in the
+        linked events; nothing is recomputed, because re-deriving risk from a
+        newer rule set would silently rewrite what was concluded at the time.
+        """
+        row = self._connection.execute(
+            "SELECT * FROM incidents WHERE id = ?", (incident_id,)
+        ).fetchone()
+        if row is None:
+            return None
+
+        events = tuple(self.incident_events(incident_id))
+        factors = tuple(
+            RiskFactor(name=f["name"], points=f["points"], because=f["because"])
+            for f in json.loads(row["risk_factors"])
+        )
+        associations = tuple(
+            Association(
+                a=(link["a"][0], int(link["a"][1])),
+                b=(link["b"][0], int(link["b"][1])),
+                score=link["score"],
+                separation_meters=link["separation_meters"],
+                allowance_meters=link["allowance_meters"],
+                time_gap_millis=link["time_gap_millis"],
+                reasons=tuple(link["reasons"]),
+            )
+            for link in json.loads(row["associations"])
+        )
+
+        return Incident(
+            id=row["id"],
+            severity=Severity(row["severity"]),
+            summary=row["summary"],
+            opened_at_millis=row["opened_at_millis"],
+            closed_at_millis=row["closed_at_millis"],
+            opened_at=utc_from_millis(row["opened_at"]),
+            distinct_objects=row["distinct_object_count"],
+            cameras=tuple(json.loads(row["cameras"])),
+            zones=tuple(json.loads(row["zones"])),
+            events=events,
+            associations=associations,
+            risk=Risk(score=row["risk_score"], factors=factors),
+        )
 
     def incident_events(self, incident_id: str) -> list[Event]:
         rows = self._connection.execute(

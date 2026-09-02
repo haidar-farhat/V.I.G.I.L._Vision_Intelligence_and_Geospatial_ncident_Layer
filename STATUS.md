@@ -22,8 +22,16 @@ implementation was removed in `582d0a8`; its architecture documents were kept
 because the thinking in them carried over, and are being brought up to date.
 Anything below that is not yet re-established after the rewrite says so.
 
-Current suite: **365 tests** — 56 Rust, 269 engine, 40 console. `cargo fmt` and
-`clippy -D warnings` clean. Run everything with `python tasks.py check`.
+Current suite: **492 tests** — 57 Rust, 395 engine, 40 console — plus two static
+checks that run before any of them: an offline audit that fails the build if the
+shipped source names any destination off the site, and a lint that fails it if
+any of the 36 diagrams in this documentation no longer parses. `cargo fmt` and
+`clippy -D warnings` clean. Run everything with `python tasks.py check`, or the
+Python half of it inside a container with no network at all:
+`docker compose run --rm verify`.
+
+**How to use it** is [docs/USAGE.md](docs/USAGE.md). **What to build next** is
+[ROADMAP.md](ROADMAP.md).
 
 A visual walk-through of everything below — the layers, the boundary, threading,
 projection, correlation, persistence and export — is in
@@ -109,6 +117,22 @@ Geometry, projection, zones and tracking, behind a C ABI.
 | Persistence | `TESTED` | SQLite in WAL, forward migrations with a reversal each, idempotent upserts on deterministic ids. No column holds a credential — asserted by walking the schema. |
 | Audit log | `TESTED` | Append-only. There is deliberately no method to edit one, and a test fails if somebody adds it. |
 | Evidence export | `TESTED` | A folder per incident: the full record, a report a person can read without tooling, and a SHA-256 for every file. Verifiable by somebody who has only the folder. |
+| Export a *stored* incident | `TESTED` | `Store.incident()` rebuilds one from the database — events and reasoning included, nothing recomputed. Until this existed an incident could only be exported while the process that raised it was still running. |
+| Headless analysis (`python -m sentinel`) | `TESTED` | The same pipeline with no window: run, incidents, export, coverage, where. Not a daemon — it processes what it is given and exits. |
+| Logging | `TESTED` | Rotating file plus console, two formats. Every record passes a redacting filter — message, arguments and traceback — so a log line cannot carry a camera password. No network handler exists, asserted against the parsed module. |
+| One data directory | `TESTED` | Database, logs and evidence under one root, overridable with `SENTINEL_DATA_DIR`. Never beside the code: a packaged install lives somewhere the running account cannot write. |
+| Bounded statistics | `TESTED` | Per-track detail is capped; the distinct-object count is counted on arrival so trimming cannot deflate it, and a track still on screen is never trimmed. |
+| Live-thread fault reporting | `TESTED` | The decode thread cannot die silently: any exception becomes a reported fault naming the exception *type*, never its text. |
+
+## Repository guards
+
+Neither of these is a feature. Both exist because a claim this system makes about
+itself was found to be false, and rewording it would have been the cheaper fix.
+
+| Guard | State | What it does | Watched failing by |
+|---|---|---|---|
+| `tools/offline_audit.py` | `TESTED` | Scans 26 shipped source files for cloud SDKs, telemetry packages and hard-coded external hosts. First CI job, no toolchain. | `test_offline_guarantee.py` · 29 |
+| `tools/docs_lint.py` | `TESTED` | Parses all 32 mermaid diagrams. A broken one renders as raw text with no error anywhere. | `test_docs.py` · 12 |
 
 ## Operator console (PySide6)
 
@@ -124,7 +148,17 @@ Geometry, projection, zones and tracking, behind a C ABI.
 | Incident panel | `TESTED` | One row per incident, expandable into its risk factors, cross-camera links and timeline. Sorted by severity, not arrival. |
 | Zones on the plan view | `TESTED` | Drawn distinctly from evidence: a zone is a rule someone wrote, not something observed. |
 | Multi-camera wall | `TESTED` | A pane per camera, a pipeline per camera, and correlation above them — never inside one. |
-| Incident replay and export | `PLANNED` | |
+| Incident replay and export | `PLANNED` | Export exists on the command line and in the console; replay does not. |
+
+## Packaging and deployment
+
+| Capability | State | Notes |
+|---|---|---|
+| Standalone executables | `TESTED` | `python tasks.py package` → three executables from one PyInstaller analysis. `onedir`, not `onefile`: unpacking 300 MB per launch is slow, leaves debris, and can be blocked outright. No UPX — a packed binary looks exactly like malware to every endpoint product an operator runs. |
+| Developer executable | `TESTED` | `SentinelVision-dev` is the same code with a terminal and `--verbose` forced on. A packaged Qt application on Windows has nowhere to print, so an exception before the window appears leaves no trace at all. |
+| Container image | `IMPLEMENTED` | Multi-stage: Rust builder, slim runtime, and a test stage carrying the dev extras. Runs the full Python suite with `network_mode: none`. Not root. No port is opened, because there is nothing to open one for. |
+| Installer | `PLANNED` | MSI/NSIS, `.deb`/`.rpm`/AppImage, signed `.dmg`. What exists is a folder to copy. |
+| Code signing | `PLANNED` | Unsigned binaries will be flagged on Windows and refused on macOS. |
 
 ## Measured behaviour
 
@@ -307,6 +341,151 @@ Each of these passed review and failed reality:
 | `db-rollback` silently undone | Opening the store auto-migrated unconditionally | Auto-migrate for the application, off for maintenance |
 | A test hung forever | A modal dialog on camera failure — exactly what an operator would have experienced | Report faults in place, not modally |
 | A zone landed beyond everything the camera could see | Placed by *stated range*, which is not coverage | Place just past the near edge of the real footprint |
+
+### Milestone — the adversarial audit
+
+The system was reviewed against its own claims rather than against a style guide:
+every sentence in the documentation was treated as an assertion, and every
+assertion was checked against the code that was supposed to implement it. 54
+findings; 51 acted on, 2 resolved *against* the finding by measurement, 1 kept as
+a documented limit.
+
+```mermaid
+flowchart LR
+    A["<b>54 findings</b>"] --> B["<b>26 defects</b><br/>code was wrong"]
+    A --> C["<b>13 false claims</b><br/>docs described<br/>code that did not exist"]
+    A --> D["<b>9 unbounded or<br/>unguarded</b>"]
+    A --> E["<b>6 tests that<br/>could not fail</b>"]
+
+    B --> F["fixed + regression test"]
+    C --> G["either the claim was<br/>corrected, or the thing<br/>it claimed was built"]
+    D --> F
+    E --> H["replaced with tests<br/>that fail when broken"]
+
+    A -.-> R["<b>2 resolved against<br/>the finding</b><br/><i>the change made<br/>tracking worse</i>"]
+
+    style A fill:#334155,stroke:#94a3b8,color:#e2e8f0
+    style B fill:#4c1d24,stroke:#f87171,color:#e2e8f0
+    style C fill:#4c1d24,stroke:#f87171,color:#e2e8f0
+    style D fill:#4c1d24,stroke:#f87171,color:#e2e8f0
+    style E fill:#4c1d24,stroke:#f87171,color:#e2e8f0
+    style F fill:#1e3f2f,stroke:#4ade80,color:#e2e8f0
+    style G fill:#1e3f2f,stroke:#4ade80,color:#e2e8f0
+    style H fill:#1e3f2f,stroke:#4ade80,color:#e2e8f0
+    style R fill:#4a3f1e,stroke:#fbbf24,color:#e2e8f0
+```
+
+**Two findings were resolved against the audit, by measurement.** Both proposed
+changes were defensible on paper and both made the system worse when run:
+
+| Proposed change | Rationale | Measured result | Outcome |
+|---|---|---|---|
+| Make `min_hits_to_confirm` literally consecutive | The name says consecutive; the code counts cumulatively | 3 people → **5 tracks became 8 tracks** | Behaviour kept, comment corrected |
+| Scale the vertical gate by *width*, so its stated tightness is real | The comment claims the vertical axis is the tight one; scaling by height undoes that | 3 people → **5 tracks became 8 tracks**; sweep 0.35→5, 0.25→6, 0.20→7, 0.15→8 | Behaviour kept, comment corrected, sweep recorded |
+
+A comment that describes the code is worth more than code that matches the
+comment. Both comments were wrong; neither behaviour was.
+
+**The thirteen false claims are the part worth dwelling on.** Every one of them
+would have read as a working feature to somebody deciding whether to trust this
+system. Two examples, both now real rather than reworded:
+
+- SECURITY.md said the CI offline job "fails the build on a cloud SDK import, an
+  analytics package, or a hard-coded external URL anywhere in the source." It did
+  not — it blocked outbound traffic and ran the suite, which proves the *tested*
+  paths need no network and says nothing about a path no test reaches. Rather
+  than soften the sentence, the check was built (below).
+- SECURITY.md's entire credentials section described `Secret<T>`, `toJSON`, the
+  Node inspection hook and `buildRtspUrl` — the TypeScript prototype, deleted in
+  `582d0a8`. It has been rewritten to describe the mechanism that exists.
+
+### Zero WAN, now enforced three ways
+
+The guarantee is checked at three different times, and each catches what the
+others cannot.
+
+```mermaid
+flowchart TD
+    subgraph commit["AT COMMIT — static"]
+        S["tools/offline_audit.py<br/><i>cloud SDKs · telemetry packages ·<br/>hard-coded external hosts</i>"]
+    end
+    subgraph ci["IN CI — behavioural"]
+        O["offline acceptance job<br/><i>iptables OUTPUT DROP, proven,<br/>then the whole suite</i>"]
+    end
+    subgraph runtime["AT RUNTIME — per connection"]
+        E["VideoSource._require_private<br/><i>every resolved address must be<br/>loopback or RFC 1918 / 4193</i>"]
+    end
+
+    S -->|"first CI job:<br/>no toolchain, no deps"| O
+    O --> SHIP["shipped"]
+    SHIP --> E
+
+    S -.->|"catches"| S1["a dependency added<br/>but never exercised<br/>by a test"]
+    O -.->|"catches"| O1["a test path that<br/>quietly needed the net"]
+    E -.->|"catches"| E1["an operator's typo, or DNS<br/>resolving a camera name<br/>to a public address"]
+
+    style S fill:#1e3f2f,stroke:#4ade80,color:#e2e8f0
+    style O fill:#1e3f2f,stroke:#4ade80,color:#e2e8f0
+    style E fill:#1e3f2f,stroke:#4ade80,color:#e2e8f0
+    style S1 fill:#4c1d24,stroke:#f87171,color:#e2e8f0
+    style O1 fill:#4c1d24,stroke:#f87171,color:#e2e8f0
+    style E1 fill:#4c1d24,stroke:#f87171,color:#e2e8f0
+```
+
+| Mechanism | State | What it scans / does | Tested by |
+|---|---|---|---|
+| `tools/offline_audit.py` | `TESTED` | `engine/sentinel`, `apps/console/sentinel_console`, `core/src`, `tasks.py`, `tools` — 26 files | `engine/tests/test_offline_guarantee.py`, 29 tests |
+| Offline CI job | `TESTED` | Drops outbound traffic, *proves* the drop works, runs all three suites | The job's own `curl` gate |
+| `VideoSource._require_private` | `TESTED` | Every address a camera host resolves to | `engine/tests/test_decode.py` |
+
+The audit is itself tested against deliberately bad source — every class of
+finding is fed to it and required to be caught, and every URL the product
+legitimately contains (`rtsp://admin:pw@192.168.1.64`, `https://node.local:8443`,
+`http://[::1]:9000`, `https://[fd00::1]:8443`) is required to pass. A guard that
+cries wolf is a guard somebody switches off; a guard nobody has watched fail is a
+guard nobody knows works.
+
+What it deliberately does **not** scan: the documentation, the tests, and the CI
+definition. All three name external hosts on purpose — the offline job proves it
+cannot reach `example.com` — and a scanner that forbade writing that down would
+forbid the proof.
+
+**Stated honestly:** the runtime guard is on the decode path, which is the only
+place this build opens an outbound socket. It is not a process-wide socket
+filter. When the control plane and node pairing are built, each needs the same
+check at its own boundary, and the static audit is what makes a new dependency
+that skips it visible.
+
+### Boundaries that were unbounded
+
+Four collections grew for as long as the process ran. On a demonstration this is
+invisible; on a node left running for a month it is the reason it dies.
+
+| Where | Grew by | Now |
+|---|---|---|
+| `PipelineStats.track_ids` | one entry per track ever seen | capped, with the distinct-object count kept exact by counting on arrival rather than by `len()` |
+| `PipelineStats.observations` | one entry per track ever seen | capped, trimmed with its id |
+| `PipelineStats.spans` | one entry per track ever seen | capped, trimmed with its id |
+| `field_of_view` output buffer | sized from the *requested* segment count, not the clamped one | sized from what the core will actually produce; truncation refused rather than discarded |
+
+The trimming had to be careful in one specific way: dropping the oldest ids would
+drop a **long-lived track that is still on screen**, and the next frame would
+count it as a new object — a stationary loiterer inflating the object count once
+per frame, forever. Live ids are skipped, and a test walks a loiterer through
+8192 frames of churn to prove it.
+
+### Failures that could not be seen
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| A camera silently stops; the interface still shows it | The live decode thread caught only `DecodeError`. Anything else unwound it and left the capture open | Catch everything; report the exception *type*, never its text, because that text may have been built from a URL |
+| A stale core dies on `AttributeError: sentinel_field_of_view` | `_bind` touched every symbol before the ABI version was read | Version read first; a mismatch says which rebuild to run |
+| A camera footprint drawn open, claiming coverage it does not have | Buffer sized for 0 segments, core clamped to 2, ring truncated to fit, status discarded | Size for the clamp; refuse a truncated footprint outright |
+| An event kind in the API that nothing raises | `ZONE_EXIT` and `PERIMETER_BREACH` are declared but no rule produces them | Labelled reserved with the reason; three tests assert the labels against the rules that exist |
+| onnxruntime telemetry left at the library default | Zero-WAN was enforced on this code, not on its dependencies | `disable_telemetry_events()` called explicitly, guarded for builds without it |
+
+Sequencing for everything below — what I would build next and why — is in
+[ROADMAP.md](ROADMAP.md).
 
 ## Not yet rebuilt after the rewrite
 

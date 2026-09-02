@@ -1,0 +1,40 @@
+# Everything the image must not carry, and why.
+
+# Build output. The image builds its own core from source in a stage that has a
+# Rust toolchain; copying a Windows DLL into a Linux image would be worse than
+# useless, because it would look like the core was present.
+core/target/
+build/
+dist/
+*.spec.bak
+
+# Version control and editor state. Large, and a .git directory in a shipped
+# image is a source-code disclosure nobody intended.
+.git/
+.github/
+.gitignore
+.vscode/
+.idea/
+
+# Python and Rust caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+venv/
+.venv/
+
+# Operator data. Footage, models, map packages and evidence are supplied at run
+# time through volumes and must never be baked into a layer — a layer is
+# copyable, and evidence in a copyable layer is evidence with no chain of
+# custody.
+media/
+evidence/
+models/*
+!models/README.md
+map-data/*
+!map-data/README.md
+
+# Benchmark scratch
+engine/tests/.bench/
