@@ -42,8 +42,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence
 
-from .events import Event
+from .events import Event, utc_from_millis
 from .incidents import Incident
+from .recording import Segment
 
 #: Bumped when the package layout changes in a way a reader must know about.
 EXPORT_FORMAT_VERSION = 1
@@ -334,12 +335,206 @@ def _readable_report(incident: Incident, exported_by: str, at: datetime) -> str:
     return "\n".join(lines)
 
 
+
+
+# --------------------------------------------------------------------- footage
+
+#: How much to include before an incident opened. An event fires *after*
+#: somebody is already inside a zone, so the footage that explains it starts
+#: earlier — usually a good deal earlier than anyone expects when they first
+#: choose a number.
+DEFAULT_LEAD_SECONDS = 30.0
+
+#: And after it closed, because what somebody does on the way out is evidence
+#: too.
+DEFAULT_TRAIL_SECONDS = 30.0
+
+
+@dataclass(frozen=True, slots=True)
+class Coverage:
+    """What footage exists for an incident, and what does not.
+
+    The second half is the point. A package that quietly contains forty seconds
+    of a ninety-second incident looks complete — the clips play, the manifest
+    verifies — and the missing part is discovered by whoever is relying on it,
+    at the worst moment. Every gap is measured, named and written into the
+    package.
+    """
+
+    camera_id: str
+    #: The window asked for, including lead and trail.
+    requested_start_millis: int
+    requested_end_millis: int
+    segments: tuple["Segment", ...]
+    #: Windows inside the request that no segment covers.
+    gaps: tuple[tuple[int, int], ...]
+
+    @property
+    def covered_millis(self) -> int:
+        requested = self.requested_end_millis - self.requested_start_millis
+        return requested - sum(end - start for start, end in self.gaps)
+
+    @property
+    def covered_fraction(self) -> float:
+        requested = self.requested_end_millis - self.requested_start_millis
+        return self.covered_millis / requested if requested > 0 else 0.0
+
+    @property
+    def is_complete(self) -> bool:
+        return not self.gaps
+
+
+def coverage_for(
+    store,
+    incident: Incident,
+    *,
+    lead_seconds: float = DEFAULT_LEAD_SECONDS,
+    trail_seconds: float = DEFAULT_TRAIL_SECONDS,
+) -> list[Coverage]:
+    """Which recorded segments cover an incident, per camera, and what is missing.
+
+    One entry per camera the incident names, including cameras with **no**
+    footage at all — an empty result would read as "nothing to attach" when the
+    truth is "this camera recorded nothing, and that is a finding".
+    """
+    # Wall clock, from `opened_at`, and **not** from `opened_at_millis`.
+    # Those two are different clocks: an incident's millis are media time,
+    # counted from the start of the footage, while recordings are indexed by
+    # when they actually happened because that is what retention and an
+    # operator both work in. Using the wrong one asked for footage from 1970
+    # and reported, correctly and uselessly, that none existed.
+    opened = int(incident.opened_at.timestamp() * 1000)
+    start = opened - int(lead_seconds * 1000)
+    end = opened + incident.duration_millis + int(trail_seconds * 1000)
+
+    coverages: list[Coverage] = []
+    for camera_id in incident.cameras:
+        segments = tuple(
+            store.segments(camera_id=camera_id, start_millis=start, end_millis=end)
+        )
+        coverages.append(
+            Coverage(
+                camera_id=camera_id,
+                requested_start_millis=start,
+                requested_end_millis=end,
+                segments=segments,
+                gaps=_gaps(start, end, segments),
+            )
+        )
+    return coverages
+
+
+def _gaps(start: int, end: int, segments) -> tuple[tuple[int, int], ...]:
+    """Windows in [start, end] that no segment covers.
+
+    Segments are merged before subtracting, because two that overlap — which
+    happens across a resolution change, where one is closed and another opened
+    on the same instant — would otherwise each punch a hole in the other.
+    """
+    spans = sorted(
+        (max(start, s.started_millis), min(end, s.ended_millis))
+        for s in segments
+        if s.ended_millis >= start and s.started_millis <= end
+    )
+    if not spans:
+        return ((start, end),) if end > start else ()
+
+    merged: list[list[int]] = [list(spans[0])]
+    for span_start, span_end in spans[1:]:
+        if span_start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], span_end)
+        else:
+            merged.append([span_start, span_end])
+
+    gaps: list[tuple[int, int]] = []
+    cursor = start
+    for span_start, span_end in merged:
+        if span_start > cursor:
+            gaps.append((cursor, span_start))
+        cursor = max(cursor, span_end)
+    if cursor < end:
+        gaps.append((cursor, end))
+
+    # A sub-second gap is a rounding artefact of frame boundaries, not a hole in
+    # the evidence, and reporting one would train an operator to ignore the
+    # field that reports real ones.
+    return tuple((s, e) for s, e in gaps if e - s > 1000)
+
+
+def _footage_document(coverages: list[Coverage], names: dict[str, str]) -> dict:
+    return {
+        "lead_and_trail": "the window extends before and after the incident on purpose",
+        "cameras": [
+            {
+                "camera_id": coverage.camera_id,
+                "window_start": utc_from_millis(coverage.requested_start_millis).isoformat(),
+                "window_end": utc_from_millis(coverage.requested_end_millis).isoformat(),
+                "covered_fraction": round(coverage.covered_fraction, 4),
+                "complete": coverage.is_complete,
+                "clips": [
+                    {
+                        "file": names[str(segment.path)],
+                        "start": utc_from_millis(segment.started_millis).isoformat(),
+                        "end": utc_from_millis(segment.ended_millis).isoformat(),
+                        "frames": segment.frames,
+                        "resolution": f"{segment.width}x{segment.height}",
+                        "codec": segment.codec,
+                        # The measured rate, not the container header's claim.
+                        # For a live camera those differ, and this is the one
+                        # that describes what actually happened.
+                        "measured_fps": round(segment.measured_fps, 3),
+                        "nominal_fps": round(segment.nominal_fps, 3),
+                        "sha256_when_recorded": segment.sha256,
+                        "complete": segment.complete,
+                    }
+                    for segment in coverage.segments
+                    if str(segment.path) in names
+                ],
+                "gaps": [
+                    {
+                        "from": utc_from_millis(start).isoformat(),
+                        "to": utc_from_millis(end).isoformat(),
+                        "seconds": round((end - start) / 1000, 1),
+                    }
+                    for start, end in coverage.gaps
+                ],
+            }
+            for coverage in coverages
+        ],
+    }
+
+
+
+def _unique_name(name: str, used: set[str]) -> str:
+    """A name that is not already in the package.
+
+    Two clips from two cameras are routinely both called `clip.mp4`, and copying
+    the second over the first loses evidence *and still verifies clean*, because
+    the manifest is written afterwards from what survived. A file named
+    `incident.json` would have destroyed the record itself. Names are made
+    unique here rather than trusted.
+    """
+    if name not in used:
+        used.add(name)
+        return name
+
+    stem, _, suffix = name.rpartition(".")
+    stem, suffix = (stem, "." + suffix) if stem else (name, "")
+    index = 2
+    while f"{stem}-{index}{suffix}" in used:
+        index += 1
+    unique = f"{stem}-{index}{suffix}"
+    used.add(unique)
+    return unique
+
+
 def export_incident(
     incident: Incident,
     destination: Path,
     *,
     exported_by: str,
     attachments: Sequence[Path] = (),
+    footage: Sequence[Coverage] = (),
     at: datetime | None = None,
 ) -> Export:
     """Write an evidence package for one incident.
@@ -347,6 +542,11 @@ def export_incident(
     ``destination`` is the *containing* directory; a folder named for the
     incident is created inside it. Attachments are copied in and hashed with
     everything else, and any that would land outside the package are refused.
+
+    ``footage`` is what :func:`coverage_for` returned. Its clips are copied in
+    like any other attachment, and a ``footage.json`` records what each one is
+    and — the part that matters — **what is missing**. A package containing
+    forty seconds of a ninety-second incident plays, verifies, and misleads.
     """
     moment = at or datetime.now(timezone.utc)
 
@@ -368,8 +568,34 @@ def export_incident(
     report.write_text(_readable_report(incident, exported_by, moment), encoding="utf-8")
     written.append(report)
 
-    reserved = {"manifest.json", "incident.json", "report.txt"}
+    reserved = {"manifest.json", "incident.json", "report.txt", "footage.json"}
     used: set[str] = set(reserved)
+
+    # Footage first, so a clip keeps its own name and a same-named attachment is
+    # the one that gets a suffix. The recording is the evidence; an attachment
+    # is somebody's addition to it.
+    clip_names: dict[str, str] = {}
+    for coverage in footage:
+        for segment in coverage.segments:
+            if not segment.path.is_file():
+                # Indexed but gone. Named in footage.json as a gap rather than
+                # failing the whole export: the rest of the package is still
+                # evidence, and its absence is itself a finding.
+                continue
+            name = _unique_name(segment.path.name, used)
+            target = _resolve_within(package, name)
+            shutil.copy2(segment.path, target)
+            written.append(target)
+            clip_names[str(segment.path)] = name
+
+    if footage:
+        footage_json = package / "footage.json"
+        footage_json.write_text(
+            json.dumps(_footage_document(list(footage), clip_names), indent=2,
+                       ensure_ascii=False),
+            encoding="utf-8",
+        )
+        written.append(footage_json)
 
     for source in attachments:
         source = Path(source)
@@ -381,14 +607,7 @@ def export_incident(
         # clean*, because the manifest is written afterwards from what survived.
         # An attachment named `incident.json` would have destroyed the record
         # itself. Names are made unique here rather than trusted.
-        name = source.name
-        if name in used:
-            stem, suffix = source.stem, source.suffix
-            index = 2
-            while f"{stem}-{index}{suffix}" in used:
-                index += 1
-            name = f"{stem}-{index}{suffix}"
-        used.add(name)
+        name = _unique_name(source.name, used)
 
         target = _resolve_within(package, name)
         shutil.copy2(source, target)

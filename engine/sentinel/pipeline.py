@@ -31,6 +31,7 @@ statistics are collected here rather than inferred later.
 from __future__ import annotations
 
 import time
+from pathlib import Path
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator, Sequence
@@ -45,6 +46,7 @@ from .incidents import Correlator, Incident
 from .zones import Zone, ZoneEvaluator
 
 from .logs import get as _get_logger
+from .recording import Recorder
 
 _log = _get_logger(__name__)
 
@@ -155,7 +157,8 @@ class Pipeline:
     __slots__ = ("_source", "_detector", "_pose", "_tracker", "stats", "_config",
                  "_keep_images", "_zones", "_evaluator", "_engine", "_epoch_millis",
                  "_correlator", "_recent_events", "_event_retention",
-                 "_resolved_epoch", "_epoch_basis")
+                 "_resolved_epoch", "_epoch_basis",
+                 "_record_to", "_segment_seconds", "_on_segment", "_recorder")
 
     def __init__(
         self,
@@ -173,6 +176,9 @@ class Pipeline:
         node_id: str = "local",
         wall_clock_epoch_millis: int | None = None,
         event_retention: int = 5000,
+        record_to: str | Path | None = None,
+        segment_seconds: float = 60.0,
+        on_segment=None,
     ):
         """
         ``max_gap_millis`` is how long a track survives without a detection. It
@@ -194,6 +200,14 @@ class Pipeline:
         )
         self._tracker: Tracker | None = None
         self.stats = PipelineStats()
+
+        # Recording is opt-in, and off by default. Writing video is the single
+        # most expensive thing this system can do to a disk — roughly 17.5 GB
+        # per camera per day — so it happens because somebody asked for it.
+        self._record_to = Path(record_to) if record_to else None
+        self._segment_seconds = segment_seconds
+        self._on_segment = on_segment
+        self._recorder: Recorder | None = None
 
         self._zones = {zone.id: zone for zone in zones}
         self._evaluator = ZoneEvaluator(zones) if zones else None
@@ -250,10 +264,31 @@ class Pipeline:
             self._tracker = None
         self._source.close()
 
+    @property
+    def recorder(self) -> Recorder | None:
+        """The recorder, once :meth:`run` has started one."""
+        return self._recorder
+
     def run(self) -> Iterator[FrameResult]:
         """Process the source, yielding one result per frame."""
-        self._source.open()
+        info = self._source.open()
         self._tracker = Tracker(self._pose, **self._config)
+
+        if self._record_to is not None:
+            self._recorder = Recorder(
+                self._source.source_id,
+                self._record_to / self._source.source_id,
+                fps=info.fps,
+                # A file must not lose frames; a camera must not build a
+                # backlog. The whole difference is this argument.
+                live=info.is_live,
+                # A file's frames are stamped from the start of the recording,
+                # and retention works in days.
+                epoch_millis=self._wall_clock_epoch(),
+                segment_seconds=self._segment_seconds,
+                on_segment=self._on_segment,
+            )
+            self._recorder.start()
 
         _log.info(
             "%s: analysis started (detector %s, %s, %d zone(s), %d rule(s))",
@@ -268,6 +303,19 @@ class Pipeline:
             for frame in self._source:
                 yield self._process(frame)
         finally:
+            if self._recorder is not None:
+                segments = self._recorder.close()
+                # The last segment closes during `close()`, on the writer
+                # thread, so it is still waiting to be indexed here.
+                self._recorder.finished()
+                stats = self._recorder.stats
+                _log.info(
+                    "%s: recorded %d segment(s), %.1f MiB%s",
+                    self._source.source_id, len(segments),
+                    stats.bytes_written / 1024 / 1024,
+                    f", {stats.frames_dropped} frame(s) dropped"
+                    if stats.frames_dropped else "",
+                )
             if self._tracker is not None:
                 self._tracker.close()
                 self._tracker = None
@@ -285,6 +333,17 @@ class Pipeline:
 
     def _process(self, frame: Frame) -> FrameResult:
         assert self._tracker is not None
+
+        if self._recorder is not None:
+            # Before analysis, not after. What gets recorded must not depend on
+            # what the analytic concludes, or on whether it concludes anything
+            # at all — an exception in a rule would otherwise take the footage
+            # with it.
+            self._recorder.offer(frame)
+            # Indexed here, on this thread, because `on_segment` is normally a
+            # database write and SQLite connections belong to the thread that
+            # created them.
+            self._recorder.finished()
 
         detections = self._detector.detect(frame.image)
         tracks = self._tracker.update(detections, frame.timestamp_millis)

@@ -67,6 +67,17 @@ def evidence_directory() -> Path:
     return data_directory() / "evidence"
 
 
+def recordings_directory() -> Path:
+    """Where recorded video goes.
+
+    Under the data directory like everything else, and overridable with it —
+    which matters more here than anywhere else, because continuous video is the
+    one thing that genuinely wants its own disk: roughly 17.5 GB per camera per
+    day at 640×480/15fps.
+    """
+    return data_directory() / "recordings"
+
+
 def is_frozen() -> bool:
     """Whether this is running from a packaged build rather than a checkout.
 
