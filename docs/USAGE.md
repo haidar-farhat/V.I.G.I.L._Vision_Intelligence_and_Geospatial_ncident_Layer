@@ -27,10 +27,11 @@ How to install it, run it, and read what it tells you.
 4. [The command line](#4-the-command-line)
 5. [Docker](#5-docker)
 6. [Cameras](#6-cameras)
-7. [Where your files are](#7-where-your-files-are)
-8. [Logs, and the developer build](#8-logs-and-the-developer-build)
-9. [When something is wrong](#9-when-something-is-wrong)
-10. [What it will refuse to do](#10-what-it-will-refuse-to-do)
+7. [Recording](#7-recording)
+8. [Where your files are](#8-where-your-files-are)
+9. [Logs, and the developer build](#9-logs-and-the-developer-build)
+10. [When something is wrong](#10-when-something-is-wrong)
+11. [What it will refuse to do](#11-what-it-will-refuse-to-do)
 
 ---
 
@@ -526,7 +527,110 @@ together when a switch loses power, and twenty dialogs is not a user interface.
 
 ---
 
-## 7. Where your files are
+## 7. Recording
+
+Off by default, because writing video is the single most expensive thing this
+system can do to a disk. Turn it on per run:
+
+```bash
+sentinel run rtsp://admin:pw@192.168.1.64/stream --id gate \
+    --place 33.8938,35.5018,6,180,-22 \
+    --record --for 3600
+```
+
+`--record` with no value writes under the data directory
+(`sentinel where` shows exactly where); `--record D:/footage` writes to the disk
+you point it at — which is the normal case, because of the table below.
+
+### The price, measured
+
+| | 640×480 · 15 fps |
+|---|---|
+| One camera | ~12.7 MiB/minute · **~17.5 GB/day** |
+| Sixteen cameras | **~280 GB/day** |
+| Encoding cost | ~800 fps — the writer is never the bottleneck |
+
+Recording uses `mp4v` (MPEG-4 Part 2) in ordinary `.mp4` files that play in any
+player. **It is deliberately not H.264**, which would be about 4× smaller:
+OpenCV's H.264 encoder is a DLL it offers to *download*, and this system never
+downloads anything — that rule is enforced by the build, not by preference. The
+4× is the honest price of the promise.
+
+### Segments, not one growing file
+
+Each camera writes bounded clips — 60 seconds each by default,
+`--segment-seconds` to change it. That number is also **the most a power cut
+can cost you**: a clip killed mid-write may not play at all, so shorter segments
+bound the loss and longer ones make fewer files.
+
+Filenames carry the camera and the wall-clock time
+(`gate_20260902-141116_00000000.mp4`), every finished clip is SHA-256 hashed
+the moment it closes, and all of it is indexed in the database so evidence and
+retention can find it.
+
+For a **file** being analysed, every frame is recorded — a replay is evidence,
+and evidence with three frames in four missing is not. For a **live camera**,
+a writer that falls behind drops frames rather than building the backlog that
+kills the process — and counts every drop, because a recorder silently
+discarding input is the worst failure a security system can have.
+
+### Retention — the disk is finite
+
+```bash
+sentinel retention                      # report: what WOULD be deleted
+sentinel retention --keep-days 7 --apply
+```
+
+Reporting is the default; nothing is deleted without `--apply`. The policy has
+three independent bounds — age (`--keep-days`, default 14), total size
+(`--max-gib`), and free space (`--min-free-gib`, default 5, because a disk at
+100% stops the database too, not just the recording).
+
+Two rules that do not bend:
+
+- **A segment an incident depends on is never deleted** — however old, however
+  full the disk. If the only way to meet the policy would be to delete
+  evidence, the policy goes unmet and the command says so and exits non-zero.
+- **Every deletion is audited.** "Where is the footage from the 3rd?" has an
+  answer: deleted by retention on the 17th, with the camera, frame count and
+  size on the audit row.
+
+### Footage in evidence packages
+
+An exported incident now includes its clips — with a lead-in before the
+incident opened, because an intrusion event fires *after* somebody is already
+inside the zone, and the footage that explains it starts earlier.
+
+The package's `footage.json` states, per camera, exactly what the clips cover
+— and **what they do not**:
+
+```json
+{
+  "camera_id": "gate",
+  "covered_fraction": 0.42,
+  "complete": false,
+  "gaps": [ { "from": "…14:11:08", "to": "…14:11:16", "seconds": 8.6 } ]
+}
+```
+
+A package holding forty seconds of a ninety-second incident plays, verifies
+clean, and misleads — unless it says so. This one says so. A camera the
+incident names that has *no* footage at all is also listed, with 0% coverage,
+because "this camera recorded nothing" is a finding, not an absence.
+
+### What recording does not do yet
+
+Honesty, per [STATUS.md](../STATUS.md): recording is **CLI-only** — the console
+cannot switch it on yet. There is no playback or timeline scrubbing inside the
+application (the clips are ordinary `.mp4`; any player opens them). There is no
+motion- or event-triggered mode — continuous recording came first because,
+with it, pre-event footage is simply already on disk. And nothing yet runs
+retention on a schedule; run `sentinel retention --apply` from your scheduler
+of choice.
+
+---
+
+## 8. Where your files are
 
 ```bash
 sentinel where
@@ -569,7 +673,7 @@ undone on a machine with no Internet and no spare hardware is a gamble.
 
 ---
 
-## 8. Logs, and the developer build
+## 9. Logs, and the developer build
 
 | variable | effect |
 |---|---|
@@ -616,7 +720,7 @@ modules or open a socket.
 
 ---
 
-## 9. When something is wrong
+## 10. When something is wrong
 
 | what you see | why | what to do |
 |---|---|---|
@@ -646,7 +750,7 @@ the log cannot contain a camera password.
 
 ---
 
-## 10. What it will refuse to do
+## 11. What it will refuse to do
 
 Not limitations. Design rules, each enforced by something other than intention.
 

@@ -27,6 +27,7 @@ import time
 from pathlib import Path
 
 from . import devices, logs, paths
+from .recording import RetentionPolicy, apply_retention
 from .core import CameraPose, LatLon
 from .decode import VideoSource
 from .detect import MotionDetector
@@ -175,6 +176,14 @@ def _run(args: argparse.Namespace) -> int:
     if args.frames is not None and args.frames < 1:
         print("error: --frames must be at least 1", file=sys.stderr)
         return 2
+    if args.segment_seconds <= 0:
+        print("error: --segment-seconds must be greater than zero", file=sys.stderr)
+        return 2
+
+    record_to = None
+    if args.record is not None:
+        record_to = Path(args.record) if args.record else paths.recordings_directory()
+        record_to.mkdir(parents=True, exist_ok=True)
 
     sources: list[VideoSource] = []
     for index, source in enumerate(args.source, start=1):
@@ -233,6 +242,11 @@ def _run(args: argparse.Namespace) -> int:
                 # them. The console gets this right by construction — one
                 # worker per camera — and this had to be made to match.
                 MotionDetector(detect_scale=args.detect_scale),
+                record_to=record_to,
+                segment_seconds=args.segment_seconds,
+                # Indexed as each segment closes rather than at the end, so a
+                # run that is interrupted still leaves findable footage.
+                on_segment=store.save_segment if record_to else None,
                 pose=pose,
                 zones=zones,
                 rules=rules,
@@ -424,6 +438,52 @@ def _coverage(args: argparse.Namespace) -> int:
     return 0
 
 
+def _retention(args: argparse.Namespace) -> int:
+    """Report or apply the recording retention policy.
+
+    Reports by default. The first thing anybody should do with a retention
+    policy is find out what it would have eaten, and a command whose default
+    deletes video is a command that deletes video by accident.
+    """
+    policy = RetentionPolicy(
+        max_age_days=args.keep_days if args.keep_days > 0 else None,
+        max_bytes=int(args.max_gib * 1024**3) if args.max_gib else None,
+        min_free_bytes=int(args.min_free_gib * 1024**3) if args.min_free_gib else None,
+    )
+
+    store = Store(args.database or default_database_path())
+    try:
+        total = store.recorded_bytes()
+        preserved = store.recorded_bytes(preserved=True)
+        count = store.recording_count()
+
+        print(f"policy      {policy.describe()}")
+        print(f"recorded    {count} segment(s), {total / 1024**3:.2f} GiB")
+        print(f"preserved   {preserved / 1024**3:.2f} GiB — evidence, never deleted")
+        print()
+
+        result = apply_retention(store, policy, actor=ACTOR, dry_run=not args.apply)
+
+        verb = "deleted" if args.apply else "would delete"
+        print(f"{verb}    {len(result.deleted)} segment(s), {result.freed_gib:.2f} GiB")
+        if result.kept_preserved:
+            print(f"kept        {result.kept_preserved} preserved segment(s)")
+        if result.already_missing:
+            print(f"missing     {result.already_missing} indexed file(s) were already gone")
+        if result.failed:
+            print(f"failed      {len(result.failed)} file(s) could not be deleted")
+        if result.shortfall:
+            print()
+            print(f"  {result.shortfall}")
+            return 1
+        if not args.apply and result.deleted:
+            print()
+            print("  Nothing was deleted. Add --apply to do it.")
+        return 0
+    finally:
+        store.close()
+
+
 def _devices(args: argparse.Namespace) -> int:
     """Cameras attached to this machine, as the operating system reports them.
 
@@ -471,6 +531,7 @@ def _where(args: argparse.Namespace) -> int:
     print(f"database         {args.database or default_database_path()}")
     print(f"logs             {paths.log_directory()}")
     print(f"evidence         {paths.evidence_directory()}")
+    print(f"recordings       {paths.recordings_directory()}")
     print(f"packaged build   {paths.is_frozen()}")
     print()
     print(f"Override the lot with {paths.DATA_DIR_VARIABLE}.")
@@ -557,6 +618,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="stop after N frames. Bounds a live run by work rather than by time.",
     )
     run.add_argument(
+        "--record", metavar="DIR", nargs="?", const="", default=None,
+        help=(
+            "record video to DIR, or to the data directory when given no value. "
+            "Roughly 17.5 GB per camera per day at 640x480/15fps — see "
+            "`sentinel retention`."
+        ),
+    )
+    run.add_argument(
+        "--segment-seconds", type=float, default=60.0, metavar="SECONDS",
+        help=(
+            "length of each recorded clip (default 60). This is the upper bound "
+            "on what a power cut costs, because a container killed mid-write may "
+            "not play at all."
+        ),
+    )
+    run.add_argument(
         "--detect-scale", type=float, default=0.75,
         help="detection resolution scale (default 0.75: 1.7x faster and "
              "slightly better recall — see docs/OVERVIEW.md)",
@@ -585,6 +662,30 @@ def build_parser() -> argparse.ArgumentParser:
     coverage.add_argument("--zone-radius", type=float, default=12.0, metavar="METRES")
     coverage.add_argument("--zone-name", default="Restricted Area A")
     coverage.set_defaults(handler=_coverage)
+
+    retention = commands.add_parser(
+        "retention", help="delete recorded video the policy no longer covers"
+    )
+    retention.add_argument(
+        "--keep-days", type=float, default=14.0, metavar="DAYS",
+        help="delete recordings older than this (default 14; 0 means no age limit)",
+    )
+    retention.add_argument(
+        "--max-gib", type=float, default=None, metavar="GIB",
+        help="delete oldest until the total is under this",
+    )
+    retention.add_argument(
+        "--min-free-gib", type=float, default=5.0, metavar="GIB",
+        help=(
+            "delete oldest until this much of the volume is free (default 5). A "
+            "disk at 100%% stops the database too, not only the recording."
+        ),
+    )
+    retention.add_argument(
+        "--apply", action="store_true",
+        help="actually delete. Without it, this reports what would go and touches nothing",
+    )
+    retention.set_defaults(handler=_retention)
 
     listing = commands.add_parser(
         "devices", help="cameras attached to this machine, through the OS's own API"

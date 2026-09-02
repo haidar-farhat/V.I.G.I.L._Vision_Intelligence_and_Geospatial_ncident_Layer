@@ -59,7 +59,7 @@ _log = _get_logger(__name__)
 #: Schema version this build expects. A database at a different version is
 #: migrated forward, never opened as-is: opening a schema you do not understand
 #: and hoping the columns line up is how evidence is silently corrupted.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class StoreError(RuntimeError):
@@ -234,6 +234,60 @@ MIGRATIONS: tuple[Migration, ...] = (
         """,
         down="""
         ALTER TABLE cameras DROP COLUMN roll;
+        """,
+    ),
+    Migration(
+        version=3,
+        name="recordings",
+        up="""
+        -- The index over recorded segments. The files are the evidence; this is
+        -- how anything finds them.
+        --
+        -- Without it a segment can only be located by listing a directory and
+        -- parsing filenames, which means retention cannot know what an incident
+        -- depends on and evidence cannot ask "what covers this window".
+        CREATE TABLE recordings (
+            path              TEXT PRIMARY KEY,
+            camera_id         TEXT NOT NULL,
+            -- Wall clock, always. Media time is meaningless across cameras and
+            -- retention works in days.
+            started_millis    INTEGER NOT NULL,
+            ended_millis      INTEGER NOT NULL,
+            frames            INTEGER NOT NULL,
+            width             INTEGER NOT NULL,
+            height            INTEGER NOT NULL,
+            -- What the container header claims, and what was actually measured.
+            -- They differ for a live source, where the rate has to be chosen
+            -- before the camera has revealed it.
+            nominal_fps       REAL NOT NULL,
+            measured_fps      REAL NOT NULL,
+            codec             TEXT NOT NULL,
+            size_bytes        INTEGER NOT NULL,
+            sha256            TEXT NOT NULL,
+            -- 0 when the writer was closed by a failure rather than by
+            -- rotation, so the clip may be short or unplayable. Recorded rather
+            -- than hidden: a gap an operator knows about is a different thing
+            -- from one they do not.
+            complete          INTEGER NOT NULL DEFAULT 1,
+            -- Set when an incident depends on this segment. Retention will not
+            -- delete a preserved segment however old it is or however full the
+            -- disk gets: losing the footage of the one thing that happened, in
+            -- order to keep the footage of everything that did not, is the
+            -- failure this column exists to prevent.
+            preserved         INTEGER NOT NULL DEFAULT 0,
+            recorded_at       INTEGER NOT NULL
+        );
+
+        -- The two questions actually asked: what covers this window, and what
+        -- is oldest.
+        CREATE INDEX recordings_by_camera_time
+            ON recordings (camera_id, started_millis, ended_millis);
+        CREATE INDEX recordings_by_age ON recordings (preserved, started_millis);
+        """,
+        down="""
+        DROP INDEX recordings_by_age;
+        DROP INDEX recordings_by_camera_time;
+        DROP TABLE recordings;
         """,
     ),
 )
@@ -850,6 +904,150 @@ class Store:
             "SELECT COUNT(*) AS n FROM incidents"
         ).fetchone()["n"]
 
+    # -------------------------------------------------------------- recordings
+
+    @staticmethod
+    def segment_key(path: "str | Path") -> str:
+        """One spelling of a segment's path, everywhere.
+
+        `str(Path("/rec/a.mp4"))` is `\rec\a.mp4` on Windows and `/rec/a.mp4`
+        everywhere else, so a path written by one call and looked up by another
+        that skipped the normalisation simply does not match. That failed
+        *silently* — `preserve_segments` reported nothing preserved and returned
+        0, and the next retention pass would have deleted the footage an
+        incident depended on. Resolved as well as normalised, so a relative path
+        and an absolute one to the same file are the same row.
+        """
+        return str(Path(path).resolve())
+
+    def save_segment(self, segment: "Segment") -> None:
+        """Index one recorded clip.
+
+        Idempotent on the path, so re-indexing a directory after a crash
+        replaces rather than duplicates. `preserved` is deliberately absent from
+        the update: re-indexing must never un-preserve evidence somebody is
+        relying on.
+        """
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO recordings (
+                    path, camera_id, started_millis, ended_millis, frames,
+                    width, height, nominal_fps, measured_fps, codec,
+                    size_bytes, sha256, complete, preserved, recorded_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0,?)
+                ON CONFLICT(path) DO UPDATE SET
+                    camera_id = excluded.camera_id,
+                    started_millis = excluded.started_millis,
+                    ended_millis = excluded.ended_millis,
+                    frames = excluded.frames,
+                    width = excluded.width,
+                    height = excluded.height,
+                    nominal_fps = excluded.nominal_fps,
+                    measured_fps = excluded.measured_fps,
+                    codec = excluded.codec,
+                    size_bytes = excluded.size_bytes,
+                    sha256 = excluded.sha256,
+                    complete = excluded.complete
+                """,
+                (
+                    self.segment_key(segment.path), segment.camera_id,
+                    segment.started_millis, segment.ended_millis, segment.frames,
+                    segment.width, segment.height,
+                    segment.nominal_fps, segment.measured_fps, segment.codec,
+                    segment.size_bytes, segment.sha256, int(segment.complete),
+                    _now(),
+                ),
+            )
+
+    def segments(
+        self,
+        *,
+        camera_id: str | None = None,
+        start_millis: int | None = None,
+        end_millis: int | None = None,
+        limit: int = 1000,
+    ) -> list["Segment"]:
+        """Segments overlapping a window, oldest first.
+
+        Overlap, not containment. A ten-second incident inside a sixty-second
+        segment is contained by nothing and covered by one, and asking for
+        containment would return an empty set for the commonest case there is.
+        """
+        clauses, params = [], []
+        if camera_id is not None:
+            clauses.append("camera_id = ?")
+            params.append(camera_id)
+        if end_millis is not None:
+            clauses.append("started_millis <= ?")
+            params.append(end_millis)
+        if start_millis is not None:
+            clauses.append("ended_millis >= ?")
+            params.append(start_millis)
+
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._connection.execute(
+            f"SELECT * FROM recordings {where} "
+            "ORDER BY started_millis, camera_id LIMIT ?",
+            (*params, limit),
+        ).fetchall()
+        return [_segment_from_row(row) for row in rows]
+
+    def preserve_segments(self, paths: Iterable[str | Path]) -> int:
+        """Mark segments as evidence, so retention will never delete them."""
+        listed = [self.segment_key(path) for path in paths]
+        if not listed:
+            return 0
+        placeholders = ",".join("?" * len(listed))
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                f"UPDATE recordings SET preserved = 1 WHERE path IN ({placeholders})",
+                listed,
+            )
+
+        preserved = cursor.rowcount
+        if preserved != len(listed):
+            # Never silent. Failing to preserve is the one outcome here that
+            # destroys evidence, and it destroys it later, on a retention pass,
+            # where nothing connects the deletion back to this call.
+            _log.warning(
+                "asked to preserve %d segment(s) but matched %d in the index; "
+                "the unmatched ones are not protected from retention",
+                len(listed), preserved,
+            )
+        return preserved
+
+    def preserved_paths(self) -> set[str]:
+        """Every segment an incident depends on, as normalised keys.
+
+        Read once per retention pass rather than per segment: a query per file
+        over a fortnight of recordings is twenty thousand round trips to answer
+        a question with one answer.
+        """
+        rows = self._connection.execute(
+            "SELECT path FROM recordings WHERE preserved = 1"
+        ).fetchall()
+        return {row["path"] for row in rows}
+
+    def recorded_bytes(self, *, preserved: bool | None = None) -> int:
+        clause = "" if preserved is None else f"WHERE preserved = {int(preserved)}"
+        row = self._connection.execute(
+            f"SELECT COALESCE(SUM(size_bytes), 0) AS total FROM recordings {clause}"
+        ).fetchone()
+        return int(row["total"])
+
+    def forget_segment(self, path: str | Path) -> None:
+        """Drop one segment from the index. The file is the caller's business."""
+        with self.transaction() as connection:
+            connection.execute(
+                "DELETE FROM recordings WHERE path = ?", (self.segment_key(path),)
+            )
+
+    def recording_count(self) -> int:
+        return self._connection.execute(
+            "SELECT COUNT(*) AS n FROM recordings"
+        ).fetchone()["n"]
+
     # ------------------------------------------------------------------- audit
 
     def audit(
@@ -886,6 +1084,29 @@ class Store:
 
 
 # ------------------------------------------------------------- reconstruction
+
+
+
+
+def _segment_from_row(row: sqlite3.Row) -> "Segment":
+    from .recording import Segment
+
+    return Segment(
+        camera_id=row["camera_id"],
+        path=Path(row["path"]),
+        started_millis=row["started_millis"],
+        ended_millis=row["ended_millis"],
+        frames=row["frames"],
+        width=row["width"],
+        height=row["height"],
+        nominal_fps=row["nominal_fps"],
+        measured_fps=row["measured_fps"],
+        codec=row["codec"],
+        size_bytes=row["size_bytes"],
+        sha256=row["sha256"],
+        complete=bool(row["complete"]),
+    )
+
 
 
 def _event_from_row(row: sqlite3.Row) -> Event:

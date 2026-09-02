@@ -90,7 +90,13 @@ no rule.
   identity database. Objects are tracked; people are not identified.
   *Enforced by:* absence. Nothing in the codebase does any of these things.
 - **Graceful degradation.** Losing the GPU, the AI, the database, the map or the
-  control node never stops recording. *Not yet:* recording does not exist.
+  control node never stops recording.
+  *Enforced by:* the recorder runs on its own thread behind a bounded queue and
+  is fed each frame *before* analysis, so a slow or crashing analytic cannot
+  take the footage with it; a failed index write never destroys a clip.
+  *Not yet:* recording still shares the decode loop with analysis, so it
+  survives a slow analytic but not a dead decode — full independence is the
+  headless daemon's job (ROADMAP 1.2).
 
 ---
 

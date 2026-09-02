@@ -147,15 +147,16 @@ geometry.
 
 ### Tier 1 — become a security system
 
-- [ ] **1.1 · Continuous recording.** *The biggest hole.* Evidence export writes
-      a manifest for video that does not exist. Needs: a segment writer per
-      camera, a pre-event ring buffer so an incident's evidence starts *before*
-      the trigger, retention by age and by disk budget, and a deletion path that
-      is audited. Recording must survive the analytic dying — that is the
-      graceful-degradation rule, and it is currently unenforceable because there
-      is nothing to degrade to.
-      *Done when:* an exported incident folder contains the clip, and the SHA-256
-      in the manifest is of that clip.
+- [x] **1.1 · Continuous recording.** **Done at the engine level, 2026-09-02.**
+      Segmented `mp4v` per camera on its own writer thread; pre-event footage by
+      construction (continuous + a lead window at export, which made a ring
+      buffer unnecessary); retention by age, size and free space, audited, with
+      preserved evidence untouchable; an exported incident folder contains its
+      clips, the manifest hashes them, and `footage.json` times every gap.
+      *Still open from this item:* the console toggle (recording is CLI-only),
+      scheduled retention, and true decode/analytic independence — the last is
+      1.2's job, and the recorder is already shaped for it (fed before analysis,
+      behind a bounded queue).
 - [ ] **1.2 · A headless engine daemon.** Today the console *is* the
       application: `ConsoleWindow` owns the store, the rules, the sessions and
       the correlation loop in 963 lines. That is fine for a demo and wrong for a

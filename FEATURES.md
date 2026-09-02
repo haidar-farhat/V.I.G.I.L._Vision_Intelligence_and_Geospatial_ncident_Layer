@@ -33,30 +33,30 @@ Related: [STATUS.md](STATUS.md) — measurements and honest gaps ·
 
 ## The scoreboard
 
-356 capabilities, each with a state. Many lines cover several related things —
+368 capabilities, each with a state. Many lines cover several related things —
 "heading · pitch · roll" is one row — so this counts *claims*, not code.
 
 | | Count | Share | What it means |
 |---|---:|---:|---|
-| **`TESTED`** | 125 | 35% | A test fails if it stops working |
-| **`IMPL`** | 22 | 6% | Works; a regression would go unnoticed |
-| **`SKEL`** | 36 | 10% | Something is there; it does not do the job |
-| **`PLAN`** | 173 | 49% | Designed, no code |
+| **`TESTED`** | 138 | 38% | A test fails if it stops working |
+| **`IMPL`** | 23 | 6% | Works; a regression would go unnoticed |
+| **`SKEL`** | 39 | 11% | Something is there; it does not do the job |
+| **`PLAN`** | 168 | 46% | Designed, no code |
 
 ```mermaid
 pie showData
-    title Sentinel Vision — 356 capabilities by state
-    "TESTED" : 125
-    "IMPLEMENTED" : 22
-    "SKELETON" : 36
-    "PLANNED" : 173
+    title Sentinel Vision — 368 capabilities by state
+    "TESTED" : 138
+    "IMPLEMENTED" : 23
+    "SKELETON" : 39
+    "PLANNED" : 168
 ```
 
-**Read that 35% carefully.** It is not "a third of the product is finished" — it
-is that the third which is finished is the analytical core, and the half that is
-planned is almost entirely the product surface around it. The parts a
-demonstration shows off are the parts that exist; the parts a deployment depends
-on are largely the ones that do not.
+**Read that 38% carefully.** It is not "a third of the product is finished" — it
+is that the part which is finished is the analytical core plus, now, the
+recording that makes its evidence real, while most of what is planned is the
+product surface around them. The parts a demonstration shows off are the parts
+that exist; several of the parts a deployment depends on still do not.
 
 ---
 
@@ -71,7 +71,7 @@ flowchart LR
 
     subgraph missing["THE PRODUCT AROUND IT DOES NOT"]
         direction TB
-        B["<b>no recording</b><br/>evidence has no video"]
+        B["<b>no playback</b><br/>clips exist; no timeline,<br/>no console toggle"]
         C["<b>no server</b><br/>one machine only"]
         D["<b>no accounts</b><br/>nobody to attribute an action to"]
         E["<b>no analyst</b><br/>the third pillar is unbuilt"]
@@ -383,7 +383,7 @@ labelled, with three tests asserting the labels stay true.
 | False-positive classification | `PLAN` | |
 | Incident archive | `PLAN` | |
 | Incident search · filtering | `SKEL` | |
-| Incident replay | `PLAN` | Depends on recording |
+| Incident replay | `PLAN` | The footage now exists; the player does not |
 | Incident export | `TESTED` | From memory *and* from the database, long after the fact |
 
 ## 🧮 Risk & threat prioritisation
@@ -427,22 +427,27 @@ must never touch a camera or a security action.
 
 ## 🎞️ Recording & video investigation
 
-**The single largest hole in the product.** Evidence export writes a SHA-256
-manifest for video that does not exist.
+Was the single largest hole in the product; the engine half is now closed.
+What remains missing is the *investigation surface* — playback, scrubbing,
+event-linked jumps — and the console toggle.
 
-| Capability | State |
-|---|---|
-| Continuous · motion · event · manual recording | `PLAN` |
-| Pre-event recording buffer | `PLAN` |
-| Post-event recording buffer | `PLAN` |
-| Configurable retention · per camera · per event | `PLAN` |
-| Incident evidence preservation | `PLAN` |
-| Segmented recordings · recording search | `PLAN` |
-| Timeline scrubbing · video playback | `PLAN` |
+| Capability | State | Note |
+|---|---|---|
+| Continuous recording | `TESTED` | Segmented `mp4v`, wall-clock names, SHA-256 on close. **CLI only** — no console toggle yet |
+| Motion · event · manual recording | `PLAN` | Continuous came first: with it, pre-event footage is already on disk |
+| Pre-event recording buffer | `TESTED` | By construction — export asks for a lead window over continuous footage |
+| Post-event recording buffer | `TESTED` | Same mechanism, trailing side |
+| Configurable retention | `TESTED` | Age, total size and free-space bounds; dry-run by default; every deletion audited |
+| Per-camera · per-event retention | `PLAN` | One policy for the store today |
+| Incident evidence preservation | `TESTED` | A preserved segment is never deleted, however old, however full the disk |
+| Segmented recordings | `TESTED` | A power cut costs at most one segment |
+| Recording search | `SKEL` | The index answers by camera and window; no interface asks |
+| Timeline scrubbing · video playback | `PLAN` | Clips are ordinary `.mp4`; any player opens them |
 | Synchronised · multi-camera playback | `PLAN` |
 | Event-linked · track-linked · map-linked playback | `PLAN` |
 | Incident replay | `PLAN` |
-| Evidence extraction · video clip generation · still-frame extraction | `PLAN` |
+| Evidence extraction | `TESTED` | The segments overlapping an incident are copied into its package |
+| Video clip generation · still-frame extraction | `PLAN` | No re-encode or frame pull yet — whole segments only |
 
 ## 🔍 Investigation
 
@@ -462,7 +467,8 @@ manifest for video that does not exist.
 | Capability | State | Note |
 |---|---|---|
 | Incident evidence packages | `TESTED` | A folder verifiable by somebody who has only the folder |
-| Video evidence · still images · thumbnails | `PLAN` | Needs recording |
+| Video evidence | `TESTED` | Clips with a lead-in, plus `footage.json` stating per-camera coverage and **timing every gap** |
+| Still images · thumbnails | `PLAN` | |
 | Event metadata · track data · timeline | `TESTED` | |
 | AI analysis | `PLAN` | |
 | Operator notes | `PLAN` | |
@@ -607,8 +613,11 @@ both are `TESTED`.
 | Database storage · evidence storage · log storage | `TESTED` | |
 | Model storage · map storage | `SKEL` | Directories exist; no import flow |
 | Log rotation | `TESTED` | 5 MB × 5, so the log cannot become what fills the disk |
-| Configurable recording disk · storage quotas · disk monitoring | `PLAN` | |
-| Automatic retention cleanup · incident evidence protection | `PLAN` | |
+| Configurable recording disk | `TESTED` | `--record DIR`, or `SENTINEL_DATA_DIR` — video is the one thing that wants its own disk |
+| Storage quotas | `TESTED` | Total-size and free-space bounds enforced by retention |
+| Disk monitoring | `SKEL` | Free space is measured during a retention pass; nothing watches between passes |
+| Retention cleanup | `TESTED` | On invocation (`sentinel retention --apply`), not yet on a schedule |
+| Incident evidence protection | `TESTED` | Preservation beats every other rule, and a shortfall is reported rather than resolved by deleting evidence |
 | Backup · restore · backup validation | `PLAN` | Migrations each carry a reversal, which is the nearest thing today |
 
 ## 🗺️ Offline GIS

@@ -25,7 +25,7 @@ implementation was removed in `582d0a8`; its architecture documents were kept
 because the thinking in them carried over, and are being brought up to date.
 Anything below that is not yet re-established after the rewrite says so.
 
-Current suite: **547 tests** — 57 Rust, 442 engine, 48 console — plus two static
+Current suite: **578 tests** — 57 Rust, 473 engine, 48 console — plus two static
 checks that run before any of them: an offline audit that fails the build if the
 shipped source names any destination off the site, and a lint that fails it if
 any of the 36 diagrams in this documentation no longer parses. `cargo fmt` and
@@ -53,6 +53,7 @@ flowchart LR
         B2["zones · schedules · rules · events"]
         B3["correlation · object identity · risk"]
         B4["persistence · audit · evidence export"]
+        B6["continuous recording · retention<br/><i>engine + CLI; no console toggle yet</i>"]
         B5["multi-camera Qt console"]
     end
 
@@ -68,7 +69,6 @@ flowchart LR
         N2["node discovery · pairing · mTLS"]
         N3["worker autonomy · reconciliation"]
         N4["camera discovery (ONVIF/mDNS)"]
-        N5["continuous recording"]
         N6["map package import"]
         N7["authentication · keychain"]
         N8["grounded AI analyst"]
@@ -132,6 +132,9 @@ Geometry, projection, zones and tracking, behind a C ABI.
 | One data directory | `TESTED` | Database, logs and evidence under one root, overridable with `SENTINEL_DATA_DIR`. Never beside the code: a packaged install lives somewhere the running account cannot write. |
 | Bounded statistics | `TESTED` | Per-track detail is capped; the distinct-object count is counted on arrival so trimming cannot deflate it, and a track still on screen is never trimmed. |
 | Live-thread fault reporting | `TESTED` | The decode thread cannot die silently: any exception becomes a reported fault naming the exception *type*, never its text. |
+| Continuous recording | `TESTED` | Segmented mp4v on a writer thread; a file loses no frames, a camera never builds a backlog; every clip hashed on close. **CLI only — the console cannot enable it yet.** |
+| Recording index and retention | `TESTED` | Migration 3. Oldest-first by age, size and free space; every deletion audited; **a segment an incident depends on is never deleted**. Dry-run by default. |
+| Footage in evidence | `TESTED` | Clips copied into the package with a pre-incident lead; `footage.json` states per-camera coverage and times every gap. |
 
 ## Repository guards
 
@@ -496,6 +499,68 @@ per frame, forever. Live ids are skipped, and a test walks a loiterer through
 Sequencing for everything below — what I would build next and why — is in
 [ROADMAP.md](ROADMAP.md).
 
+### Milestone — continuous recording
+
+The largest hole in the product, closed at the engine level. Before this,
+`evidence.py` wrote a SHA-256 manifest for video that did not exist.
+
+```mermaid
+flowchart LR
+    D["decode"] --> A["analyse"]
+    D --> O["Recorder.offer()<br/><i>before analysis — footage must not<br/>depend on what a rule concludes</i>"]
+    O --> Q{"bounded queue"}
+    Q -->|"file: waits<br/><i>a replay is evidence</i>"| W["writer thread"]
+    Q -->|"live: drops + counts<br/><i>a backlog kills the process</i>"| W
+    W --> S["60 s segments<br/>mp4v · wall-clock names"]
+    S --> H["SHA-256 on close"]
+    H --> IX["index (migration 3)<br/><i>drained on the caller's thread —<br/>SQLite is thread-affine</i>"]
+    IX --> R["retention<br/><i>oldest first · audited ·<br/><b>never deletes evidence</b></i>"]
+    IX --> EV["evidence export<br/><i>clips + footage.json<br/>with measured gaps</i>"]
+
+    style D fill:#334155,stroke:#94a3b8,color:#e2e8f0
+    style A fill:#334155,stroke:#94a3b8,color:#e2e8f0
+    style O fill:#1e3f2f,stroke:#4ade80,color:#e2e8f0
+    style Q fill:#4a3f1e,stroke:#fbbf24,color:#e2e8f0
+    style W fill:#1e3f2f,stroke:#4ade80,color:#e2e8f0
+    style S fill:#1e3f2f,stroke:#4ade80,color:#e2e8f0
+    style H fill:#1e3f2f,stroke:#4ade80,color:#e2e8f0
+    style IX fill:#1e3f2f,stroke:#4ade80,color:#e2e8f0
+    style R fill:#1e3a5f,stroke:#4a9eff,color:#e2e8f0
+    style EV fill:#1e3a5f,stroke:#4a9eff,color:#e2e8f0
+```
+
+**The decisions, and why they fell the way they did:**
+
+| Decision | Why |
+|---|---|
+| `mp4v`, not H.264 | Asking OpenCV for H.264 prints a download link. Zero-WAN wins; the ~4× size cost is documented next to the storage numbers rather than discovered when a disk fills |
+| Segments, not one file | Retention deletes whole units; export copies whole units; **a power cut costs at most one segment** (a container killed mid-write may not play) |
+| Continuous first, event-triggered later | With continuous recording, pre-event footage is *already on disk* — the simpler mechanism is the one that gets evidence right |
+| File waits, camera drops | A replay is evidence and loses nothing (measured before the rule: 130 of 180 frames dropped). A camera cannot be slowed down, so drops are taken — and counted |
+| `measured_fps` beside `nominal_fps` | A live camera's real rate is only revealed by its frames. The header carries the assumption, the index carries the measurement — and an early version derived the "measurement" from the assumption, caught by test |
+| Coverage reports gaps | A package holding 42% of the requested window says **42%, with each gap timed** — a package that plays and verifies clean can still mislead by omission |
+| Preserved segments are untouchable | Retention that cannot meet its policy without deleting evidence leaves the policy unmet and says so, non-zero exit and all |
+
+**Measured:** ~12.7 MiB/min → **~17.5 GB/day/camera** at 640×480/15fps
+(~280 GB/day for sixteen); encoding ~800 fps, so the writer never limits
+throughput. Storage numbers and the retention command are in
+[docs/USAGE.md §7](docs/USAGE.md).
+
+**Found by building it, fixed, and pinned by test:** a file source losing 130 of
+180 frames to the drop policy; `on_segment` firing on the writer thread against
+thread-affine SQLite (every segment of the first recording was written and none
+indexed); `str(Path(...))` path-spelling divergence making `preserve_segments`
+a silent no-op on Windows — the failure mode being *retention deletes the
+evidence*; `measured_fps` echoing the nominal rate; incident windows queried in
+media time against a wall-clock index (asked for footage from 1970, correctly
+found none).
+
+**Stated honestly:** recording is engine/CLI only — the console cannot switch it
+on yet. No playback inside the application. No event-triggered mode. Retention
+runs when invoked, not on a schedule. Decode and analysis still share one loop,
+so recording survives a slow analytic but not a dead decode — full independence
+is the headless daemon's job (ROADMAP 1.2).
+
 ## Not yet rebuilt after the rewrite
 
 These existed in the TypeScript and have not been re-established. They are listed
@@ -509,7 +574,6 @@ exists for them in `docs/`.
 | Node discovery and pairing | `PLANNED` | |
 | Worker autonomy and reconciliation | `PLANNED` | |
 | Camera discovery (ONVIF/mDNS) | `PLANNED` | |
-| Continuous recording | `PLANNED` | Export exists; there is no recorded video to attach to it yet. |
 | Map package import | `PLANNED` | |
 | Authentication | `PLANNED` | The audit half is built; there is nobody to attribute an action to yet. |
 | Secret storage in the OS keychain | `PLANNED` | No secret is stored at all today. |
