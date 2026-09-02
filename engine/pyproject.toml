@@ -9,6 +9,11 @@ dependencies = [
     "onnxruntime>=1.20",
 ]
 
+[project.scripts]
+# The headless analyser. `python -m sentinel` works from a checkout without an
+# install; this makes `sentinel` a command once installed.
+sentinel = "sentinel.cli:main"
+
 [project.optional-dependencies]
 # `onnx` is a test-fixture dependency only: it builds the small model that makes
 # the ONNX inference path executable in tests. Nothing at runtime imports it, and

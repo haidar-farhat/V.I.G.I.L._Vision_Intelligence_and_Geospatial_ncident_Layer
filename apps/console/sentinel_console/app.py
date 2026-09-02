@@ -948,16 +948,60 @@ class ConsoleWindow(QMainWindow):
         event.accept()
 
 
-def run() -> int:
-    """Start the console. The console-script entry point."""
+def run(argv: list[str] | None = None) -> int:
+    """Start the console. The console-script and packaged entry point.
+
+    Two flags only, because everything else an operator sets belongs in the
+    window rather than on a command line they will not see:
+
+    ``--verbose`` turns on developer logging — DEBUG, with thread, file and
+    line. It is what the ``-dev`` executable passes, and it is why that
+    executable exists: a packaged operator build has no terminal to read.
+
+    ``--database`` points at a specific database, which is how two deployments
+    share a machine.
+    """
+    import argparse
     import sys
 
     from PySide6.QtWidgets import QApplication
+    from sentinel import logs
 
-    app = QApplication(sys.argv)
+    parser = argparse.ArgumentParser(
+        prog="sentinel-console", description="Sentinel Vision operator console."
+    )
+    parser.add_argument(
+        "-v", "--verbose", action="store_true",
+        help="developer logging: DEBUG, with thread, file and line",
+    )
+    parser.add_argument("--database", default=None, help="database to open")
+    arguments, unknown = parser.parse_known_args(sys.argv[1:] if argv is None else argv)
+
+    logs.configure(
+        level="DEBUG" if arguments.verbose else None, developer=arguments.verbose
+    )
+    log = logs.get(__name__)
+    if unknown:
+        # Qt takes its own arguments (-platform, -style). Passing them through
+        # rather than refusing them keeps `-platform offscreen` working, which
+        # is what the tests and any headless check rely on.
+        log.debug("passing %d argument(s) through to Qt", len(unknown))
+
+    log.info("console starting")
+
+    app = QApplication([sys.argv[0], *unknown] if unknown else sys.argv[:1])
     app.setApplicationName("Sentinel Vision Console")
     app.setOrganizationName("Sentinel Vision")
 
-    window = ConsoleWindow()
-    window.show()
-    return app.exec()
+    try:
+        window = ConsoleWindow(database=arguments.database)
+        window.show()
+        code = app.exec()
+    except Exception:
+        # A packaged build has no terminal, so an unhandled exception would
+        # otherwise close the window with no trace of why. The log survives it.
+        log.critical("the console failed to start", exc_info=True)
+        raise
+
+    log.info("console exited with %d", code)
+    return code

@@ -164,11 +164,13 @@ The dividing line is **rate**, not importance.
 
 ### Scale
 
-**428 tests** — 57 Rust, 331 engine, 40 console — plus two static checks that
+**492 tests** — 57 Rust, 395 engine, 40 console — plus two static checks that
 run before any of them: an offline audit that fails the build if the shipped
 source names any destination off the site, and a lint that fails it if any of the
-32 diagrams in this documentation no longer parses. `cargo fmt` and
-`clippy -D warnings` clean.
+36 diagrams in this documentation no longer parses. `cargo fmt` and
+`clippy -D warnings` clean. The whole Python suite also runs inside a container
+with `network_mode: none`, which is the offline claim tested the way an operator
+would test it.
 
 | Throughput, 640×480, idle machine | fps | ms/frame |
 |---|---:|---:|
@@ -212,10 +214,32 @@ python -m pip install -e "engine[dev]" PySide6
 
 python tasks.py build      # build the Rust engine core
 python tasks.py audit      # no route off the site; every diagram parses
-python tasks.py test       # 428 tests, no network
+python tasks.py test       # 492 tests, no network
 python tasks.py lint       # rustfmt + clippy
 python tasks.py check      # all of the above — what CI runs
 ```
+
+### Three ways to run it
+
+```bash
+python tasks.py console                    # the operator console
+python tasks.py cli run gate.mp4 --place 33.8938,35.5018,6,180,-22
+python tasks.py package                    # standalone executables in dist/
+```
+
+```bash
+docker compose run --rm analyse run /media/gate.mp4 --place 33.8938,35.5018,6,180,-22
+docker compose run --rm verify             # the whole suite, network_mode: none
+```
+
+`python tasks.py package` produces **three executables from one bundle**:
+`SentinelVision` (the console), `SentinelVision-dev` (the same console with a
+terminal and verbose logging — because a packaged Qt application on Windows has
+nowhere to print, and *"it just closes"* is the least actionable bug report there
+is), and `sentinel` (the headless analyser).
+
+**Start with [docs/USAGE.md](docs/USAGE.md)** — install, first five minutes,
+every command, how to read what it tells you, and what to do when it is wrong.
 
 ### See it work
 
@@ -259,6 +283,8 @@ there is one set of instructions and no shell-script pair to drift apart.
 | `python tasks.py audit` | Prove the source has no route off the site, and that every diagram parses |
 | `python tasks.py check` | Audit, lint, build, test — what CI runs |
 | `python tasks.py console` | Run the operator console |
+| `python tasks.py cli …` | Run the headless analyser; everything after `cli` is passed through |
+| `python tasks.py package` | Build the standalone executables into `dist/` |
 | `python tasks.py db` | Report the database's migration state |
 | `python tasks.py db-migrate` | Apply pending migrations |
 | `python tasks.py db-rollback` | Undo the most recent migration |
@@ -282,7 +308,13 @@ engine/             Python engine
   sentinel/store.py      SQLite persistence, migrations, audit
   sentinel/evidence.py   verifiable evidence export
   sentinel/pipeline.py   the whole spine, per camera
+  sentinel/cli.py        headless analysis: `python -m sentinel`
+  sentinel/logs.py       logging, with a credential-redacting filter
+  sentinel/redact.py     credential redaction — no dependencies, so the logger
+                         does not have to import OpenCV to be safe
+  sentinel/paths.py      one answer to "where does this keep my files"
 apps/console/       PySide6 operator console — native widgets, no webview
+packaging/          PyInstaller build: one analysis, three executables
 tools/              guards that run before the tests
   offline_audit.py    no cloud SDK, no telemetry package, no external host
   docs_lint.py        every mermaid diagram in the documentation parses
@@ -318,6 +350,7 @@ list is part of the attack surface, and everything in it is arithmetic.
 
 | Document | Covers |
 |---|---|
+| [docs/USAGE.md](docs/USAGE.md) | **How to use it.** Install, first run, the console screen by screen, every command-line option, Docker, cameras, logs, and a troubleshooting table |
 | [ROADMAP.md](ROADMAP.md) | What is left between today and a system worth putting in front of a real site, in the order it should be built, with the reasoning |
 | [docs/OVERVIEW.md](docs/OVERVIEW.md) | **Start here.** Diagrams of every layer, the spine, the boundary, threading, zones, projection, correlation, risk, persistence, export and test topology — with the measurements behind each |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Components, processes, ERD, protocol, security model, data flow, AI and map architecture |

@@ -1,0 +1,547 @@
+# Using Sentinel Vision
+
+How to install it, run it, and read what it tells you.
+
+> **What this build is.** A local-first multi-camera analyser. It decodes video,
+> finds moving objects, keeps their identity across frames, works out where they
+> are *on the ground*, decides whether that matters, groups everything one
+> intrusion caused into a single incident, and hands you an evidence package you
+> can verify later. It does all of that with the network cable unplugged.
+>
+> **What this build is not.** It does not record video yet, so an evidence
+> package contains the record and not the footage. It has no server, no
+> multi-machine mode, no user accounts, and it has never been pointed at a
+> physical camera. Nothing here has been run against real footage or trained
+> detection weights. See [STATUS.md](../STATUS.md) for the honest state of every
+> capability and [ROADMAP.md](../ROADMAP.md) for what is coming and in what
+> order.
+
+---
+
+## Contents
+
+1. [Install](#1-install)
+2. [Your first five minutes](#2-your-first-five-minutes)
+3. [The console, screen by screen](#3-the-console-screen-by-screen)
+4. [The command line](#4-the-command-line)
+5. [Docker](#5-docker)
+6. [Cameras](#6-cameras)
+7. [Where your files are](#7-where-your-files-are)
+8. [Logs, and the developer build](#8-logs-and-the-developer-build)
+9. [When something is wrong](#9-when-something-is-wrong)
+10. [What it will refuse to do](#10-what-it-will-refuse-to-do)
+
+---
+
+## 1. Install
+
+Three ways, for three different people.
+
+```mermaid
+flowchart TD
+    Q{"who are you?"}
+    Q -->|"an operator"| A["<b>the packaged build</b><br/>unzip a folder, double-click<br/>no Python, no Rust, no install"]
+    Q -->|"a developer"| B["<b>from source</b><br/>Python 3.12+ and a Rust toolchain<br/>everything runnable and testable"]
+    Q -->|"running it on a server"| C["<b>Docker</b><br/>headless analysis<br/>network_mode: none"]
+
+    style A fill:#1e3f2f,stroke:#4ade80,color:#e2e8f0
+    style B fill:#1e3a5f,stroke:#4a9eff,color:#e2e8f0
+    style C fill:#3f2f1e,stroke:#fbbf24,color:#e2e8f0
+```
+
+### The packaged build
+
+```bash
+python tasks.py package
+```
+
+That builds the Rust core, bundles everything, and leaves a folder in `dist/`:
+
+```
+dist/SentinelVision/
+    SentinelVision.exe        the console
+    SentinelVision-dev.exe    the console with a terminal and verbose logging
+    sentinel.exe              the headless analyser
+    ... about 300 MB of libraries the three share
+```
+
+**Ship the whole folder.** The executables need the libraries beside them, which
+is what every Qt application ships. It is deliberately not a single self-
+extracting `.exe`: that would unpack 300 MB to a temporary directory on every
+launch, leave debris when it is killed, and on a locked-down machine can be
+blocked outright.
+
+Nothing is installed, nothing is written to the registry, and nothing is
+downloaded — at build time or at run time. Copy the folder, run it, delete the
+folder.
+
+PyInstaller is needed to *build* the package and is not a runtime dependency:
+
+```bash
+python -m pip install pyinstaller
+```
+
+### From source
+
+Requires **Python 3.12+** and a **Rust toolchain** (stable).
+
+```bash
+python -m pip install -e "engine[dev]" PySide6
+
+python tasks.py build      # build the Rust engine core
+python tasks.py check      # audit, lint, build, test — what CI runs
+python tasks.py console    # run the console
+python tasks.py cli --help # run the headless analyser
+```
+
+`cargo` reaches the network once to resolve crates, and `pip` once for wheels.
+Nothing after that does, ever — `python tasks.py audit` fails the build if any
+shipped source file so much as names a destination off the site.
+
+### Docker
+
+See [§5](#5-docker). Short version:
+
+```bash
+docker compose build
+docker compose run --rm analyse run /media/gate.mp4 --place 33.8938,35.5018,6,180,-22
+```
+
+---
+
+## 2. Your first five minutes
+
+The fastest path to seeing it work, with a video file rather than a camera.
+
+### In the console
+
+1. **Add a camera.** *Add camera* → pick a video file. The pane appears in the
+   wall on the left.
+2. **Place it.** *Place camera* → type where it is: latitude, longitude, mast
+   height, which way it points, how far down it tilts. As you type, the dialog
+   tells you **the band of ground that pose actually covers** — see
+   [§3](#placement-is-not-optional-and-there-is-no-default).
+3. **Add a zone.** *Add zone* puts a square of the radius you choose just past
+   the near edge of what that camera can genuinely see.
+4. **Press Start.**
+
+The frame appears with its overlay, the ground beside it, one table row per
+tracked object, and — if anything crossed a rule — incidents in the panel below.
+
+### On the command line
+
+```bash
+# 1. Where can this camera actually see?
+sentinel coverage --place 33.8938,35.5018,6,180,-22,62,36,90
+
+#    ground covered   7.2 m to 85.8 m ahead
+#    A 12 m square just past that near edge:
+#      --zone "Restricted Area A:33.893736,35.501800;..."
+
+# 2. Analyse, with the zone it just handed you.
+sentinel run gate.mp4 --id gate \
+    --place 33.8938,35.5018,6,180,-22,62,36,90 \
+    --zone "Restricted Area A:33.893736,35.501800;33.893628,35.501930;33.893520,35.501800;33.893628,35.501670" \
+    --export ./evidence
+
+# 3. Look at what it concluded.
+sentinel incidents
+```
+
+From a checkout, every `sentinel` above is `python tasks.py cli` or
+`python -m sentinel`.
+
+**Run `coverage` first.** The single most common way to get zero events is to
+put a zone somewhere the camera cannot see. A camera's *stated range* is not its
+coverage: a 6 m mast tilted 22° with a 36° vertical field covers **7 m to 86 m**
+however large the number on the datasheet is, and it sees no ground at all at
+the mast.
+
+---
+
+## 3. The console, screen by screen
+
+```mermaid
+flowchart LR
+    subgraph window["the console window"]
+        direction TB
+        WALL["<b>camera wall</b><br/>one pane per camera<br/>detections, confirmed tracks<br/>and coasting tracks drawn<br/><i>differently</i>"]
+        MAP["<b>plan view</b><br/>metric grid, camera footprints,<br/>uncertainty discs, trails, zones<br/><i>no tiles, no network</i>"]
+        TABLE["<b>track table</b><br/>one row per object: class,<br/>confidence, duration, speed,<br/>heading, position, uncertainty,<br/>provenance"]
+        INC["<b>incident panel</b><br/>one row per incident, expandable<br/>into risk factors, cross-camera<br/>links and a timeline.<br/><i>sorted by severity, not arrival</i>"]
+    end
+
+    style WALL fill:#1e3a5f,stroke:#4a9eff,color:#e2e8f0
+    style MAP fill:#1e3f2f,stroke:#4ade80,color:#e2e8f0
+    style TABLE fill:#3f2f1e,stroke:#fbbf24,color:#e2e8f0
+    style INC fill:#4c1d24,stroke:#f87171,color:#e2e8f0
+```
+
+### Placement is not optional, and there is no default
+
+Until a camera is placed, objects are tracked and reported as **not placed**.
+There is deliberately no default position: a nominal origin produces coordinates
+that look exactly like measured ones, and somebody gets sent to them.
+
+The placement dialog reports the ground band as you type because the number on a
+camera's datasheet is not what it can see:
+
+| you type | what it can actually see |
+|---|---|
+| 6 m mast, −22° pitch, 36° vertical field, range 90 m | **7.2 m to 85.8 m** ahead |
+| the same camera at −45° | roughly 2.5 m to 12 m — a much smaller patch, much closer |
+| the same camera level or tilted up | **nothing.** No ground is in frame, so nothing can be located |
+
+The footprint drawn on the plan view is an **annular sector**, not a pie slice —
+a downward-tilted camera cannot see the ground at its own mast, and drawing the
+slice would claim coverage it does not have.
+
+### Reading the plan view
+
+| what you see | what it means |
+|---|---|
+| A dot with a circle around it | an object, and how well its position is known. The circle is 1σ horizontal uncertainty and it grows **super-linearly** with distance |
+| A large circle centred on the camera | the projection failed and the system fell back to "something is happening at this camera", which is true. It is not a position |
+| No dot at all | the camera is not placed. The object is still tracked and still in the table |
+| A dashed box in the camera pane | a *coasting* track — held open through frames with no detection supporting it. A weaker claim than a solid one, drawn differently so you can tell |
+
+### Reading an incident
+
+Every incident expands into the reasoning that produced it:
+
+```
+inc_ABA008BFC4EF5A862535
+HIGH     risk 75/100    6 events    1 camera
+4 objects in Restricted Area A
+  · +45.0  severity: most serious event is HIGH (ZONE_ENTRY)
+  · +20.0  group: 4 distinct objects involved
+  · +10.0  location: occurred in a restricted zone
+```
+
+The score never appears without its factors. A bare number invites you to
+calibrate against it without understanding it, and then to ignore it the first
+time it is wrong.
+
+**Three cameras seeing one person is one incident, not three alerts.** That
+collapse is the product. On the reference scene, 13 events become 1 incident —
+92% less for a person to read.
+
+### Exporting evidence
+
+*Export incident* writes a folder containing the full record, a report a person
+can read without any tooling, and a SHA-256 for every file plus one for the
+manifest itself.
+
+**Record the manifest digest separately.** It is what makes the package
+checkable later by somebody who has only the folder.
+
+---
+
+## 4. The command line
+
+The console is a *viewer*. `sentinel` is the same pipeline with no window, which
+is what a container, a scheduled job, or a developer chasing one file wants.
+
+It is **not a daemon**. It processes the sources it is given, in order, to
+completion, and exits. Every frame of a file is processed, so a replay
+reproduces the original result exactly.
+
+```
+sentinel [-v|-q] [--database PATH] <command>
+
+  run <source>...      analyse and record what happened
+  incidents            list what has been recorded
+  export <id> --to DIR write one incident out as evidence
+  coverage --place ... what a placed camera can actually see
+  where                every path this build uses
+```
+
+### `run`
+
+| option | meaning |
+|---|---|
+| `--id NAME` | camera id, once per source. Default `cam-01`, `cam-02`, … |
+| `--place lat,lon,height,heading,pitch[,hfov,vfov,range]` | once, or once per source. Without it, objects are tracked but not located |
+| `--zone "Name:lat,lon;lat,lon;lat,lon[;…]"` | a restricted polygon, three vertices up. Repeatable |
+| `--detect-scale 0.75` | detection resolution. 0.75 is the default: **1.7× faster and slightly better recall**, because the downscale is a mild denoise |
+| `--export DIR` | write an evidence package per incident |
+| `--node NAME` | node id recorded on every event |
+
+Two cameras of one world, correlated into one incident:
+
+```bash
+sentinel run north.mp4 south.mp4 \
+    --id north --id south \
+    --place 33.8938,35.5018,6,180,-22 \
+    --place 33.8942,35.5018,6,0,-22 \
+    --zone "Yard:33.8940,35.5016;33.8940,35.5020;33.8936,35.5020;33.8936,35.5016"
+```
+
+Correlation runs across **every** source, deliberately. A camera correlating only
+its own events raises one incident per camera for one intrusion, which is the
+duplication the whole stage exists to remove.
+
+### Placement is validated, not clamped
+
+Every one of these is refused with a message, not silently corrected — because a
+camera the system quietly "fixes" reports positions indistinguishable from
+measured ones:
+
+- a latitude or longitude out of range
+- a mast of zero or negative height
+- a pitch that is level or tilted up: it sees no ground to project onto
+- five fields, then six — it takes five or eight
+- more `--id` or `--place` than there are sources
+
+### Exit codes
+
+| code | meaning |
+|---:|---|
+| `0` | done |
+| `1` | something failed. Re-run with `--verbose` for the traceback |
+| `2` | the command line was wrong. Nothing was opened |
+| `130` | interrupted. Everything already written stays written — each event and incident is its own transaction |
+
+---
+
+## 5. Docker
+
+Every service runs with **`network_mode: none`**. That is not hardening, it is
+the product's central claim under test: if any of it needs the network, this
+system does not do what it says.
+
+```bash
+docker compose build
+
+# Put footage in ./media, then:
+docker compose run --rm analyse run /media/gate.mp4 \
+    --place 33.8938,35.5018,6,180,-22 \
+    --zone "Yard:33.8940,35.5016;33.8940,35.5020;33.8936,35.5020" \
+    --export /evidence
+
+docker compose run --rm incidents
+
+# The offline acceptance proof: the whole Python suite, no network at all.
+docker compose run --rm verify
+```
+
+| path | what goes there |
+|---|---|
+| `./media` | your footage, mounted read-only |
+| `./evidence` | where exported packages land |
+| the `data` volume | the database. **Named**, so it survives a container being replaced — a security system whose records vanish on `docker compose down` is not one |
+
+**There is no server in the image.** No control plane, no REST API, no daemon.
+The container runs an analysis and exits; nothing listens on a port, and if you
+find something that does, that is a bug.
+
+The one service that takes a network is `cameras`, commented out by default,
+because a camera is on a LAN. It uses `network_mode: host` so RTSP over UDP works
+without port games — and the runtime egress guard still refuses any address
+outside RFC 1918 / 4193, so "has a network" does not become "can reach the
+Internet".
+
+The build stage uses the network to resolve crates and wheels, exactly as a
+developer's machine does. Nothing after it may.
+
+---
+
+## 6. Cameras
+
+> **No physical camera has ever been contacted by this code.** RTSP is a code
+> path, not a verified capability. Real cameras deviate from the specifications
+> in ways local testing cannot anticipate. Treat this section as the design and
+> expect surprises.
+
+```bash
+sentinel run "rtsp://admin:PASSWORD@192.168.1.64:554/Streaming/Channels/101" \
+    --id gate --place 33.8938,35.5018,6,180,-22
+```
+
+### Your password does not go anywhere
+
+The URL is held in one private field, read in exactly one place — the call that
+opens the capture — and everything downstream is given a redacted copy:
+
+```
+rtsp://admin:hunter2@10.0.0.5/s   →   rtsp://admin:***@10.0.0.5/s
+```
+
+That redacted form is what appears in the camera id, the display URL, **every
+error message**, the log, the database, the interface and every export. The
+replacement is a fixed `***` and never a run of stars matching the password's
+length, because a password's length is part of the password.
+
+Nine awkward URL shapes that each caused a real leak are now tests: a password
+containing `@`, a password with no username, an IPv6 literal, a non-numeric
+port, a credential in the query string, no scheme at all.
+
+**Nothing persists a camera password today** — the keychain integration is
+designed and not built, so the safest thing is that there is nowhere to put one.
+
+### The egress guard
+
+Every address a camera host resolves to must be loopback or inside RFC 1918 /
+RFC 4193. One public answer refuses the whole connection, with the address
+named — because an operator who genuinely means to reach a routable host needs
+to know exactly what stopped them and that it was deliberate.
+
+A name that does not resolve is refused rather than resolved onward. The system
+will not reach the Internet to find out whether it is allowed to reach the
+Internet.
+
+### Unreachable cameras fail fast
+
+A socket probe runs before the decoder is involved, because OpenCV's own RTSP
+connect timeout is a hard-coded 30 seconds that its documented FFmpeg options do
+not change — measured, not assumed. Thirty seconds per camera means a node with
+twenty cameras behind a switch that has just lost power takes ten minutes to
+work out that none of them are there.
+
+Faults are reported **in place**, never in a modal dialog. Twenty cameras drop
+together when a switch loses power, and twenty dialogs is not a user interface.
+
+---
+
+## 7. Where your files are
+
+```bash
+sentinel where
+```
+
+```
+data directory   C:\Users\you\AppData\Local\SentinelVision
+database         C:\Users\you\AppData\Local\SentinelVision\sentinel.db
+logs             C:\Users\you\AppData\Local\SentinelVision\logs
+evidence         C:\Users\you\AppData\Local\SentinelVision\evidence
+packaged build   True
+```
+
+| platform | default |
+|---|---|
+| Windows | `%LOCALAPPDATA%\SentinelVision` |
+| macOS | `~/Library/Application Support/SentinelVision` |
+| Linux | `$XDG_DATA_HOME/SentinelVision`, else `~/.local/share/SentinelVision` |
+
+**`SENTINEL_DATA_DIR` overrides all of it**, which is the normal case for a
+security appliance with a dedicated disk — continuous video does not belong on
+the system volume.
+
+Nothing is stored beside the code. A packaged install lives in Program Files or
+`/usr/lib`, which the account running it cannot write to, and a security system
+that silently fails to record because its install directory is read-only is
+worse than one that refuses to start.
+
+### Database maintenance
+
+```bash
+python tasks.py db           # what schema version is applied, and what is pending
+python tasks.py db-migrate   # apply pending migrations
+python tasks.py db-rollback  # undo the most recent one
+```
+
+`db` is read-only and deliberately so — applying a migration is something you do
+knowingly. Every migration carries a way back, because an upgrade that cannot be
+undone on a machine with no Internet and no spare hardware is a gamble.
+
+---
+
+## 8. Logs, and the developer build
+
+| variable | effect |
+|---|---|
+| `SENTINEL_LOG_LEVEL` | `DEBUG`, `INFO` (default), `WARNING`, `ERROR`. Turns a packaged build up in the field without a rebuild |
+| `SENTINEL_LOG_FILE` | a specific path, or `""` to write nothing to disk — which is what a container wants, since its log is stdout |
+
+The file rotates at 5 MB and keeps five, so it cannot become the thing that
+fills the disk.
+
+**`--quiet` silences the terminal, not the record.** The file is never quieter
+than INFO: an operator who silences the console and then has an outage still
+needs the log to say what happened.
+
+### `SentinelVision-dev.exe`
+
+Not a debug build — the same code with its output visible, plus `--verbose`
+forced on.
+
+It exists because a packaged Qt application on Windows has nowhere to print. An
+exception raised before the window appears leaves no trace at all, and *"it just
+closes"* is the least actionable bug report there is. The developer executable
+turns that into a stack trace on a terminal you can read and copy.
+
+```
+17:24:51.676  INFO     sentinel.pipeline   MainThread   pipeline.py:251
+              gate: analysis started (detector MOG2 background subtraction at
+              0.75 scale, placed, 1 zone(s), 4 rule(s))
+```
+
+The operator format is timestamp / level / module / message. The developer
+format adds milliseconds, the thread, and the file and line that logged it.
+
+### A log line can never carry a password
+
+Every record passes a redacting filter before it is formatted — the message, the
+interpolation arguments, and the exception text. That is a backstop rather than
+the defence: messages are built from the redacted URL in the first place. But it
+is exactly the right backstop for the case that actually happens, which is a
+library raising an exception containing a URL nobody sanitised.
+
+There is no syslog handler, no HTTP handler, and no `logging.config` file
+loading. A log configuration has no business being able to import arbitrary
+modules or open a socket.
+
+---
+
+## 9. When something is wrong
+
+| what you see | why | what to do |
+|---|---|---|
+| **No events at all** | The zone is somewhere the camera cannot see. This is the most common cause by a distance | `sentinel coverage --place …` and use the zone it hands you |
+| **Objects tracked but "not placed"** | The camera has no pose. There is no default, deliberately | Place it — console *Place camera*, or `--place` |
+| **A huge uncertainty circle at the camera** | Projection failed, so it fell back to "something is happening at this camera" | Check the pitch. A camera near level sees the horizon, where a pixel is hundreds of metres |
+| **Objects reported near the horizon with metre-scale error** | Uncertainty grows **super-linearly** with distance; this is honest, not broken | Put zones near the camera. That is where the geometry is worth anything |
+| **A person who stops moving disappears** | Background subtraction cannot see a stationary object. This is what background subtraction *is*, not a bug | Known and measured: 0.49 recall on the loiterer against 0.74 and 0.65. The real answer is a trained detector — [ROADMAP](../ROADMAP.md) 1.4 |
+| **3 people reported as 4 objects** | Appearance-free tracking. When two people cross, box geometry alone cannot tell which is which | Known and bounded by tests. [ROADMAP](../ROADMAP.md) 1.3 |
+| **`The Rust engine core was not found`** | The core is not built, or you moved the library | `python tasks.py build`, or set `SENTINEL_CORE_LIB` |
+| **`reports ABI version N; this build expects M`** | A stale core beside a newer engine | `cargo build --release` in `core/`. The refusal is deliberate: calling a function whose signature moved produces plausible, wrong geometry |
+| **`does not export sentinel_abi_version`** | That library is not the engine core, or is far older | Same fix |
+| **`Refused to contact "…"`** | The egress guard: that address is not on a private network | Intended. Use a LAN address. There is no override, and there will not be one |
+| **The console exits immediately, packaged** | An exception before the window appeared | Run `SentinelVision-dev.exe` — that is what it is for |
+| **Docker: `no such file /media/…`** | The file is not in the mounted directory | Put footage in `./media`; the container sees it as `/media` |
+
+Still stuck: run the developer executable or `sentinel --verbose`, then send the
+folder that `sentinel where` prints. It contains the log and nothing else — and
+the log cannot contain a camera password.
+
+---
+
+## 10. What it will refuse to do
+
+Not limitations. Design rules, each enforced by something other than intention.
+
+| It will not | Why |
+|---|---|
+| Reach the Internet | Zero WAN, checked three ways: a static source audit at commit, an offline CI job that drops all outbound traffic, and the runtime egress guard |
+| Download a model | Models are supplied by you and placed in `models/`. A missing model is an error that says so, not a cue to go and find one |
+| Send telemetry | Nothing here, and onnxruntime's own telemetry is switched off explicitly — the promise has to hold for every dependency |
+| Identify a person | No facial recognition, no biometrics, no identity database. Objects are tracked; people are not identified. Enforced by absence |
+| Control a camera or take a security action | The AI is an analyst. The operator is the decision maker |
+| Invent a position | A projection that cannot be made returns nothing. It never guesses and never clamps |
+| Report speed it cannot measure | Speed is withheld below 1.2 s of observation, because dividing a distance by one frame interval amplifies position error fivefold |
+| Claim a class it did not find | The motion detector emits `UNCLASSIFIED` and the console will not label it |
+| Edit an audit entry | There is no method to, and a test fails if somebody adds one |
+| Write outside its own directories | Map, model and video imports are sandboxed. A path escaping the destination is **refused**, not sanitised — quietly rewriting one hides both the bug and the attack |
+
+---
+
+## See also
+
+| Document | What it covers |
+|---|---|
+| [STATUS.md](../STATUS.md) | The honest state of every capability, with the measurements |
+| [ROADMAP.md](../ROADMAP.md) | What is left, in the order it should be built |
+| [docs/OVERVIEW.md](OVERVIEW.md) | A visual walk-through of the whole system |
+| [docs/SECURITY.md](SECURITY.md) | Threat model, credential handling, the three zero-WAN enforcers |
+| [docs/DEVELOPMENT.md](DEVELOPMENT.md) | Working on the code |
+| [docs/TESTING.md](TESTING.md) | What is tested, and what only each layer can catch |

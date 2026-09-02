@@ -1,0 +1,117 @@
+# Sentinel Vision — container services.
+#
+# Every service here runs with `network_mode: none`. That is not hardening, it
+# is the product's central claim under test: if any of these need the network,
+# this system does not do what it says. The one exception is documented where it
+# appears and is about reaching a camera on the LAN, which is not the Internet.
+#
+#   docker compose run --rm analyse run /media/gate.mp4 --place ...
+#   docker compose run --rm verify
+#   docker compose run --rm incidents
+#
+# Put footage in ./media. Everything the system writes lands in the `data`
+# volume, and evidence packages in ./evidence.
+
+services:
+  # ------------------------------------------------------------ the workload
+  #
+  # Headless analysis. This is what the image is for.
+  analyse:
+    build:
+      context: .
+      target: runtime
+    image: sentinel-vision:local
+    # Proof, not hardening. The whole pipeline — decode, detect, track, project,
+    # rules, correlation, persistence, evidence export — runs with no route out
+    # of the container at all.
+    network_mode: none
+    volumes:
+      - data:/data
+      - ./media:/media:ro
+      - ./evidence:/evidence
+    # `run --rm analyse <args>` appends to the entrypoint, so this is only the
+    # default when nothing is passed.
+    command: ["--help"]
+
+  # ---------------------------------------------------------- the proof
+  #
+  # The offline acceptance test, reproducible on any machine with Docker rather
+  # than only inside GitHub Actions. Runs the whole suite — Rust excluded, since
+  # the toolchain is not in the runtime image — with no network at all.
+  verify:
+    build:
+      context: .
+      # A separate stage: the test fixtures need `onnx` to build a model
+      # locally — nothing may be downloaded — and a shipping image has no
+      # business carrying a graph compiler.
+      target: test
+    image: sentinel-vision:test
+    network_mode: none
+    volumes:
+      - data:/data
+
+  # ------------------------------------------------------------ inspection
+  incidents:
+    build:
+      context: .
+      target: runtime
+    image: sentinel-vision:local
+    network_mode: none
+    command: ["incidents"]
+    volumes:
+      - data:/data
+
+  # ------------------------------------------------------- cameras on the LAN
+  #
+  # The one service with a network, and only because a camera is on one. It is
+  # `host` rather than a bridge so RTSP over UDP works without port games, and
+  # the runtime egress guard still refuses any address outside RFC 1918 / 4193 —
+  # so "has a network" does not become "can reach the Internet".
+  #
+  # Commented out by default: a service that quietly takes a network is exactly
+  # the thing this project promises not to do.
+  #
+  # cameras:
+  #   build: .
+  #   image: sentinel-vision:local
+  #   network_mode: host
+  #   volumes:
+  #     - data:/data
+  #     - ./evidence:/evidence
+  #   command:
+  #     - "run"
+  #     - "rtsp://camera.example.lan:554/Streaming/Channels/101"
+  #     - "--place"
+  #     - "33.8938,35.5018,6,180,-22"
+
+  # ---------------------------------------------------------------- the console
+  #
+  # The Qt desktop application. It runs, and running the packaged executable
+  # natively is easier and better — this exists for a Linux host that would
+  # rather not install PySide6.
+  #
+  # Needs an X server the container can reach:
+  #   xhost +local:  &&  docker compose run --rm console
+  #
+  # Commented out because it needs a display socket that does not exist on most
+  # machines, and a service that fails on `compose up` for everyone who has not
+  # read this comment is a service that wastes their afternoon.
+  #
+  # console:
+  #   build: .
+  #   image: sentinel-vision:local
+  #   network_mode: none
+  #   entrypoint: ["python", "/app/apps/console/main.py"]
+  #   environment:
+  #     DISPLAY: "${DISPLAY}"
+  #     QT_X11_NO_MITSHM: "1"
+  #   volumes:
+  #     - data:/data
+  #     - ./media:/media:ro
+  #     - ./evidence:/evidence
+  #     - /tmp/.X11-unix:/tmp/.X11-unix:ro
+
+volumes:
+  # Named, so evidence and the database survive a container being replaced. A
+  # security system whose records vanish on `docker compose down` is not one.
+  data:

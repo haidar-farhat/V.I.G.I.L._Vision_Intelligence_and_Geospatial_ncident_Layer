@@ -4,8 +4,12 @@
 > Python and Rust. The reasoning is intact and is what the implementation will
 > follow; the code it refers to no longer exists. See [STATUS.md](../STATUS.md).
 
-> **Status:** `PLANNED`. Packaging, installers and the offline update flow are
-> designed here and not built. See [STATUS.md](../STATUS.md).
+> **Status:** partly built. `python tasks.py package` produces standalone
+> executables today, and there is a container image — see
+> [docs/USAGE.md](USAGE.md) for how to use both. Still `PLANNED`: signed
+> installers (MSI/NSIS, `.deb`/`.rpm`/AppImage, notarised `.dmg`), the offline
+> update flow, and everything below that describes more than one machine. See
+> [STATUS.md](../STATUS.md).
 
 ## Deployment shapes
 
@@ -102,11 +106,29 @@ never silently corrected.
 
 ## Installation
 
-Packages are produced per platform:
+### What exists today
+
+`python tasks.py package` produces a folder in `dist/SentinelVision` holding
+three executables and the libraries they share. Copy the folder, run it, delete
+the folder — nothing is installed, nothing is written to the registry, nothing
+is downloaded. There is also a container image for headless analysis. Both are
+documented in [docs/USAGE.md](USAGE.md).
+
+It is `onedir` rather than a single self-extracting binary, and it is not UPX
+packed. Both are deliberate: a onefile build unpacks 300 MB to a temporary
+directory on every launch and can be blocked outright on a locked-down machine,
+and a packed binary looks exactly like malware to every endpoint product an
+operator runs. A security appliance that trips the antivirus is a security
+appliance that gets uninstalled.
+
+Neither is signed. On Windows that means a SmartScreen warning; on macOS it
+means Gatekeeper refuses it outright.
+
+### What is planned
 
 | Platform | Format |
 |---|---|
-| Windows | MSI / NSIS installer |
+| Windows | MSI / NSIS installer, signed |
 | Linux | `.deb`, `.rpm`, AppImage |
 | macOS | `.dmg` (signed and notarised) |
 

@@ -7,6 +7,8 @@
     python tasks.py audit      prove the source has no route off the site,
                                and that every diagram in the docs parses
     python tasks.py console    run the operator console
+    python tasks.py cli        run the headless analyser (pass arguments after it)
+    python tasks.py package    build the standalone executables
     python tasks.py db         report the database's migration state
     python tasks.py db-migrate apply pending migrations
     python tasks.py db-rollback undo the most recent migration
@@ -172,6 +174,60 @@ def console() -> None:
     run([sys.executable, str(CONSOLE / "main.py")], ROOT, python_path())
 
 
+def cli() -> None:
+    """The headless analyser, with everything after `cli` passed through."""
+    build()
+    run([sys.executable, "-m", "sentinel", *sys.argv[2:]], ROOT, python_path())
+
+
+def package() -> None:
+    """Build the standalone executables.
+
+    The core is built first and unconditionally. Packaging a stale library is
+    how a green test run ships broken geometry: the tests loaded one core and
+    the bundle carries another.
+
+    PyInstaller is a build-time dependency and is not installed by default,
+    because a machine that only runs the tests should not have to carry it.
+    """
+    build()
+
+    try:
+        import PyInstaller  # noqa: F401
+    except ImportError:
+        raise SystemExit(
+            "PyInstaller is not installed. It is a build tool, not a runtime "
+            "dependency:\n\n"
+            "    python -m pip install pyinstaller\n\n"
+            "Nothing it produces reaches the network; the bundle is assembled "
+            "from what is already on this machine."
+        ) from None
+
+    spec = ROOT / "packaging" / "sentinel.spec"
+    run(
+        [
+            sys.executable, "-m", "PyInstaller", str(spec),
+            "--noconfirm",
+            "--distpath", str(ROOT / "dist"),
+            "--workpath", str(ROOT / "build"),
+        ],
+        ROOT,
+        python_path(),
+    )
+
+    produced = ROOT / "dist" / "SentinelVision"
+    print()
+    print(f"  {produced}")
+    for name in ("SentinelVision", "SentinelVision-dev", "sentinel"):
+        suffix = ".exe" if sys.platform == "win32" else ""
+        executable = produced / f"{name}{suffix}"
+        state = "ok" if executable.is_file() else "MISSING"
+        print(f"    {name}{suffix:<4}  {state}")
+    print()
+    print("  Ship the whole folder. The executables need the libraries beside")
+    print("  them, which is what every Qt application ships.")
+
+
 TASKS = {
     "build": build,
     "lint": lint,
@@ -179,16 +235,25 @@ TASKS = {
     "test": test,
     "check": check,
     "console": console,
+    "cli": cli,
+    "package": package,
     "db": db,
     "db-migrate": db_migrate,
     "db-rollback": db_rollback,
 }
 
 
+#: Tasks that take arguments of their own, passed through untouched.
+PASSTHROUGH = {"cli"}
+
+
 def main(argv: list[str]) -> int:
-    if len(argv) != 2 or argv[1] not in TASKS:
+    if len(argv) < 2 or argv[1] not in TASKS:
         print(__doc__)
         return 1 if len(argv) > 1 else 0
+    if len(argv) > 2 and argv[1] not in PASSTHROUGH:
+        print(f"{argv[1]} takes no arguments")
+        return 1
 
     TASKS[argv[1]]()
     print("\n\033[32mok\033[0m")

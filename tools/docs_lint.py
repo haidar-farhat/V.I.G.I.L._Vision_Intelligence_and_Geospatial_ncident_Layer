@@ -29,8 +29,15 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
-#: Every markdown file in the repository, wherever it lives.
-SKIPPED_DIRS = {".git", "target", "__pycache__", "node_modules", ".venv"}
+#: Every markdown file in the repository, wherever it lives — except build
+#: output and operator data. A packaged bundle carries the READMEs of every
+#: library it vendors, and linting somebody else's documentation is both slow
+#: and none of this project's business.
+SKIPPED_DIRS = {
+    ".git", "__pycache__", ".venv", "venv", "node_modules",
+    "target", "build", "dist", "site-packages",
+    "media", "evidence", "models", "map-data",
+}
 
 #: The first word of a mermaid block. Anything else is a typo or a diagram type
 #: this repository does not use, and both are worth being told about.

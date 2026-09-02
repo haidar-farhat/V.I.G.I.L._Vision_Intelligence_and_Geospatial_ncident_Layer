@@ -44,6 +44,10 @@ from .events import Event, EventEngine, Rule, utc_from_millis
 from .incidents import Correlator, Incident
 from .zones import Zone, ZoneEvaluator
 
+from .logs import get as _get_logger
+
+_log = _get_logger(__name__)
+
 
 #: How many tracks' per-track detail the statistics keep. Everything that grows
 #: per track — the id set, the observation counts, the spans — is trimmed to
@@ -251,6 +255,15 @@ class Pipeline:
         self._source.open()
         self._tracker = Tracker(self._pose, **self._config)
 
+        _log.info(
+            "%s: analysis started (detector %s, %s, %d zone(s), %d rule(s))",
+            self._source.source_id,
+            self._detector.info.name,
+            "placed" if self._pose else "not placed",
+            len(self._zones),
+            len(self._engine.rules) if self._engine else 0,
+        )
+
         try:
             for frame in self._source:
                 yield self._process(frame)
@@ -258,6 +271,17 @@ class Pipeline:
             if self._tracker is not None:
                 self._tracker.close()
                 self._tracker = None
+            # At INFO because this is the line an operator sends when asked what
+            # the system saw, and it is one line per run rather than per frame.
+            _log.info(
+                "%s: analysis finished: %d frames, %d detections, %d object(s), "
+                "%d event(s)",
+                self._source.source_id,
+                self.stats.frames,
+                self.stats.detections,
+                self.stats.distinct_objects,
+                self.stats.events,
+            )
 
     def _process(self, frame: Frame) -> FrameResult:
         assert self._tracker is not None

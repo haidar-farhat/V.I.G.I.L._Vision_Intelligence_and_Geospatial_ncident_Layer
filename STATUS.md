@@ -22,11 +22,16 @@ implementation was removed in `582d0a8`; its architecture documents were kept
 because the thinking in them carried over, and are being brought up to date.
 Anything below that is not yet re-established after the rewrite says so.
 
-Current suite: **428 tests** — 57 Rust, 331 engine, 40 console — plus two static
+Current suite: **492 tests** — 57 Rust, 395 engine, 40 console — plus two static
 checks that run before any of them: an offline audit that fails the build if the
 shipped source names any destination off the site, and a lint that fails it if
-any of the 32 diagrams in this documentation no longer parses. `cargo fmt` and
-`clippy -D warnings` clean. Run everything with `python tasks.py check`.
+any of the 36 diagrams in this documentation no longer parses. `cargo fmt` and
+`clippy -D warnings` clean. Run everything with `python tasks.py check`, or the
+Python half of it inside a container with no network at all:
+`docker compose run --rm verify`.
+
+**How to use it** is [docs/USAGE.md](docs/USAGE.md). **What to build next** is
+[ROADMAP.md](ROADMAP.md).
 
 A visual walk-through of everything below — the layers, the boundary, threading,
 projection, correlation, persistence and export — is in
@@ -112,6 +117,10 @@ Geometry, projection, zones and tracking, behind a C ABI.
 | Persistence | `TESTED` | SQLite in WAL, forward migrations with a reversal each, idempotent upserts on deterministic ids. No column holds a credential — asserted by walking the schema. |
 | Audit log | `TESTED` | Append-only. There is deliberately no method to edit one, and a test fails if somebody adds it. |
 | Evidence export | `TESTED` | A folder per incident: the full record, a report a person can read without tooling, and a SHA-256 for every file. Verifiable by somebody who has only the folder. |
+| Export a *stored* incident | `TESTED` | `Store.incident()` rebuilds one from the database — events and reasoning included, nothing recomputed. Until this existed an incident could only be exported while the process that raised it was still running. |
+| Headless analysis (`python -m sentinel`) | `TESTED` | The same pipeline with no window: run, incidents, export, coverage, where. Not a daemon — it processes what it is given and exits. |
+| Logging | `TESTED` | Rotating file plus console, two formats. Every record passes a redacting filter — message, arguments and traceback — so a log line cannot carry a camera password. No network handler exists, asserted against the parsed module. |
+| One data directory | `TESTED` | Database, logs and evidence under one root, overridable with `SENTINEL_DATA_DIR`. Never beside the code: a packaged install lives somewhere the running account cannot write. |
 | Bounded statistics | `TESTED` | Per-track detail is capped; the distinct-object count is counted on arrival so trimming cannot deflate it, and a track still on screen is never trimmed. |
 | Live-thread fault reporting | `TESTED` | The decode thread cannot die silently: any exception becomes a reported fault naming the exception *type*, never its text. |
 
@@ -139,7 +148,17 @@ itself was found to be false, and rewording it would have been the cheaper fix.
 | Incident panel | `TESTED` | One row per incident, expandable into its risk factors, cross-camera links and timeline. Sorted by severity, not arrival. |
 | Zones on the plan view | `TESTED` | Drawn distinctly from evidence: a zone is a rule someone wrote, not something observed. |
 | Multi-camera wall | `TESTED` | A pane per camera, a pipeline per camera, and correlation above them — never inside one. |
-| Incident replay and export | `PLANNED` | |
+| Incident replay and export | `PLANNED` | Export exists on the command line and in the console; replay does not. |
+
+## Packaging and deployment
+
+| Capability | State | Notes |
+|---|---|---|
+| Standalone executables | `TESTED` | `python tasks.py package` → three executables from one PyInstaller analysis. `onedir`, not `onefile`: unpacking 300 MB per launch is slow, leaves debris, and can be blocked outright. No UPX — a packed binary looks exactly like malware to every endpoint product an operator runs. |
+| Developer executable | `TESTED` | `SentinelVision-dev` is the same code with a terminal and `--verbose` forced on. A packaged Qt application on Windows has nowhere to print, so an exception before the window appears leaves no trace at all. |
+| Container image | `IMPLEMENTED` | Multi-stage: Rust builder, slim runtime, and a test stage carrying the dev extras. Runs the full Python suite with `network_mode: none`. Not root. No port is opened, because there is nothing to open one for. |
+| Installer | `PLANNED` | MSI/NSIS, `.deb`/`.rpm`/AppImage, signed `.dmg`. What exists is a folder to copy. |
+| Code signing | `PLANNED` | Unsigned binaries will be flagged on Windows and refused on macOS. |
 
 ## Measured behaviour
 
