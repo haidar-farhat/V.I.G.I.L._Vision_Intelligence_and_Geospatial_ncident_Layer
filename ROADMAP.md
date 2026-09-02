@@ -20,13 +20,14 @@ absent.
 
 ```mermaid
 flowchart LR
-    subgraph done["BUILT · 428 tests"]
+    subgraph done["BUILT · 547 tests"]
         direction TB
         D1["decode · detect · track · project"]
         D2["zones · rules · events"]
         D3["correlation · identity · risk"]
         D4["persistence · audit · export"]
         D5["operator console"]
+        D6["<b>local cameras</b><br/>through each OS's own capture API"]
     end
 
     subgraph missing["MISSING · the system around it"]
@@ -41,7 +42,7 @@ flowchart LR
         direction TB
         U1["real footage"]
         U2["trained weights"]
-        U3["a physical camera"]
+        U3["a physical <i>IP</i> camera"]
         U4["CI has never run"]
     end
 
@@ -55,7 +56,10 @@ flowchart LR
 
 **The one-sentence version:** this is a very well-tested analysis library with a
 demo application on top of it, and the gap to a product is recording, a headless
-runtime, and having pointed it at something real.
+runtime, and having pointed it at something real. It has now been pointed at one
+real thing — a camera attached to the machine — and that immediately produced
+two surprises local reasoning had not, which is the argument for the rest of
+Tier 0.
 
 ---
 
@@ -74,6 +78,7 @@ Listed only where I would defend the claim, not merely where code exists.
 | The C ABI boundary | Version-checked and layout-checked before a single call, with round-trip tests that catch a same-width field swap the size guard cannot. |
 | Credential handling | Structural, not procedural: one private slot, one read, everything downstream given the redacted form — including every exception. Nine awkward URLs that each caused a real leak are now tests. |
 | Zero WAN | Three enforcement points at three different times, all three tested, and the static one tested against deliberately bad source. |
+| Local camera capture | Each platform's own device interface and capture API, with no third-party dependency. Enumeration opens nothing; an index nothing has opened is reported as *assumed*, because there is no supported mapping from an OS device to a capture index. Run end to end against a real webcam. |
 
 ---
 
@@ -83,7 +88,7 @@ Ordered by what I would actually do next, not by size.
 
 ```mermaid
 flowchart TD
-    T0["<b>TIER 0 — establish truth</b><br/>real footage · trained model · one camera · run CI"]
+    T0["<b>TIER 0 — establish truth</b><br/>real footage · trained model · an IP camera · run CI"]
     T1["<b>TIER 1 — become a security system</b><br/>recording · headless daemon · appearance re-ID"]
     T2["<b>TIER 2 — become a multi-node system</b><br/>control plane · pairing · worker autonomy"]
     T3["<b>TIER 3 — become operable</b><br/>auth · keychain · discovery · retention · health"]
@@ -119,11 +124,17 @@ geometry.
       all of which are currently tested against a brightness fixture.
       *Done when:* `class_label` in a stored event names something a model
       believed, not `UNCLASSIFIED`.
-- [ ] **0.3 · Contact one physical IP camera.** RTSP is a code path, not a
-      capability. Expect to find: timestamps that jump, streams that reconnect
+- [x] **0.3a · Contact a camera attached to the machine.** Done. `device:N`,
+      through each platform's own capture API. The first real hardware this
+      system has touched, and it immediately produced two surprises local
+      reasoning had not: Media Foundation refuses the development machine's
+      integrated camera and DirectShow opens it, and a Windows Hello infrared
+      sensor lists as a camera and opens on nothing.
+- [ ] **0.3b · Contact one physical IP camera.** RTSP is still a code path, not
+      a capability. Expect to find: timestamps that jump, streams that reconnect
       with a different resolution, ONVIF that lies about profiles, and at least
       one credential-handling assumption that is wrong.
-      *Done when:* a real camera runs for an hour without a reconnect storm.
+      *Done when:* a real IP camera runs for an hour without a reconnect storm.
 - [ ] **0.4 · Push once and let CI run.** The workflow targets three platforms
       and Python 3.12; development is on Windows and 3.14. It has never executed.
       *Done when:* the offline job is green on Linux.
@@ -195,7 +206,11 @@ TypeScript prototype.
       column already exists and holds nothing.
 - [ ] **3.3 · Camera discovery (ONVIF / mDNS).** An operator should not be typing
       RTSP URLs. Discovery is also where a hostile camera first touches the
-      system, so the parser needs to be treated as such.
+      system, so the parser needs to be treated as such. Local devices are
+      already discovered this way — through the operating system rather than the
+      network — and `sentinel.devices` is the shape the network version should
+      follow: enumerate without connecting, confirm by opening, and never claim
+      an identity that has not been established.
 - [ ] **3.4 · Retention, disk budget and health.** A node that fills its disk
       stops being a security system. Needs a disk watermark, an eviction policy
       that is audited, per-camera health (frames, drops, reconnects, last-seen)

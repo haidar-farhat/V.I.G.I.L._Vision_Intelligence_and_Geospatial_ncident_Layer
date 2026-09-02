@@ -10,11 +10,12 @@ How to install it, run it, and read what it tells you.
 >
 > **What this build is not.** It does not record video yet, so an evidence
 > package contains the record and not the footage. It has no server, no
-> multi-machine mode, no user accounts, and it has never been pointed at a
-> physical camera. Nothing here has been run against real footage or trained
-> detection weights. See [STATUS.md](../STATUS.md) for the honest state of every
-> capability and [ROADMAP.md](../ROADMAP.md) for what is coming and in what
-> order.
+> multi-machine mode and no user accounts. A camera attached to this machine
+> works and has been run end to end; **no *network* camera has ever been
+> contacted** — RTSP remains a code path. Nothing here has been run against real
+> footage or trained detection weights. See [STATUS.md](../STATUS.md) for the
+> honest state of every capability and [ROADMAP.md](../ROADMAP.md) for what is
+> coming and in what order.
 
 ---
 
@@ -115,8 +116,10 @@ The fastest path to seeing it work, with a video file rather than a camera.
 
 ### In the console
 
-1. **Add a camera.** *Add camera* → pick a video file. The pane appears in the
-   wall on the left.
+1. **Add a camera.** *Add camera* offers three things: a camera attached to
+   this machine (found through the operating system's own device interface), a
+   camera on the network, or a video file. The pane appears in the wall on the
+   left.
 2. **Place it.** *Place camera* → type where it is: latitude, longitude, mast
    height, which way it points, how far down it tilts. As you type, the dialog
    tells you **the band of ground that pose actually covers** — see
@@ -250,6 +253,7 @@ reproduces the original result exactly.
 sentinel [-v|-q] [--database PATH] <command>
 
   run <source>...      analyse and record what happened
+  devices              cameras attached to this machine
   incidents            list what has been recorded
   export <id> --to DIR write one incident out as evidence
   coverage --place ... what a placed camera can actually see
@@ -261,11 +265,22 @@ sentinel [-v|-q] [--database PATH] <command>
 | option | meaning |
 |---|---|
 | `--id NAME` | camera id, once per source. Default `cam-01`, `cam-02`, … |
+| `<source>` | a video file, an `rtsp://` URL, or `device:N` for a camera attached to this machine |
 | `--place lat,lon,height,heading,pitch[,hfov,vfov,range]` | once, or once per source. Without it, objects are tracked but not located |
 | `--zone "Name:lat,lon;lat,lon;lat,lon[;…]"` | a restricted polygon, three vertices up. Repeatable |
 | `--detect-scale 0.75` | detection resolution. 0.75 is the default: **1.7× faster and slightly better recall**, because the downscale is a mild denoise |
+| `--for SECONDS` | stop a live source after this long |
+| `--frames N` | stop after N frames |
 | `--export DIR` | write an evidence package per incident |
 | `--node NAME` | node id recorded on every event |
+
+**A live source has no end, so bound it.** A camera runs until the stream stops
+or you press Ctrl-C at an interactive terminal — and a scheduled job or a
+container has no terminal. On Windows an interrupt sent from outside does not
+reach a Python process at all, measured, so there is no way to stop an unbounded
+run short of killing it. `--for` and `--frames` are how a headless run ends
+cleanly with everything it found recorded. A file ignores both: it stops on its
+own.
 
 Two cameras of one world, correlated into one incident:
 
@@ -348,6 +363,100 @@ developer's machine does. Nothing after it may.
 
 ## 6. Cameras
 
+There are three kinds of source, and they are genuinely different things rather
+than three spellings of one.
+
+```mermaid
+flowchart TD
+    Q{"what is the camera?"}
+    Q -->|"attached to this machine"| L["<b>device:N</b><br/>found through the OS's own<br/>device interface, opened through<br/>its native capture API"]
+    Q -->|"on the network"| N["<b>rtsp://…</b><br/>a URL, usually with a password.<br/>Must resolve to a private address"]
+    Q -->|"footage"| F["<b>a file</b><br/>not a camera. The only source<br/>that is <i>evidence</i>: every frame,<br/>in order, reproducibly"]
+
+    style L fill:#1e3f2f,stroke:#4ade80,color:#e2e8f0
+    style N fill:#3f2f1e,stroke:#fbbf24,color:#e2e8f0
+    style F fill:#1e3a5f,stroke:#4a9eff,color:#e2e8f0
+```
+
+### A camera attached to this machine
+
+A USB or built-in camera is not a file and not a network stream: it is a device
+the operating system owns, and the only honest way to find one is to ask the
+operating system.
+
+| Platform | Enumerated through | Opened through |
+|---|---|---|
+| **Windows** | `Win32_PnPEntity` — the PnP device registry | Media Foundation, falling back to DirectShow |
+| **Linux** | `/sys/class/video4linux` — the V4L2 device tree | Video4Linux2 |
+| **macOS** | `system_profiler SPCameraDataType` | AVFoundation |
+
+No third-party dependency is added for any of it. Each is a query the platform
+already answers, and all three are local.
+
+```bash
+sentinel devices            # what the OS reports. Opens nothing.
+sentinel devices --probe    # opens each one to confirm which index is which
+
+sentinel run device:0 --id front-door --place 33.8938,35.5018,3,90,-15 --for 60
+```
+
+In the console, **Add camera → This machine** shows the same list.
+
+**Listing does not switch a camera on.** Enumeration reads metadata and captures
+nothing, so opening the dialog does not light the webcam light and, on macOS,
+does not raise a permission prompt for a camera nobody asked to use. *Detect* is
+a separate button because opening a camera is a deliberate act — and on macOS it
+is what triggers the permission prompt, which is the right place for that to
+happen.
+
+#### Why an index can say "assumed"
+
+The operating system knows a camera's **name**. OpenCV opens one by **index**.
+There is no supported way to map between them, so the pairing is an assumption
+and the listing says so:
+
+```
+0: Integrated Camera  (index assumed)
+```
+
+`--probe` (or *Detect*) opens each index and turns the assumption into a fact:
+
+```
+0: Integrated Camera — 640x480
+    use    device:0
+    id     USB\VID_5986&PID_2174&MI_00\7&3B5246B5&1&0000
+    opens  DirectShow
+```
+
+This matters. Two identical webcams are indistinguishable by name, and a USB bus
+can enumerate differently after a reboot. A system that guessed, and was wrong,
+would attribute an intrusion to the wrong side of a building. **The only way to
+tell two identical cameras apart is to look at the picture** — so add the
+camera, press Start, and check the frame is the one you meant.
+
+The stable hardware id is recorded alongside the index precisely because the
+index is not stable and the id is.
+
+#### Windows needs two interfaces, and says which one worked
+
+Media Foundation is the modern interface and the default. DirectShow still opens
+devices that Media Foundation refuses outright — measured on the development
+machine, where the integrated camera opens on DirectShow and not on Media
+Foundation. The fallback is a fallback, and which one succeeded is recorded in
+the source's provenance rather than forgotten, because an operator whose camera
+works on one machine and not another needs to know which one each took.
+
+#### Not every listed camera is a camera you can use
+
+A Windows Hello infrared sensor lists as a camera and opens on nothing. A Linux
+UVC camera exposes a metadata node next to its capture node, and the metadata
+node opens happily and produces no image — those are filtered out by the
+device's own reported capabilities rather than by guessing from the name. A
+camera already in use by another application will not open. All of these are
+ordinary, and `--probe` is what distinguishes "listed" from "works".
+
+### A camera on the network
+
 > **No physical camera has ever been contacted by this code.** RTSP is a code
 > path, not a verified capability. Real cameras deviate from the specifications
 > in ways local testing cannot anticipate. Treat this section as the design and
@@ -355,7 +464,7 @@ developer's machine does. Nothing after it may.
 
 ```bash
 sentinel run "rtsp://admin:PASSWORD@192.168.1.64:554/Streaming/Channels/101" \
-    --id gate --place 33.8938,35.5018,6,180,-22
+    --id gate --place 33.8938,35.5018,6,180,-22 --for 300
 ```
 
 ### Your password does not go anywhere
@@ -508,7 +617,13 @@ modules or open a socket.
 | **`does not export sentinel_abi_version`** | That library is not the engine core, or is far older | Same fix |
 | **`Refused to contact "…"`** | The egress guard: that address is not on a private network | Intended. Use a LAN address. There is no override, and there will not be one |
 | **The console exits immediately, packaged** | An exception before the window appeared | Run `SentinelVision-dev.exe` — that is what it is for |
+| **A camera is listed but will not open** | In use by another application, blocked by a privacy setting, or not a capture device at all — a Windows Hello IR sensor lists as a camera and opens on nothing | `sentinel devices --probe` shows which ones actually open |
+| **`sentinel devices` finds nothing** | Some cameras do not appear in the device registry but do open | `sentinel devices --probe` scans indices directly |
+| **The wrong camera opened** | The index was assumed from enumeration order, not confirmed | `--probe`, or press Start and look at the picture. Two identical cameras cannot be told apart any other way |
+| **macOS refuses to open a camera** | The operating system's privacy control. The prompt appears the first time something opens one | Allow it in System Settings → Privacy & Security → Camera |
+| **A headless run against a camera never ends** | A live source has no end, and Ctrl-C is not available to a scheduled job | `--for SECONDS` or `--frames N` |
 | **Docker: `no such file /media/…`** | The file is not in the mounted directory | Put footage in `./media`; the container sees it as `/media` |
+| **Docker: `device:0` will not open** | A container sees no hardware it was not given | Pass the device through: `--device /dev/video0`. Linux hosts only — Docker Desktop on Windows and macOS cannot forward a USB camera into a container |
 
 Still stuck: run the developer executable or `sentinel --verbose`, then send the
 folder that `sentinel where` prints. It contains the log and nothing else — and

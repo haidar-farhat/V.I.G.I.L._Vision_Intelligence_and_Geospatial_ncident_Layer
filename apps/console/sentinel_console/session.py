@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from sentinel.core import CameraPose
+from sentinel.decode import _looks_live, redact_url
 from sentinel.events import Event
 
 from .video_view import VideoView
@@ -28,7 +29,15 @@ class CameraSession:
     """A camera in the console: where it is, what it is watching, what it found."""
 
     camera_id: str
-    source_path: Path
+    #: What the source *is*, as a string rather than a path: `device:0` for a
+    #: camera attached to this machine, an RTSP URL for one on the network, a
+    #: file path for footage. A `Path` could only represent the last of the
+    #: three, and made the other two look like files that did not exist.
+    #:
+    #: For a network camera this holds the credential. It is read in exactly one
+    #: place — the moment `VideoSource` is constructed — and everything else
+    #: uses `display_source`.
+    source: str
     view: VideoView
     pose: CameraPose | None = None
     worker: AnalysisWorker | None = None
@@ -39,6 +48,20 @@ class CameraSession:
     #: Set when this camera's own run ends or fails, so the window can show
     #: which camera is in trouble rather than only that something is.
     fault: str | None = None
+
+    @property
+    def display_source(self) -> str:
+        """The source with any credential removed. Safe to log, show and store."""
+        return redact_url(self.source)
+
+    @property
+    def is_live(self) -> bool:
+        """Whether this source has no end.
+
+        A file is replayed to completion; a camera runs until it is stopped.
+        The difference decides whether the window can ever show "finished".
+        """
+        return _looks_live(self.source)
 
     @property
     def is_running(self) -> bool:
