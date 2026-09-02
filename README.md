@@ -318,6 +318,7 @@ list is part of the attack surface, and everything in it is arithmetic.
 
 | Document | Covers |
 |---|---|
+| [ROADMAP.md](ROADMAP.md) | What is left between today and a system worth putting in front of a real site, in the order it should be built, with the reasoning |
 | [docs/OVERVIEW.md](docs/OVERVIEW.md) | **Start here.** Diagrams of every layer, the spine, the boundary, threading, zones, projection, correlation, risk, persistence, export and test topology — with the measurements behind each |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Components, processes, ERD, protocol, security model, data flow, AI and map architecture |
 | [STATUS.md](STATUS.md) | What is actually built, per capability |

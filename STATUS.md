@@ -465,6 +465,9 @@ per frame, forever. Live ids are skipped, and a test walks a loiterer through
 | An event kind in the API that nothing raises | `ZONE_EXIT` and `PERIMETER_BREACH` are declared but no rule produces them | Labelled reserved with the reason; three tests assert the labels against the rules that exist |
 | onnxruntime telemetry left at the library default | Zero-WAN was enforced on this code, not on its dependencies | `disable_telemetry_events()` called explicitly, guarded for builds without it |
 
+Sequencing for everything below — what I would build next and why — is in
+[ROADMAP.md](ROADMAP.md).
+
 ## Not yet rebuilt after the rewrite
 
 These existed in the TypeScript and have not been re-established. They are listed
