@@ -30,6 +30,7 @@ from sentinel.core import CameraPose, LatLon  # noqa: E402
 from sentinel.decode import VideoSource  # noqa: E402
 from sentinel.detect import MotionDetector  # noqa: E402
 from sentinel_console import theme  # noqa: E402
+from sentinel_console.add_camera import AddCameraDialog  # noqa: E402
 from sentinel_console.app import ConsoleWindow  # noqa: E402
 from sentinel_console.map_view import MapView  # noqa: E402
 from sentinel_console.placement import PlacementDialog  # noqa: E402
@@ -811,3 +812,173 @@ def test_the_export_names_no_operator_it_cannot_verify(qt_app, window, tmp_path)
 
     manifest = json.loads((export.directory / "manifest.json").read_text(encoding="utf-8"))
     assert "unauthenticated" in manifest["exported_by"]
+
+
+# ----------------------------------------------------------- adding a camera
+#
+# "Add camera" now covers three genuinely different things: a camera attached to
+# this machine through the operating system's own device interface, a camera on
+# the network, and a video file. These check the two properties that would be
+# expensive to discover in the field — that listing cameras does not switch one
+# on, and that a network camera's password does not reach the screen.
+
+
+def test_the_add_camera_dialog_lists_local_cameras_without_opening_one(qt_app, monkeypatch):
+    # The property that makes it safe to open this dialog at all: enumeration
+    # reads metadata and captures nothing, so this does not light the webcam
+    # and, on macOS, does not raise a permission prompt for a camera nobody
+    # asked to use.
+    import cv2
+    from sentinel import devices as device_module
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("opening the dialog switched a camera on")
+
+    monkeypatch.setattr(cv2, "VideoCapture", forbidden)
+    monkeypatch.setattr(
+        device_module, "list_cameras",
+        lambda: [
+            device_module.LocalCamera(0, "Integrated Camera", r"USB\ONE", "Media Foundation"),
+            device_module.LocalCamera(1, "Logitech C920", r"USB\TWO", "Media Foundation"),
+        ],
+    )
+
+    dialog = AddCameraDialog()
+    try:
+        assert dialog._device_list.count() == 2
+        assert "Integrated Camera" in dialog._device_list.item(0).text()
+        # An unconfirmed index must say so where an operator will read it.
+        assert "assumed" in dialog._device_list.item(0).text()
+        assert "Detect" in dialog._device_note.text()
+    finally:
+        dialog.deleteLater()
+
+
+def test_choosing_a_local_camera_yields_a_device_source(qt_app, monkeypatch):
+    from sentinel import devices as device_module
+
+    monkeypatch.setattr(
+        device_module, "list_cameras",
+        lambda: [device_module.LocalCamera(2, "Logitech C920", r"USB\TWO", "Video4Linux2")],
+    )
+
+    dialog = AddCameraDialog()
+    try:
+        dialog._tabs.setCurrentIndex(0)
+        dialog._device_list.item(0).setSelected(True)
+
+        chosen = dialog._current_choices()
+
+        assert len(chosen) == 1
+        assert chosen[0].source == "device:2"
+        assert chosen[0].is_device
+        # The operating system's name, not "device:2". An operator picked
+        # "Logitech C920" and should see that in the camera list.
+        assert chosen[0].suggested_id == "logitech-c920"
+    finally:
+        dialog.deleteLater()
+
+
+def test_a_camera_with_no_index_confirmed_does_not_claim_one(qt_app, monkeypatch):
+    from sentinel import devices as device_module
+
+    monkeypatch.setattr(
+        device_module, "list_cameras",
+        lambda: [device_module.LocalCamera(0, "Camera A", None, "Media Foundation")],
+    )
+
+    dialog = AddCameraDialog()
+    try:
+        note = dialog._device_note.text()
+        assert "assumed" in note
+        # And it must say how to resolve it, not merely that it is uncertain.
+        assert "Detect" in note and "picture" in note
+    finally:
+        dialog.deleteLater()
+
+
+def test_a_machine_with_no_camera_says_so_and_offers_the_next_step(qt_app, monkeypatch):
+    from sentinel import devices as device_module
+
+    monkeypatch.setattr(device_module, "list_cameras", lambda: [])
+
+    dialog = AddCameraDialog()
+    try:
+        assert dialog._device_list.count() == 0
+        assert "No cameras" in dialog._device_note.text()
+        assert "Detect" in dialog._device_note.text()
+    finally:
+        dialog.deleteLater()
+
+
+def test_a_device_subsystem_that_fails_does_not_break_the_dialog(qt_app, monkeypatch):
+    # The other two tabs must still work. A machine whose device registry cannot
+    # be queried can still open a file and an RTSP URL.
+    from sentinel import devices as device_module
+
+    def explode():
+        raise OSError("the device subsystem is unavailable")
+
+    monkeypatch.setattr(device_module, "list_cameras", explode)
+
+    dialog = AddCameraDialog()
+    try:
+        assert dialog._device_list.count() == 0
+        dialog._tabs.setCurrentIndex(2)
+        dialog._file.setText("/media/gate.mp4")
+        assert dialog._current_choices()[0].source == "/media/gate.mp4"
+    finally:
+        dialog.deleteLater()
+
+
+def test_a_network_camera_password_never_reaches_the_screen(qt_app, monkeypatch):
+    from sentinel import devices as device_module
+    from sentinel.decode import contains_credential
+
+    monkeypatch.setattr(device_module, "list_cameras", lambda: [])
+
+    secret = "hunter2-not-a-real-password"
+    url = f"rtsp://admin:{secret}@192.168.1.64:554/Streaming/Channels/101"
+
+    dialog = AddCameraDialog()
+    try:
+        dialog._tabs.setCurrentIndex(1)
+        dialog._url.setText(url)
+
+        # The preview shows the operator exactly what everything downstream will
+        # see, so the redaction is something they can verify rather than trust.
+        preview = dialog._url_preview.text()
+        assert secret not in preview
+        assert not contains_credential(preview, url)
+        assert "192.168.1.64" in preview
+
+        chosen = dialog._current_choices()[0]
+        # The raw URL is what gets connected with, and only that.
+        assert chosen.source == url
+        assert secret not in chosen.display
+        assert secret not in chosen.suggested_id
+    finally:
+        dialog.deleteLater()
+
+
+def test_a_session_holds_a_source_string_not_a_path(qt_app, window):
+    # A `Path` could only represent a file, and made a device and an RTSP URL
+    # look like files that did not exist.
+    session = window.add_camera("device:0", camera_id="webcam")
+
+    assert session.source == "device:0"
+    assert session.display_source == "device:0"
+    assert session.is_live is True
+
+
+def test_a_camera_session_never_exposes_its_credential(qt_app, window):
+    from sentinel.decode import contains_credential
+
+    secret = "hunter2-not-a-real-password"
+    url = f"rtsp://admin:{secret}@10.20.30.40:554/Streaming/Channels/101"
+
+    session = window.add_camera(url, camera_id="gate")
+
+    assert not contains_credential(session.display_source, url)
+    assert not contains_credential(session.camera_id, url)
+    assert session.is_live is True

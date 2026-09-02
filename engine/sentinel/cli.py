@@ -23,9 +23,10 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
-from . import logs, paths
+from . import devices, logs, paths
 from .core import CameraPose, LatLon
 from .decode import VideoSource
 from .detect import MotionDetector
@@ -168,12 +169,30 @@ def _run(args: argparse.Namespace) -> int:
     if not 0.1 <= args.detect_scale <= 1.0:
         print("error: --detect-scale must be between 0.1 and 1.0", file=sys.stderr)
         return 2
+    if args.duration is not None and args.duration <= 0:
+        print("error: --for must be greater than zero", file=sys.stderr)
+        return 2
+    if args.frames is not None and args.frames < 1:
+        print("error: --frames must be at least 1", file=sys.stderr)
+        return 2
 
     sources: list[VideoSource] = []
     for index, source in enumerate(args.source, start=1):
         # A local file is checked here rather than inside the decoder, so a typo
         # fails before any camera is opened rather than half way through a run.
-        if "://" not in source and not Path(source).exists():
+        # A device is neither a file nor a URL: `VideoSource` validates the
+        # index at construction, and whether it opens is a question only the
+        # operating system can answer.
+        if devices.is_device_source(source):
+            # A malformed index is a mistyped command line, not a failure: exit
+            # 2 with the sentence, the same as every other bad argument, rather
+            # than letting the exception become a traceback at an operator.
+            try:
+                devices.device_index(source)
+            except devices.DeviceError as error:
+                print(f"error: {error}", file=sys.stderr)
+                return 2
+        elif "://" not in source and not Path(source).exists():
             print(f"error: no such file: {source}", file=sys.stderr)
             return 2
         sources.append(
@@ -193,6 +212,19 @@ def _run(args: argparse.Namespace) -> int:
                 source.source_id, source.source_id, source.display_url, pose=pose
             )
 
+            if source.is_live and args.duration is None and args.frames is None:
+                # Said before it starts, not discovered afterwards. A live source
+                # has no end, and on Windows an external SIGINT does not reach a
+                # Python process at all — measured — so a scheduled job or a
+                # container that started one without a bound has no way to stop
+                # it short of killing the process.
+                print(
+                    f"\n{source.source_id}: live source, unbounded. It runs until "
+                    "the stream ends or you press Ctrl-C at this terminal. For a "
+                    "scheduled job or a container, use --for SECONDS or --frames N.",
+                    file=sys.stderr,
+                )
+
             with Pipeline(
                 source,
                 # One detector per camera, never shared. MOG2 carries a
@@ -207,8 +239,25 @@ def _run(args: argparse.Namespace) -> int:
                 node_id=args.node,
             ) as pipeline:
                 events = []
-                for result in pipeline.run():
+                deadline = (
+                    time.monotonic() + args.duration
+                    if args.duration is not None
+                    else None
+                )
+
+                for count, result in enumerate(pipeline.run(), start=1):
                     events.extend(result.events)
+
+                    # Checked after the frame, so `--frames 1` processes one
+                    # frame rather than none.
+                    if args.frames is not None and count >= args.frames:
+                        _log.info("%s: stopping after %d frames", source.source_id, count)
+                        break
+                    if deadline is not None and time.monotonic() >= deadline:
+                        _log.info(
+                            "%s: stopping after %.0fs", source.source_id, args.duration
+                        )
+                        break
 
                 store.save_events(events)
                 all_events.extend(events)
@@ -375,6 +424,47 @@ def _coverage(args: argparse.Namespace) -> int:
     return 0
 
 
+def _devices(args: argparse.Namespace) -> int:
+    """Cameras attached to this machine, as the operating system reports them.
+
+    Listing opens nothing. `--probe` opens each one briefly to confirm which
+    index is which and what resolution it gives — which is a deliberate act, and
+    on macOS is what triggers the operating system's permission prompt, so it is
+    a flag rather than the default.
+    """
+    found = devices.discover(probe_indices=args.probe)
+
+    if not found:
+        print("No cameras. The operating system reports none attached.")
+        if not args.probe:
+            print("\nSome cameras are not listed by the device registry but do "
+                  "open. Try: sentinel devices --probe")
+        return 0
+
+    print(f"{len(found)} camera(s), through {devices.preferred_backend()}:")
+    print()
+    for camera in found:
+        print(f"  {camera.label}")
+        print(f"      use    {camera.source}")
+        if camera.identifier:
+            print(f"      id     {camera.identifier}")
+        if camera.index_confirmed:
+            print(f"      opens  {camera.backend}")
+    print()
+
+    if any(not camera.index_confirmed for camera in found):
+        # Said plainly, because acting on a wrong index attributes an intrusion
+        # to the wrong side of a building.
+        print("An index marked assumed has not been opened, so it is this")
+        print("machine's enumeration order and not a fact. Confirm it with")
+        print("`sentinel devices --probe`, or in the console, which shows you a")
+        print("frame — two identical cameras cannot be told apart any other way.")
+        print()
+
+    print("Then: sentinel run device:0 --place lat,lon,height,heading,pitch")
+    return 0
+
+
 def _where(args: argparse.Namespace) -> int:
     """Answer "where does this thing keep my files", which is asked constantly."""
     print(f"data directory   {paths.data_directory()}")
@@ -407,6 +497,8 @@ def build_parser() -> argparse.ArgumentParser:
             "      --place 33.8942,35.5018,6,0,-22 \\\n"
             "      --zone 'Yard:33.8940,35.5016;33.8940,35.5020;"
             "33.8936,35.5020;33.8936,35.5016'\n"
+            "  sentinel devices --probe\n"
+            "  sentinel run device:0 --place 33.8938,35.5018,3,90,-15\n"
             "  sentinel incidents\n"
             "  sentinel export INC-abc123 --to ./evidence\n"
             "  sentinel where\n"
@@ -430,7 +522,11 @@ def build_parser() -> argparse.ArgumentParser:
     run = commands.add_parser(
         "run", help="analyse one or more sources and record what happened"
     )
-    run.add_argument("source", nargs="+", help="video files, or rtsp:// URLs")
+    run.add_argument(
+        "source", nargs="+",
+        help="video files, rtsp:// URLs, or device:N for a camera attached to "
+             "this machine (see `sentinel devices`)",
+    )
     run.add_argument(
         "--id", action="append", default=None,
         help="camera id, once per source (default: cam-01, cam-02, ...)",
@@ -446,6 +542,19 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--zone", action="append", type=_zone, default=None,
         help="name:lat,lon;lat,lon;lat,lon — a restricted polygon",
+    )
+    run.add_argument(
+        "--for", dest="duration", type=float, default=None, metavar="SECONDS",
+        help=(
+            "stop a live source after this long. A camera has no end, so "
+            "without this a headless run never returns — and Ctrl-C is not "
+            "available to a scheduled job or a container. Ignored by files, "
+            "which stop on their own."
+        ),
+    )
+    run.add_argument(
+        "--frames", type=int, default=None, metavar="N",
+        help="stop after N frames. Bounds a live run by work rather than by time.",
     )
     run.add_argument(
         "--detect-scale", type=float, default=0.75,
@@ -476,6 +585,15 @@ def build_parser() -> argparse.ArgumentParser:
     coverage.add_argument("--zone-radius", type=float, default=12.0, metavar="METRES")
     coverage.add_argument("--zone-name", default="Restricted Area A")
     coverage.set_defaults(handler=_coverage)
+
+    listing = commands.add_parser(
+        "devices", help="cameras attached to this machine, through the OS's own API"
+    )
+    listing.add_argument(
+        "--probe", action="store_true",
+        help="open each camera briefly to confirm its index and resolution",
+    )
+    listing.set_defaults(handler=_devices)
 
     where = commands.add_parser("where", help="print every path this build uses")
     where.set_defaults(handler=_where)

@@ -36,6 +36,7 @@ from PySide6.QtGui import QAction, QCloseEvent, QFont
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QDialog,
     QDoubleSpinBox,
     QFileDialog,
     QFrame,
@@ -59,7 +60,7 @@ from sentinel.core import (
     field_of_view,
     haversine_distance,
 )
-from sentinel.decode import DecodeError, VideoSource, redact_url
+from sentinel.decode import DecodeError, VideoSource
 from sentinel.detect import MotionDetector
 from sentinel.events import (
     AfterHoursRule,
@@ -70,6 +71,7 @@ from sentinel.events import (
 from sentinel.evidence import ExportError, export_incident
 from sentinel.incidents import Correlator
 from sentinel.store import Store, default_database_path
+from sentinel import devices, logs
 from sentinel.zones import Zone, ZoneKind
 
 from . import theme
@@ -77,7 +79,10 @@ from .incident_view import IncidentView
 from .map_view import MapView
 from .placement import PlacementDialog
 from .session import CameraSession
+from .add_camera import AddCameraDialog
 from .video_view import VideoView
+
+_log = logs.get(__name__)
 from .worker import AnalysisWorker
 
 #: How often the interface collects results. 30 Hz is smooth to the eye and
@@ -356,9 +361,17 @@ class ConsoleWindow(QMainWindow):
 
     # ----------------------------------------------------------------- cameras
 
-    def add_camera(self, path: Path, camera_id: str | None = None) -> CameraSession:
-        """Register a source as a camera. Does not start it."""
-        identifier = camera_id or path.stem or f"cam-{len(self._sessions) + 1:02d}"
+    def add_camera(self, source: str | Path, camera_id: str | None = None) -> CameraSession:
+        """Register a source as a camera. Does not start it, and opens nothing.
+
+        ``source`` is a file path, an RTSP URL, or ``device:N`` for a camera
+        attached to this machine. Nothing here distinguishes between them —
+        that is `VideoSource`'s job — so adding a webcam is the same operation
+        as adding a clip.
+        """
+        text = str(source)
+        default = Path(text).stem if "://" not in text and not text.startswith("device:") else text
+        identifier = camera_id or default or f"cam-{len(self._sessions) + 1:02d}"
         if identifier in self._sessions:
             identifier = f"{identifier}-{len(self._sessions) + 1}"
 
@@ -366,7 +379,7 @@ class ConsoleWindow(QMainWindow):
         view.set_placeholder(f"{identifier} — not started")
         view.set_show_detections(self.show_detections.isChecked())
 
-        session = CameraSession(camera_id=identifier, source_path=path, view=view)
+        session = CameraSession(camera_id=identifier, source=text, view=view)
         self._sessions[identifier] = session
 
         self.camera_picker.addItem(identifier, identifier)
@@ -401,16 +414,33 @@ class ConsoleWindow(QMainWindow):
             session.view.setVisible(True)
 
     def _choose_source(self) -> None:
-        paths, _ = QFileDialog.getOpenFileNames(
-            self,
-            "Add one or more cameras",
-            str(Path.home()),
-            "Video (*.mp4 *.mkv *.avi *.mov *.m4v);;All files (*)",
-        )
-        for path in paths:
-            self.add_camera(Path(path))
+        """Add a camera: one attached to this machine, one on the network, or a file.
 
-        if paths:
+        The dialog enumerates local cameras through the operating system's own
+        device interface and opens none of them to do it — so this does not
+        light a webcam, and on macOS does not raise a permission prompt for a
+        camera nobody asked to use.
+        """
+        dialog = AddCameraDialog(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        added = []
+        for choice in dialog.chosen:
+            session = self.add_camera(choice.source, camera_id=choice.suggested_id)
+            added.append(session)
+            # The display form, never the raw one: this line goes to a log file.
+            _log.info("added camera %s from %s", session.camera_id, choice.display)
+
+        if not added:
+            return
+
+        if any(devices.is_device_source(session.source) for session in added):
+            self._set_status(
+                f"{len(self._sessions)} camera(s). Press Start and check the "
+                "picture is the camera you meant, then place it."
+            )
+        else:
             self._set_status(
                 f"{len(self._sessions)} camera(s). Place them, then press Start."
             )
@@ -453,7 +483,7 @@ class ConsoleWindow(QMainWindow):
             # the value was "already redacted" and it was not — it was the raw
             # source, which for an RTSP camera is the password, written into a
             # database column whose whole point is never to hold one.
-            source=redact_url(str(session.source_path)),
+            source=session.display_source,
             pose=session.pose,
         )
         self.store.audit(
@@ -630,7 +660,7 @@ class ConsoleWindow(QMainWindow):
             session.events.clear()
 
             try:
-                source = VideoSource(session.source_path, source_id=session.camera_id)
+                source = VideoSource(session.source, source_id=session.camera_id)
                 source.open()
             except DecodeError as error:
                 # A modal is right here: the operator asked for this, just now,

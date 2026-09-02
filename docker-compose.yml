@@ -50,6 +50,38 @@ services:
     volumes:
       - data:/data
 
+  # ------------------------------------------- a camera attached to the host
+  #
+  # A container sees no hardware it was not explicitly given. On a Linux host a
+  # V4L2 node can be passed through; `device:0` then means /dev/video0 inside
+  # the container exactly as it does outside.
+  #
+  # Docker Desktop on Windows and macOS runs a Linux VM that has no access to
+  # the host's USB bus, so this does not work there — run the packaged
+  # executable natively instead. Said plainly because the failure is a camera
+  # that simply will not open, which looks like a bug rather than a boundary.
+  #
+  # Still `network_mode: none`: a camera on the USB bus is not a network device.
+  #
+  # webcam:
+  #   build:
+  #     context: .
+  #     target: runtime
+  #   image: sentinel-vision:local
+  #   network_mode: none
+  #   devices:
+  #     - "/dev/video0:/dev/video0"
+  #   volumes:
+  #     - data:/data
+  #     - ./evidence:/evidence
+  #   command:
+  #     - "run"
+  #     - "device:0"
+  #     - "--place"
+  #     - "33.8938,35.5018,3,90,-15"
+  #     - "--for"
+  #     - "300"
+
   # ------------------------------------------------------------ inspection
   incidents:
     build:

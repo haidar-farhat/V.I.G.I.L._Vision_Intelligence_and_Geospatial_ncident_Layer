@@ -343,3 +343,185 @@ def test_two_cameras_do_not_share_a_background_model(
 
     assert len(built) == 2
     assert built[0] is not built[1]
+
+
+# ------------------------------------------------------------- local cameras
+
+
+def test_devices_lists_what_the_operating_system_reports(monkeypatch, capsys):
+    from sentinel import devices
+
+    monkeypatch.setattr(
+        devices, "list_cameras",
+        lambda: [
+            devices.LocalCamera(0, "Integrated Camera", "USB-ONE", "Media Foundation"),
+            devices.LocalCamera(1, "Logitech C920", "USB-TWO", "Media Foundation"),
+        ],
+    )
+
+    assert cli.main(["--quiet", "devices"]) == 0
+
+    printed = capsys.readouterr().out
+    assert "Integrated Camera" in printed
+    assert "device:0" in printed and "device:1" in printed
+    assert "USB-TWO" in printed
+    # An unconfirmed index must say so, and say how to resolve it.
+    assert "assumed" in printed
+    assert "--probe" in printed
+
+
+def test_devices_opens_nothing_without_probe(monkeypatch):
+    import cv2
+
+    from sentinel import devices
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("listing devices opened a camera")
+
+    monkeypatch.setattr(cv2, "VideoCapture", forbidden)
+    monkeypatch.setattr(devices, "list_cameras", lambda: [])
+
+    assert cli.main(["--quiet", "devices"]) == 0
+
+
+def test_devices_on_a_machine_with_none_suggests_probing(monkeypatch, capsys):
+    from sentinel import devices
+
+    monkeypatch.setattr(devices, "list_cameras", lambda: [])
+
+    assert cli.main(["--quiet", "devices"]) == 0
+    assert "--probe" in capsys.readouterr().out
+
+
+def test_a_device_source_is_not_mistaken_for_a_missing_file(monkeypatch, database: Path):
+    # `device:0` has no "://" and is not a path that exists, so the file check
+    # rejected it outright before this was handled.
+    opened: list[str] = []
+
+    class FakePipeline:
+        def __init__(self, source, detector, **kwargs):
+            opened.append(source.source_id)
+            self.stats = __import__(
+                "sentinel.pipeline", fromlist=["PipelineStats"]
+            ).PipelineStats()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def run(self):
+            return iter(())
+
+    monkeypatch.setattr(cli, "Pipeline", FakePipeline)
+
+    assert cli.main(["--database", str(database), "--quiet", "run", "device:0"]) == 0
+    assert opened == ["cam-01"]
+
+
+@pytest.mark.parametrize("source", ["device:front", "device:", "device:-1"])
+def test_a_malformed_device_source_is_refused_before_anything_opens(
+    source: str, database: Path, capsys
+):
+    # A mistyped index is a command-line mistake, so it exits 2 with a sentence.
+    # It must never quietly become index 0: that would point a camera at
+    # somewhere nobody chose, and every position it reported would be wrong.
+    code = cli.main(["--database", str(database), "--quiet", "run", source])
+
+    assert code == 2
+    assert "device:N" in capsys.readouterr().err
+
+
+# --------------------------------------------------------- bounding a live run
+
+
+def test_a_live_run_can_be_bounded_by_frames(reference_video: Path, database: Path):
+    # A camera has no end. Without a bound a headless run never returns — and
+    # Ctrl-C is not available to a scheduled job or a container, which on
+    # Windows cannot even be sent an interrupt from outside.
+    code = cli.main([
+        "--database", str(database), "--quiet",
+        "run", str(reference_video), "--frames", "12",
+    ])
+
+    assert code == 0
+
+
+def test_frames_one_processes_one_frame_not_none(reference_video: Path, database: Path):
+    # The bound is checked *after* the frame, so `--frames 1` does one frame.
+    seen: list[int] = []
+    from sentinel.pipeline import Pipeline
+
+    original = Pipeline.run
+
+    def counting(self):
+        for result in original(self):
+            seen.append(result.index)
+            yield result
+
+    import sentinel.pipeline as pipeline_module
+
+    pipeline_module.Pipeline.run = counting
+    try:
+        assert cli.main([
+            "--database", str(database), "--quiet",
+            "run", str(reference_video), "--frames", "1",
+        ]) == 0
+    finally:
+        pipeline_module.Pipeline.run = original
+
+    assert len(seen) == 1
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["--for", "0"],
+        ["--for", "-5"],
+        ["--frames", "0"],
+        ["--frames", "-1"],
+    ],
+)
+def test_an_impossible_bound_is_refused(arguments, reference_video: Path, database: Path):
+    code = cli.main([
+        "--database", str(database), "--quiet", "run", str(reference_video), *arguments,
+    ])
+
+    assert code == 2
+
+
+def test_an_unbounded_live_source_says_so_before_it_starts(
+    reference_video: Path, database: Path, monkeypatch, capsys
+):
+    # Said before it starts, not discovered afterwards by an operator whose
+    # scheduled job never finished.
+    monkeypatch.setattr(cli.VideoSource, "is_live", property(lambda self: True))
+
+    class Stopped(RuntimeError):
+        pass
+
+    class FakePipeline:
+        def __init__(self, *args, **kwargs):
+            from sentinel.pipeline import PipelineStats
+
+            self.stats = PipelineStats()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def run(self):
+            return iter(())
+
+    monkeypatch.setattr(cli, "Pipeline", FakePipeline)
+
+    cli.main([
+        "--database", str(database), "--quiet", "run", str(reference_video),
+    ])
+
+    printed = capsys.readouterr().err
+    assert "unbounded" in printed
+    assert "--for" in printed and "--frames" in printed

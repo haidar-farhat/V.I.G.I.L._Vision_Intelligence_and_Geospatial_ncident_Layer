@@ -13,22 +13,27 @@ this one operates in. Every capability carries one of five states:
 | `PRODUCTION-READY` | Tested, hardened, documented, and exercised against real hardware. |
 
 **Nothing in this repository is `PRODUCTION-READY`.** No part of this system has
-been run against a physical IP camera, a GPU, a real detection model, or a
-multi-machine LAN. Everything marked `TESTED` is tested against generated
-fixtures, which is a real bar but not the same bar.
+been run against a physical **IP** camera, a GPU, a real detection model, or a
+multi-machine LAN. A camera attached to the machine — USB or built-in, through
+the operating system's own capture API — has been run end to end, which is the
+first piece of real hardware this system has ever touched. Everything else
+marked `TESTED` is tested against generated fixtures, which is a real bar but
+not the same bar.
 
 **The codebase was rewritten in Python and Rust.** The previous TypeScript
 implementation was removed in `582d0a8`; its architecture documents were kept
 because the thinking in them carried over, and are being brought up to date.
 Anything below that is not yet re-established after the rewrite says so.
 
-Current suite: **492 tests** — 57 Rust, 395 engine, 40 console — plus two static
+Current suite: **547 tests** — 57 Rust, 442 engine, 48 console — plus two static
 checks that run before any of them: an offline audit that fails the build if the
 shipped source names any destination off the site, and a lint that fails it if
 any of the 36 diagrams in this documentation no longer parses. `cargo fmt` and
 `clippy -D warnings` clean. Run everything with `python tasks.py check`, or the
 Python half of it inside a container with no network at all:
-`docker compose run --rm verify`.
+`docker compose run --rm verify`. One of them opens a real camera and is skipped unless
+`SENTINEL_TEST_CAMERA=1` is set, because a suite that switches on the
+developer's webcam is a suite people stop running.
 
 **How to use it** is [docs/USAGE.md](docs/USAGE.md). **What to build next** is
 [ROADMAP.md](ROADMAP.md).
@@ -105,6 +110,9 @@ Geometry, projection, zones and tracking, behind a C ABI.
 | ctypes bindings | `TESTED` | ABI version and every struct size checked at load. |
 | Video decode (file) | `TESTED` | Real H.264 through OpenCV/FFmpeg. Timestamps come from container PTS, never from a nominal frame rate. |
 | Video decode (RTSP) | `SKELETON` | The code path exists and is shaped correctly. **No camera has ever been contacted.** |
+| Local camera capture | `TESTED` | `device:N`, through each platform's own capture API: Media Foundation (falling back to DirectShow) on Windows, V4L2 on Linux, AVFoundation on macOS. Exercised against a real webcam on Windows — 224 frames in 12 s through DirectShow, after Media Foundation refused the device. |
+| Local camera enumeration | `TESTED` | The PnP registry, the V4L2 tree, the system profiler. Opens nothing to list; `--probe` is a separate, deliberate act. An index that has not been opened is reported as *assumed*, because there is no supported mapping from an OS device to a capture index and two identical webcams are indistinguishable by name. |
+| Bounded live runs | `TESTED` | `--for SECONDS` and `--frames N`. A live source has no end, and on Windows an external interrupt does not reach a Python process — measured — so an unbounded headless run cannot be stopped without killing it. |
 | Reachability pre-check | `TESTED` | A socket probe bounds the connect. OpenCV's own RTSP timeout is a hard-coded 30 s that its documented FFmpeg options do not change — measured, not assumed. |
 | Live-stream frame dropping | `TESTED` | Newest-wins with a count of what was dropped. Refuses to wrap a file, because that would make replay non-deterministic. |
 | Credential redaction | `TESTED` | A password is unreachable through `repr`, `str`, display URL, source id, or any error message — including its length. |
@@ -511,7 +519,7 @@ exists for them in `docs/`.
 flowchart LR
     G1["rendered footage only"] --> C1["no accuracy claim<br/>about the real world"]
     G2["no trained model"] --> C2["detection quality<br/>entirely unmeasured"]
-    G3["no physical camera"] --> C3["RTSP is a code path,<br/>not a capability"]
+    G3["no physical IP camera"] --> C3["RTSP is a code path,<br/>not a capability"]
     G4["background subtraction<br/>loses a stationary object"] --> C4["loitering — the case that<br/>matters most — is weakest"]
     G5["appearance-free tracking"] --> C5["5 objects reported<br/>for 3 people"]
     G6["no authentication"] --> C6["nobody to attribute<br/>an action to"]
@@ -551,9 +559,22 @@ flowchart LR
    downstream. It establishes **nothing** about detection quality, classes, or
    real-world behaviour. Trained weights remain untried.
 
-3. **No physical camera has ever been contacted.** RTSP support is a code path,
-   not a verified capability. Real cameras deviate from the specifications in
-   ways no amount of local testing anticipates.
+3. **No physical *network* camera has ever been contacted.** RTSP support is a
+   code path, not a verified capability. Real IP cameras deviate from the
+   specifications in ways no amount of local testing anticipates.
+
+   A camera *attached to the machine* has been, and the first contact with real
+   hardware immediately produced two things local reasoning had not:
+
+   - **Media Foundation refused the integrated camera outright** and DirectShow
+     opened it. The Windows fallback is not defensive coding; it is the only
+     reason there is a working camera on the development machine at all.
+   - **A Windows Hello infrared sensor lists as a camera and opens on nothing.**
+     "The operating system says it is a camera" and "it produces images" are
+     different claims, and only probing distinguishes them.
+
+   Both are exactly the class of surprise expected from an IP camera, which is
+   the argument for getting one.
 
 4. **Background subtraction cannot see a stationary object.** This is not a bug
    to be tuned away; it is what background subtraction is. On the reference

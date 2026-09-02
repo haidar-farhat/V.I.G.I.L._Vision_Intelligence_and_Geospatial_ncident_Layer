@@ -164,7 +164,7 @@ The dividing line is **rate**, not importance.
 
 ### Scale
 
-**492 tests** — 57 Rust, 395 engine, 40 console — plus two static checks that
+**547 tests** — 57 Rust, 442 engine, 48 console — plus two static checks that
 run before any of them: an offline audit that fails the build if the shipped
 source names any destination off the site, and a lint that fails it if any of the
 36 diagrams in this documentation no longer parses. `cargo fmt` and
@@ -185,7 +185,8 @@ background model's per-pixel state, measured and written up in
 
 ### Not yet true, and stated as such
 
-No physical camera has been contacted. No *trained* detection model has been run
+No physical **IP** camera has been contacted — a camera attached to the machine
+has, and works end to end. No *trained* detection model has been run
 — the ONNX path executes against a model built locally for the purpose, which
 tests the machinery around a model and nothing about detection quality. All
 footage is rendered, so none of this is an accuracy claim about the real world.
@@ -214,10 +215,26 @@ python -m pip install -e "engine[dev]" PySide6
 
 python tasks.py build      # build the Rust engine core
 python tasks.py audit      # no route off the site; every diagram parses
-python tasks.py test       # 492 tests, no network
+python tasks.py test       # 547 tests, no network
 python tasks.py lint       # rustfmt + clippy
 python tasks.py check      # all of the above — what CI runs
 ```
+
+### Three kinds of camera
+
+```bash
+sentinel devices --probe                     # cameras attached to this machine
+sentinel run device:0 --place …  --for 60    # one of them
+sentinel run rtsp://admin:pw@192.168.1.64/s  # one on the network
+sentinel run gate.mp4                        # footage
+```
+
+A camera attached to the machine is found through the operating system's own
+device interface — the PnP registry on Windows, the V4L2 tree on Linux, the
+system profiler on macOS — and opened through that platform's native capture
+API. No third-party dependency is added for it. Listing opens nothing; `--probe`
+is a separate, deliberate act, and on macOS is what raises the permission
+prompt.
 
 ### Three ways to run it
 

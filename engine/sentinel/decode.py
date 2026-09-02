@@ -40,6 +40,7 @@ from urllib.parse import urlsplit
 import cv2
 import numpy as np
 
+from . import devices
 from .redact import (
     CREDENTIAL_QUERY_KEYS,
     REDACTED,
@@ -152,6 +153,12 @@ class SourceInfo:
     #: Always safe to log or display.
     display_url: str
     is_live: bool
+    #: Which capture interface actually opened this source — "Media Foundation",
+    #: "DirectShow", "Video4Linux2", "AVFoundation" for a local camera, "FFmpeg"
+    #: for anything else. Recorded rather than assumed: on Windows the modern
+    #: interface refuses some devices and the fallback opens them, and an
+    #: operator debugging a camera needs to know which one they are looking at.
+    backend: str = "FFmpeg"
 
 
 class VideoSource:
@@ -162,7 +169,8 @@ class VideoSource:
     closed or reconnection is abandoned.
     """
 
-    __slots__ = ("_url", "_display", "_id", "_capture", "_info", "_index", "_is_live", "_opened")
+    __slots__ = ("_url", "_display", "_id", "_capture", "_info", "_index", "_is_live",
+                 "_opened", "_is_device", "_backend")
 
     def __init__(self, url: str | Path, *, source_id: str | None = None, live: bool | None = None):
         """
@@ -174,7 +182,20 @@ class VideoSource:
         self._url = raw
         self._display = redact_url(raw)
         self._id = source_id or self._display
-        self._is_live = _looks_live(raw) if live is None else live
+        self._is_device = devices.is_device_source(raw)
+        # A device is live whatever the caller says. `live=False` on a camera
+        # would make the pipeline treat an endless stream as a file and queue
+        # every frame it could not keep up with, until the process died.
+        self._is_live = True if self._is_device else (
+            _looks_live(raw) if live is None else live
+        )
+        self._backend = devices.preferred_backend() if self._is_device else "FFmpeg"
+
+        if self._is_device:
+            # Validated here rather than at open. `device:` with nothing after
+            # it, or `device:front`, is a typo — and a typo that quietly opened
+            # index 0 would point a camera at somewhere nobody meant.
+            devices.device_index(raw)
         self._capture: cv2.VideoCapture | None = None
         self._info: SourceInfo | None = None
         self._index = 0
@@ -218,7 +239,11 @@ class VideoSource:
         if self._opened:
             return self.info
 
-        if not self._is_live:
+        if self._is_device:
+            # No path to check and no host to reach. The device either opens or
+            # it does not, and `_open_capture` says which interface it took.
+            pass
+        elif not self._is_live:
             path = Path(self._url)
             # Reported through the redacted display string, never the raw path.
             # `live` is a caller-supplied override and `_looks_live` only knows
@@ -230,7 +255,7 @@ class VideoSource:
             if not path.is_file():
                 raise DecodeError(f"Not a file: {self._display}")
 
-        if self._is_live:
+        if self._is_live and not self._is_device:
             self._require_reachable()
 
         capture = self._open_capture()
@@ -262,6 +287,7 @@ class VideoSource:
             frame_count=int(count) if not self._is_live and count and count > 0 else None,
             display_url=self._display,
             is_live=self._is_live,
+            backend=self._backend,
         )
         self._opened = True
         return self._info
@@ -368,6 +394,9 @@ class VideoSource:
         a preference passed to the demuxer rather than a claim about behaviour,
         and it has not been verified against physical hardware.
         """
+        if self._is_device:
+            return self._open_device()
+
         if not self._url.lower().startswith(("rtsp://", "rtsps://")):
             return cv2.VideoCapture(self._url)
 
@@ -391,6 +420,37 @@ class VideoSource:
                     os.environ.pop("OPENCV_FFMPEG_CAPTURE_OPTIONS", None)
                 else:
                     os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = previous
+
+    def _open_device(self) -> cv2.VideoCapture:
+        """Open a local camera through this platform's own capture interface.
+
+        Named explicitly rather than left to OpenCV's `CAP_ANY`, because "any"
+        picks whatever it finds first and gives no way to record what that was.
+        An operator whose camera works on one machine and not another needs to
+        know that one took Media Foundation and the other DirectShow.
+
+        Windows is the reason this is a loop. Media Foundation is the modern
+        interface and the right default; DirectShow still opens devices that
+        Media Foundation refuses outright — measured on this build, where the
+        integrated camera opens on DirectShow and not on Media Foundation. The
+        fallback is a fallback, and which one won is kept.
+        """
+        index = devices.device_index(self._url)
+
+        for constant, backend in devices.backend_constants():
+            capture = cv2.VideoCapture(index, constant)
+            if capture.isOpened():
+                self._backend = backend
+                _log.info(
+                    "%s opened through %s", self._display, backend
+                )
+                return capture
+            capture.release()
+            _log.debug("%s did not open through %s", self._display, backend)
+
+        # An unopened capture, so the caller's own check produces the single
+        # error message rather than two competing ones.
+        return cv2.VideoCapture()
 
     def close(self) -> None:
         if self._capture is not None:
@@ -450,6 +510,12 @@ class VideoSource:
 
 def _looks_live(url: str) -> bool:
     lowered = url.lower()
+    # A local camera is a firehose like any other: it has no end, it cannot be
+    # rewound, and an analytic slower than the sensor must drop frames rather
+    # than build a backlog. Treating one as a file would make `LiveStream`
+    # refuse it and the pipeline queue the past.
+    if devices.is_device_source(lowered):
+        return True
     return lowered.startswith(("rtsp://", "rtsps://", "http://", "https://", "udp://", "tcp://"))
 
 
