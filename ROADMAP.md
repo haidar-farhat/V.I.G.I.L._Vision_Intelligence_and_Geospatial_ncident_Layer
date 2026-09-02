@@ -9,6 +9,12 @@ It is an opinion, not a specification. Where it disagrees with
 [ARCHITECTURE.md](ARCHITECTURE.md) the architecture document is the design and
 this is the sequencing.
 
+[FEATURES.md](FEATURES.md) is the product definition — every capability the
+system is meant to have, with its state. Nothing below is displaced by it, and
+five items here turn out to gate the large majority of everything still marked
+`PLAN` there: **recording** (1.1), **appearance features** (1.3), **the headless
+daemon** (1.2), **accounts** (3.1) and **offline GIS** (4.3).
+
 ---
 
 ## 1. Where the line actually falls
