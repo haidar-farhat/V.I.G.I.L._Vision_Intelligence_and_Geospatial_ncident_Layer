@@ -367,6 +367,7 @@ list is part of the attack surface, and everything in it is arithmetic.
 
 | Document | Covers |
 |---|---|
+| [FEATURES.md](FEATURES.md) | **The product definition.** Every capability Sentinel Vision is meant to have — 356 of them — each carrying the state it is actually in |
 | [docs/USAGE.md](docs/USAGE.md) | **How to use it.** Install, first run, the console screen by screen, every command-line option, Docker, cameras, logs, and a troubleshooting table |
 | [ROADMAP.md](ROADMAP.md) | What is left between today and a system worth putting in front of a real site, in the order it should be built, with the reasoning |
 | [docs/OVERVIEW.md](docs/OVERVIEW.md) | **Start here.** Diagrams of every layer, the spine, the boundary, threading, zones, projection, correlation, risk, persistence, export and test topology — with the measurements behind each |

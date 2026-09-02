@@ -233,3 +233,72 @@ def test_the_bundle_is_not_compressed_with_upx():
 
     assert "upx=True" not in spec
     assert spec.count("upx=False") >= 2
+
+
+# ------------------------------------------- the scratch directory is not the product
+
+
+def load_tasks():
+    """Load the repository's task runner by path — it is not an installed module."""
+    spec = importlib.util.spec_from_file_location("sentinel_tasks", ROOT / "tasks.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_the_build_directory_keeps_no_runnable_looking_executable(tmp_path: Path):
+    # An hour was lost to this. PyInstaller writes each executable into its
+    # *work* directory first and then copies it into `dist` alongside the
+    # libraries. What is left behind has the right name, the right icon and the
+    # right size, it is the first thing found by anybody looking for a file
+    # called `sentinel.exe`, and running it reports a missing Python DLL — which
+    # reads like a broken build rather than the wrong file.
+    tasks = load_tasks()
+    work = tmp_path / "build" / "sentinel"
+    work.mkdir(parents=True)
+
+    for name in tasks.executable_names():
+        (work / name).write_bytes(b"bootloader")
+    # The incremental-rebuild cache, which must survive.
+    for keep in ("Analysis-00.toc", "PYZ-00.pyz", "sentinel.pkg", "base_library.zip"):
+        (work / keep).write_bytes(b"cache")
+
+    removed = tasks.strip_work_executables(tmp_path / "build")
+
+    assert len(removed) == len(tasks.executable_names())
+    for name in tasks.executable_names():
+        assert not (work / name).exists(), f"{name} was left behind"
+    for keep in ("Analysis-00.toc", "PYZ-00.pyz", "sentinel.pkg", "base_library.zip"):
+        assert (work / keep).is_file(), f"{keep} is rebuild cache and must survive"
+
+
+def test_stripping_a_directory_that_is_not_there_is_not_an_error(tmp_path: Path):
+    tasks = load_tasks()
+
+    assert tasks.strip_work_executables(tmp_path / "never-built") == []
+
+
+def test_the_executable_names_carry_the_platform_suffix():
+    tasks = load_tasks()
+    names = tasks.executable_names()
+
+    assert len(names) == 3
+    if sys.platform == "win32":
+        assert all(name.endswith(".exe") for name in names)
+    else:
+        assert not any(name.endswith(".exe") for name in names)
+
+
+def test_the_shipped_folder_says_how_to_run_it():
+    # An operator receives a folder, not this repository. The one failure it has
+    # to pre-empt is the one that actually happened: an executable moved away
+    # from `_internal`, which reports a missing Python DLL and looks like a
+    # broken build.
+    tasks = load_tasks()
+    notes = tasks.RUN_NOTES.format(suffix=".exe")
+
+    assert "Failed to load Python DLL" in notes
+    assert "_internal" in notes
+    assert "SentinelVision-dev.exe" in notes
+    # And where the data is, because it is deliberately not in that folder.
+    assert "where" in notes

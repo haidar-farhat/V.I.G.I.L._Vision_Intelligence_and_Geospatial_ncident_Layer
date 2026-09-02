@@ -180,6 +180,72 @@ def cli() -> None:
     run([sys.executable, "-m", "sentinel", *sys.argv[2:]], ROOT, python_path())
 
 
+#: What the bundle contains. Named once, because the summary, the cleanup and
+#: the notes written into the folder must not be able to disagree.
+EXECUTABLES = ("SentinelVision", "SentinelVision-dev", "sentinel")
+
+RUN_NOTES = """Sentinel Vision
+===============
+
+Run one of these, from THIS folder:
+
+  SentinelVision{suffix}       the operator console
+  SentinelVision-dev{suffix}   the same console with a terminal and verbose
+                          logging. Run this one if the console will not start:
+                          a packaged Qt application has nowhere to print, so
+                          without a terminal an error at start-up is invisible.
+  sentinel{suffix}             the headless analyser. Try `sentinel{suffix} where`.
+
+Keep the whole folder together. The executables need `_internal` beside them,
+which is what every Qt application ships. Moving an executable on its own gives:
+
+    Failed to load Python DLL '...\\_internal\\python3xx.dll'
+
+Nothing here is installed, written to the registry, or downloaded. Copy the
+folder, run it, delete the folder.
+
+Your data — the database, the log and any exported evidence — is NOT in here.
+`sentinel{suffix} where` prints exactly where it is.
+
+Documentation: docs/USAGE.md in the source repository.
+"""
+
+
+def executable_names() -> tuple[str, ...]:
+    suffix = ".exe" if sys.platform == "win32" else ""
+    return tuple(f"{name}{suffix}" for name in EXECUTABLES)
+
+
+def strip_work_executables(work: Path) -> list[Path]:
+    """Delete the runnable-looking stubs PyInstaller leaves in its scratch dir.
+
+    This exists because of a real hour lost to it. PyInstaller writes each
+    executable into the *work* directory first and then copies it into `dist`
+    alongside the libraries. What is left behind in `build/` is a bootloader
+    with no `_internal` next to it: it has the right name, the right icon and
+    the right size, it is the first thing you find if you go looking for a file
+    called `sentinel.exe`, and running it produces
+
+        Failed to load Python DLL '...\\build\\sentinel\\_internal\\python314.dll'
+
+    which reads like a broken build rather than the wrong file.
+
+    Only the executables go. The `.toc`, `.pkg` and `.pyz` files beside them are
+    the incremental-rebuild cache and deleting those would make every rebuild a
+    full one.
+    """
+    removed: list[Path] = []
+    if not work.is_dir():
+        return removed
+
+    for name in executable_names():
+        for stub in work.rglob(name):
+            if stub.is_file():
+                stub.unlink()
+                removed.append(stub)
+    return removed
+
+
 def package() -> None:
     """Build the standalone executables.
 
@@ -204,28 +270,50 @@ def package() -> None:
         ) from None
 
     spec = ROOT / "packaging" / "sentinel.spec"
+    work = ROOT / "build"
     run(
         [
             sys.executable, "-m", "PyInstaller", str(spec),
             "--noconfirm",
             "--distpath", str(ROOT / "dist"),
-            "--workpath", str(ROOT / "build"),
+            "--workpath", str(work),
         ],
         ROOT,
         python_path(),
     )
 
     produced = ROOT / "dist" / "SentinelVision"
+    missing = [name for name in executable_names() if not (produced / name).is_file()]
+    if missing:
+        raise SystemExit(
+            f"The build finished but {', '.join(missing)} is not in {produced}. "
+            "Nothing here is shippable; look at the PyInstaller output above."
+        )
+
+    # Only after the dist copies are confirmed present: the stubs are the
+    # fallback if something went wrong, right up until there is a real bundle.
+    stripped = strip_work_executables(work)
+
+    (produced / "HOW TO RUN.txt").write_text(
+        RUN_NOTES.format(suffix=".exe" if sys.platform == "win32" else ""),
+        encoding="utf-8",
+    )
+
     print()
-    print(f"  {produced}")
-    for name in ("SentinelVision", "SentinelVision-dev", "sentinel"):
-        suffix = ".exe" if sys.platform == "win32" else ""
-        executable = produced / f"{name}{suffix}"
-        state = "ok" if executable.is_file() else "MISSING"
-        print(f"    {name}{suffix:<4}  {state}")
+    print("  Run it from here, and nowhere else:")
     print()
-    print("  Ship the whole folder. The executables need the libraries beside")
+    print(f"      {produced}")
+    print()
+    for name in executable_names():
+        print(f"        {name}")
+    print()
+    print("  Ship the whole folder. The executables need `_internal` beside")
     print("  them, which is what every Qt application ships.")
+    if stripped:
+        print()
+        print(f"  ({len(stripped)} unrunnable stub(s) removed from {work.name}/ —")
+        print("   PyInstaller leaves copies there with no libraries next to them,")
+        print("   and running one reports a missing Python DLL.)")
 
 
 TASKS = {

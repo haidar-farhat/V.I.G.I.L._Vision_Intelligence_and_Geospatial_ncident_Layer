@@ -35,8 +35,9 @@ Python half of it inside a container with no network at all:
 `SENTINEL_TEST_CAMERA=1` is set, because a suite that switches on the
 developer's webcam is a suite people stop running.
 
-**How to use it** is [docs/USAGE.md](docs/USAGE.md). **What to build next** is
-[ROADMAP.md](ROADMAP.md).
+**What the product is** is [FEATURES.md](FEATURES.md) — 356 capabilities, each
+with its state. **How to use what exists** is [docs/USAGE.md](docs/USAGE.md).
+**What to build next** is [ROADMAP.md](ROADMAP.md).
 
 A visual walk-through of everything below — the layers, the boundary, threading,
 projection, correlation, persistence and export — is in
