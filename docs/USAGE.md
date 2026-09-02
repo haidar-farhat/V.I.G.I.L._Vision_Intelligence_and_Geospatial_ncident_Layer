@@ -66,11 +66,25 @@ dist/SentinelVision/
     ... about 300 MB of libraries the three share
 ```
 
-**Ship the whole folder.** The executables need the libraries beside them, which
-is what every Qt application ships. It is deliberately not a single self-
-extracting `.exe`: that would unpack 300 MB to a temporary directory on every
-launch, leave debris when it is killed, and on a locked-down machine can be
-blocked outright.
+**Run it from `dist/SentinelVision/`, and nowhere else.** PyInstaller also
+leaves a `build/` directory — that is its scratch space, and the executables in
+it are bootloaders with no libraries beside them. `python tasks.py package`
+deletes them once the real bundle exists, because running one produces
+
+```
+Failed to load Python DLL '...\build\sentinel\_internal\python314.dll'.
+LoadLibrary: The specified module could not be found.
+```
+
+which reads like a broken build rather than the wrong file. If you ever see that
+message, an executable has been separated from the `_internal` folder next to it.
+
+**Ship the whole folder.** The executables need `_internal` beside them, which is
+what every Qt application ships. It is deliberately not a single self-extracting
+`.exe`: that would unpack 300 MB to a temporary directory on every launch, leave
+debris when it is killed, and on a locked-down machine can be blocked outright.
+The folder carries a `HOW TO RUN.txt` saying all of this, for whoever receives it
+without this document.
 
 Nothing is installed, nothing is written to the registry, and nothing is
 downloaded — at build time or at run time. Copy the folder, run it, delete the
@@ -616,6 +630,7 @@ modules or open a socket.
 | **`reports ABI version N; this build expects M`** | A stale core beside a newer engine | `cargo build --release` in `core/`. The refusal is deliberate: calling a function whose signature moved produces plausible, wrong geometry |
 | **`does not export sentinel_abi_version`** | That library is not the engine core, or is far older | Same fix |
 | **`Refused to contact "…"`** | The egress guard: that address is not on a private network | Intended. Use a LAN address. There is no override, and there will not be one |
+| **`Failed to load Python DLL '…\_internal\python3xx.dll'`** | An executable was run away from the `_internal` folder beside it — most often one out of `build/`, which is PyInstaller's scratch directory and not the product | Run from `dist/SentinelVision/`. `python tasks.py package` now deletes those stubs |
 | **The console exits immediately, packaged** | An exception before the window appeared | Run `SentinelVision-dev.exe` — that is what it is for |
 | **A camera is listed but will not open** | In use by another application, blocked by a privacy setting, or not a capture device at all — a Windows Hello IR sensor lists as a camera and opens on nothing | `sentinel devices --probe` shows which ones actually open |
 | **`sentinel devices` finds nothing** | Some cameras do not appear in the device registry but do open | `sentinel devices --probe` scans indices directly |
