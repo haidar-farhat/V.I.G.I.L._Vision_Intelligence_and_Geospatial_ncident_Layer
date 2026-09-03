@@ -435,3 +435,39 @@ def test_no_rule_raises_a_reserved_kind():
             f"{rule.__name__} now raises {rule.event_type}; move it out of "
             "RESERVED and out of the 'not built' comment on EventType"
         )
+
+
+def test_the_after_hours_condition_is_written_in_the_site_clock():
+    # The reader checks the condition against a wall clock, so it carries the
+    # site's time and offset; the event's own timestamp stays UTC beside it.
+    from datetime import time as clock
+    from datetime import timedelta
+
+    from sentinel.events import AfterHoursRule
+    from sentinel.zones import Schedule
+
+    from sentinel.core import BoundingBox
+
+    night = restricted(schedule=Schedule(clock(18, 0), clock(6, 0)))
+    track = Track(
+        id=1, class_id=0, bbox=BoundingBox(0.4, 0.5, 0.1, 0.2), confidence=0.9, hits=10,
+        first_seen_millis=0, last_seen_millis=2000, position=None, speed_mps=None,
+        heading_degrees=None,
+    )
+    moment = datetime(2026, 8, 30, 16, 30, tzinfo=timezone.utc)
+
+    beirut = EventEngine([AfterHoursRule()], node_id="nd_test", camera_id="cam-07",
+                         site_tz=timezone(timedelta(hours=3)))
+    (event,) = beirut.on_presence_changes(
+        [PresenceChange("ENTERED", presence(track.id), 2000)], {night.id: night},
+        {track.id: track}, at_millis=2000, moment=moment, detector=MOTION, frame_index=60,
+    )
+    assert any(c.startswith("19:30 UTC+0300") for c in event.triggering_conditions), event.triggering_conditions
+    assert event.occurred_at == moment and event.occurred_at.tzinfo is timezone.utc
+
+    plain = EventEngine([AfterHoursRule()], node_id="nd_test", camera_id="cam-07")
+    (event,) = plain.on_presence_changes(
+        [PresenceChange("ENTERED", presence(track.id), 2000)], {night.id: night},
+        {track.id: track}, at_millis=2000, moment=moment, detector=MOTION, frame_index=60,
+    )
+    assert any(c.startswith("16:30 UTC+0000") for c in event.triggering_conditions)

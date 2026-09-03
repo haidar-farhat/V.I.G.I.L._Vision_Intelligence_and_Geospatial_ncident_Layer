@@ -291,6 +291,7 @@ class ConsoleWindow(QMainWindow):
         self.zones_view.itemSelectionChanged.connect(self._zone_selection_changed)
         self.zone_properties = ZonePropertiesPanel()
         self.zone_properties.changed.connect(self._zone_properties_applied)
+        self.zone_properties.set_clock(self.node.site_clock_label)
 
         outer.addLayout(self._build_toolbar())
 

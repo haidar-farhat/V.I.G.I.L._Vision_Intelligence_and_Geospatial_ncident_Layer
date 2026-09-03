@@ -335,3 +335,40 @@ def test_a_simple_outline_is_accepted_whatever_its_winding():
     )
     assert ring_problem(square) is None
     assert ring_problem(tuple(reversed(square))) is None
+
+
+# ------------------------------------------------------------ the site clock
+
+
+def test_schedules_are_read_in_the_site_clock_not_utc():
+    """18:00–06:00 typed in Beirut means 18:00 in Beirut.
+
+    The evaluator used to read the window off a UTC moment, so that schedule
+    armed at 21:00 local and disarmed at 09:00 — three hours of an open site
+    every morning, and nothing on screen said so.
+    """
+    from datetime import timedelta
+
+    night = zone(schedule=Schedule(time(18, 0), time(6, 0)), enter_after_millis=200)
+    track = make_track(1, SITE)
+
+    # 16:30Z is 19:30 at UTC+3 (Beirut, in summer): inside the window there,
+    # outside it in UTC. A fixed offset rather than an IANA zone, because a
+    # Windows machine has no tz database unless the optional tzdata is installed.
+    moment = datetime(2026, 8, 30, 16, 30, tzinfo=timezone.utc)
+
+    beirut = ZoneEvaluator([night], site_tz=timezone(timedelta(hours=3)))
+    for step in range(3):
+        beirut.update([track], step * 200, moment)
+    assert len(beirut.open_presences()) == 1, "the window is open in Beirut at 19:30"
+
+    utc = ZoneEvaluator([night])
+    for step in range(3):
+        utc.update([track], step * 200, moment)
+    assert utc.open_presences() == (), "without a site clock the moment is taken as given"
+
+    # And 04:30Z, 07:30 in Beirut, is outside the window there.
+    early = ZoneEvaluator([night], site_tz=timezone(timedelta(hours=3)))
+    for step in range(3):
+        early.update([track], step * 200, datetime(2026, 8, 30, 4, 30, tzinfo=timezone.utc))
+    assert early.open_presences() == ()

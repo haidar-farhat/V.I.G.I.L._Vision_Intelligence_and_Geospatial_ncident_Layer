@@ -258,6 +258,28 @@ launch check and screenshots.
 
 ## 6. What is next
 
+**The map/zones/control programme now has a written build order** — ROADMAP.md,
+"Map, zones and control — the build order", sixteen slices from a four-lens
+design pass (operator, geospatial correctness, evidence integrity, platform) and
+a synthesis against FEATURES.md, which gained 47 rows and 22 amended notes.
+Slice 1 ("Zone adjudicability: what the cameras can rule on, shown before a zone
+is armed") is specified in the workflow output down to function names and test
+names; see `synthesis.json` in the session scratchpad if it still exists, else
+the ROADMAP text. Its separable part — the site clock — is already done:
+
+- **Defect found by the design pass and fixed:** zone schedules were evaluated
+  in UTC while the docstring promised local time, so 18:00–06:00 typed in
+  Beirut armed at 21:00. `ZoneEvaluator(site_tz=…)`, `EventEngine(site_tz=…)`,
+  `Pipeline(site_tz=…)`, `Node(site_tz=…)` defaulting to the machine's zone;
+  the after-hours condition reads `19:30 UTC+0300 falls within …`;
+  `Event.occurred_at` stays UTC; the properties panel says which clock. Tests
+  use a fixed offset, never an IANA name: Windows has no tz database without
+  the optional `tzdata` package.
+- **Honest limit the pass surfaced:** `Store.save_zone` overwrites the ring in
+  place, so an event raised before a reshape now points at a shape that no
+  longer exists. Slice 5 (versioned geometry) is what lifts that; until then
+  the audit row is the only record of the previous outline.
+
 **Immediate:**
 
 1. **1.3 appearance re-ID.** The tracker fragments (17 tracks over 15 s on one

@@ -229,6 +229,26 @@ Documentation: docs/USAGE.md in the source repository.
 """
 
 
+def bundle_in_use() -> list[str]:
+    """Names of this bundle's executables that are running right now.
+
+    Windows only, because only Windows locks a loaded library against being
+    replaced; elsewhere the build overwrites the file and the running process
+    keeps the old inode. Checked by image name, which is specific enough: the
+    three names are this product's.
+    """
+    if sys.platform != "win32":
+        return []
+    try:
+        listing = subprocess.run(
+            ["tasklist", "/FO", "CSV", "/NH"], capture_output=True, text=True, check=False
+        ).stdout
+    except OSError:
+        return []
+    running = {line.split('","')[0].strip('"').lower() for line in listing.splitlines() if line}
+    return [name for name in executable_names() if name.lower() in running]
+
+
 def executable_names() -> tuple[str, ...]:
     suffix = ".exe" if sys.platform == "win32" else ""
     return tuple(f"{name}{suffix}" for name in EXECUTABLES)
@@ -286,6 +306,15 @@ def package() -> None:
             "Nothing it produces reaches the network; the bundle is assembled "
             "from what is already on this machine."
         ) from None
+
+    running = bundle_in_use()
+    if running:
+        raise SystemExit(
+            f"{', '.join(running)} is running from dist/SentinelVision. Close it "
+            "first: PyInstaller cannot replace a library under a process that has "
+            "it open, and the failure it reports otherwise is an access-denied "
+            "traceback three screens long."
+        )
 
     spec = ROOT / "packaging" / "sentinel.spec"
     work = ROOT / "build"

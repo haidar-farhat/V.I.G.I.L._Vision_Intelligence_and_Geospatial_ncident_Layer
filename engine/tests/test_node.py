@@ -766,3 +766,14 @@ def test_a_zone_outline_change_is_audited_as_such(tmp_path: Path, yard: Zone):
         detail = next(row["detail"] for row in store.audit_trail(limit=50) if row["action"] == "zone.changed")
         assert "outline" in detail and "4 -> 5 points" in detail
         assert "name" not in detail, "an unchanged field was reported as changed"
+
+
+def test_a_node_names_the_clock_its_schedules_are_read_against(tmp_path: Path):
+    from datetime import timedelta, timezone
+
+    with Node(tmp_path / "n.db", site_tz=timezone(timedelta(hours=3))) as node:
+        assert node.site_tz == timezone(timedelta(hours=3))
+        assert node.site_clock_label.startswith("this machine's clock, UTC+0")
+    with Node(tmp_path / "m.db") as node:
+        assert node.site_tz is not None, "a node with no clock declared falls back to the machine's"
+        assert "UTC" in node.site_clock_label

@@ -22,14 +22,15 @@ the presence ends. Without that hysteresis one person produces forty events.
 
 **Time is part of the condition.** The same person in the same place is
 unremarkable at 14:00 and worth waking somebody for at 03:00. A zone carries a
-schedule, and the schedule is evaluated in the site's local time, because that is
+schedule, and the schedule is evaluated in the site's clock — today the machine's
+own zone, passed in as ``site_tz``; UTC when none is given — because that is
 what "after hours" means to the person being woken.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, time, timezone
+from datetime import datetime, time, timezone, tzinfo
 from enum import Enum
 from typing import Iterable, Sequence
 
@@ -238,10 +239,17 @@ class ZoneEvaluator:
     observation. Feed it every frame's tracks; it reports only the transitions.
     """
 
-    __slots__ = ("_zones", "_open", "_last_seen")
+    __slots__ = ("_zones", "_open", "_last_seen", "_site_tz")
 
-    def __init__(self, zones: Iterable[Zone]):
+    def __init__(self, zones: Iterable[Zone], *, site_tz: tzinfo | None = None):
+        """
+        ``site_tz`` is the clock schedules are written in. Without it the
+        moment is used as given, which for the pipeline means UTC — and a
+        schedule of 18:00–06:00 typed by someone in Beirut would arm at 21:00
+        their time. The pipeline and the node pass the machine's zone.
+        """
         self._zones = {zone.id: zone for zone in zones}
+        self._site_tz = site_tz
         #: (zone_id, track_id) -> Presence
         self._open: dict[tuple[str, int], Presence] = {}
         self._last_seen: dict[tuple[str, int], int] = {}
@@ -258,6 +266,8 @@ class ZoneEvaluator:
     ) -> list[PresenceChange]:
         """Feed one frame's tracks. Returns presences that started or ended."""
         when = moment or datetime.now(timezone.utc)
+        if self._site_tz is not None:
+            when = when.astimezone(self._site_tz)
         changes: list[PresenceChange] = []
         live = {track.id for track in tracks}
 

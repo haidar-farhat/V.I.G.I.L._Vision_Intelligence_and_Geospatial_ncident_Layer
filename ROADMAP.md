@@ -304,3 +304,173 @@ Not gaps — decisions I think are wrong, or right-for-now and about to stop bei
 
 Everything else is real work and none of it changes what this is until those are
 done.
+
+---
+
+## Map, zones and control — the build order
+
+The operator's verdict on the console was that detection is acceptable and the
+map, the zones and the controls around them are not. This is the order in which
+that gets fixed. Each slice ships on its own and is photographed before it is
+called done; earlier slices carry the most operator value for the least
+dependency, and several reuse what the engine already has (blind-spot analysis,
+recording, correlation, the audit log). Produced by a four-lens design pass and
+a synthesis against FEATURES.md; the rows each slice moves to `TESTED` are named.
+
+### 1. Zone adjudicability: what the cameras can rule on, shown before a zone is armed — M
+
+`coverage.zone_report()` and per-pose cached 1σ bands; bands shaded inside every footprint with a legend; a live 'covered · confident · area' readout in the draw/reshape band; a Covered column and warning glyph in the Zones list; a 'What the cameras can rule on' group and the schedule-clock label in the properties panel; the interim fix that evaluates schedules in the machine's clock instead of UTC. Not in this slice: presets, snapping, the site record, any migration.
+
+*Why here:* The prescribed first slice (polygon drawing, vertex editing, properties panel) is already TESTED in the working tree. Roadmap 4.1 names the live adjudicability count as the remaining half, it reuses `coverage`, `field_of_view` and `project_to_ground`, needs no migration, and fixes the most dangerous honesty gap: a zone that will never fire looking exactly like one that will.
+
+*Rows:* Zone validation against what the cameras can actually adjudicate · Iso-uncertainty bands on every footprint · Zone properties panel · Reshape a zone on the map
+
+### 2. One selection, honest modes, and a map you can read by hovering — M
+
+The `Selection` bus across map, panes, track table and incidents with one highlight colour and Esc clearing; checkable mutually exclusive map modes with the band; Monitor/Configure with the idle timeout, audited; hover inspection and provenance glyphs completing the legend; the cursor ground readout in the status bar. Not in this slice: dragging cameras, undo, shortcuts beyond Esc.
+
+*Why here:* Every later control feature hangs on knowing what is selected and what the next click does; this is the cheapest fix to 'control is so bad' and needs no engine change.
+
+*Depends on:* Zone adjudicability: what the cameras can rule on, shown before a zone is armed
+
+*Rows:* Selection bus: one selected thing across map, video wall, track table and incidents · Map modes with a visible mode band; Escape always returns to Select · Monitor and Configure modes with a layout lock · Uncertainty legend, provenance glyphs and hover readout · Cursor ground readout and copy-to-clipboard
+
+### 3. Cameras you can see and move — M
+
+The camera list panel with the per-camera status strip via `Node.camera_health()`, replacing the combo box; drag a placed camera with live footprint, heading handle and Shift-click aim, committing once on release; 'Place here…' pre-filling position only; dark cameras hatched on the map and excluded from coverage; the recording checkbox and indicator; the far-edge solid/dashed distinction. Not in this slice: undo, pose versions.
+
+*Why here:* Placing eight cameras through a dialog and a blind click is the friction the user means; the health strip, recording toggle and dark-footprint rule are checkboxes and drawing in front of finished engine work.
+
+*Depends on:* One selection, honest modes, and a map you can read by hovering
+
+*Rows:* Camera list panel with per-camera status strip · Drag a placed camera on the map, with a live footprint and heading handle · Camera map placement · Footprint and coverage reflect camera health · Camera recording enable/disable · Footprint far edge: range clamp or horizon, drawn differently
+
+### 4. The site record: one frame, a boundary, the blind spots on the map — M
+
+Migration v4 `sites` with `site_id` defaults; one `SiteFrame` replacing `MapView._to_local` and `coverage._Frame`; 'Set site boundary…' drawn or promoted; coverage gaps hatched on the plan view with the CLI's caveat; a minimal layer toggle set (footprints, bands, discs, trails, zone kinds, gaps) in `QSettings`; the declared IANA site time zone completing the schedule fix. Not in this slice: any import, layer provenance.
+
+*Why here:* Blind-spot analysis is one of 'the ten' and finished at the engine yet invisible in the product; the site record is what basemaps, plans, exports and indoor levels all stand on, and it stops the map re-anchoring when the first camera is removed.
+
+*Depends on:* Zone adjudicability: what the cameras can rule on, shown before a zone is armed
+
+*Rows:* Site record with boundary, origin, frame kind and time zone · Real geographic map · Coverage gaps drawn on the plan view · covered % per zone · Site time zone, declared and used by schedules
+
+### 5. Versions: zones and poses that history can point at — L
+
+Migration v5 `zone_versions` and `pose_versions`; `Event`/`Incident` referencing versions; `canonical.py`; structured before/after audit JSON with the Audit tab; the immutability list enforced by a store grep test; `save_incident` narrowed. Not in this slice: undo, export.
+
+*Why here:* The reshape that already ships overwrites geometry past events were measured against; nothing built on top of editing (undo, incident focus, export, replay) is honest until the version tables exist.
+
+*Depends on:* The site record: one frame, a boundary, the blind spots on the map
+
+*Rows:* Versioned zone geometry — an edit creates a new version, never overwrites the ring · Camera configuration history · rule changes · model changes · Events and incidents reference the exact zone and camera-pose versions that produced them · Structured before/after audit records for every map, zone and camera edit · Canonical JSON serialisation for everything that is hashed · Immutable incident history
+
+### 6. The plan under the grid — L
+
+Site-plan image import with world file / GeoTIFF tags via `tifffile` or control points with residuals and the 'add a fourth' rule; north from the georeference; the measure tool with scale checks recorded; the full layer panel with provenance rows; plan fingerprinting. Not in this slice: tiles, GeoJSON.
+
+*Why here:* A metric grid tells the operator nothing about where the loading bay is; a plan under the footprints is the single largest readability gain, and it can be done with OpenCV and numpy already in the bundle.
+
+*Depends on:* The site record: one frame, a boundary, the blind spots on the map
+
+*Rows:* Site-plan image import with world file or control points · Measure tool and scale verification · Layer panel with provenance for every layer · Basemap and plan-image fingerprinting on every render
+
+### 7. Undo, keys and labels — M
+
+`QUndoStack` with compensating audited node calls and `undo_of`; the confirmation policy and toast; every action a `QAction` with the shortcut sheet and the digits-to-cameras rule; label collision pass; the weakening confirmation in the properties panel. Not in this slice: incidents.
+
+*Why here:* Under pressure people mis-click; undo lets them act fast and take it back without rewriting history, which the version tables now make possible.
+
+*Depends on:* Versions: zones and poses that history can point at; One selection, honest modes, and a map you can read by hovering
+
+*Rows:* Undo and redo as compensating, audited edits — never a deletion from history · Keyboard shortcuts and a shortcut sheet · Map labels that never collide · Weakening a zone asks for confirmation and records it
+
+### 8. Working incidents — M
+
+Migration v6 `incident_actions` ledger with derived status, dismissal vocabulary, `claimed_by`; A/D/E keys; pulsing unacknowledged HIGH/CRITICAL zones; incident focus on the map with the zone version in force; event markers with decay and correlated-event links; zone health columns. Not in this slice: video replay.
+
+*Why here:* An incident list that only grows cannot be worked and re-creates the alert fatigue the 92 % reduction exists to prevent; every input is already persisted and TESTED.
+
+*Depends on:* One selection, honest modes, and a map you can read by hovering; Versions: zones and poses that history can point at
+
+*Rows:* Incident acknowledgement · investigation workflow · escalation · resolution · Incident status · False-positive classification · Map-based incident investigation · Event markers with decay · correlated-event links for the selected incident · Zone health in the list: last fired, events in 24 h, open presences, silent zones
+
+### 9. Zone shapes, dry-runs and disarming — M
+
+Rectangle and circle presets retiring the square and spinbox; snapping; the labelled footprint copy; the dry-run against the ring buffer; zones drawn by arming state; timed disarm with reason and auto re-arm; the overlap report wording. Not in this slice: tripwires.
+
+*Why here:* Finishes the zone editor the user was promised, and tests a zone against recent movement before it goes live — the question every operator asks after drawing one.
+
+*Depends on:* Zone adjudicability: what the cameras can rule on, shown before a zone is armed; Undo, keys and labels
+
+*Rows:* Rectangle · circle · line-crossing · corridor zones · Dry-run a zone against recent tracks before arming it · Zones drawn by their arming state · Disarm a zone temporarily, with a reason and an automatic re-arm · Nested zones
+
+### 10. The site travels: export, import and evidence context — L
+
+`sentinel site export／import` and the console flow with manifest, redaction scan, diff preview and Review mode; `site_context/` in the evidence package; the labelled console-rendered map snapshot; hash-chained audit with `verify` and the chain head in exports; clock provenance; the audit excerpt and site diff reports. Not in this slice: signing.
+
+*Why here:* A site laid out over a shift must survive a reinstall and move to the next machine, and an evidence folder must carry the polygon and pose it was judged against; both need the version tables first.
+
+*Depends on:* Versions: zones and poses that history can point at; The plan under the grid
+
+*Rows:* Site configuration export and import · Evidence package carries site_context/: zone versions, poses, map fingerprint and calibration as they were · Map snapshots · Hash-chained audit log with `sentinel audit verify` · Clock provenance on every audited action and geometry version · Audit report · system health · camera health · AI performance report
+
+### 11. Time on the map — M
+
+The console ring buffer with pause, scrub and Live drawing the zone and pose versions in force; the freshness stamp; follow the selected track; the map as a floating dock for a second monitor. Not in this slice: recorded video.
+
+*Why here:* When something happened fifteen seconds ago the operator needs to see where it came from; the version tables make the rewound map honest, and no store change is needed.
+
+*Depends on:* Versions: zones and poses that history can point at; One selection, honest modes, and a map you can read by hovering
+
+*Rows:* Pause, rewind and scrub the live plan view — analysis, not footage · Map freshness stamp · Follow the selected track · Multi-monitor command-centre layouts
+
+### 12. Basemaps and GeoJSON, offline by proof — L
+
+MBTiles via sqlite3 and PMTiles via the file source only, validated as docs/MAPS.md specifies, vector tiles listed but labelled not rendered; GeoJSON overlays with CRS handling and promote-to-zone; pyproj imported with the network disabled and asserted; `offline_audit.py` and the fetch-nothing test extended. Not in this slice: vector rendering.
+
+*Why here:* Outdoor sites expect a satellite or street raster under the plan; the package format is already documented and the fetch-nothing guarantee must be proven over the new reader before it ships.
+
+*Depends on:* The plan under the grid
+
+*Rows:* Offline raster basemap from MBTiles or PMTiles · GeoJSON overlay import and promote-to-zone · Offline guarantee extended to GIS: no GDAL, PROJ network off, audit covers the tile reader
+
+### 13. The picture as the truth — L
+
+Zone rings projected into every pane and drawn on the video with σ bands; pose fit from picture-to-map pairs via `solvePnP` writing an ordinary `CameraPose`, stored as a versioned calibration artifact with residuals and frame hash; intrinsics file import; the walk test; coordinate entry in DMS/UTM/metres. Not in this slice: homography projection.
+
+*Why here:* Nobody knows a camera's pitch to the degree but the picture does, and the operator knows where the bay is in the frame, not on a grid; all of it uses the two FFI calls that exist.
+
+*Depends on:* One selection, honest modes, and a map you can read by hovering; Versions: zones and poses that history can point at
+
+*Rows:* Zone outlines in the camera image, and zones drawn on the video · Camera calibration · camera matrix · distortion · extrinsics · Walk test: projected position against a marked truth · Camera position entry in decimal degrees, DMS, UTM or site metres
+
+### 14. Tripwires and direction — L
+
+LINE geometry, direction, the σ-aware crossing predicate with hysteresis, `PERIMETER_BREACH` raised, corridors as buffered polylines, the arrow on the map. Not in this slice: the ABI move to Rust unless profiling demands it.
+
+*Why here:* A perimeter is a line and 'crossed inbound' is the question; the reserved event type has been declared-but-unraised long enough, and the semantics are new enough to deserve their own slice.
+
+*Depends on:* Versions: zones and poses that history can point at; Zone shapes, dry-runs and disarming
+
+*Rows:* Tripwire (line-crossing) and directional zones · corridors
+
+### 15. Levels, elevation and shadows — L
+
+LOCAL-frame sites with floor plans as levels, the NOT GEOGRAPHIC badge and metres-only display; per-camera ground elevation and the second-pass zone elevation; obstruction polygons casting shadows in footprints and coverage. Not in this slice: slopes, cross-floor correlation.
+
+*Why here:* Indoor sites are most sites and every real site has a wall; both are honesty fixes to coverage the operator already trusts too much.
+
+*Depends on:* The plan under the grid; Basemaps and GeoJSON, offline by proof
+
+*Rows:* Outdoor · indoor · building / floor maps · Ground-plane configuration · Obstruction polygons cast shadows in the footprint
+
+### 16. Samples, heatmaps, replay and the ellipse — XL
+
+`track_samples` at 1 Hz with preservation inside incident windows; the heatmap layer labelled by source; incident replay with recorded clips and events on one axis; the Jacobian-propagated uncertainty ellipse in the core (ABI change). Not in this slice: anything the analyst pillar needs.
+
+*Why here:* These are the largest items and each rests on everything before it — recording toggle, ledger, versions — and the ellipse is the one geometry change that touches the ABI, so it goes last where it can be measured against a walk test.
+
+*Depends on:* Cameras you can see and move; Working incidents; Versions: zones and poses that history can point at
+
+*Rows:* Track position samples persisted at 1 Hz for replay and heatmaps · Site activity heatmaps · track density maps · Incident replay · Uncertainty as an ellipse from the pinhole Jacobian

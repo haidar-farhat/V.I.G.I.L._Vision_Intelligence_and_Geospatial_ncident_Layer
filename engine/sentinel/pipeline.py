@@ -181,6 +181,7 @@ class Pipeline:
         record_to: str | Path | None = None,
         segment_seconds: float = 60.0,
         on_segment=None,
+        site_tz=None,
     ):
         """
         ``max_gap_millis`` is how long a track survives without a detection. It
@@ -219,9 +220,12 @@ class Pipeline:
         self._recorder: Recorder | None = None
 
         self._zones = {zone.id: zone for zone in zones}
-        self._evaluator = ZoneEvaluator(zones) if zones else None
+        # The clock zone schedules are written in. `None` keeps UTC, which is
+        # what every test that hands the evaluator a UTC moment expects; the
+        # node passes the machine's zone.
+        self._evaluator = ZoneEvaluator(zones, site_tz=site_tz) if zones else None
         self._engine = (
-            EventEngine(rules, node_id=node_id, camera_id=source.source_id)
+            EventEngine(rules, node_id=node_id, camera_id=source.source_id, site_tz=site_tz)
             if rules
             else None
         )

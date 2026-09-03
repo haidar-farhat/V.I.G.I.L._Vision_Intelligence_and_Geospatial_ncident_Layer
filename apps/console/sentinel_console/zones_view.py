@@ -281,6 +281,14 @@ class ZonePropertiesPanel(QWidget):
         form.addRow("", days)
         self._scheduled.toggled.connect(self._enable_schedule)
 
+        # Which clock the window is read against. Until a site record declares
+        # a zone this is the machine's, and saying so is the difference between
+        # an operator trusting 18:00 and an operator in Beirut being armed at
+        # 21:00 without knowing.
+        self._clock = QLabel("")
+        self._clock.setObjectName("Caption")
+        form.addRow("", self._clock)
+
         self._dwell = QDoubleSpinBox()
         self._dwell.setRange(0.0, 600.0)
         self._dwell.setDecimals(1)
@@ -366,6 +374,9 @@ class ZonePropertiesPanel(QWidget):
     def _enable_schedule(self, on: bool) -> None:
         for widget in (self._start, self._end, *self._days):
             widget.setEnabled(on)
+
+    def set_clock(self, label: str) -> None:
+        self._clock.setText(f"Times are read against {label}." if label else "")
 
     def zone_from_fields(self) -> Zone:
         """The selected zone with the fields as they are on screen."""

@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone, tzinfo
 from enum import Enum
 from typing import Iterable, Sequence
 
@@ -226,9 +226,18 @@ class RuleContext:
     track: Track | None
     presence: Presence | None
     at_millis: int
+    #: When, in UTC. What `Event.occurred_at` records.
     moment: datetime
     detector: DetectorInfo
     frame_index: int
+    #: The clock schedules are written in, for anything a rule *says* about
+    #: the time. ``None`` means UTC.
+    site_tz: tzinfo | None = None
+
+    @property
+    def local_moment(self) -> datetime:
+        """The moment in the site's clock, for text a person reads."""
+        return self.moment.astimezone(self.site_tz) if self.site_tz else self.moment
 
 
 class Rule:
@@ -444,7 +453,10 @@ class AfterHoursRule(Rule):
                 context,
                 summary=f"An object was in {zone.name} outside permitted hours",
                 conditions=[
-                    f"{context.moment:%H:%M} falls within {zone.schedule.describe()}",
+                    # The site's clock, with its offset, because the schedule
+                    # was written in it and the reader will check it against a
+                    # wall clock — and `occurred_at` stays UTC beside it.
+                    f"{context.local_moment:%H:%M UTC%z} falls within {zone.schedule.describe()}",
                     f"presence confirmed after {zone.enter_after_millis} ms",
                 ],
                 confidence=change.presence.confidence,
@@ -542,12 +554,16 @@ class EventEngine:
     the thing this codebase is least willing to allow.
     """
 
-    __slots__ = ("_rules", "_node_id", "_camera_id", "_seen", "stats")
+    __slots__ = ("_rules", "_node_id", "_camera_id", "_seen", "stats", "_site_tz",)
 
-    def __init__(self, rules: Sequence[Rule], *, node_id: str, camera_id: str):
+    def __init__(
+        self, rules: Sequence[Rule], *, node_id: str, camera_id: str,
+        site_tz: tzinfo | None = None,
+    ):
         self._rules = list(rules)
         self._node_id = node_id
         self._camera_id = camera_id
+        self._site_tz = site_tz
         self._seen: set[str] = set()
         self.stats = EventEngineStats()
 
@@ -582,6 +598,7 @@ class EventEngine:
                 presence=change.presence,
                 at_millis=at_millis,
                 moment=moment,
+                site_tz=self._site_tz,
                 detector=detector,
                 frame_index=frame_index,
             )
@@ -616,6 +633,7 @@ class EventEngine:
                 presence=presence,
                 at_millis=at_millis,
                 moment=moment,
+                site_tz=self._site_tz,
                 detector=detector,
                 frame_index=frame_index,
             )
@@ -635,6 +653,7 @@ class EventEngine:
                 presence=None,
                 at_millis=at_millis,
                 moment=moment,
+                site_tz=self._site_tz,
                 detector=detector,
                 frame_index=frame_index,
             )

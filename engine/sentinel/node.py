@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import threading
 import time
+from datetime import datetime
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -149,7 +150,7 @@ class CameraRunner:
         "_epoch_millis", "_keep_images", "_realtime", "_record_to",
         "_segment_seconds", "_thread", "_lock", "_stopping",
         "_latest", "_skipped", "_pending_pose", "_pose_changed", "_fault",
-        "_pipeline", "_new_events", "_new_segments",
+        "_pipeline", "_new_events", "_new_segments", "_site_tz",
     )
 
     def __init__(
@@ -165,6 +166,7 @@ class CameraRunner:
         realtime: bool = False,
         record_to: Path | None = None,
         segment_seconds: float = 60.0,
+        site_tz=None,
     ):
         """
         ``keep_images`` is off by default. A node with nobody watching has no use
@@ -185,6 +187,7 @@ class CameraRunner:
         self._realtime = realtime
         self._record_to = record_to
         self._segment_seconds = segment_seconds
+        self._site_tz = site_tz
 
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
@@ -362,6 +365,7 @@ class CameraRunner:
             record_to=self._record_to,
             segment_seconds=self._segment_seconds,
             on_segment=self._collect_segment,
+            site_tz=self._site_tz,
         )
         self._pipeline = pipeline
 
@@ -477,6 +481,7 @@ class Node:
         correlate_every_millis: int = DEFAULT_CORRELATE_MILLIS,
         event_retention: int = 5000,
         actor: str = ACTOR,
+        site_tz=None,
     ):
         """
         ``detector_factory`` is called once per camera. One detector per camera,
@@ -491,6 +496,12 @@ class Node:
         ``zones`` left empty means *load whatever this node already had*, not
         *watch nothing* — a restarted node must come back watching what it was
         watching. Passing zones explicitly replaces that.
+
+        ``site_tz`` is the clock zone schedules are written in. Defaults to this
+        machine's own zone — the honest interim until a site record declares
+        one — and is labelled as such wherever a schedule is shown. Schedules
+        used to be evaluated in UTC while the interface implied local time,
+        which armed an 18:00 zone at 21:00 in Beirut.
 
         ``restore_cameras`` brings back the cameras and, crucially, their poses.
         Placements were written to the database and never read, so a console
@@ -513,6 +524,7 @@ class Node:
         # says "node" when an operator pressed a button is a false entry in a
         # chain of custody. Whoever owns this node names themselves.
         self._actor = actor
+        self._site_tz = site_tz if site_tz is not None else datetime.now().astimezone().tzinfo
 
         self._cameras: dict[str, CameraRecord] = {}
         self._restored_cameras = 0
@@ -545,6 +557,21 @@ class Node:
         )
 
     # ------------------------------------------------------------------ state
+
+    @property
+    def site_tz(self):
+        """The clock zone schedules are evaluated in."""
+        return self._site_tz
+
+    @property
+    def site_clock_label(self) -> str:
+        """For the interface: which clock a schedule is read against.
+
+        The UTC offset, never the zone's name: on Windows the machine zone's
+        name is localised and can run to forty characters.
+        """
+        offset = datetime.now(self._site_tz).strftime("%z")
+        return f"this machine's clock, UTC{offset[:3]}:{offset[3:]}"
 
     @property
     def node_id(self) -> str:
@@ -844,6 +871,7 @@ class Node:
                 realtime=self._realtime,
                 record_to=self._record_to,
                 segment_seconds=self._segment_seconds,
+                site_tz=self._site_tz,
             )
             record.runner.start()
             started += 1
@@ -851,7 +879,10 @@ class Node:
         self._running = started > 0
         self._stop.clear()
         self.store.audit(self._actor, "analysis.started", detail=f"{started} camera(s)")
-        _log.info("node %s: started %d camera(s)", self._node_id, started)
+        _log.info(
+            "node %s: started %d camera(s); zone schedules read against %s",
+            self._node_id, started, self.site_clock_label,
+        )
         return started
 
     def stop(self) -> bool:
