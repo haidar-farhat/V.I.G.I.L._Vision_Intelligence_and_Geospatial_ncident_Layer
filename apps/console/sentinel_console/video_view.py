@@ -82,10 +82,14 @@ def _mask_image(mask: "np.ndarray", colour: QColor) -> QImage:
     buffer[..., 1] = colour.green()
     buffer[..., 2] = colour.red()
     buffer[..., 3] = (mask > 0) * MASK_ALPHA
-    # `.copy()` because QImage does not take ownership of the buffer, and
-    # `buffer` is a local that dies at the end of this function.
+
+    # `tobytes()`, not the array's own buffer. A `QImage` built over a live
+    # numpy buffer only borrows it: the array must outlive both the image and
+    # every copy Qt makes of it lazily, and a local that goes out of scope at
+    # the end of this function does not. `.copy()` then forces a deep copy of
+    # the pixels, so the returned image owns everything it points at.
     return QImage(
-        buffer.data, width, height, width * 4, QImage.Format.Format_ARGB32
+        buffer.tobytes(), width, height, width * 4, QImage.Format.Format_ARGB32
     ).copy()
 
 
