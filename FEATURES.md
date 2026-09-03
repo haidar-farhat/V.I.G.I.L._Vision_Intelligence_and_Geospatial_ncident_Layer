@@ -38,17 +38,17 @@ Related: [STATUS.md](STATUS.md) — measurements and honest gaps ·
 
 | | Count | Share | What it means |
 |---|---:|---:|---|
-| **`TESTED`** | 138 | 38% | A test fails if it stops working |
+| **`TESTED`** | 139 | 38% | A test fails if it stops working |
 | **`IMPL`** | 23 | 6% | Works; a regression would go unnoticed |
-| **`SKEL`** | 39 | 11% | Something is there; it does not do the job |
+| **`SKEL`** | 38 | 10% | Something is there; it does not do the job |
 | **`PLAN`** | 168 | 46% | Designed, no code |
 
 ```mermaid
 pie showData
     title Sentinel Vision — 368 capabilities by state
-    "TESTED" : 138
+    "TESTED" : 139
     "IMPLEMENTED" : 23
-    "SKELETON" : 39
+    "SKELETON" : 38
     "PLANNED" : 168
 ```
 
@@ -540,7 +540,7 @@ both are `TESTED`.
 | False-positive statistics · rule performance | `PLAN` | |
 | Detection trends · incident trends | `PLAN` | |
 | Site activity heatmaps · track density maps | `PLAN` | |
-| Camera coverage statistics | `SKEL` | The ground band a pose covers is computed and shown while placing |
+| Camera coverage statistics | `TESTED` | Union of every placed camera's footprint against a site boundary: what fraction is covered, and every uncovered region with its true area |
 
 ## 🧪 AI / model lab
 
@@ -701,10 +701,13 @@ covered. *Stands on:* the annular-sector footprint is already computed per camer
 and drawn — the near edge, the far edge and the blind foreground are all real
 numbers today.
 
-**3 · Camera Blind-Spot Analysis** — `PLAN`. *"UNMONITORED AREA DETECTED."* The
-union of the footprints subtracted from the site polygon. *Stands on:* footprints
-and polygon geometry, both `TESTED`. **The cheapest of the ten, and a genuinely
-useful security-planning feature.**
+**3 · Camera Blind-Spot Analysis** — **`TESTED`, and it was as cheap as
+predicted.** `sentinel coverage --site` unions every placed camera's footprint,
+subtracts it from the site boundary, and reports each uncovered region with its
+true area — exiting non-zero when anything is uncovered, so a scheduled check
+says something. `shapely` does the geometry. The numbers are a geometric upper
+bound and the report says so: nothing models occlusion or resolution, and both
+only ever make real coverage smaller.
 
 **4 · Track Replay** — `PLAN`. Click a track, watch it reconstructed across
 `C01 → C04 → C07 → C09` on map and video together. *Stands on:* cross-camera

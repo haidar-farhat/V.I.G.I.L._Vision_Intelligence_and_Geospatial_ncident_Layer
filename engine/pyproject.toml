@@ -7,6 +7,13 @@ dependencies = [
     "numpy>=2.0",
     "opencv-python-headless>=4.10",
     "onnxruntime>=1.20",
+    # Polygon union and difference, for coverage and blind-spot analysis. That
+    # geometry is genuinely hard — holes, degenerate rings, near-tangent edges —
+    # and its bugs are invisible until one particular arrangement of cameras
+    # produces a wrong answer. Offline: no sockets, no telemetry, three compiled
+    # files carrying no endpoint, checked with tools/binary_audit.py before it
+    # was adopted.
+    "shapely>=2.0",
 ]
 
 [project.scripts]

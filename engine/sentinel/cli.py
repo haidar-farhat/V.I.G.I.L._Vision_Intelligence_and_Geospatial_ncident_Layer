@@ -126,6 +126,27 @@ def _zone(text: str) -> Zone:
     )
 
 
+def _ring(text: str) -> list[LatLon]:
+    """``lat,lon;lat,lon;lat,lon[;...]`` — a boundary, three vertices up.
+
+    The same vertex syntax as `--zone` without the name, so an operator who has
+    typed one has typed the other.
+    """
+    points = []
+    for vertex in text.split(";"):
+        try:
+            lat, lon = (float(part) for part in vertex.split(","))
+        except ValueError as error:
+            raise argparse.ArgumentTypeError(f"--site: {error}") from error
+        points.append(LatLon(lat, lon))
+
+    if len(points) < 3:
+        raise argparse.ArgumentTypeError(
+            "--site: a boundary needs at least three vertices"
+        )
+    return points
+
+
 #: One definition, in `events.py`, shared by the CLI, the node and the console.
 #: There were two copies and a third was about to appear; rule sets that drift
 #: produce two deployments that disagree about what an incident is.
@@ -467,6 +488,64 @@ def _export(args: argparse.Namespace) -> int:
         store.close()
 
 
+def _site_coverage(args: argparse.Namespace) -> int:
+    """What every placed camera covers of the site, and what it misses.
+
+    The question an installer actually has, and the one a plan view cannot
+    answer by eye: six cameras drawn as six overlapping wedges look like
+    thorough coverage, and the four-metre corridor between two of them looks
+    like nothing at all until somebody walks down it.
+    """
+    from .coverage import CoverageError, analyse
+
+    store = Store(args.database or default_database_path())
+    try:
+        placed = {}
+        unplaced = []
+        for row in store.cameras():
+            pose = store.camera_pose(row["id"])
+            if pose is None:
+                unplaced.append(row["id"])
+            else:
+                placed[row["id"]] = pose
+
+        if not placed:
+            print(
+                "No camera on this node is placed, so there is no coverage to "
+                "compute. Place them with `sentinel run --place` or in the "
+                "console.",
+                file=sys.stderr,
+            )
+            return 1
+
+        try:
+            result = analyse(args.site, placed)
+        except CoverageError as error:
+            print(f"error: {error}", file=sys.stderr)
+            return 2
+
+        print(result.describe())
+        if unplaced:
+            print()
+            print(f"not counted, because unplaced   {', '.join(unplaced)}")
+
+        if result.gaps:
+            print()
+            print("UNMONITORED AREAS, largest first:")
+            for index, gap in enumerate(result.gaps[:10], start=1):
+                centre = gap.ring[0]
+                print(
+                    f"  {index}. {gap.area_m2:,.0f} m²  near "
+                    f"{centre.lat:.6f},{centre.lon:.6f}"
+                )
+            # Non-zero, because an uncovered site is a finding and a scheduled
+            # check that exits 0 is a check nobody reads.
+            return 1
+        return 0
+    finally:
+        store.close()
+
+
 def _coverage(args: argparse.Namespace) -> int:
     """What a placed camera can actually see, and where to put a zone.
 
@@ -477,6 +556,16 @@ def _coverage(args: argparse.Namespace) -> int:
     the number on the datasheet is, and it sees no ground at all at the mast.
     """
     from .core import destination_point, field_of_view, haversine_distance
+
+    if getattr(args, "site", None):
+        return _site_coverage(args)
+    if args.place is None:
+        print(
+            "error: give --place for one camera's coverage, or --site for the "
+            "whole node's",
+            file=sys.stderr,
+        )
+        return 2
 
     pose = args.place
     footprint = field_of_view(pose, arc_segments=24)
@@ -833,9 +922,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     coverage = commands.add_parser(
         "coverage",
-        help="what a placed camera can actually see, and a zone that fits inside it",
+        help="what a camera can see — or, with --site, what the whole node misses",
     )
-    coverage.add_argument("--place", type=_pose, required=True)
+    coverage.add_argument(
+        "--place", type=_pose, default=None,
+        help="one camera's pose, for what it alone covers and where a zone fits",
+    )
+    coverage.add_argument(
+        "--site", type=_ring, default=None, metavar="lat,lon;lat,lon;...",
+        help=(
+            "the site boundary. Given this, reports what every *placed* camera "
+            "on this node covers of it and — the useful half — what it does not. "
+            "Exits non-zero when anything is uncovered, so a scheduled check "
+            "says something."
+        ),
+    )
     coverage.add_argument("--zone-radius", type=float, default=12.0, metavar="METRES")
     coverage.add_argument("--zone-name", default="Restricted Area A")
     coverage.set_defaults(handler=_coverage)

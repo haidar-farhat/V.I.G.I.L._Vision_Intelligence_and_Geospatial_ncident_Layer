@@ -181,7 +181,7 @@ The dividing line is **rate**, not importance.
 
 ### Scale
 
-**631 tests** — 57 Rust, 526 engine, 48 console — plus two static checks that
+**648 tests** — 57 Rust, 543 engine, 48 console — plus two static checks that
 run before any of them: an offline audit that fails the build if the shipped
 source names any destination off the site, and a lint that fails it if any of the
 36 diagrams in this documentation no longer parses. `cargo fmt` and
@@ -232,7 +232,7 @@ python -m pip install -e "engine[dev]" PySide6
 
 python tasks.py build      # build the Rust engine core
 python tasks.py audit      # no route off the site; every diagram parses
-python tasks.py test       # 631 tests, no network
+python tasks.py test       # 648 tests, no network
 python tasks.py lint       # rustfmt + clippy
 python tasks.py check      # all of the above — what CI runs
 ```
