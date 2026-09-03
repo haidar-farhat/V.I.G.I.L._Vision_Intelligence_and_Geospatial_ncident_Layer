@@ -24,7 +24,7 @@ obtains any of those gains more than they would from most databases.
 | **Hostile camera** | A compromised or counterfeit device on a trusted address. Sends malformed RTSP/ONVIF. | Decoder isolation, bounded queues, restart-on-wedge, no parsing in a privileged process |
 | **Curious insider** | A valid low-privilege account. | Permission-based authorization, audit on every privileged action, confirmation on destructive ones |
 | **Evidence tamperer** | Wants a recording to disappear or change. | Content-addressed evidence, SHA-256 manifests, append-only audit and notes |
-| **Supply chain** | A malicious or compromised dependency. | Zero third-party runtime dependencies in core packages; egress guard; no auto-update |
+| **Supply chain** | A malicious or compromised dependency. | Every dependency must be offline at runtime, enforced by a static source audit and an offline CI job; no auto-update; the Rust core has none at all. See [Dependencies](#dependencies) — including what is *not* yet enforced |
 | **Physical thief** | Takes the machine. | Secrets in the OS keychain rather than in files; disk encryption is the operator's responsibility and is documented as such |
 
 ### Explicitly out of scope
@@ -207,6 +207,87 @@ dependency that skips it visible. `PLANNED`: hoisting all three into one
 only then runs the Rust, engine and console suites. Mechanisms 1 and 2 are
 claims about code; this is the claim about the product, tested the way an
 operator would test it — by unplugging the cable.
+
+## Dependencies
+
+**Third-party packages are allowed. The network is available when the system is
+installed, and never again.**
+
+That is the whole rule, and it is a deliberate change from an earlier position of
+"zero third-party runtime dependencies", which was a supply-chain control bought
+by writing everything by hand. The cost of that was not paying for itself: a
+security platform needs an ONVIF client, a certificate library, a keychain
+binding, a geometry library and a local inference runtime, and hand-rolling any
+of those produces something worse than the maintained version — including
+security-worse, which is the opposite of what the rule was for.
+
+| | Network |
+|---|---|
+| `pip install`, `cargo build` | **Allowed.** Resolves from an index like any other software |
+| Everything after that | **Never.** The product works with the cable unplugged |
+
+### What that means when choosing a package
+
+A package is disqualified, however good it is, if at *runtime* it:
+
+- downloads models, weights, tiles, fonts or schemas on first use — this is the
+  common one, and it disqualifies several otherwise-obvious choices;
+- sends telemetry or analytics of any kind;
+- checks for updates, checks a licence, or calls home for any reason;
+- requires a cloud service or an account;
+- resolves an external hostname.
+
+A package that *can* be used offline but does not by default is acceptable only
+with the configuration that makes it so written down at the point of use — the
+way `onnxruntime`'s telemetry is switched off explicitly in `detect.py` rather
+than assumed to be off.
+
+### Installing with no Internet at all
+
+An air-gapped site never gets the install step either. That is supported and is
+the reason the rule is about *runtime* rather than about the package list:
+
+```bash
+# On a connected machine, once:
+pip download -d wheelhouse -r requirements.txt
+cargo vendor
+
+# Carry the wheelhouse in, then on the appliance:
+pip install --no-index --find-links wheelhouse -r requirements.txt
+```
+
+Nothing about the product changes; the packages simply arrive on a disk instead
+of over a wire.
+
+### What enforces this
+
+| Control | Catches | State |
+|---|---|---|
+| `tools/offline_audit.py` | A cloud SDK, an analytics or telemetry package, or a hard-coded external host named anywhere in shipped source. First CI job, before any toolchain runs | `TESTED` |
+| Runtime egress guard | A camera address that resolves outside RFC 1918 / 4193 or loopback | `TESTED` |
+| Offline CI job | The whole suite with outbound traffic dropped, *after proving the drop took effect* | `TESTED` |
+| Rust core | Still has zero dependencies, and will keep them. It is arithmetic; there is nothing to import | `TESTED` |
+
+### What does not enforce it yet
+
+Stated plainly, because a control everybody believes exists and does not is worse
+than no control:
+
+- **Versions are floors, not pins.** `numpy>=2.0` resolves to whatever is current
+  on the day somebody installs. There is no Python lock file and no hash
+  pinning — `core/Cargo.lock` is the only lock in the repository. Two installs a
+  month apart are not the same software.
+- **The audit scans our source, not our dependency tree.** A package that is
+  clean itself but pulls in a telemetry library transitively comes in through a
+  door the guard is not watching.
+- **Nothing verifies a package's runtime behaviour.** "It does not download
+  anything" is currently established by reading and by reasoning, not by
+  observing a process with the network taken away.
+
+The offline CI job partly covers the last of these — it exercises the real
+dependencies with no route out — but only along the paths the tests reach.
+
+---
 
 ## Authorization
 

@@ -59,6 +59,11 @@ no rule.
 - **Zero WAN.** No feature requires the Internet. No cloud services, no telemetry,
   no external map tiles, no CDN assets, no auto-updater, no model downloads.
   Block all outbound traffic and the system keeps working.
+  *The network is available once, to install, and never again* — third-party
+  packages are allowed and are chosen on exactly that criterion, so anything that
+  downloads a model or a tile on first use is disqualified however good it is. An
+  air-gapped site installs from a wheelhouse carried in on a disk; see
+  [docs/SECURITY.md](docs/SECURITY.md#dependencies).
   *Enforced by:* **three checks at three different times.** `python tasks.py
   audit` — the first CI job, before any toolchain runs — scans the shipped source
   for cloud SDKs, telemetry packages and hard-coded external hosts. The CI
