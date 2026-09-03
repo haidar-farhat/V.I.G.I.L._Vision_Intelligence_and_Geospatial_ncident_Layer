@@ -167,6 +167,16 @@ class SourceInfo:
     backend: str = "FFmpeg"
 
 
+def is_live_source(url: str | Path) -> bool:
+    """Whether a source is a camera — a device or a stream — rather than a file.
+
+    A file can be read by any number of readers at once; a camera cannot, and a
+    node uses this to refuse a second camera on the same device.
+    """
+    raw = str(url)
+    return devices.is_device_source(raw) or _looks_live(raw)
+
+
 class VideoSource:
     """A file or live stream, decoded to frames.
 

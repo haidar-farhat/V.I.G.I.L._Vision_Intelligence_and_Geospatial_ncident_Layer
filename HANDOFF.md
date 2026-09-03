@@ -127,10 +127,36 @@ was a person at the keyboard clicking the real window the tool puts on the
 desktop, not a defect — a trace of `_add_zone` calls in an unattended run
 shows exactly one. Worth knowing: the screenshot tool's window is live.)
 
+### Three things the operator's own log found
+
+The user ran the packaged `SentinelVision-dev.exe`, pressed Start and Stop, and
+pasted the log. It showed:
+
+- **"no detection model"** — with `models/yolov8n-seg.onnx` in the checkout. A
+  frozen build looked in `_internal/models` (`sys._MEIPASS`), where no operator
+  would put anything. `paths.models_directory()` now uses `models/` **beside the
+  executables**; `tasks.py package` copies any `models/*.onnx` there; `sentinel
+  where` prints it; `HOW TO RUN.txt` says so.
+- **"restored 3 camera(s)"**, all `device:0`, all started: MSMF refused two with
+  `-1072873821`, every pane reconnected in a loop, and the one that worked
+  managed one frame. `Node.add_camera` refuses a second camera on the same
+  **live** source by name (the redacted form, never the credential); a duplicate
+  already in the database is restored, faulted `same source as X; not started`,
+  and `start()` leaves it alone. Files are exempt: a replay may back any number
+  of cameras, which is how multi-camera correlation is tested. The console shows
+  the refusal in a message box instead of raising out of the slot.
+- `QFont::setPointSize: Point size <= 0 (-1)` once at start-up. Not chased:
+  the stylesheet sets fonts in px, and something copies such a font and asks
+  for its point size. Cosmetic; find it with `QT_FATAL_WARNINGS=1`.
+
+Also verified: the packaged console, closed with `taskkill /PID` (WM_CLOSE, no
+`/F`) after 8 s, **exits 0**. The shutdown path is clean in the real binary,
+not only in the test process.
+
 ### Docs
 
-FEATURES.md +3 rows (149 `TESTED` of 374). STATUS.md counts corrected (they
-were stale: 648 → 675 tests, 36 → 41 diagrams) and a row for the contact
+FEATURES.md +5 rows (151 `TESTED` of 376). STATUS.md counts corrected (they
+were stale: 648 → 679 tests, 36 → 41 diagrams) and a row for the contact
 crossing. USAGE §7 says the dot is where the position came from. README file
 map.
 
@@ -172,10 +198,8 @@ launch check and screenshots.
 - Track ids reached #3 and #5 within 224 frames for two stationary objects:
   the fragmentation number to beat with appearance re-ID.
 
-**Not done by me, and worth a person doing:** close the real console and the
-packaged `SentinelVision-dev.exe` and check `$LASTEXITCODE` is 0 — the crash was
-only ever observed in the test process, and `run()` now frees its window by
-refcount, but nobody has watched the packaged binary exit.
+- Packaged `SentinelVision-dev.exe` launched, closed gracefully after 8 s:
+  **exit 0**, log ends `console exited with 0`.
 
 ---
 

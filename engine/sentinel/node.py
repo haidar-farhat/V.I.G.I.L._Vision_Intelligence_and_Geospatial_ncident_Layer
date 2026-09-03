@@ -44,7 +44,7 @@ from pathlib import Path
 from typing import Iterator, Sequence
 
 from .core import CameraPose
-from .decode import REDACTED, DecodeError, VideoSource
+from .decode import REDACTED, DecodeError, VideoSource, is_live_source
 from .detect import Detector, DetectorInfo, MotionDetector
 from .evidence import (
     DEFAULT_LEAD_SECONDS,
@@ -559,11 +559,29 @@ class Node:
             # was never persisted and must not be. A network camera therefore
             # comes back needing its password again, and says so rather than
             # failing at connect time with something unhelpful.
-            self._cameras[camera_id] = CameraRecord(
+            record = CameraRecord(
                 camera_id=camera_id,
                 source=row["source"],
                 pose=self.store.camera_pose(camera_id),
             )
+            # Rows written before one-source-one-camera was enforced. Kept, so
+            # the operator can see them and nothing silently disappears from a
+            # list they made — but faulted from the start, and `start` leaves a
+            # faulted duplicate alone rather than fighting the first for the
+            # device.
+            twin = next(
+                (r for r in self._cameras.values() if r.source == record.source), None
+            )
+            if twin is not None and is_live_source(record.source):
+                record.fault = (
+                    f"same source as {twin.camera_id}; not started. One source is "
+                    "one camera."
+                )
+                _log.warning(
+                    "node %s: camera %s duplicates %s (%s) and will not be started",
+                    self._node_id, camera_id, twin.camera_id, record.display_source,
+                )
+            self._cameras[camera_id] = record
             self._restored_cameras += 1
 
         if self._restored_cameras:
@@ -602,6 +620,21 @@ class Node:
             raise NodeError(
                 f"there is already a camera called {identifier!r} on this node"
             )
+        # One live source, one camera. An operator's log showed `device:0`
+        # added three times across sessions, all three restored and all three
+        # started against one webcam: the driver refused two of them, every
+        # pane reconnected in a loop, and the one that worked was down to a
+        # frame a second. A file is exempt — it is a replay, and any number of
+        # cameras may read it. The display form is compared and reported,
+        # never the raw one.
+        if is_live_source(text):
+            display = CameraRecord(camera_id=identifier, source=text).display_source
+            for existing in self._cameras.values():
+                if existing.source == text or existing.display_source == display:
+                    raise NodeError(
+                        f"{display} is already camera {existing.camera_id!r} on "
+                        "this node. One camera per device; start that one."
+                    )
 
         record = CameraRecord(camera_id=identifier, source=text, pose=pose)
         self._cameras[identifier] = record
@@ -692,6 +725,8 @@ class Node:
         started = 0
         for record in self._cameras.values():
             if record.is_running:
+                continue
+            if record.fault is not None and record.fault.startswith("same source as"):
                 continue
             record.fault = None
             source = VideoSource(record.source, source_id=record.camera_id)

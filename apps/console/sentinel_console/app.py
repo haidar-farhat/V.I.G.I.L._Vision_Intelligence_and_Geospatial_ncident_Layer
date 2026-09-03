@@ -514,7 +514,14 @@ class ConsoleWindow(QMainWindow):
 
         added = []
         for choice in dialog.chosen:
-            session = self.add_camera(choice.source, camera_id=choice.suggested_id)
+            try:
+                session = self.add_camera(choice.source, camera_id=choice.suggested_id)
+            except NodeError as error:
+                # The node's message names the existing camera and carries the
+                # redacted source only. Shown, not logged and swallowed: the
+                # operator just asked for this and needs to know why not.
+                QMessageBox.information(self, "Already a camera", str(error))
+                continue
             added.append(session)
             # The display form, never the raw one: this line goes to a log file.
             _log.info("added camera %s from %s", session.camera_id, choice.display)

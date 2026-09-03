@@ -33,20 +33,20 @@ Related: [STATUS.md](STATUS.md) — measurements and honest gaps ·
 
 ## The scoreboard
 
-374 capabilities, each with a state. Many lines cover several related things —
+376 capabilities, each with a state. Many lines cover several related things —
 "heading · pitch · roll" is one row — so this counts *claims*, not code.
 
 | | Count | Share | What it means |
 |---|---:|---:|---|
-| **`TESTED`** | 149 | 40% | A test fails if it stops working |
+| **`TESTED`** | 151 | 40% | A test fails if it stops working |
 | **`IMPL`** | 23 | 6% | Works; a regression would go unnoticed |
 | **`SKEL`** | 35 | 9% | Something is there; it does not do the job |
 | **`PLAN`** | 167 | 45% | Designed, no code |
 
 ```mermaid
 pie showData
-    title Sentinel Vision — 374 capabilities by state
-    "TESTED" : 149
+    title Sentinel Vision — 376 capabilities by state
+    "TESTED" : 151
     "IMPLEMENTED" : 23
     "SKELETON" : 35
     "PLANNED" : 167
@@ -226,6 +226,8 @@ two identical webcams are indistinguishable by name.
 | Conclusions never squeezed out of sight | `TESTED` | On a short window the video shrinks, not the incident and track panels. A live screenshot had shown "2 tracked now" above a table reduced to its header row |
 | Contact point drawn in the console | `TESTED` | A dot in the track's colour where the position was projected from — on the feet with a mask, at the box's bottom-centre without. Checked as pixels, not as a call |
 | Segmentation masks drawn in the console | `TESTED` | The silhouette, at low alpha, instead of a box. An overlay that hides the pixels it describes makes the frame useless as evidence |
+| One camera per device | `TESTED` | A second camera on the same device or stream is refused by name; a duplicate already stored is restored, faulted and never started. An operator's log had three cameras on `device:0` fighting one webcam. Files are exempt: a replay may back any number of cameras |
+| Models found beside the executables | `TESTED` | A packaged build looks in `models/` next to the `.exe`, not inside `_internal`; packaging copies any model in the checkout there; `sentinel where` prints the directory |
 | Model switching · multiple models | `TESTED` | Three detectors, interchangeable everywhere downstream. `--model` on `run`, `node` and the console; the console falls back to motion and says so |
 | GPU inference | `PLAN` | |
 | CPU fallback | `TESTED` | The only provider used today |

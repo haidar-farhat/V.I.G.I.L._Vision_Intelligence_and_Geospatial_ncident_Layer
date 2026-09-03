@@ -614,3 +614,63 @@ def test_an_incident_can_be_exported_long_after_the_run(
 
     assert (export.directory / "incident.json").is_file()
     assert (export.directory / "report.txt").is_file()
+
+
+# --------------------------------------------------- one live source, one camera
+
+
+def test_the_same_device_cannot_be_added_twice(tmp_path: Path):
+    # An operator's log: device:0 added three times across sessions, all three
+    # started against one webcam, two refused by the driver and every pane
+    # reconnecting in a loop. Nothing is opened here — add_camera never opens.
+    with Node(tmp_path / "n.db") as node:
+        node.add_camera("device:0", camera_id="integrated-camera")
+        with pytest.raises(NodeError, match="already camera 'integrated-camera'"):
+            node.add_camera("device:0", camera_id="integrated-camera-2")
+        with pytest.raises(NodeError, match="already camera"):
+            node.add_camera("rtsp://user:secret@10.0.0.9/live", camera_id="gate")
+            node.add_camera("rtsp://user:secret@10.0.0.9/live", camera_id="gate-2")
+        assert [c.camera_id for c in node.cameras] == ["integrated-camera", "gate"]
+
+
+def test_the_refusal_never_carries_the_credential(tmp_path: Path):
+    with Node(tmp_path / "n.db") as node:
+        node.add_camera("rtsp://user:secret@10.0.0.9/live", camera_id="gate")
+        with pytest.raises(NodeError) as caught:
+            node.add_camera("rtsp://user:secret@10.0.0.9/live", camera_id="gate-2")
+        assert "secret" not in str(caught.value)
+
+
+def test_a_file_may_back_as_many_cameras_as_asked(tmp_path: Path, reference_video: Path):
+    # A file is a replay; two cameras on one clip is how multi-camera
+    # correlation is tested and demonstrated.
+    with Node(tmp_path / "n.db") as node:
+        node.add_camera(reference_video, camera_id="cam-07")
+        node.add_camera(reference_video, camera_id="cam-08")
+        assert len(node.cameras) == 2
+
+
+def test_a_duplicate_device_already_stored_is_restored_but_not_started(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # Rows written before the rule existed. They must not vanish from a list
+    # the operator made, and they must not fight the first camera for the
+    # device either.
+    database = tmp_path / "n.db"
+    with Store(database) as store:
+        store.save_camera("integrated-camera", "integrated-camera", "device:0")
+        store.save_camera("integrated-camera-2", "integrated-camera-2", "device:0")
+
+    # Nothing may touch a real webcam from a unit test: the runner's thread is
+    # never started, so what is checked is exactly which runners were built.
+    monkeypatch.setattr(CameraRunner, "start", lambda self: None)
+
+    with Node(database) as node:
+        assert node.restored_cameras == 2
+        twin = node.camera("integrated-camera-2")
+        assert twin.fault is not None and "same source as integrated-camera" in twin.fault
+
+        assert node.start() == 1, "only one camera may open the device"
+        assert node.camera("integrated-camera").runner is not None
+        assert twin.runner is None
+        assert "same source as integrated-camera" in (twin.fault or "")

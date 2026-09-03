@@ -793,6 +793,7 @@ def _devices(args: argparse.Namespace) -> int:
 def _where(args: argparse.Namespace) -> int:
     """Answer "where does this thing keep my files", which is asked constantly."""
     print(f"data directory   {paths.data_directory()}")
+    print(f"models directory {paths.models_directory()}")
     print(f"database         {args.database or default_database_path()}")
     print(f"logs             {paths.log_directory()}")
     print(f"evidence         {paths.evidence_directory()}")

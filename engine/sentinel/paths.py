@@ -89,14 +89,19 @@ def models_directory() -> Path:
     ``SENTINEL_MODELS_DIR`` overrides it, which a packaged build needs — the
     bundle root is read-only on a proper install, so the models an operator adds
     afterwards have to be somewhere they can write.
+
+    In a packaged build the directory is ``models/`` **beside the executables**,
+    not inside ``_internal``. An earlier version looked inside the bundle's
+    private directory, and an operator who did the natural thing — a `models`
+    folder next to `SentinelVision.exe` — got motion detection with no word about
+    the model sitting one folder away.
     """
     override = os.environ.get("SENTINEL_MODELS_DIR")
     if override:
         return Path(override).expanduser()
 
-    bundle = bundle_directory()
-    if bundle is not None:
-        return bundle / "models"
+    if is_frozen():
+        return Path(sys.executable).resolve().parent / "models"
 
     # A checkout: the repository's own models/ directory, which is gitignored.
     return Path(__file__).resolve().parents[2] / "models"

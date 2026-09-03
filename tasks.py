@@ -28,6 +28,7 @@ in CI.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -220,6 +221,10 @@ folder, run it, delete the folder.
 Your data — the database, the log and any exported evidence — is NOT in here.
 `sentinel{suffix} where` prints exactly where it is.
 
+Detection models go in `models/` in THIS folder (a `*-seg.onnx` is picked up
+on its own; `sentinel{suffix} where` prints the directory). Without one the
+console detects motion only, and says so in its toolbar.
+
 Documentation: docs/USAGE.md in the source repository.
 """
 
@@ -312,6 +317,18 @@ def package() -> None:
         encoding="utf-8",
     )
 
+    # Operator-supplied models travel with the bundle when they are present.
+    # Nothing is fetched: this copies files that are already on this machine,
+    # and a checkout without any simply ships a console that detects motion
+    # and says so. Without this, the first packaged run found no model while
+    # one sat in the repository's models/ directory the whole time.
+    models = sorted((ROOT / "models").glob("*.onnx"))
+    if models:
+        target = produced / "models"
+        target.mkdir(exist_ok=True)
+        for model in models:
+            shutil.copy2(model, target / model.name)
+
     print()
     print("  Run it from here, and nowhere else:")
     print()
@@ -322,6 +339,10 @@ def package() -> None:
     print()
     print("  Ship the whole folder. The executables need `_internal` beside")
     print("  them, which is what every Qt application ships.")
+    if models:
+        print(f"  {len(models)} model(s) copied into {produced.name}/models/.")
+    else:
+        print("  No model in models/: the bundle detects motion until one is added.")
     if stripped:
         print()
         print(f"  ({len(stripped)} unrunnable stub(s) removed from {work.name}/ —")

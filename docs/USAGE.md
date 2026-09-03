@@ -585,7 +585,9 @@ python devtools/export_model.py --task segment --size n
 
 That writes `models/yolov8n-seg.onnx` (about 14 MB) and prints its SHA-256.
 Copy the file to the offline machine and put it in the models directory —
-`SENTINEL_MODELS_DIR` if you have set it, otherwise `models/` beside the install.
+`SENTINEL_MODELS_DIR` if you have set it, otherwise `models/` **beside the
+executables** (`sentinel where` prints the exact path). Packaging copies any
+model already in the checkout's `models/` into the bundle for you.
 `ultralytics` is a developer tool and is deliberately **not** a dependency of
 the product; see `devtools/README.md` for why that separation matters.
 
