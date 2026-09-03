@@ -35,7 +35,7 @@ from sentinel_console.app import ConsoleWindow  # noqa: E402
 from sentinel_console.map_view import MapView  # noqa: E402
 from sentinel_console.placement import PlacementDialog  # noqa: E402
 from sentinel_console.video_view import VideoView  # noqa: E402
-from sentinel_console.worker import AnalysisWorker  # noqa: E402
+from sentinel.node import CameraRunner  # noqa: E402
 
 # The track table leads with the camera, because a track id is only unique
 # within one camera and a table without it shows two objects as if they were one.
@@ -109,7 +109,8 @@ def test_placing_a_camera_mid_run_produces_positions(qt_app, window, reference_v
         range_meters=90.0,
     )
     window._refresh_placement()
-    session.worker.set_pose(session.pose)
+    # No second call: assigning the pose *is* the placement, and it reaches the
+    # running analysis on its way through the node.
     pump(qt_app, window, 4.0)
 
     row = window.tracks.topLevelItem(0)
@@ -237,33 +238,42 @@ def test_no_part_of_the_console_embeds_a_browser(qt_app):
 
 def test_the_analysis_does_not_run_on_the_ui_thread(qt_app, reference_video: Path):
     # A decode loop on the UI thread freezes the interface, including the button
-    # that stops it. Subclassed rather than monkeypatched: QThread dispatches to
-    # the class's run(), so assigning an instance attribute would silently not
-    # be called and the test would pass while proving nothing.
+    # that stops it. Subclassed rather than monkeypatched, because assigning an
+    # instance attribute would silently not be called and the test would pass
+    # while proving nothing.
+    #
+    # The runner is the engine's now, not a QThread — which is what lets a
+    # worker node run this same loop with no display at all.
+    import threading
+
     seen: list[object] = []
 
-    class Observed(AnalysisWorker):
-        def run(self):
-            seen.append(QThread.currentThread())
-            super().run()
+    class Observed(CameraRunner):
+        def _run(self):
+            seen.append(threading.current_thread())
+            super()._run()
 
-    worker = Observed(VideoSource(reference_video), MotionDetector(), realtime=False)
-    worker.start()
+    runner = Observed(VideoSource(reference_video), MotionDetector(), realtime=False)
+    runner.start()
 
     deadline = time.perf_counter() + 5.0
     while not seen and time.perf_counter() < deadline:
         qt_app.processEvents(QEventLoop.ProcessEventsFlag.AllEvents, 10)
-    worker.stop()
-    worker.wait(5000)
+    runner.stop()
 
-    assert seen, "the worker never started"
-    assert seen[0] is not QThread.currentThread()
-    assert seen[0] is worker, "run() must execute on the worker's own thread"
+    assert seen, "the runner never started"
+    assert seen[0] is not threading.current_thread()
+    assert seen[0] is not threading.main_thread(), (
+        "the analysis must not execute on the thread that paints"
+    )
 
 
 def test_the_newest_result_wins_rather_than_a_backlog_building(qt_app, reference_video: Path):
-    # Never reading from the worker must not accumulate frames.
-    worker = AnalysisWorker(VideoSource(reference_video), MotionDetector(), realtime=False)
+    # Never reading from the runner must not accumulate frames. A pipeline at
+    # 90 fps in front of a display repainting at 30 would otherwise build a
+    # backlog that grows until memory runs out — and every frame in it is stale
+    # by the time it would be drawn.
+    worker = CameraRunner(VideoSource(reference_video), MotionDetector(), realtime=False)
     worker.start()
 
     deadline = time.perf_counter() + 5.0
@@ -272,7 +282,6 @@ def test_the_newest_result_wins_rather_than_a_backlog_building(qt_app, reference
 
     skipped = worker._skipped
     worker.stop()
-    worker.wait(5000)
 
     assert skipped > 0, "nothing was skipped, so the drop path never ran"
     # Exactly one result is retained no matter how many were produced.
@@ -286,11 +295,10 @@ def test_closing_the_window_stops_the_analysis(qt_app, reference_video: Path):
     win._start()
     pump(qt_app, win, 2.0)
 
-    worker = session.worker
-    assert worker is not None and worker.isRunning()
+    assert session.is_running, "the camera did not start"
 
     win.close()
-    assert not worker.isRunning(), "a thread outlived the window that owned it"
+    assert not session.is_running, "a thread outlived the window that owned it"
 
 
 # -------------------------------------------------------------------- redaction
@@ -300,7 +308,7 @@ def test_no_credential_reaches_the_interface(qt_app):
     secret = "hunter2-not-a-real-password"
     url = f"rtsp://admin:{secret}@10.20.30.40:554/Streaming/Channels/101"
 
-    worker = AnalysisWorker(VideoSource(url, source_id="cam-07"), MotionDetector())
+    worker = CameraRunner(VideoSource(url, source_id="cam-07"), MotionDetector())
 
     for text in (worker.display_url, worker.source_id, repr(worker._source)):
         assert secret not in text
@@ -312,17 +320,27 @@ def test_a_failed_source_reports_in_place_rather_than_in_a_modal(qt_app, window)
     # This test would hang forever if a modal were opened, which is exactly what
     # an operator would experience.
     message = "rtsp://admin:***@203.0.113.99:554/none is not reachable"
-    window._on_failed(message)
+    # Set on the node's record and surfaced by the next poll — there is no
+    # queued signal to deliver it any more, which is what removed the whole
+    # class of bug where one arrived after the database had closed.
+    session = window.add_camera("rtsp://admin:pw@203.0.113.99:554/none", "cam-09")
+    session.record.fault = message
+    window._collect()
 
     assert window.fault_label.isVisible()
     assert message in window.fault_label.text()
-    assert "***" in window.status.currentMessage()
+    assert "***" in window.fault_label.text()
 
 
 def test_a_new_run_clears_a_previous_fault(qt_app, window, reference_video: Path):
     # A stale error beside a healthy camera is worse than no error at all.
-    window._on_failed("something went wrong earlier")
+    stale = window.add_camera("rtsp://admin:pw@203.0.113.99:554/none", "cam-09")
+    stale.record.fault = "something went wrong earlier"
+    window._collect()
     assert window.fault_label.isVisible()
+
+    # Removed before the new run, so the fault it carries goes with it.
+    window._sessions.pop("cam-09")
 
     window.add_camera(reference_video, "cam-07")
     window._start()
@@ -537,9 +555,10 @@ def test_each_camera_runs_its_own_pipeline(qt_app, window, reference_video: Path
     window._start()
     pump(qt_app, window, 3.0)
 
-    workers = [s.worker for s in window._sessions.values()]
-    assert len(workers) == 2
-    assert workers[0] is not workers[1], "two cameras shared one pipeline"
+    runners = [s.record.runner for s in window._sessions.values()]
+    assert len(runners) == 2
+    assert all(runner is not None for runner in runners)
+    assert runners[0] is not runners[1], "two cameras shared one pipeline"
 
     window._stop()
 
@@ -683,7 +702,7 @@ def test_incidents_survive_the_console_being_closed(qt_app, reference_video, tmp
     first._start()
     pump(qt_app, first, 16.0)
     first._stop()
-    first._correlate()
+    first.node.correlate()
     stored_incidents = first.store.incident_count()
     first.close()
 
@@ -730,15 +749,21 @@ def test_the_console_records_what_the_operator_did(qt_app, window, reference_vid
     from sentinel.core import CameraPose, LatLon
 
     session = window.add_camera(reference_video, "cam-07")
+    # No separate save/audit call: placing a camera *is* the operation, and it
+    # persists and audits on the way through. The console used to do all three
+    # by hand, which is how a placement could be recorded without being saved.
     session.pose = CameraPose(
         position=LatLon(33.8938, 35.5018), mount_height=6.0, heading=180.0, pitch=-22.0
     )
-    window.store.save_camera("cam-07", "cam-07", str(reference_video), session.pose)
-    window.store.audit("console", "camera.placed", "cam-07", "6.0 m, bearing 180")
 
-    actions = {row["action"] for row in window.store.audit_trail()}
-    assert "console.started" in actions
-    assert "camera.placed" in actions
+    rows = window.store.audit_trail()
+    actions = {row["action"] for row in rows}
+    actors = {row["actor"] for row in rows}
+
+    assert {"node.started", "camera.added", "camera.placed"} <= actions
+    # The actor is what a chain of custody is about, and it is the console —
+    # the same engine code audits as `node` when a daemon runs it.
+    assert actors == {"console"}
 
 
 def test_re_correlating_does_not_multiply_stored_incidents(qt_app, window, reference_video):
@@ -765,10 +790,10 @@ def test_re_correlating_does_not_multiply_stored_incidents(qt_app, window, refer
     pump(qt_app, window, 16.0)
     window._stop()
 
-    window._correlate()
+    window.node.correlate()
     after_one = window.store.incident_count()
     for _ in range(5):
-        window._correlate()
+        window.node.correlate()
 
     assert after_one > 0
     assert window.store.incident_count() == after_one
@@ -787,10 +812,13 @@ def test_an_incident_can_be_exported_with_a_verifiable_manifest(qt_app, window, 
     from test_store import make_event
 
     incident = Correlator().correlate([make_event(track=n) for n in (1, 2)])[0]
-    window._incidents = [incident]
+    window.store.save_incident(incident)
 
-    export = export_incident(incident, tmp_path, exported_by="console (unauthenticated)")
-    window.store.audit("console", "incident.exported", incident.id, str(export.directory))
+    # Through the node, which is the one implementation: it finds the incident,
+    # works out which recorded segments cover it, preserves them from retention,
+    # audits that, and exports with the footage. The console used to do none of
+    # those and produce a package with no video in it.
+    export, _ = window.node.export_incident(incident.id, tmp_path)
 
     assert verify_export(export.directory) == []
     assert any(

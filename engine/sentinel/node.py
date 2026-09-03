@@ -38,13 +38,14 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass, field
+
+import numpy as np
 from pathlib import Path
 from typing import Iterator, Sequence
 
 from .core import CameraPose
-from .decode import DecodeError, VideoSource
+from .decode import REDACTED, DecodeError, VideoSource
 from .detect import Detector, DetectorInfo, MotionDetector
-from .decode import REDACTED
 from .evidence import (
     DEFAULT_LEAD_SECONDS,
     DEFAULT_TRAIL_SECONDS,
@@ -94,6 +95,15 @@ class Update:
     #: Results nobody collected, because the collector was busy.
     skipped: int
     stats: PipelineStats
+
+    @property
+    def image(self) -> "np.ndarray | None":
+        """The frame these conclusions were drawn from, when one was kept.
+
+        `None` unless the runner was built with `keep_images` — a node with
+        nobody watching has no use for a full-resolution image per result.
+        """
+        return self.result.image
 
 
 @dataclass
@@ -638,6 +648,25 @@ class Node:
                 "restart a camera for it to take effect there",
                 self._node_id, zone.id,
             )
+
+    def probe(self, camera_id: str) -> None:
+        """Open a camera and close it again, or raise.
+
+        A daemon must not block its start-up on a camera that is not there — an
+        unreachable RTSP host costs seconds, and twenty of them cost minutes.
+        An *interface* wants the opposite: the operator asked for this, just
+        now, and is waiting, so a bad source should say so immediately rather
+        than appear as a fault banner a moment later.
+
+        Both are right, so this is a separate call and neither `start` nor
+        `run_forever` makes it. The console probes; the daemon does not.
+        """
+        record = self.camera(camera_id)
+        source = VideoSource(record.source, source_id=camera_id)
+        try:
+            source.open()
+        finally:
+            source.close()
 
     # --------------------------------------------------------------- lifecycle
 

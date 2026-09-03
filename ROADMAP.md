@@ -163,12 +163,16 @@ geometry.
       import anywhere in the process** — asserted by two tests that import the
       node, and then every engine module, in a subprocess and fail if `PySide`
       appears in `sys.modules`.
-      *Still open:* the console does not yet attach to it. `ConsoleWindow`
-      keeps its own `Store`, its own correlation loop and its own `QThread`
-      worker, so the analysis loop now exists twice and can drift. That is the
-      next slice, and it is a deletion rather than an addition — the mapping is
-      written down, seam by seam, and the console shrinks to widgets plus a
-      33 ms repaint that calls `node.poll()`.
+      **And the console is now a client of it, same day.** `ConsoleWindow` owns
+      no store, no zones, no rule set, no correlation loop and no analysis
+      thread; it owns widgets and calls `node.poll()` on a 33 ms repaint. As
+      predicted it was a deletion: 623 lines removed against 307 added, and
+      `worker.py` — the whole 240-line `QThread` adaptor — is gone.
+
+      *Still open from this item:* true decode/analytic independence. Recording
+      survives a slow analytic but not a dead decode, because both still share
+      one loop. That needs the decode thread to fan out to a recorder queue and
+      an analytic queue separately, and it is the last piece.
 - [ ] **1.3 · Appearance-based association.** The tracker reports 4 objects for
       3 people and switches identity 7 times in 388 observations, because
       position and box geometry are all it has. A small appearance descriptor —

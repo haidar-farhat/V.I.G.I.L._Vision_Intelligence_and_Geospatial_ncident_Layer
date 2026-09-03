@@ -31,7 +31,7 @@ from PySide6.QtWidgets import QSizePolicy, QWidget
 from sentinel.detect import DetectorInfo
 
 from . import theme
-from .worker import Update
+from sentinel.node import Update
 
 
 class VideoView(QWidget):

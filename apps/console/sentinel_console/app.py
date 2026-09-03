@@ -69,8 +69,8 @@ from sentinel.events import (
     ZoneEntryRule,
 )
 from sentinel.evidence import ExportError, export_incident
-from sentinel.incidents import Correlator
-from sentinel.store import Store, default_database_path
+from sentinel.node import Node, NodeError, Update
+from sentinel.store import default_database_path
 from sentinel import devices, logs, telemetry
 from sentinel.zones import Zone, ZoneKind
 
@@ -83,7 +83,6 @@ from .add_camera import AddCameraDialog
 from .video_view import VideoView
 
 _log = logs.get(__name__)
-from .worker import AnalysisWorker
 
 #: How often the interface collects results. 30 Hz is smooth to the eye and
 #: leaves the analysis threads the rest of the machine.
@@ -131,24 +130,66 @@ class ConsoleWindow(QMainWindow):
         self.setStyleSheet(theme.STYLESHEET)
 
         self._sessions: dict[str, CameraSession] = {}
-        self._zones: list[Zone] = []
-        self._incidents: list = []
-        self._persisted: set[str] = set()
 
-        self.store = Store(database if database is not None else default_database_path())
-        self.store.audit("console", "console.started")
-        # Zones outlive a session: they describe the ground, not the run.
-        self._zones = self.store.zones()
+        # The console is a *client* of this. It owns no store, no zones, no
+        # rule set and no analysis thread; it owns widgets, and it calls
+        # `poll()` on a repaint timer. The same object runs a worker node with
+        # no display, which is the point: one analysis loop, not two that drift.
+        self.node = Node(
+            database if database is not None else default_database_path(),
+            actor="console",
+            # A viewer needs the frame the conclusions were drawn from, and
+            # needs a file paced to its own timeline rather than flashing past.
+            keep_images=True,
+            realtime=True,
+            correlate_every_millis=CORRELATE_INTERVAL_MILLIS,
+        )
 
         self._build()
+        self._restore_cameras()
 
         self._timer = QTimer(self)
         self._timer.setInterval(REPAINT_INTERVAL_MILLIS)
         self._timer.timeout.connect(self._collect)
 
-        self._correlate_timer = QTimer(self)
-        self._correlate_timer.setInterval(CORRELATE_INTERVAL_MILLIS)
-        self._correlate_timer.timeout.connect(self._correlate)
+    @property
+    def store(self):
+        """The node's store. The console does not own one."""
+        return self.node.store
+
+    @property
+    def _zones(self) -> list:
+        return list(self.node.zones)
+
+    @property
+    def _incidents(self) -> list:
+        return list(self.node.incidents)
+
+    def _restore_cameras(self) -> None:
+        """Show the cameras this node already had.
+
+        Placements used to be written and never read, so every restart brought
+        the cameras back unplaced — or rather, did not bring them back at all.
+        The node restores them; this gives each one a pane.
+        """
+        for record in self.node.cameras:
+            self._attach(record)
+        if self._sessions:
+            self._relayout_wall()
+            self.start_button.setEnabled(True)
+            self._refresh_placement()
+
+    def _attach(self, record) -> CameraSession:
+        """Give a node camera a pane, a row in the picker and a place on the wall."""
+        view = VideoView()
+        view.set_placeholder(f"{record.camera_id} — not started")
+        view.set_show_detections(self.show_detections.isChecked())
+
+        session = CameraSession(record=record, view=view, node=self.node)
+        self._sessions[record.camera_id] = session
+        self.camera_picker.addItem(record.camera_id, record.camera_id)
+        self.camera_picker.setCurrentIndex(self.camera_picker.count() - 1)
+        return session
 
     # -------------------------------------------------------- the primary camera
     #
@@ -166,11 +207,6 @@ class ConsoleWindow(QMainWindow):
     def _pose(self) -> CameraPose | None:
         session = self._selected
         return session.pose if session else None
-
-    @property
-    def _worker(self) -> AnalysisWorker | None:
-        session = self._selected
-        return session.worker if session else None
 
     @property
     def _running(self) -> bool:
@@ -370,20 +406,18 @@ class ConsoleWindow(QMainWindow):
         as adding a clip.
         """
         text = str(source)
-        default = Path(text).stem if "://" not in text and not text.startswith("device:") else text
+        default = (
+            Path(text).stem
+            if "://" not in text and not text.startswith("device:")
+            else text
+        )
         identifier = camera_id or default or f"cam-{len(self._sessions) + 1:02d}"
         if identifier in self._sessions:
             identifier = f"{identifier}-{len(self._sessions) + 1}"
 
-        view = VideoView()
-        view.set_placeholder(f"{identifier} — not started")
-        view.set_show_detections(self.show_detections.isChecked())
+        record = self.node.add_camera(text, camera_id=identifier)
+        session = self._attach(record)
 
-        session = CameraSession(camera_id=identifier, source=text, view=view)
-        self._sessions[identifier] = session
-
-        self.camera_picker.addItem(identifier, identifier)
-        self.camera_picker.setCurrentIndex(self.camera_picker.count() - 1)
         self._relayout_wall()
         self.start_button.setEnabled(True)
         return session
@@ -472,26 +506,11 @@ class ConsoleWindow(QMainWindow):
         if not accepted:
             return
 
-        session.pose = pose
-        if session.worker is not None:
-            session.worker.set_pose(session.pose)
-
-        self.store.save_camera(
-            session.camera_id,
-            session.camera_id,
-            # Redacted here, at the boundary. The comment this replaced claimed
-            # the value was "already redacted" and it was not — it was the raw
-            # source, which for an RTSP camera is the password, written into a
-            # database column whose whole point is never to hold one.
-            source=session.display_source,
-            pose=session.pose,
-        )
-        self.store.audit(
-            "console",
-            "camera.placed",
-            session.camera_id,
-            f"{session.pose.mount_height:.1f} m, bearing {session.pose.heading:.0f}",
-        )
+        # One call. It assigns the pose, pushes it to the running analysis so
+        # existing tracks keep their identity, persists it with the *redacted*
+        # source, and audits it — and it is the same call a daemon makes, so
+        # the two cannot drift about what placing a camera means.
+        self.node.place_camera(session.camera_id, pose)
         self._refresh_placement()
 
     def _refresh_placement(self) -> None:
@@ -553,18 +572,18 @@ class ConsoleWindow(QMainWindow):
             for bearing in (0.0, 90.0, 180.0, 270.0)
         )
 
-        index = len(self._zones) + 1
-        self._zones.append(
-            Zone(
-                id=f"zone-{index}",
-                name=f"Restricted Area {chr(64 + index)}",
-                kind=ZoneKind.RESTRICTED,
-                ring=ring,
-                enter_after_millis=600,
-            )
+        index = len(self.node.zones) + 1
+        zone = Zone(
+            id=f"zone-{index}",
+            name=f"Restricted Area {chr(64 + index)}",
+            kind=ZoneKind.RESTRICTED,
+            ring=ring,
+            enter_after_millis=600,
         )
-        self.store.save_zone(self._zones[-1])
-        self.store.audit("console", "zone.created", self._zones[-1].id, self._zones[-1].name)
+        # The node persists it, audits it, and — if this is the first zone —
+        # rebuilds the rule set, because rules that need a zone are dead weight
+        # until there is one and must not stay dead once there is.
+        self.node.add_zone(zone)
 
         self.map.set_zones(self._zones)
         self._set_status(
@@ -653,57 +672,36 @@ class ConsoleWindow(QMainWindow):
             return
 
         self.fault_label.setVisible(False)
-        started = 0
 
-        for session in self._sessions.values():
-            session.fault = None
-            session.events.clear()
-
+        # Probed here rather than inside the node, because a *daemon* must not
+        # block start-up on an unreachable camera while an *interface* should
+        # say so at once: the operator asked for this, just now, and is waiting.
+        for session in list(self._sessions.values()):
+            if self.node.needs_credentials(session.camera_id):
+                QMessageBox.warning(
+                    self, f"{session.camera_id} needs its password",
+                    "This camera was restored from the database, which never "
+                    "stores a password — that is deliberate. Remove it and add "
+                    "it again with its credentials.",
+                )
+                return
             try:
-                source = VideoSource(session.source, source_id=session.camera_id)
-                source.open()
+                self.node.probe(session.camera_id)
             except DecodeError as error:
-                # A modal is right here: the operator asked for this, just now,
-                # and is waiting for it.
-                QMessageBox.warning(self, f"Cannot open {session.camera_id}", str(error))
-                continue
+                QMessageBox.warning(
+                    self, f"Cannot open {session.camera_id}", str(error)
+                )
+                return
 
-            detector = MotionDetector()
-            session.view.set_detector_info(detector.info)
-
-            worker = AnalysisWorker(
-                source,
-                detector,
-                session.pose,
-                realtime=True,
-                zones=self._zones,
-                rules=self._rules(),
-                node_id="local",
-                parent=self,
-            )
-            # The worker is captured alongside the session so the slot can check
-            # that the signal came from the worker the session currently holds.
-            # Without that check a worker dropped on a previous Start/Stop cycle
-            # can still deliver a queued `failed` and disown the worker that
-            # replaced it, stopping a camera that is running perfectly well.
-            worker.finished_run.connect(
-                lambda reason, s=session, w=worker: self._on_finished(reason, s, w)
-            )
-            worker.failed.connect(
-                lambda message, s=session, w=worker: self._on_failed(message, s, w)
-            )
-
-            session.worker = worker
-            worker.start()
-            started += 1
-
+        started = self.node.start()
         if started == 0:
             return
 
+        for session in self._sessions.values():
+            session.view.set_detector_info(None)
+
         self.detector_label.setText("MOG2 background subtraction — does not classify")
         self._timer.start()
-        self._correlate_timer.start()
-        self.store.audit("console", "analysis.started", detail=f"{started} camera(s)")
 
         self.open_button.setEnabled(False)
         self.start_button.setEnabled(False)
@@ -718,12 +716,16 @@ class ConsoleWindow(QMainWindow):
         of sixteen could freeze for the better part of a minute — while the
         operator watches a window that has stopped responding.
         """
-        for session in self._sessions.values():
-            if session.worker is not None:
-                session.worker.stop()
+        ended = self.node.stop()
+        stubborn = [] if ended else [
+            s.camera_id for s in self._sessions.values() if s.is_running
+        ]
 
-        stubborn = [s.camera_id for s in self._sessions.values() if not s.stop()]
-
+        # One last collection, so the final frames and whatever the node
+        # concluded from them reach the screen. Releasing first is how the last
+        # seconds of a run get discarded — a file ending on an intrusion used to
+        # show nothing.
+        self._collect()
         self._teardown()
         if stubborn:
             self._set_status(
@@ -735,7 +737,6 @@ class ConsoleWindow(QMainWindow):
 
     def _teardown(self) -> None:
         self._timer.stop()
-        self._correlate_timer.stop()
         self.open_button.setEnabled(True)
         self.start_button.setEnabled(bool(self._sessions))
         self.stop_button.setEnabled(False)
@@ -743,53 +744,53 @@ class ConsoleWindow(QMainWindow):
     # ------------------------------------------------------------------ updates
 
     def _collect(self) -> None:
-        """Pull the newest result from every camera. Runs on the repaint timer."""
-        changed = False
+        """Move the node forward and draw what came back. On the repaint timer.
 
-        for session in self._sessions.values():
-            if session.worker is None:
-                continue
-            update = session.worker.take_latest()
-            if update is None:
-                continue
+        `poll` is the whole engine step: it drains each camera's events,
+        persists them, indexes any recorded segment, notices faults and
+        correlates when due. The console does none of that any more; it draws.
+        """
+        updates = self.node.poll()
 
+        for update in updates:
+            session = self._sessions.get(update.result.source_id)
+            if session is None:
+                continue
             session.absorb(update)
             session.view.show_update(update)
             self.map.set_tracks(update.result.tracks, session.camera_id)
-            changed = True
 
-        if changed:
+        self._show_faults()
+        self.incidents.show_incidents(self._incidents)
+        self.export_button.setEnabled(bool(self.node.incidents))
+
+        if updates:
             self._refresh_tracks()
-            self._refresh_status()
+        self._refresh_status()
 
-    def _correlate(self) -> None:
-        """Group every camera's events into incidents.
+        if self._running and not any(s.is_running for s in self._sessions.values()):
+            # Every camera has ended on its own. For files that is completion.
+            self._teardown()
+            self._set_status("Finished.")
 
-        Across all cameras, deliberately. A camera correlating its own events
-        would raise one incident per camera for one intrusion, which is exactly
-        the duplication this stage exists to remove.
+    def _show_faults(self) -> None:
+        """Report which camera is in trouble, in place and never modally.
+
+        Twenty cameras drop together when a switch loses power, and twenty
+        dialogs is not a user interface — it is a wall between the operator and
+        the cameras that still work.
         """
-        events = [event for session in self._sessions.values() for event in session.events]
-        if not events:
-            self.incidents.show_incidents([])
+        faulted = [s for s in self._sessions.values() if s.fault]
+        if not faulted:
+            self.fault_label.setVisible(False)
             return
 
-        correlator = Correlator(zone_kinds={zone.id: zone.kind for zone in self._zones})
-        self._incidents = correlator.correlate(events)
-        self.incidents.show_incidents(self._incidents)
-
-        # Written every time, and idempotent every time: ids are deterministic,
-        # so re-correlating a growing window upserts the same incident rather
-        # than accumulating a new one each pass.
-        self.export_button.setEnabled(bool(self._incidents))
-
-        for incident in self._incidents:
-            self.store.save_incident(incident)
-            if incident.id not in self._persisted:
-                self._persisted.add(incident.id)
-                self.store.audit(
-                    "engine", "incident.opened", incident.id, incident.summary
-                )
+        first = faulted[0]
+        more = f" (+{len(faulted) - 1} more)" if len(faulted) > 1 else ""
+        self.fault_label.setText(f"{first.camera_id}: {first.fault}{more}")
+        self.fault_label.setVisible(True)
+        for session in faulted:
+            session.view.set_placeholder(f"{session.camera_id} — {session.fault}")
 
     def _refresh_tracks(self) -> None:
         # Rebuilt rather than diffed. At the handful of objects a site sees this
@@ -803,7 +804,8 @@ class ConsoleWindow(QMainWindow):
             if update is None:
                 continue
 
-            info = session.worker.detector_info if session.worker else None
+            runner = session.record.runner
+            info = runner.detector_info if runner is not None else None
             for track in sorted(update.result.tracks, key=lambda t: t.id):
                 self.tracks.addTopLevelItem(
                     self._track_row(session.camera_id, track, update, info)
@@ -864,72 +866,6 @@ class ConsoleWindow(QMainWindow):
             f"{events} events -> {len(self._incidents)} incidents"
         )
 
-    def _on_finished(
-        self,
-        reason: str,
-        session: CameraSession | None = None,
-        worker: AnalysisWorker | None = None,
-    ) -> None:
-        """A camera's run ended by itself.
-
-        Order matters here and an earlier version had it backwards: it cleared
-        `session.worker` first and then called `_collect()`, which skips
-        sessions with no worker — so the last frames of every run, and any
-        incident correlated from them, were produced and immediately discarded.
-        A file ending on an intrusion showed nothing.
-
-        Collect first, then release.
-        """
-        self._collect()
-        self._correlate()
-
-        if session is not None and session.worker is not None:
-            if worker is not None and session.worker is not worker:
-                return
-            # The thread has finished; detaching hands ownership back to Python
-            # rather than leaving Qt holding a QThread nobody will start again.
-            session.worker.setParent(None)
-            session.worker = None
-
-        if not self._running:
-            self._teardown()
-            self._set_status(reason)
-
-    def _on_failed(
-        self,
-        message: str,
-        session: CameraSession | None = None,
-        worker: AnalysisWorker | None = None,
-    ) -> None:
-        """A running camera failed.
-
-        Reported in place rather than as a modal. A modal is right for something
-        the operator just asked for and which did not work; it is wrong for a
-        camera dropping on its own, because that happens to twenty cameras at
-        once when a switch loses power, and the operator would face a stack of
-        dialogs each of which must be dismissed before anything else can be
-        done — including looking at the cameras that are still working.
-
-        The message came from DecodeError, which is redacted by construction, so
-        it is safe to put in front of a person.
-        """
-        if session is not None:
-            # A worker dropped on an earlier Start/Stop cycle can still deliver
-            # a queued signal. Without this check it would disown the worker
-            # that replaced it and stop a camera that is running fine.
-            if worker is not None and session.worker is not worker:
-                return
-            session.fault = message
-            session.worker = None
-            session.view.set_placeholder(f"{session.camera_id} — {message}")
-
-        self.fault_label.setText(message)
-        self.fault_label.setVisible(True)
-        self._set_status(message)
-
-        if not self._running:
-            self._teardown()
-
     def _set_status(self, text: str) -> None:
         self.status.showMessage(text)
 
@@ -948,33 +884,18 @@ class ConsoleWindow(QMainWindow):
         """Shut down in the order that cannot leave something writing.
 
         An earlier version closed the database while both timers were still
-        armed and worker signals were still queued, so the next 33 ms tick — or
-        the last `finished_run` to arrive — ran `_correlate()` against a closed
-        connection and raised inside an event handler.
+        armed and worker signals were still queued, so the next 33 ms tick ran
+        `_correlate()` against a closed connection and raised inside an event
+        handler. That whole class of bug is now gone by construction: there are
+        no queued signals to arrive late, because collection is a direct call.
 
-        Timers first, then threads, then the database. And the threads are
-        signalled together before any of them is waited on: stopping them one at
-        a time blocked the interface for up to three seconds *per camera*, so
-        closing a wall of sixteen could hang for the better part of a minute.
+        The timer stops first so nothing polls a closing node. `Node.close`
+        does the rest — signal every camera, wait for all of them, correlate
+        once more so the last seconds of a run are not discarded, and close the
+        database.
         """
         self._timer.stop()
-        self._correlate_timer.stop()
-
-        for session in self._sessions.values():
-            if session.worker is not None:
-                session.worker.stop()
-
-        stubborn = [s.camera_id for s in self._sessions.values() if not s.stop()]
-        if stubborn:
-            # Recorded rather than hidden: a thread that would not stop is a
-            # fact about this run worth keeping.
-            self.store.audit(
-                "console", "analysis.thread_stuck", ", ".join(stubborn),
-                "left running to avoid destroying a live QThread",
-            )
-
-        self.store.audit("console", "console.stopped")
-        self.store.close()
+        self.node.close()
         event.accept()
 
 
