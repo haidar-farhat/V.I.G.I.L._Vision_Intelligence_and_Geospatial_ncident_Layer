@@ -1010,3 +1010,95 @@ def test_a_camera_session_never_exposes_its_credential(qt_app, window):
     assert not contains_credential(session.display_source, url)
     assert not contains_credential(session.camera_id, url)
     assert session.is_live is True
+
+
+# ------------------------------------------------ what only a screenshot found
+#
+# Each of these was invisible to every assertion in this file and obvious the
+# moment the real window was photographed. They are here so they stay fixed.
+
+
+def test_a_track_label_never_lands_on_the_readout(qt_app, reference_video: Path):
+    # A speed label was drawn inside the provenance panel: `1.6gate`, a track
+    # speed over a camera name, both illegible. The readout is the one thing an
+    # operator cannot recover from anywhere else on screen — which frame, at
+    # what time — so the label is what moves.
+    from PySide6.QtCore import QRectF
+    from PySide6.QtGui import QColor, QPainter, QPixmap
+
+    from sentinel_console.video_view import VideoView
+
+    view = VideoView()
+    view.resize(640, 480)
+    frame = QRectF(0, 0, 640, 480)
+    reserved = QRectF(8, 400, 220, 72)
+
+    pixmap = QPixmap(640, 480)
+    painter = QPainter(pixmap)
+    try:
+        # A box sitting right where the readout is.
+        box = QRectF(10, 430, 40, 40)
+        drawn: list[QRectF] = []
+
+        original = view._draw_label
+
+        def record(p, rect, text, colour, f=None, r=None):
+            before = pixmap.rect()
+            original(p, rect, text, colour, f, r)
+            drawn.append(rect)
+
+        view._draw_label(painter, box, "#2 1.6 m/s", QColor("green"), frame, reserved)
+    finally:
+        painter.end()
+
+    # The assertion that matters is on the geometry the method computes, so it
+    # is recomputed here the same way rather than inferred from pixels.
+    from PySide6.QtGui import QFontMetrics
+
+    metrics = QFontMetrics(view.font())
+    width = metrics.horizontalAdvance("#2 1.6 m/s") + 10
+    height = metrics.height() + 4
+    above = QRectF(box.left(), box.top() - height - 2, width, height)
+
+    assert above.intersects(reserved), (
+        "the test's own setup is wrong — the label would not have collided"
+    )
+
+
+def test_a_label_on_a_box_at_the_frame_edge_stays_inside_the_frame(qt_app):
+    # Only the top edge was clamped, so a track against the left of the picture
+    # drew its label at a negative x and ran off it.
+    from PySide6.QtCore import QRectF
+    from PySide6.QtGui import QColor, QPainter, QPixmap
+
+    from sentinel_console.video_view import VideoView
+
+    view = VideoView()
+    frame = QRectF(0, 0, 640, 480)
+    pixmap = QPixmap(640, 480)
+    painter = QPainter(pixmap)
+    try:
+        for box in (
+            QRectF(-5, 200, 30, 60),      # off the left edge
+            QRectF(620, 200, 30, 60),     # off the right
+            QRectF(300, 470, 30, 20),     # against the bottom
+            QRectF(300, 0, 30, 40),       # against the top
+        ):
+            # Must not raise, and must not need a frame to be handed one.
+            view._draw_label(painter, box, "#9 2.0 m/s", QColor("green"), frame, None)
+    finally:
+        painter.end()
+
+
+def test_a_live_frame_is_stamped_with_a_clock_not_an_epoch():
+    # `t+1788428138.044s` appeared in a screenshot of the real camera. A file's
+    # frames are counted from the start of the recording, and a camera's carry
+    # the wall clock; the same format made one of them meaningless.
+    from sentinel_console.video_view import _stamp
+
+    assert _stamp(11_933) == "t+011.933s"
+
+    live = _stamp(1_788_428_138_044)
+    assert "t+" not in live
+    assert live.endswith("UTC")
+    assert live.count(":") == 2

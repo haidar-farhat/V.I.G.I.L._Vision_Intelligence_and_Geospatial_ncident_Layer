@@ -64,3 +64,4 @@ media/*
 !media/README.md
 evidence/*
 !evidence/README.md
+dist/screenshots/

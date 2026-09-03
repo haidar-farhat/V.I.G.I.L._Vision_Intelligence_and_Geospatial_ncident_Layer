@@ -321,7 +321,10 @@ class ConsoleWindow(QMainWindow):
         self.zone_radius.setRange(2.0, 200.0)
         self.zone_radius.setValue(10.0)
         self.zone_radius.setSuffix(" m")
-        self.zone_radius.setFixedWidth(80)
+        # Wide enough for "200.00 m" plus the arrows. At 80 px a screenshot of
+        # the real thing showed "12.0(" — the value cut off mid-number, which
+        # reads as a broken control rather than a narrow one.
+        self.zone_radius.setMinimumWidth(104)
         row.addWidget(self.zone_radius)
 
         row.addSpacing(12)
@@ -855,16 +858,35 @@ class ConsoleWindow(QMainWindow):
         return item
 
     def _refresh_status(self) -> None:
-        running = [s for s in self._sessions.values() if s.is_running]
-        tracked = sum(
-            len(s.last.result.tracks) for s in running if s.last is not None
-        )
-        events = sum(len(s.events) for s in self._sessions.values())
+        """One line describing the state, which must not contradict the screen.
 
-        self._set_status(
-            f"{len(running)} camera(s)   {tracked} tracked now   "
-            f"{events} events -> {len(self._incidents)} incidents"
+        It used to say "0 camera(s)   0 tracked now" beside a table listing four
+        tracked objects — both statements true, of different instants, and
+        together they read as a broken interface. A run that has ended says so
+        instead, and the counts it then reports are the ones still on screen.
+        """
+        running = [s for s in self._sessions.values() if s.is_running]
+        events = sum(len(s.events) for s in self._sessions.values())
+        tail = f"{events} events -> {len(self._incidents)} incidents"
+
+        if running:
+            tracked = sum(
+                len(s.last.result.tracks) for s in running if s.last is not None
+            )
+            self._set_status(f"{len(running)} camera(s)   {tracked} tracked now   {tail}")
+            return
+
+        if not self._sessions:
+            self._set_status("No cameras. Add one to begin.")
+            return
+
+        faulted = [s for s in self._sessions.values() if s.fault]
+        state = (
+            f"{len(faulted)} of {len(self._sessions)} camera(s) faulted"
+            if faulted
+            else f"{len(self._sessions)} camera(s) stopped"
         )
+        self._set_status(f"{state}   {tail}")
 
     def _set_status(self, text: str) -> None:
         self.status.showMessage(text)

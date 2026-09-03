@@ -13,6 +13,8 @@
     python tasks.py db-migrate apply pending migrations
     python tasks.py db-rollback undo the most recent migration
     python tasks.py check      audit, lint, build and test — what CI runs
+    python tasks.py ci         every CI stage this machine can run (--package, --screenshots)
+    python tasks.py shots      photograph the real console (--live for this machine's camera)
 
 Python rather than a Makefile or a shell script, because the product ships on
 Windows, macOS and Linux and the developer commands should not be the one part
@@ -325,8 +327,29 @@ def package() -> None:
         print("   and running one reports a missing Python DLL.)")
 
 
+def ci() -> None:
+    """Every CI stage this machine can run, in CI's order.
+
+    Standing rule: run it here rather than waiting on a remote result nobody
+    reads. `tools/local_ci.py` says plainly which stages it could not run —
+    three platforms and the real `iptables` block are not among them.
+    """
+    run([sys.executable, str(ROOT / "tools" / "local_ci.py"), *sys.argv[2:]], ROOT)
+
+
+def shots() -> None:
+    """Drive the real console and photograph it. `--live` uses this machine's camera."""
+    build()
+    run(
+        [sys.executable, str(ROOT / "tools" / "screenshot_console.py"), *sys.argv[2:]],
+        ROOT, python_path(),
+    )
+
+
 TASKS = {
     "build": build,
+    "ci": ci,
+    "shots": shots,
     "lint": lint,
     "audit": audit,
     "test": test,
@@ -341,7 +364,7 @@ TASKS = {
 
 
 #: Tasks that take arguments of their own, passed through untouched.
-PASSTHROUGH = {"cli"}
+PASSTHROUGH = {"cli", "ci", "shots"}
 
 
 def main(argv: list[str]) -> int:
