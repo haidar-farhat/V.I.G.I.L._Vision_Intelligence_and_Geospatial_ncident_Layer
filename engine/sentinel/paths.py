@@ -78,6 +78,52 @@ def recordings_directory() -> Path:
     return data_directory() / "recordings"
 
 
+def models_directory() -> Path:
+    """Where detection models live.
+
+    Deliberately **not** under the data directory. Models are install artifacts,
+    not operator data: they are large, they are shared between every deployment
+    on the machine, and wiping the data directory to start clean should not
+    throw away a 14 MB file the operator had to obtain on a connected machine.
+
+    ``SENTINEL_MODELS_DIR`` overrides it, which a packaged build needs — the
+    bundle root is read-only on a proper install, so the models an operator adds
+    afterwards have to be somewhere they can write.
+    """
+    override = os.environ.get("SENTINEL_MODELS_DIR")
+    if override:
+        return Path(override).expanduser()
+
+    bundle = bundle_directory()
+    if bundle is not None:
+        return bundle / "models"
+
+    # A checkout: the repository's own models/ directory, which is gitignored.
+    return Path(__file__).resolve().parents[2] / "models"
+
+
+def default_model_path() -> Path | None:
+    """The segmentation model to use when the operator names none, if present.
+
+    Returns ``None`` when there is no model, and that is a normal state, not a
+    failure: the system runs on motion detection without one. Nothing here
+    downloads anything — `models_directory()` is filled by the operator, from
+    `devtools/export_model.py` run on a connected machine.
+
+    Only segmentation models are picked up automatically. A plain detector is a
+    deliberate choice with a real cost — no masks, so every ground-contact point
+    falls back to the bottom edge of a rectangle — and silently making that
+    choice on the operator's behalf would hide it.
+    """
+    directory = models_directory()
+    if not directory.is_dir():
+        return None
+    for candidate in sorted(directory.glob("*-seg.onnx")):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
 def is_frozen() -> bool:
     """Whether this is running from a packaged build rather than a checkout.
 

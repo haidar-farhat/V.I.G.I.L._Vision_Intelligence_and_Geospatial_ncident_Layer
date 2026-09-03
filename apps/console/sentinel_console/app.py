@@ -61,7 +61,7 @@ from sentinel.core import (
     haversine_distance,
 )
 from sentinel.decode import DecodeError, VideoSource
-from sentinel.detect import MotionDetector
+from sentinel.detect import DetectionError, detector_for
 from sentinel.events import (
     AfterHoursRule,
     LoiteringRule,
@@ -70,6 +70,7 @@ from sentinel.events import (
 )
 from sentinel.evidence import ExportError, export_incident
 from sentinel.node import Node, NodeError, Update
+from sentinel.paths import default_model_path
 from sentinel.store import default_database_path
 from sentinel import devices, logs, telemetry
 from sentinel.zones import Zone, ZoneKind
@@ -114,10 +115,29 @@ def _panel(title: str, body: QWidget) -> QFrame:
     return frame
 
 
+def _detector_summary(info) -> str:
+    """One line describing what is drawing the conclusions.
+
+    Says what the detector *cannot* do as plainly as what it can. An operator
+    reading "does not classify" beside a track labelled `unclassified` learns
+    something; one reading a model name beside the same track would assume the
+    model looked and found nothing recognisable, which is the opposite of true.
+    """
+    if info is None:
+        return "No detector running"
+    if not info.classifies:
+        return f"{info.name} — does not classify, and cannot see a stationary object"
+    masks = " with masks" if info.kind.endswith("segment") else ", boxes only"
+    digest = f" · {info.model_sha256[:12]}" if info.model_sha256 else ""
+    return f"{info.name} — {len(info.class_names)} classes{masks}{digest}"
+
+
 class ConsoleWindow(QMainWindow):
     """The main window."""
 
-    def __init__(self, database: str | Path | None = None):
+    def __init__(
+        self, database: str | Path | None = None, model: str | Path | None = None
+    ):
         """
         ``database`` is the path to persist to. ``":memory:"`` runs the console
         without keeping anything, which is right for a test and wrong for a
@@ -131,6 +151,13 @@ class ConsoleWindow(QMainWindow):
 
         self._sessions: dict[str, CameraSession] = {}
 
+        # `None` means motion detection, and it means it *explicitly*. Finding a
+        # model on disk and using it is a decision about what the system can
+        # conclude, so it is made once, out loud, at the entry point in `run()`
+        # — not here, where a test constructing a window would silently acquire
+        # a different detector than the one it was written against.
+        self._model = Path(model) if model is not None else None
+
         # The console is a *client* of this. It owns no store, no zones, no
         # rule set and no analysis thread; it owns widgets, and it calls
         # `poll()` on a repaint timer. The same object runs a worker node with
@@ -143,6 +170,8 @@ class ConsoleWindow(QMainWindow):
             keep_images=True,
             realtime=True,
             correlate_every_millis=CORRELATE_INTERVAL_MILLIS,
+            # One detector per camera, never shared, built at start.
+            detector_factory=lambda: detector_for(self._model),
         )
 
         self._build()
@@ -696,14 +725,33 @@ class ConsoleWindow(QMainWindow):
                 )
                 return
 
+        # The model is loaded once here for the same reason the cameras are
+        # probed here: the factory runs inside each camera's own thread, so a
+        # broken model file would otherwise fail sixteen times somewhere the
+        # operator cannot see, leaving a window that started and shows nothing.
+        if self._model is not None:
+            try:
+                detector_for(self._model)
+            except DetectionError as error:
+                QMessageBox.warning(self, "Cannot load the detection model", str(error))
+                return
+
         started = self.node.start()
         if started == 0:
             return
 
+        # What is actually running, asked of the running thing. This used to be
+        # a constant naming MOG2, which was true only for as long as MOG2 was
+        # the only option — and a capability label that can be wrong is worse
+        # than none, because it is the line an operator reads to decide whether
+        # a classification means anything.
+        info = None
         for session in self._sessions.values():
-            session.view.set_detector_info(None)
+            runner = session.record.runner
+            info = runner.detector_info if runner is not None else None
+            session.view.set_detector_info(info)
 
-        self.detector_label.setText("MOG2 background subtraction — does not classify")
+        self.detector_label.setText(_detector_summary(info))
         self._timer.start()
 
         self.open_button.setEnabled(False)
@@ -950,6 +998,18 @@ def run(argv: list[str] | None = None) -> int:
         help="developer logging: DEBUG, with thread, file and line",
     )
     parser.add_argument("--database", default=None, help="database to open")
+    parser.add_argument(
+        "--model", default=None, metavar="FILE",
+        help=(
+            "an ONNX model to detect with. Defaults to a *-seg.onnx in the "
+            "models directory if one is there. Operator-supplied — nothing is "
+            "ever downloaded."
+        ),
+    )
+    parser.add_argument(
+        "--no-model", action="store_true",
+        help="ignore any installed model and detect motion only",
+    )
     arguments, unknown = parser.parse_known_args(sys.argv[1:] if argv is None else argv)
 
     logs.configure(
@@ -969,7 +1029,21 @@ def run(argv: list[str] | None = None) -> int:
     app.setOrganizationName("Sentinel Vision")
 
     try:
-        window = ConsoleWindow(database=arguments.database)
+        # Resolved here, and logged, because "which detector am I running"
+        # must never be something an operator has to infer.
+        model = None
+        if not arguments.no_model:
+            model = Path(arguments.model) if arguments.model else default_model_path()
+
+        if model is None:
+            log.info(
+                "no detection model: running on motion detection, which does "
+                "not classify and cannot see a stationary object"
+            )
+        else:
+            log.info("detection model: %s", model)
+
+        window = ConsoleWindow(database=arguments.database, model=model)
         window.show()
         code = app.exec()
     except Exception:

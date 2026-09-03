@@ -18,6 +18,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+import numpy as np
+
 from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import (
     QBrush,
@@ -55,6 +57,36 @@ def _stamp(millis: int) -> str:
         moment = datetime.fromtimestamp(millis / 1000.0, tz=timezone.utc)
         return moment.strftime("%H:%M:%S.") + f"{moment.microsecond // 1000:03d} UTC"
     return f"t+{millis / 1000.0:07.3f}s"
+
+
+#: How strongly a mask tints the frame underneath it. Low on purpose: this is
+#: evidence, and an overlay that hides the pixels it is describing makes the
+#: frame useless for the one job it has.
+MASK_ALPHA = 90
+
+
+def _mask_image(mask: "np.ndarray", colour: QColor) -> QImage:
+    """A translucent, single-colour image of one instance's silhouette.
+
+    Built per frame rather than cached: the mask changes every frame, and at
+    thirty a second a cache keyed on anything would miss every time while
+    holding a reference to every frame it had ever seen.
+    """
+    height, width = mask.shape
+    # ARGB32 is BGRA in memory on a little-endian machine, which every platform
+    # this runs on is. Writing the channels in the wrong order costs nothing at
+    # runtime and turns every person blue-green, which reads as a rendering
+    # style rather than as the bug it is.
+    buffer = np.empty((height, width, 4), dtype=np.uint8)
+    buffer[..., 0] = colour.blue()
+    buffer[..., 1] = colour.green()
+    buffer[..., 2] = colour.red()
+    buffer[..., 3] = (mask > 0) * MASK_ALPHA
+    # `.copy()` because QImage does not take ownership of the buffer, and
+    # `buffer` is a local that dies at the end of this function.
+    return QImage(
+        buffer.data, width, height, width * 4, QImage.Format.Format_ARGB32
+    ).copy()
 
 
 class VideoView(QWidget):
@@ -173,17 +205,27 @@ class VideoView(QWidget):
 
         if self._show_detections:
             pen = QPen(theme.DETECTION, 1.0, Qt.PenStyle.SolidLine)
-            painter.setPen(pen)
             painter.setBrush(Qt.BrushStyle.NoBrush)
             for detection in result.detections:
                 box = detection.bbox
-                painter.drawRect(to_screen(box.x, box.y, box.w, box.h))
+                rect = to_screen(box.x, box.y, box.w, box.h)
+                # The silhouette when there is one, the rectangle when there is
+                # not. Showing both would draw a box around every mask and hide
+                # the one difference the operator is being shown: whether this
+                # detector knows the object's shape or only its extent.
+                mask = getattr(detection, "mask", None)
+                if mask is not None and mask.size:
+                    painter.drawImage(rect, _mask_image(mask, theme.DETECTION))
+                else:
+                    painter.setPen(pen)
+                    painter.drawRect(rect)
 
         font = QFont(painter.font())
         font.setPointSize(9)
         font.setBold(True)
         painter.setFont(font)
 
+        placed: list[QRectF] = []
         for track in result.tracks:
             gap = result.timestamp_millis - track.last_seen_millis
             coasting = gap > theme.COASTING_AFTER_MILLIS
@@ -199,7 +241,9 @@ class VideoView(QWidget):
             painter.drawRect(rect)
 
             label = self._label_for(track)
-            self._draw_label(painter, rect, label, colour, target, reserved)
+            self._draw_label(
+                painter, rect, label, colour, target, reserved, placed
+            )
 
     def _label_for(self, track) -> str:
         """What to write beside a track.
@@ -227,7 +271,16 @@ class VideoView(QWidget):
     def _draw_label(
         self, painter: QPainter, rect: QRectF, text: str, colour: QColor,
         frame: QRectF | None = None, reserved: QRectF | None = None,
+        placed: list[QRectF] | None = None,
     ) -> None:
+        """Draw one track's label, avoiding the readout and the labels already
+        drawn.
+
+        ``placed`` accumulates what has been drawn this frame. Without it two
+        objects standing near each other get their labels stacked in the same
+        few pixels, which is unreadable at exactly the moment the operator most
+        needs to tell them apart — a person beside a bag reads as one smear.
+        """
         metrics = painter.fontMetrics()
         width = metrics.horizontalAdvance(text) + 10
         height = metrics.height() + 4
@@ -270,6 +323,25 @@ class VideoView(QWidget):
                 background.moveLeft(reserved.right() + 4)
                 if frame is not None and background.right() > frame.right():
                     background.moveRight(frame.right() - 2)
+
+        if placed is not None:
+            # Step down past anything already drawn. Bounded: after a few tries
+            # the labels are further apart than they are tall, and going on
+            # would push a label further from the box it names than from the one
+            # it does not — a label in the wrong place is worse than a crowded
+            # one.
+            for _ in range(6):
+                clash = next(
+                    (other for other in placed if background.intersects(other)), None
+                )
+                if clash is None:
+                    break
+                background.moveTop(clash.bottom() + 2)
+                if frame is not None and background.bottom() > frame.bottom():
+                    background.moveBottom(frame.bottom() - 2)
+                    break
+            placed.append(QRectF(background))
+
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QBrush(QColor(0, 0, 0, 170)))
         painter.drawRoundedRect(background, 3, 3)

@@ -117,6 +117,10 @@ def live_camera() -> str | None:
 
 def main() -> int:
     live = "--live" in sys.argv
+    # Off by default: the reference scene is a drawn walker, and a COCO model
+    # correctly finds no person in it. Shots of the segmenter have to be taken
+    # against a real camera or they show an empty track table and prove nothing.
+    segment = "--segment" in sys.argv
     text_is_real = choose_platform()
 
     from PySide6.QtWidgets import QApplication
@@ -134,7 +138,17 @@ def main() -> int:
     media = scene.write_scene(workspace / "reference.mp4")
 
     app = QApplication.instance() or QApplication([])
-    window = ConsoleWindow(workspace / "console.db")
+    model = None
+    if segment:
+        from sentinel.paths import default_model_path
+
+        model = default_model_path()
+        if model is None:
+            print("--segment: no *-seg.onnx in the models directory", file=sys.stderr)
+            return 2
+        print(f"detector: {model}")
+
+    window = ConsoleWindow(workspace / "console.db", model=model)
     window.resize(1500, 920)
     window.show()
 

@@ -19,15 +19,17 @@ and names it, rather than asserting what it ought to do and being skipped.
 
 from __future__ import annotations
 
+import time
 from collections import defaultdict
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 import onnx_fixture
 import scene
 from sentinel.core import CameraPose, haversine_distance
-from sentinel.decode import VideoSource
+from sentinel.decode import Frame, SourceInfo, VideoSource
 from sentinel.detect import UNCLASSIFIED, MotionDetector, OnnxDetector
 from sentinel.pipeline import Pipeline
 
@@ -593,3 +595,105 @@ def test_a_live_track_is_never_trimmed_out_from_under_itself(
     assert stats.observations[loiterer] == _MAX_TRACKED_DETAIL * 2
     # The loiterer plus one new object per frame, each counted exactly once.
     assert stats.distinct_objects == _MAX_TRACKED_DETAIL * 2 + 1
+
+
+# ------------------------------------------- a camera does not end, it stops
+
+
+class _FlakyLiveSource:
+    """A live camera: paced frames, one failed read in the middle, no end.
+
+    `VideoSource.read` returns ``None`` both at the end of a file *and* on a
+    single failed read, and the pipeline used to iterate a live source exactly
+    the way it iterated a file — so one dropped frame ended the run, and the log
+    reported "analysis finished", which is what a file does when it runs out.
+    A security camera that stops watching must never be reported the same way as
+    a file that finished.
+
+    Paced deliberately: `LiveStream` keeps only the newest frame and drops the
+    rest, so a source that returns instantly would have most of its frames
+    discarded and the test would be measuring the queue rather than the
+    reconnect.
+    """
+
+    is_live = True
+    source_id = "flaky"
+    display_url = "device:test"
+
+    def __init__(self, fail_at: int | None = 5, quiet_after: int | None = None):
+        self._fail_at = fail_at
+        self._quiet_after = quiet_after
+        self._index = 0
+        self._failed = False
+        self.opens = 0
+
+    def open(self):
+        self.opens += 1
+        return SourceInfo(
+            width=64, height=48, fps=15.0, frame_count=None, is_live=True,
+            display_url=self.display_url,
+        )
+
+    @property
+    def info(self):
+        return self.open()
+
+    def read(self):
+        if self._index == self._fail_at and not self._failed:
+            self._failed = True
+            return None  # the glitch, indistinguishable from an ending
+        if self._quiet_after is not None and self._index >= self._quiet_after:
+            # A camera that has gone quiet without dying: it neither returns a
+            # frame nor reports an error, which is the case that makes shutdown
+            # hard.
+            time.sleep(0.05)
+            return None
+        time.sleep(0.02)
+        frame = Frame(
+            image=np.zeros((48, 64, 3), dtype=np.uint8),
+            timestamp_millis=int(time.time() * 1000),
+            index=self._index,
+            source_id=self.source_id,
+        )
+        self._index += 1
+        return frame
+
+    def close(self):
+        pass
+
+
+def test_a_live_camera_survives_a_dropped_frame():
+    source = _FlakyLiveSource(fail_at=5)
+    pipeline = Pipeline(source, MotionDetector())
+
+    seen = 0
+    for _ in pipeline.run():
+        seen += 1
+        if seen >= 10:
+            pipeline.ask_to_stop()
+    pipeline.close()
+
+    # Before the fix the run ended at the glitch, having called itself finished.
+    assert seen >= 10, f"the run ended after {seen} frame(s)"
+    assert source.opens >= 2, "the stream was never reconnected"
+
+
+def test_a_live_run_stops_when_asked_even_while_the_camera_is_silent():
+    # The stop flag alone is only checked between frames, and a silent camera
+    # delivers no frames to be between. A shutdown that waits for the next frame
+    # from a camera that has stopped sending is a shutdown that never happens —
+    # and the console signals every camera and then waits.
+    source = _FlakyLiveSource(fail_at=None, quiet_after=2)
+    pipeline = Pipeline(source, MotionDetector())
+
+    results = pipeline.run()
+    next(results)
+
+    pipeline.ask_to_stop()
+    started = time.perf_counter()
+    with pytest.raises(StopIteration):
+        next(results)
+    elapsed = time.perf_counter() - started
+    pipeline.close()
+
+    assert elapsed < 5.0, f"shutdown took {elapsed:.1f}s waiting on a dead camera"

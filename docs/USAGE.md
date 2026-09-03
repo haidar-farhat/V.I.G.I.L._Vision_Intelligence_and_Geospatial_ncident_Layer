@@ -27,11 +27,12 @@ How to install it, run it, and read what it tells you.
 4. [The command line](#4-the-command-line)
 5. [Docker](#5-docker)
 6. [Cameras](#6-cameras)
-7. [Recording](#7-recording)
-8. [Where your files are](#8-where-your-files-are)
-9. [Logs, and the developer build](#9-logs-and-the-developer-build)
-10. [When something is wrong](#10-when-something-is-wrong)
-11. [What it will refuse to do](#11-what-it-will-refuse-to-do)
+7. [Detection models](#7-detection-models)
+8. [Recording](#8-recording)
+9. [Where your files are](#9-where-your-files-are)
+10. [Logs, and the developer build](#10-logs-and-the-developer-build)
+11. [When something is wrong](#11-when-something-is-wrong)
+12. [What it will refuse to do](#12-what-it-will-refuse-to-do)
 
 ---
 
@@ -527,7 +528,75 @@ together when a switch loses power, and twenty dialogs is not a user interface.
 
 ---
 
-## 7. Recording
+## 7. Detection models
+
+Out of the box the system detects **motion**. That is free, needs nothing, and
+has two limits worth stating plainly, because they decide what the rest of the
+product can conclude:
+
+- It does not classify. Every track is `unclassified`, and the system says so
+  rather than guessing.
+- It cannot see anything that has stopped moving. A person standing still
+  disappears.
+
+Point it at a model and both limits go away:
+
+```bash
+sentinel run device:0 --model models/yolov8n-seg.onnx
+```
+
+The console takes the same flag, and with no flag it uses the first `*-seg.onnx`
+it finds in the models directory:
+
+```bash
+sentinel-console --model models/yolov8n-seg.onnx
+sentinel-console --no-model          # motion only, whatever is installed
+```
+
+Which detector you get is decided by **reading the file**, not by a flag:
+
+| The model has | You get | What it can conclude |
+|---|---|---|
+| *no model* | motion | something changed here |
+| one output | detection | a *person* is in this box |
+| two outputs | segmentation | a *person* is this shape, and touches the ground *here* |
+
+That last column is the whole reason to bother. Every position this system
+reports comes from one point per object — where it meets the ground — and
+without a mask that point is the bottom-centre of a rectangle, which is only
+correct for someone upright, unoccluded, and tightly boxed. With a mask it is
+the object's own lowest pixel.
+
+The line beside the toolbar always names what is actually running, with the
+model's SHA-256 abbreviated. That digest is recorded on every event, so a
+detection can be traced to the exact file months later.
+
+### Getting a model
+
+**Nothing is ever downloaded by the product.** Not on first run, not as a
+fallback, not ever. You obtain a model once, on a machine with a network:
+
+```bash
+pip install ultralytics onnxslim
+python devtools/export_model.py --task segment --size n
+```
+
+That writes `models/yolov8n-seg.onnx` (about 14 MB) and prints its SHA-256.
+Copy the file to the offline machine and put it in the models directory —
+`SENTINEL_MODELS_DIR` if you have set it, otherwise `models/` beside the install.
+`ultralytics` is a developer tool and is deliberately **not** a dependency of
+the product; see `devtools/README.md` for why that separation matters.
+
+### What it costs
+
+On an ordinary laptop CPU, YOLOv8n-seg runs at roughly **11–14 fps** against a
+640×480 webcam, against a few hundred for motion. That is the trade: motion is
+nearly free and tells you almost nothing; segmentation costs a core and tells
+you what the object is and where it stands.
+
+---
+
+## 8. Recording
 
 Off by default, because writing video is the single most expensive thing this
 system can do to a disk. Turn it on per run:
@@ -640,7 +709,7 @@ of choice.
 
 ---
 
-## 8. Where your files are
+## 9. Where your files are
 
 ```bash
 sentinel where
@@ -683,7 +752,7 @@ undone on a machine with no Internet and no spare hardware is a gamble.
 
 ---
 
-## 9. Logs, and the developer build
+## 10. Logs, and the developer build
 
 | variable | effect |
 |---|---|
@@ -730,7 +799,7 @@ modules or open a socket.
 
 ---
 
-## 10. When something is wrong
+## 11. When something is wrong
 
 | what you see | why | what to do |
 |---|---|---|
@@ -760,7 +829,7 @@ the log cannot contain a camera password.
 
 ---
 
-## 11. What it will refuse to do
+## 12. What it will refuse to do
 
 Not limitations. Design rules, each enforced by something other than intention.
 

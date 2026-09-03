@@ -30,6 +30,7 @@ statistics are collected here rather than inferred later.
 
 from __future__ import annotations
 
+import threading
 import time
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -39,7 +40,7 @@ from typing import Iterator, Sequence
 import numpy as np
 
 from .core import CameraPose, Detection, Track, Tracker
-from .decode import Frame, VideoSource
+from .decode import Frame, LiveStream, VideoSource
 from .detect import Detector, DetectorInfo
 from .events import Event, EventEngine, Rule, utc_from_millis
 from .incidents import Correlator, Incident
@@ -158,7 +159,8 @@ class Pipeline:
                  "_keep_images", "_zones", "_evaluator", "_engine", "_epoch_millis",
                  "_correlator", "_recent_events", "_event_retention",
                  "_resolved_epoch", "_epoch_basis",
-                 "_record_to", "_segment_seconds", "_on_segment", "_recorder")
+                 "_record_to", "_segment_seconds", "_on_segment", "_recorder",
+                 "_stopping", "_stream")
 
     def __init__(
         self,
@@ -200,6 +202,13 @@ class Pipeline:
         )
         self._tracker: Tracker | None = None
         self.stats = PipelineStats()
+
+        # A live run has no end of its own, so it needs to be told. Checking
+        # this between frames is not enough: a camera that has gone quiet
+        # produces no frames to check between, and the caller's own loop never
+        # gets a turn. The read loop below waits on this directly.
+        self._stopping = threading.Event()
+        self._stream: LiveStream | None = None
 
         # Recording is opt-in, and off by default. Writing video is the single
         # most expensive thing this system can do to a disk — roughly 17.5 GB
@@ -269,6 +278,15 @@ class Pipeline:
         """The recorder, once :meth:`run` has started one."""
         return self._recorder
 
+    def ask_to_stop(self) -> None:
+        """End a live run. Safe from any thread, and returns immediately."""
+        self._stopping.set()
+
+    @property
+    def stream(self) -> LiveStream | None:
+        """The live reader, once :meth:`run` has started one. ``None`` for a file."""
+        return self._stream
+
     def run(self) -> Iterator[FrameResult]:
         """Process the source, yielding one result per frame."""
         info = self._source.open()
@@ -300,8 +318,13 @@ class Pipeline:
         )
 
         try:
-            for frame in self._source:
-                yield self._process(frame)
+            if info.is_live:
+                yield from self._run_live()
+            else:
+                # A file has an end, and every frame of it matters. Iterating
+                # the source directly is what makes replay deterministic.
+                for frame in self._source:
+                    yield self._process(frame)
         finally:
             if self._recorder is not None:
                 segments = self._recorder.close()
@@ -334,13 +357,47 @@ class Pipeline:
             # the system saw, and it is one line per run rather than per frame.
             _log.info(
                 "%s: analysis finished: %d frames, %d detections, %d object(s), "
-                "%d event(s)",
+                "%d event(s)%s",
                 self._source.source_id,
                 self.stats.frames,
                 self.stats.detections,
                 self.stats.distinct_objects,
                 self.stats.events,
+                # Silence about dropped frames would let a camera that lost half
+                # its input report the same line as one that lost none.
+                (
+                    f", {self._stream.dropped_frames} dropped, "
+                    f"{self._stream.reconnects} reconnect(s)"
+                    if self._stream is not None
+                    and (self._stream.dropped_frames or self._stream.reconnects)
+                    else ""
+                ),
             )
+
+    def _run_live(self) -> Iterator[FrameResult]:
+        """Read a camera until told to stop.
+
+        A file ends; a camera does not. Until this existed the pipeline iterated
+        a live source the same way it iterated a file, and `VideoSource.read`
+        returns ``None`` for *both* the end of a file and a single failed read —
+        so one dropped frame ended the run, and the log said "analysis finished"
+        as though that were the normal conclusion. A security camera that stops
+        watching must never look like a camera that finished.
+
+        `LiveStream` already had the right behaviour — reconnect with bounded
+        backoff, keep only the newest frame, count what it drops — and nothing
+        in the product called it.
+        """
+        with LiveStream(self._source) as stream:
+            self._stream = stream
+            while not self._stopping.is_set():
+                # Raises if the reader has given up; returns `None` merely
+                # because nothing arrived in time, which on a camera is a gap
+                # and not an ending.
+                frame = stream.read()
+                if frame is None:
+                    continue
+                yield self._process(frame)
 
     def _process(self, frame: Frame) -> FrameResult:
         assert self._tracker is not None

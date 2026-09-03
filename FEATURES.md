@@ -33,26 +33,26 @@ Related: [STATUS.md](STATUS.md) — measurements and honest gaps ·
 
 ## The scoreboard
 
-368 capabilities, each with a state. Many lines cover several related things —
+371 capabilities, each with a state. Many lines cover several related things —
 "heading · pitch · roll" is one row — so this counts *claims*, not code.
 
 | | Count | Share | What it means |
 |---|---:|---:|---|
-| **`TESTED`** | 139 | 38% | A test fails if it stops working |
+| **`TESTED`** | 146 | 39% | A test fails if it stops working |
 | **`IMPL`** | 23 | 6% | Works; a regression would go unnoticed |
-| **`SKEL`** | 38 | 10% | Something is there; it does not do the job |
-| **`PLAN`** | 168 | 46% | Designed, no code |
+| **`SKEL`** | 35 | 9% | Something is there; it does not do the job |
+| **`PLAN`** | 167 | 45% | Designed, no code |
 
 ```mermaid
 pie showData
-    title Sentinel Vision — 368 capabilities by state
-    "TESTED" : 139
+    title Sentinel Vision — 371 capabilities by state
+    "TESTED" : 146
     "IMPLEMENTED" : 23
-    "SKELETON" : 38
-    "PLANNED" : 168
+    "SKELETON" : 35
+    "PLANNED" : 167
 ```
 
-**Read that 38% carefully.** It is not "a third of the product is finished" — it
+**Read that 39% carefully.** It is not "a third of the product is finished" — it
 is that the part which is finished is the analytical core plus, now, the
 recording that makes its evidence real, while most of what is planned is the
 product surface around them. The parts a demonstration shows off are the parts
@@ -115,7 +115,7 @@ the engine already computes.
 | Arabic / English / French interface | `PLAN` | No string extraction yet |
 | RTL support | `PLAN` | |
 | Crash recovery | `SKEL` | An unhandled exception is logged with its traceback; nothing restarts |
-| Automatic service recovery | `SKEL` | A camera reconnects with backoff; the application does not |
+| Automatic service recovery | `SKEL` | A camera reconnects with backoff — genuinely, since the pipeline began using it; the application does not |
 | Health monitoring | `PLAN` | |
 | Diagnostics centre | `SKEL` | `sentinel where` and the log are the whole of it |
 
@@ -170,7 +170,7 @@ the engine already computes.
 | Bitrate monitoring | `PLAN` | |
 | Dropped-frame monitoring | `TESTED` | Counted, because a system silently discarding half its input is worse than one that says so |
 | Decode-error monitoring | `IMPL` | Every failure is logged with its type |
-| Reconnection monitoring | `TESTED` | Counted, with bounded backoff |
+| Reconnection monitoring | `TESTED` | Counted, with bounded backoff, and now reported in the run summary — a camera that lost half its input no longer prints the same line as one that lost none |
 | Stream-profile selection · main/sub-stream | `PLAN` | |
 | Codec detection | `PLAN` | |
 | Connection testing | `TESTED` | Socket probe before the decoder — OpenCV's own 30 s timeout cannot be changed |
@@ -217,11 +217,13 @@ two identical webcams are indistinguishable by name.
 
 | Capability | State | Note |
 |---|---|---|
-| Real-time object detection | `TESTED` | Motion detection. Emits `UNCLASSIFIED` and never claims otherwise |
-| Person · vehicle · car · truck · bus · motorcycle · bicycle detection | `PLAN` | **No trained weights have ever been run** |
+| Real-time object detection | `TESTED` | Motion, boxes, or instance masks — chosen by *reading* the model file, not by a flag. Motion still emits `UNCLASSIFIED` and never claims otherwise |
+| Person · vehicle · car · truck · bus · motorcycle · bicycle detection | `TESTED` | YOLOv8n-seg, 80 COCO classes. Verified on a live webcam: one person at 0.86 held 160 frames / 11.5 s, plus two correctly-classed bottles. Weights are operator-supplied and never downloaded |
 | Animal · bag · package · smoke · fire detection | `PLAN` | |
-| Custom detection classes | `SKEL` | The ONNX path takes a class map; nothing has exercised it with real classes |
-| Model switching · multiple models | `SKEL` | Two detectors are interchangeable everywhere downstream, asserted by test |
+| Custom detection classes | `TESTED` | Class names are read from the model's own metadata; a model that carries none reports no labels rather than inventing them |
+| Instance segmentation | `TESTED` | Per-object masks from a two-output model. The ground-contact point comes from the mask's own lowest row — not the bottom edge of a rectangle, which is what the whole position layer used to rest on |
+| Segmentation masks drawn in the console | `TESTED` | The silhouette, at low alpha, instead of a box. An overlay that hides the pixels it describes makes the frame useless as evidence |
+| Model switching · multiple models | `TESTED` | Three detectors, interchangeable everywhere downstream. `--model` on `run`, `node` and the console; the console falls back to motion and says so |
 | GPU inference | `PLAN` | |
 | CPU fallback | `TESTED` | The only provider used today |
 | Hardware acceleration · GPU detection · VRAM monitoring | `PLAN` | |
@@ -568,7 +570,7 @@ both are `TESTED`.
 
 | Capability | State | Note |
 |---|---|---|
-| Automatic camera reconnect | `TESTED` | Bounded backoff — one outage must not become a broadcast storm |
+| Automatic camera reconnect | `TESTED` | Bounded backoff — one outage must not become a broadcast storm. This row was `TESTED` for months while **nothing in the product called the class**: a live source was iterated like a file, so one failed read ended the run and the log said "analysis finished". The class was tested; the capability was absent |
 | Decoder restart | `TESTED` | And the thread can no longer die silently |
 | Database retry | `IMPL` | WAL, transactional |
 | Graceful GPU fallback · CPU fallback | `IMPL` | CPU is the only path today |
@@ -642,8 +644,9 @@ acknowledgement, alert history, escalation rules.
 |---|---|---|
 | Pluggable detector | `TESTED` | Two implementations, interchangeable everywhere downstream |
 | Pluggable camera sources | `TESTED` | File, RTSP and local device behind one type |
-| Pluggable AI models | `SKEL` | Any ONNX graph the loader can infer a layout for |
-| Pluggable tracker · classifier · segmenter · pose estimator · embeddings | `PLAN` | |
+| Pluggable AI models | `TESTED` | Detection and segmentation graphs both load; the factory picks by output count, so a file and a flag can never disagree |
+| Pluggable segmenter | `TESTED` | Behind the same `Detector` interface as the other two |
+| Pluggable tracker · classifier · pose estimator · embeddings | `PLAN` | |
 | Pluggable VLM · local LLM | `PLAN` | |
 | Pluggable map sources · worker nodes | `PLAN` | |
 | Versioned APIs · versioned worker protocol | `PLAN` | |

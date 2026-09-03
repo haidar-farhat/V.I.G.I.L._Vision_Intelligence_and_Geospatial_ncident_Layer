@@ -13,12 +13,12 @@ this one operates in. Every capability carries one of five states:
 | `PRODUCTION-READY` | Tested, hardened, documented, and exercised against real hardware. |
 
 **Nothing in this repository is `PRODUCTION-READY`.** No part of this system has
-been run against a physical **IP** camera, a GPU, a real detection model, or a
-multi-machine LAN. A camera attached to the machine — USB or built-in, through
-the operating system's own capture API — has been run end to end, which is the
-first piece of real hardware this system has ever touched. Everything else
-marked `TESTED` is tested against generated fixtures, which is a real bar but
-not the same bar.
+been run against a physical **IP** camera, a GPU, or a multi-machine LAN. Two
+things are no longer on that list: a camera attached to the machine — USB or
+built-in, through the operating system's own capture API — and a **real
+pretrained detection model**, both run end to end, together, through the console
+and the CLI. Everything else marked `TESTED` is tested against generated
+fixtures, which is a real bar but not the same bar.
 
 **The codebase was rewritten in Python and Rust.** The previous TypeScript
 implementation was removed in `582d0a8`; its architecture documents were kept
@@ -134,6 +134,9 @@ Geometry, projection, zones and tracking, behind a C ABI.
 | Live-thread fault reporting | `TESTED` | The decode thread cannot die silently: any exception becomes a reported fault naming the exception *type*, never its text. |
 | Continuous recording | `TESTED` | Segmented mp4v on a writer thread; a file loses no frames, a camera never builds a backlog; every clip hashed on close. **CLI only — the console cannot enable it yet.** |
 | Recording index and retention | `TESTED` | Migration 3. Oldest-first by age, size and free space; every deletion audited; **a segment an incident depends on is never deleted**. Dry-run by default. |
+| Instance segmentation | `TESTED` | YOLOv8n-seg through ONNX Runtime: 80 COCO classes, one mask per object, ~11–14 fps on CPU. The ground-contact point is taken from the mask's own lowest row, not the bottom edge of a box. Weights are operator-supplied and **never downloaded**. |
+| Detector chosen by reading the model | `TESTED` | No model → motion; one output → boxes; two outputs → masks. Decided from the file, because a flag can disagree with the file and the operator cannot tell which won. |
+| Live camera survives a dropped frame | `TESTED` | `VideoSource.read` returns `None` for both the end of a file and a single failed read, and the pipeline iterated a live source exactly like a file — so **one dropped frame stopped a camera for good**, logged as "analysis finished". `LiveStream` had reconnect-with-backoff all along and nothing called it. |
 | Footage in evidence | `TESTED` | Clips copied into the package with a pre-incident lead; `footage.json` states per-camera coverage and times every gap. |
 
 ## Repository guards
@@ -544,7 +547,7 @@ flowchart LR
 **Measured:** ~12.7 MiB/min → **~17.5 GB/day/camera** at 640×480/15fps
 (~280 GB/day for sixteen); encoding ~800 fps, so the writer never limits
 throughput. Storage numbers and the retention command are in
-[docs/USAGE.md §7](docs/USAGE.md).
+[docs/USAGE.md §8](docs/USAGE.md).
 
 **Found by building it, fixed, and pinned by test:** a file source losing 130 of
 180 frames to the drop policy; `on_segment` firing on the writer thread against

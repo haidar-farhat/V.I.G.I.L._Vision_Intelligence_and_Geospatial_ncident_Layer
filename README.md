@@ -95,7 +95,10 @@ no rule.
 - **No AI claim without evidence.** Every conclusion carries its timestamp,
   camera, evidence, confidence, triggering conditions and model version.
   *Enforced by:* the detector's own honesty — a motion blob is emitted as
-  `UNCLASSIFIED` and the console will not label it with a class, asserted by test.
+  `UNCLASSIFIED` and the console will not label it with a class, asserted by
+  test; a model's classes come from the model's own metadata, and one that
+  carries none reports no labels rather than inventing them. The toolbar names
+  the detector that is actually running, with its SHA-256.
   *Not yet:* the analyst guardrail, which is designed but not rebuilt.
 - **Privacy by default.** No facial recognition, no biometric identification, no
   identity database. Objects are tracked; people are not identified.
@@ -192,6 +195,7 @@ would test it.
 | Throughput, 640×480, idle machine | fps | ms/frame |
 |---|---:|---:|
 | Motion detector (0.75 scale) | 433 | 2.31 |
+| YOLOv8n-seg, 80 classes with masks | ~11 | ~92 |
 | Whole pipeline, one camera | ~190 | ~5.2 |
 | Aggregate, 16 cameras | ~370 | — |
 
@@ -203,12 +207,12 @@ background model's per-pixel state, measured and written up in
 ### Not yet true, and stated as such
 
 No physical **IP** camera has been contacted — a camera attached to the machine
-has, and works end to end. No *trained* detection model has been run
-— the ONNX path executes against a model built locally for the purpose, which
-tests the machinery around a model and nothing about detection quality. All
-footage is rendered, so none of this is an accuracy claim about the real world.
-There is no authentication, no keychain storage, and no networking between
-machines.
+has, and works end to end. A trained model now runs on it: YOLOv8n-seg, on the
+laptop's own webcam, through the console. That is one model on one camera in one
+room, which is enough to say the machinery is real and nowhere near enough to be
+an accuracy claim; no benchmark has been run and no detection rate is quoted.
+The rendered footage the other tests use remains rendered. There is no
+authentication, no keychain storage, and no networking between machines.
 
 The system reports **4 distinct objects where 3 people walked past** on the
 single-camera scene, inheriting the tracker's over-count. Background subtraction
@@ -335,7 +339,8 @@ core/               Rust engine core: geometry, projection, zones, tracking
 engine/             Python engine
   sentinel/core.py       ctypes bindings to the core
   sentinel/decode.py     decode, credential redaction, live streams
-  sentinel/detect.py     motion and ONNX detectors
+  sentinel/detect.py     motion and ONNX detectors, and the factory that picks
+  sentinel/segment.py    instance segmentation; ground contact from the mask
   sentinel/zones.py      zones, schedules, presence with hysteresis
   sentinel/events.py     rules and events, each carrying its evidence
   sentinel/incidents.py  correlation, object identity, risk scoring

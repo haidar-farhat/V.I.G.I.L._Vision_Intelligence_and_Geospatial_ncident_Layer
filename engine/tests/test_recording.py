@@ -26,7 +26,7 @@ import cv2
 import numpy as np
 import pytest
 
-from sentinel import logs
+from sentinel import logs, recording
 from sentinel.decode import Frame
 from sentinel.evidence import coverage_for, export_incident
 from sentinel.recording import (
@@ -217,9 +217,60 @@ def test_an_impossible_segment_length_is_refused():
         Recorder("cam", "/tmp", segment_seconds=0)
 
 
-def test_an_unavailable_codec_says_so_and_does_not_reach_for_one(tmp_path: Path):
+class _WriterThatWillNotOpen:
+    """A `cv2.VideoWriter` that reports itself unopened, and writes nothing.
+
+    A bogus fourcc used to produce this for free. It no longer does: OpenCV 5's
+    FFMPEG backend *silently substitutes* a codec when a tag is unknown —
+    `tag 'ZZZZ' is not found ... fallback to use tag 'mp4v'` — so the writer
+    opens, the recording succeeds, and both tests below passed a healthy
+    recorder off as a broken one until the substitution started happening.
+
+    What is under test here is the recorder's own reporting, not OpenCV's codec
+    table, so the failure is injected at the seam rather than coaxed out of a
+    third-party build whose behaviour differs by version and platform.
+    """
+
+    def __init__(self, *_args, **_kwargs):
+        pass
+
+    def isOpened(self) -> bool:  # noqa: N802 - the cv2 spelling
+        return False
+
+    def write(self, _image) -> None:
+        raise AssertionError("nothing may be written to a writer that never opened")
+
+    def release(self) -> None:
+        pass
+
+
+class _WriterThatDiesMidRun:
+    """Opens, takes one frame, then fails — a disk filling up, or a device
+    disappearing under an overnight run. The interesting case, because the
+    recorder has already told its caller that recording is underway."""
+
+    def __init__(self, *_args, **_kwargs):
+        self._written = 0
+
+    def isOpened(self) -> bool:  # noqa: N802
+        return True
+
+    def write(self, _image) -> None:
+        self._written += 1
+        if self._written > 1:
+            raise OSError(28, "No space left on device")
+
+    def release(self) -> None:
+        pass
+
+
+def test_an_unavailable_codec_says_so_and_does_not_reach_for_one(
+    tmp_path: Path, monkeypatch
+):
     # Nothing is ever downloaded to obtain a codec — which is exactly why H.264
     # is not the default, since asking OpenCV for it prints a download link.
+    monkeypatch.setattr(recording.cv2, "VideoWriter", _WriterThatWillNotOpen)
+
     recorder = Recorder("cam", tmp_path, fps=15.0, live=False, codec="ZZZZ")
     recorder.start()
     for frame in frames(5):
@@ -228,6 +279,30 @@ def test_an_unavailable_codec_says_so_and_does_not_reach_for_one(tmp_path: Path)
 
     assert recorder.stats.fault is not None
     assert "downloaded" in recorder.stats.fault or "codec" in recorder.stats.fault
+
+
+def test_a_dead_writer_is_reported_rather_than_accepted_from(
+    tmp_path: Path, monkeypatch
+):
+    # `offer` checked only whether it had ever started a thread, so it went on
+    # returning True for a writer that had died — telling the caller a frame was
+    # recorded when nothing was going to record it.
+    monkeypatch.setattr(recording.cv2, "VideoWriter", _WriterThatDiesMidRun)
+
+    recorder = Recorder("cam", tmp_path, fps=15.0, live=True)
+    recorder.start()
+    try:
+        deadline = time.time() + 5.0
+        while recorder.offer(frames(1)[0]) and time.time() < deadline:
+            time.sleep(0.01)
+
+        # The writer is dead by now; every further frame must be refused.
+        assert recorder.offer(frames(1)[0]) is False
+    finally:
+        recorder.close()
+
+    assert recorder.stats.fault is not None
+    assert recorder.stats.frames_dropped > 0
 
 
 def test_indexing_happens_on_the_caller_s_thread(tmp_path: Path):
@@ -604,26 +679,6 @@ def test_a_second_run_does_not_overwrite_the_first(tmp_path: Path):
     assert first[0].path.is_file(), "the first run's evidence was destroyed"
     assert second[0].path.is_file()
     assert len(list(tmp_path.glob("*.mp4"))) == 2
-
-
-def test_a_dead_writer_is_reported_rather_than_accepted_from(tmp_path: Path):
-    # `offer` checked only whether it had ever started a thread, so it went on
-    # returning True for a writer that had died — telling the caller a frame was
-    # recorded when nothing was going to record it.
-    recorder = Recorder("cam", tmp_path, fps=15.0, live=True, codec="ZZZZ")
-    recorder.start()
-    try:
-        for frame in frames(20):
-            recorder.offer(frame)
-            time.sleep(0.01)
-
-        # The writer is dead by now; every further frame must be refused.
-        assert recorder.offer(frames(1)[0]) is False
-    finally:
-        recorder.close()
-
-    assert recorder.stats.fault is not None
-    assert recorder.stats.frames_dropped > 0
 
 
 def test_a_recording_that_stopped_early_is_surfaced_by_the_pipeline(

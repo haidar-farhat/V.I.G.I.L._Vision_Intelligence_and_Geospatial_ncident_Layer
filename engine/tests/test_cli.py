@@ -324,7 +324,11 @@ def test_two_cameras_do_not_share_a_background_model(
     # between two cameras corrupts both models and every detection that comes
     # out of them — and it corrupts them quietly, because the output is still
     # detection-shaped.
-    from sentinel import cli as module
+    # Patched where `detector_for` resolves it, which is the module that owns
+    # the class — not on `cli`, which stopped naming it when the choice of
+    # detector moved behind the factory. A test hooked to the old spelling went
+    # on passing while counting nothing at all.
+    from sentinel import detect as module
 
     built: list[object] = []
     original = module.MotionDetector

@@ -251,6 +251,14 @@ class CameraRunner:
         """
         with self._lock:
             self._stopping = True
+            pipeline = self._pipeline
+
+        # The flag alone only stops the loop *between* frames, and a camera that
+        # has gone quiet delivers no frames to be between. The pipeline's own
+        # read wait has to be interrupted or shutdown blocks for the full frame
+        # timeout on every silent camera.
+        if pipeline is not None:
+            pipeline.ask_to_stop()
 
     def stop(self, timeout: float = STOP_TIMEOUT_SECONDS) -> bool:
         """Ask the run to end and wait for it. Returns whether it actually ended.
