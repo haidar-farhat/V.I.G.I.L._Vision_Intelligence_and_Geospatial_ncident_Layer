@@ -316,6 +316,17 @@ class Pipeline:
                     f", {stats.frames_dropped} frame(s) dropped"
                     if stats.frames_dropped else "",
                 )
+                if stats.fault is not None:
+                    # `RecorderStats.fault` says the pipeline surfaces it, and
+                    # for a while the pipeline did not: a writer that died in
+                    # the first minute of an overnight run ended with the same
+                    # cheerful summary as a healthy one. Recording that is not
+                    # recording must not look like recording.
+                    _log.error(
+                        "%s: RECORDING STOPPED EARLY — %s. Footage after that "
+                        "point does not exist.",
+                        self._source.source_id, stats.fault,
+                    )
             if self._tracker is not None:
                 self._tracker.close()
                 self._tracker = None

@@ -25,7 +25,7 @@ implementation was removed in `582d0a8`; its architecture documents were kept
 because the thinking in them carried over, and are being brought up to date.
 Anything below that is not yet re-established after the rewrite says so.
 
-Current suite: **578 tests** — 57 Rust, 473 engine, 48 console — plus two static
+Current suite: **585 tests** — 57 Rust, 480 engine, 48 console — plus two static
 checks that run before any of them: an offline audit that fails the build if the
 shipped source names any destination off the site, and a lint that fails it if
 any of the 36 diagrams in this documentation no longer parses. `cargo fmt` and
@@ -554,6 +554,24 @@ a silent no-op on Windows — the failure mode being *retention deletes the
 evidence*; `measured_fps` echoing the nominal rate; incident windows queried in
 media time against a wall-clock index (asked for footage from 1970, correctly
 found none).
+
+**Then reviewed adversarially, which found more.** Six dimensions over the
+diff, three independent refuters per finding. Three survived, and one of them
+was the whole feature:
+
+| Found | Why it mattered |
+|---|---|
+| **Neither CLI export path attached footage or preserved anything** | Recording worked, coverage worked, preservation worked, and *nothing called any of them*. Every package came out with no video, `preserved` was never set on any segment, and retention was free to delete the exact footage an incident depended on. Every part was tested; the wire between them was not — so the tests now test the wire |
+| `offer()` documented "the image is copied" and did not | `np.ascontiguousarray` returns *the same object* for an already-contiguous array, which every OpenCV frame is — verified. The queued frame aliased the caller's, so a viewer drawing track boxes would bake its overlay into the evidence, and a reused capture buffer would make each frame mutate into a later moment while its timestamp and hash described the earlier one |
+| A second run silently overwrote the first | `cv2.VideoWriter` truncates, and every part of a segment's name is deterministic for a file source. Re-analysing the same clip destroyed the previous run's segments — including *preserved* ones, whose index row then vouched for the replacement with a freshly computed hash |
+| `RecorderStats.fault` was surfaced by nobody | Its own docstring said "the pipeline surfaces it". A writer that died in minute one of an overnight run ended with the same cheerful summary as a healthy one. Now an ERROR line, a line on stdout, and a non-zero exit |
+
+Each is pinned by a test that was watched failing with the defect restored.
+
+**The review was cut short** — it ran out of session budget with 115 of 132
+agents unfinished, so several raised findings were never verified either way.
+The export-wiring defect above came from that unverified pile and was confirmed
+by hand; the rest are unexamined.
 
 **Stated honestly:** recording is engine/CLI only — the console cannot switch it
 on yet. No playback inside the application. No event-triggered mode. Retention

@@ -597,9 +597,19 @@ Two rules that do not bend:
 
 ### Footage in evidence packages
 
-An exported incident now includes its clips — with a lead-in before the
-incident opened, because an intrusion event fires *after* somebody is already
-inside the zone, and the footage that explains it starts earlier.
+An exported incident includes its clips — with a lead-in before the incident
+opened, because an intrusion event fires *after* somebody is already inside the
+zone, and the footage that explains it starts earlier. Adjust the window with
+`--lead` and `--trail`:
+
+```bash
+sentinel export inc_ABA008BFC4EF5A862535 --to ./evidence --lead 60 --trail 30
+```
+
+Exporting also **preserves** the clips it used: they are marked as evidence in
+the index and retention will not delete them afterwards, however old they get.
+That preservation is itself audited, so "why can this segment not be deleted?"
+has an answer on the record.
 
 The package's `footage.json` states, per camera, exactly what the clips cover
 — and **what they do not**:

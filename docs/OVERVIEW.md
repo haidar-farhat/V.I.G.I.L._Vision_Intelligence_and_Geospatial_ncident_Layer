@@ -556,32 +556,33 @@ What the export refuses to do:
 
 ## 14. Test topology
 
-**547 tests**, plus two static checks that run before any of them. Where they
+**585 tests**, plus two static checks that run before any of them. Where they
 sit and what only they can catch:
 
 ```mermaid
 flowchart TB
     subgraph gate["BEFORE ANY TEST — static"]
-        AU["tools/offline_audit.py<br/><i>26 files scanned for cloud SDKs,<br/>telemetry packages, external hosts</i>"]
-        DL["tools/docs_lint.py<br/><i>32 diagrams; a broken one renders<br/>as raw text with no error</i>"]
+        AU["tools/offline_audit.py<br/><i>35 files scanned for cloud SDKs,<br/>telemetry packages, external hosts</i>"]
+        DL["tools/docs_lint.py<br/><i>41 diagrams; a broken one renders<br/>as raw text with no error</i>"]
     end
     subgraph rust["core · 57 tests"]
         G["geometry.rs · 26<br/><i>the mathematics</i>"]
         T["tracking.rs · 20<br/><i>identity and motion</i>"]
         F["ffi.rs · 11<br/><i>null tolerance, layout, truncation</i>"]
     end
-    subgraph eng["engine · 442 tests"]
+    subgraph eng["engine · 480 tests"]
         C["test_core · 36<br/><i>does the boundary lie?</i>"]
         DE["test_decode · 41<br/><i>credentials, timestamps, thread death</i>"]
         OG["test_offline_guarantee · 29<br/><i>watches the guard fail</i>"]
         DC["test_docs · 12<br/><i>watches the lint fail</i>"]
         DV["test_devices · 33<br/><i>each OS's device query,<br/>parsed from its own output</i>"]
-        CL["test_cli · 43 · test_logs · 16 · test_packaging · 19"]
+        CL["test_cli · 43 · test_logs · 16 · test_packaging · 23"]
         DT["test_detect · 25 · test_onnx · 18"]
         Z["test_zones · 20 · test_events · 26"]
         IN["test_incidents · 29"]
         P["test_pipeline · 25 · test_multicamera · 11"]
         ST["test_store · 33 · test_evidence · 26"]
+        RE["test_recording · 35<br/><i>a file loses no frames; retention<br/>never deletes evidence; a package<br/>says what it lacks</i>"]
     end
     subgraph con["console · 48 tests"]
         CO["placement · honesty · threading<br/>redaction · persistence · export"]

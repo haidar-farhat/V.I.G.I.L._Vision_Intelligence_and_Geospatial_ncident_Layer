@@ -31,7 +31,13 @@ from .recording import RetentionPolicy, apply_retention
 from .core import CameraPose, LatLon
 from .decode import VideoSource
 from .detect import MotionDetector
-from .evidence import ExportError, export_incident
+from .evidence import (
+    DEFAULT_LEAD_SECONDS,
+    DEFAULT_TRAIL_SECONDS,
+    ExportError,
+    coverage_for,
+    export_incident,
+)
 from .events import (
     AfterHoursRule,
     LoiteringRule,
@@ -210,6 +216,7 @@ def _run(args: argparse.Namespace) -> int:
 
     store = Store(args.database or default_database_path())
     all_events = []
+    recording_failed = False
 
     try:
         for index, source in enumerate(sources):
@@ -279,12 +286,43 @@ def _run(args: argparse.Namespace) -> int:
                 print(f"\n{source.source_id}  ({source.display_url})")
                 print(pipeline.stats.summary())
 
+                # Only when recording was actually asked for. Reading the
+                # attribute otherwise says nothing and couples this reporting
+                # to a detail of the pipeline that a caller passing its own
+                # pipeline-shaped object need not provide.
+                recorder = pipeline.recorder if record_to is not None else None
+                if recorder is not None:
+                    recording_stats = recorder.stats
+                    print(
+                        f"recorded              {recording_stats.segments_written}"
+                        f" segment(s), "
+                        f"{recording_stats.bytes_written / 1024**2:.1f} MiB"
+                    )
+                    if recording_stats.frames_dropped:
+                        print(
+                            f"  dropped             {recording_stats.frames_dropped}"
+                            f" frame(s)"
+                            f" ({recording_stats.dropped_fraction:.0%}) — the writer"
+                            " could not keep up"
+                        )
+                    if recording_stats.fault is not None:
+                        # On stdout as well as in the log, because an operator
+                        # reading the run's report must not have to also read
+                        # the log to find out the recording stopped.
+                        print(
+                            f"  RECORDING FAILED    {recording_stats.fault}",
+                            file=sys.stderr,
+                        )
+                        recording_failed = True
+
         for zone in zones:
             store.save_zone(zone)
 
         if not all_events:
             print("\nNo events. Nothing crossed a rule.")
-            return 0
+            # A failed recording is a failed run even when the analysis found
+            # nothing: a scheduled job that exits 0 is a job nobody looks at.
+            return 1 if recording_failed else 0
 
         # Across every source, deliberately: a camera correlating only its own
         # events raises one incident per camera for one intrusion, which is the
@@ -301,7 +339,7 @@ def _run(args: argparse.Namespace) -> int:
         if args.export:
             _export_all(incidents, Path(args.export), store)
 
-        return 0
+        return 1 if recording_failed else 0
     finally:
         store.close()
         for source in sources:
@@ -331,18 +369,69 @@ def _report(events, incidents) -> None:
             print(f"    · {factor.points:+5.1f}  {factor.name}: {factor.because}")
 
 
-def _export_all(incidents, destination: Path, store: Store) -> None:
+def _export_one(incident, destination: Path, store: Store, lead: float, trail: float):
+    """Export one incident *with the footage that shows it*.
+
+    This function exists because for a while the two export paths did neither
+    half of it. Recording worked, coverage worked, preservation worked, and
+    nothing in the shipped code ever called any of them — so every package came
+    out with no video, and `preserved` was never set on any segment, which left
+    retention free to delete the exact footage an incident depended on. The
+    mechanism that prevents that was real, tested, and unreachable.
+
+    Preservation happens *before* the copy and is kept even if the copy then
+    fails. Over-preserving costs disk; under-preserving destroys evidence.
+    """
+    coverage = coverage_for(store, incident, lead_seconds=lead, trail_seconds=trail)
+
+    clips = [segment.path for cover in coverage for segment in cover.segments]
+    if clips:
+        preserved = store.preserve_segments(clips)
+        store.audit(
+            ACTOR, "recording.preserved", incident.id,
+            f"{preserved} segment(s) held as evidence and exempted from retention",
+        )
+
+    export = export_incident(
+        incident, destination, exported_by=ACTOR, footage=coverage
+    )
+    store.audit(ACTOR, "incident.exported", incident.id, str(export.directory))
+    return export, coverage
+
+
+def _describe_coverage(coverage) -> None:
+    """Say what the package has, and — the part that matters — what it lacks."""
+    for cover in coverage:
+        if cover.is_complete and cover.segments:
+            print(f"      {cover.camera_id}: {len(cover.segments)} clip(s), complete")
+            continue
+        if not cover.segments:
+            # A camera the incident names with nothing recorded is a finding,
+            # not an absence, and it is invisible unless said out loud.
+            print(f"      {cover.camera_id}: NO FOOTAGE", file=sys.stderr)
+            continue
+        missing = sum(end - start for start, end in cover.gaps) / 1000
+        print(
+            f"      {cover.camera_id}: {len(cover.segments)} clip(s), "
+            f"{cover.covered_fraction:.0%} covered — {missing:.0f}s missing",
+            file=sys.stderr,
+        )
+
+
+def _export_all(incidents, destination: Path, store: Store,
+                lead: float = DEFAULT_LEAD_SECONDS,
+                trail: float = DEFAULT_TRAIL_SECONDS) -> None:
     destination.mkdir(parents=True, exist_ok=True)
     print()
     for incident in incidents:
         try:
-            export = export_incident(incident, destination, exported_by=ACTOR)
+            export, coverage = _export_one(incident, destination, store, lead, trail)
         except ExportError as error:
             print(f"  export failed for {incident.id}: {error}", file=sys.stderr)
             continue
-        store.audit(ACTOR, "incident.exported", incident.id, str(export.directory))
         print(f"  {incident.id}  ->  {export.directory}")
         print(f"      manifest sha256  {export.manifest_sha256}")
+        _describe_coverage(coverage)
     print("\n  Record those digests separately. They are what makes a package "
           "checkable later.")
 
@@ -379,11 +468,13 @@ def _export(args: argparse.Namespace) -> int:
 
         destination = Path(args.to)
         destination.mkdir(parents=True, exist_ok=True)
-        export = export_incident(incident, destination, exported_by=ACTOR)
-        store.audit(ACTOR, "incident.exported", incident.id, str(export.directory))
+        export, coverage = _export_one(
+            incident, destination, store, args.lead, args.trail
+        )
 
         print(f"{len(export.files)} files written to {export.directory}")
         print(f"manifest sha256  {export.manifest_sha256}")
+        _describe_coverage(coverage)
         return 0
     except ExportError as error:
         print(f"error: {error}", file=sys.stderr)
@@ -438,6 +529,19 @@ def _coverage(args: argparse.Namespace) -> int:
     return 0
 
 
+def _bytes(count: int) -> str:
+    """Bytes at a scale a person can read.
+
+    Fixed GiB made a real 2.8 MiB of preserved evidence print as "0.00 GiB",
+    directly above the line saying three segments were preserved — two true
+    statements that read as a contradiction.
+    """
+    for unit, size in (("GiB", 1024**3), ("MiB", 1024**2), ("KiB", 1024)):
+        if count >= size:
+            return f"{count / size:.2f} {unit}"
+    return f"{count} bytes"
+
+
 def _retention(args: argparse.Namespace) -> int:
     """Report or apply the recording retention policy.
 
@@ -458,14 +562,14 @@ def _retention(args: argparse.Namespace) -> int:
         count = store.recording_count()
 
         print(f"policy      {policy.describe()}")
-        print(f"recorded    {count} segment(s), {total / 1024**3:.2f} GiB")
-        print(f"preserved   {preserved / 1024**3:.2f} GiB — evidence, never deleted")
+        print(f"recorded    {count} segment(s), {_bytes(total)}")
+        print(f"preserved   {_bytes(preserved)} — evidence, never deleted")
         print()
 
         result = apply_retention(store, policy, actor=ACTOR, dry_run=not args.apply)
 
         verb = "deleted" if args.apply else "would delete"
-        print(f"{verb}    {len(result.deleted)} segment(s), {result.freed_gib:.2f} GiB")
+        print(f"{verb}    {len(result.deleted)} segment(s), {_bytes(result.freed_bytes)}")
         if result.kept_preserved:
             print(f"kept        {result.kept_preserved} preserved segment(s)")
         if result.already_missing:
@@ -652,6 +756,23 @@ def build_parser() -> argparse.ArgumentParser:
     export = commands.add_parser("export", help="export one incident as evidence")
     export.add_argument("id", help="incident id, from `sentinel incidents`")
     export.add_argument("--to", required=True, metavar="DIR")
+    export.add_argument(
+        "--lead", type=float, default=DEFAULT_LEAD_SECONDS, metavar="SECONDS",
+        help=(
+            "how much recorded footage to include from before the incident "
+            f"opened (default {DEFAULT_LEAD_SECONDS:g}). An event fires after "
+            "somebody is already inside a zone, so what explains it starts "
+            "earlier."
+        ),
+    )
+    export.add_argument(
+        "--trail", type=float, default=DEFAULT_TRAIL_SECONDS, metavar="SECONDS",
+        help=(
+            "and from after it closed (default "
+            f"{DEFAULT_TRAIL_SECONDS:g}) — what somebody does on the way out is "
+            "evidence too."
+        ),
+    )
     export.set_defaults(handler=_export)
 
     coverage = commands.add_parser(

@@ -439,7 +439,7 @@ event-linked jumps — and the console toggle.
 | Post-event recording buffer | `TESTED` | Same mechanism, trailing side |
 | Configurable retention | `TESTED` | Age, total size and free-space bounds; dry-run by default; every deletion audited |
 | Per-camera · per-event retention | `PLAN` | One policy for the store today |
-| Incident evidence preservation | `TESTED` | A preserved segment is never deleted, however old, however full the disk |
+| Incident evidence preservation | `TESTED` | Exporting marks its clips as evidence and audits it; a preserved segment is never deleted, however old, however full the disk. Tested through the CLI, because for a while every part worked and nothing called them |
 | Segmented recordings | `TESTED` | A power cut costs at most one segment |
 | Recording search | `SKEL` | The index answers by camera and window; no interface asks |
 | Timeline scrubbing · video playback | `PLAN` | Clips are ordinary `.mp4`; any player opens them |
@@ -467,7 +467,7 @@ event-linked jumps — and the console toggle.
 | Capability | State | Note |
 |---|---|---|
 | Incident evidence packages | `TESTED` | A folder verifiable by somebody who has only the folder |
-| Video evidence | `TESTED` | Clips with a lead-in, plus `footage.json` stating per-camera coverage and **timing every gap** |
+| Video evidence | `TESTED` | Clips with a `--lead`/`--trail` window, plus `footage.json` stating per-camera coverage and **timing every gap**. Asserted by running the real CLI and opening the package |
 | Still images · thumbnails | `PLAN` | |
 | Event metadata · track data · timeline | `TESTED` | |
 | AI analysis | `PLAN` | |
