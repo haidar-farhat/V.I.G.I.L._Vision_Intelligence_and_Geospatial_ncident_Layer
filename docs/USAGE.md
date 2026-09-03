@@ -221,9 +221,12 @@ slice would claim coverage it does not have.
 |---|---|
 | **Remove camera** | Forgets the selected camera. If it is running it is stopped first and its last events kept. What it saw — events, incidents — stays in the database; only the camera goes |
 | **Move on map** | Click the plan view to move the selected camera there. Height, heading and optics are kept. The first placement has to be *Place…*, because a click cannot say how high a camera is or which way it faces |
-| **Add zone…** | Name, kind, size, and where: in front of the selected camera, or a point you click on the plan view |
-| **Zones tab → Change…** | Rename a zone or change its kind. Shape is fixed at creation: incidents were measured against it |
+| **Add zone…** | A square: name, kind, size, and where — in front of the selected camera, or a point you click on the plan view |
+| **Zones tab → Draw zone** | Any outline. Click each corner on the plan view; double-click or Enter closes it; right-click or Backspace undoes a corner; Esc abandons. Fewer than three corners is never accepted, and a figure of eight is refused with the reason |
+| **Zones tab → Reshape** | Edit the selected zone's outline: drag a corner, click an edge to add one, right-click a corner to remove it (never below three), drag inside to move the whole zone. Enter applies, Esc reverts. The audit row records the corner count before and after |
+| **Zones tab → properties** | Beside the list: name, kind, schedule (a window that ends before it starts wraps midnight; weekdays), how long an object must be inside before it counts, how long it must be gone before the presence ends, and whether an uncertain position may count. Nothing is written until *Apply* |
 | **Zones tab → Remove** | Forgets the zone. Events it raised keep its name |
+| **Click a zone on the map** | Selects it in the list and shows its properties |
 
 Five kinds of zone, each drawn in its own colour on the plan view so a rule to
 *ignore* a place never looks like a rule that nobody should be there:

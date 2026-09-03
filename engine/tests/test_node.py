@@ -748,3 +748,21 @@ def test_a_zone_can_be_changed_and_removed(tmp_path: Path, yard: Zone):
         assert "zone.changed" in actions and "zone.removed" in actions
         detail = next(row["detail"] for row in store.audit_trail(limit=50) if row["action"] == "zone.changed")
         assert "RESTRICTED" in detail and "EXCLUSION" in detail
+        assert "Loading bay" in detail, "the audit row did not say what the name became"
+
+
+def test_a_zone_outline_change_is_audited_as_such(tmp_path: Path, yard: Zone):
+    # "name -> name" would hide a zone quietly shrinking to exclude the door
+    # it was drawn around. The outline change is named in the audit row.
+    from sentinel.core import destination_point
+
+    with Node(tmp_path / "n.db", zones=[yard]) as node:
+        centre = yard.ring[0]
+        bigger = tuple(destination_point(centre, b, 25.0) for b in (0.0, 72.0, 144.0, 216.0, 288.0))
+        node.replace_zone(Zone(id=yard.id, name=yard.name, kind=yard.kind, ring=bigger))
+        assert len(node.zones[0].ring) == 5
+
+    with Store(tmp_path / "n.db") as store:
+        detail = next(row["detail"] for row in store.audit_trail(limit=50) if row["action"] == "zone.changed")
+        assert "outline" in detail and "4 -> 5 points" in detail
+        assert "name" not in detail, "an unchanged field was reported as changed"

@@ -201,6 +201,15 @@ def main() -> int:
         name="Public pavement", kind=ZoneKind.EXCLUSION, radius=6.0,
         centre=destination_point(session.pose.position, session.pose.heading + 28.0, 30.0),
     )
+    # A drawn outline — five corners, not a square — selected so the properties
+    # panel is populated in the photograph.
+    anchor = destination_point(session.pose.position, session.pose.heading - 30.0, 40.0)
+    drawn = window._create_zone(
+        tuple(destination_point(anchor, b, 9.0) for b in (10.0, 80.0, 150.0, 230.0, 300.0)),
+        name="Delivery yard", kind=ZoneKind.INTEREST,
+    )
+    if drawn is not None:
+        window.zones_view.select(drawn.id)
 
     shoot(window, ("live-" if live else "") + "02-configured")
 

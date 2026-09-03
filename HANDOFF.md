@@ -176,14 +176,34 @@ the map. Now:
 - Photographed on the reference scene: `03-running.png` (toolbar, two kinds on
   the map), `08-zones.png` (the tab).
 
-**Still not done, honestly:** drawing an arbitrary polygon (only squares of a
-chosen half-width); moving a zone (remove and re-add, so the audit shows both);
-schedules from the GUI; a camera's first placement still needs the dialog.
+### Zones can be drawn, reshaped, scheduled — the first slice of the map programme
+
+- `MapView.begin_draw()` / `drawn`: corner-by-corner outlines; `begin_edit()` /
+  `edited`: drag corners, click an edge to add one, right-click to remove (never
+  below three), drag inside to move; Enter applies, Esc reverts. `zone_at()`,
+  `select_zone()`, `zone_clicked`.
+- `ZonePropertiesPanel` beside the zone list: name, kind, schedule, dwell,
+  release, accept-uncertain. Apply / Revert. `ZoneDialog(ring_given=True)` asks
+  only name and kind after a drawing.
+- `zones.ring_problem()` (Shapely `is_valid` + convex-hull area) runs inside
+  `Zone.__post_init__`, so no path can create a figure of eight. Found the hard
+  way: a bow tie's signed area cancels to zero, so "no area" fired before
+  "self-intersection"; the hull test fixed the order.
+- `Node.replace_zone` audits *what* changed — every field, with corner counts —
+  via `_describe_zone_change`.
+- 8 console tests drive the map with `QtTest` mouse and key events (corners land
+  within 0.5 m of the click); 3 engine tests for ring validity; 1 for the audit.
+- Photographed: `08-zones.png` (list + properties), `04-plan-view.png` (a
+  pentagon drawn beside two squares, selected with a solid outline).
+
+**Still not done, honestly:** moving a zone by drag is there, but circles,
+rectangles-by-drag, tripwires and corridors are not; a camera's first placement
+still needs the dialog; there is no basemap under any of it.
 
 ### Docs
 
 FEATURES.md +8 rows (155 `TESTED` of 379). STATUS.md counts corrected (they
-were stale: 648 → 693 tests, 36 → 41 diagrams) and a row for the contact
+were stale: 648 → 705 tests, 36 → 41 diagrams) and a row for the contact
 crossing. USAGE §7 says the dot is where the position came from. README file
 map.
 

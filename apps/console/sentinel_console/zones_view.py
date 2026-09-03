@@ -14,9 +14,10 @@ or a point the operator clicks on the plan view.
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QTime, Qt, Signal
 from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -24,7 +25,10 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QHeaderView,
     QLabel,
+    QHBoxLayout,
     QLineEdit,
+    QPushButton,
+    QTimeEdit,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -32,7 +36,10 @@ from PySide6.QtWidgets import (
 )
 
 from sentinel.core import LatLon, haversine_distance
-from sentinel.zones import Zone, ZoneKind
+from dataclasses import replace
+from datetime import time as clock
+
+from sentinel.zones import Schedule, Zone, ZoneKind
 
 from . import theme
 
@@ -114,10 +121,11 @@ class ZonesView(QTreeWidget):
 class ZoneDialog(QDialog):
     """Create a zone, or change the name and kind of one that exists.
 
-    Shape is chosen at creation only. A zone's geometry is the fact an incident
-    was measured against; changing it under existing events would make them
-    describe a place that no longer exists. Move a zone by removing it and
-    placing a new one — the audit log then shows both.
+    With ``ring_given`` the outline was just drawn on the map, so size and
+    placement do not apply and are not shown. Reshaping an existing zone is done
+    on the map, and every change to an outline is audited with the vertex count
+    before and after — a zone quietly shrinking to exclude the door it was drawn
+    around is exactly what the audit log exists to record.
     """
 
     def __init__(
@@ -126,10 +134,12 @@ class ZoneDialog(QDialog):
         default_radius: float = 10.0,
         existing: Zone | None = None,
         can_pick: bool = False,
+        ring_given: bool = False,
         parent: QWidget | None = None,
     ):
         super().__init__(parent)
         self._existing = existing
+        self._ring_given = ring_given
         self.setWindowTitle("Change zone" if existing else "Add zone")
         self.setMinimumWidth(460)
 
@@ -163,8 +173,9 @@ class ZoneDialog(QDialog):
         self._radius.setSuffix(" m")
         self._radius.setValue(zone_extent_meters(existing) / 2 if existing else default_radius)
         self._radius.setToolTip("Half the width of the square drawn on the ground.")
-        self._radius.setEnabled(existing is None)
-        form.addRow("Half-width", self._radius)
+        self._radius.setEnabled(existing is None and not ring_given)
+        if not ring_given:
+            form.addRow("Half-width", self._radius)
 
         self._placement = QComboBox()
         self._placement.addItem(IN_FRONT_OF_CAMERA)
@@ -175,8 +186,9 @@ class ZoneDialog(QDialog):
                 "Picking on the map needs a placed camera: until one is placed "
                 "the map has no origin to measure a click against."
             )
-        self._placement.setEnabled(existing is None)
-        form.addRow("Where", self._placement)
+        self._placement.setEnabled(existing is None and not ring_given)
+        if not ring_given:
+            form.addRow("Where", self._placement)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -205,4 +217,188 @@ class ZoneDialog(QDialog):
         return float(self._radius.value())
 
     def pick_on_map(self) -> bool:
-        return self._placement.currentText() == PICK_ON_MAP
+        return not self._ring_given and self._placement.currentText() == PICK_ON_MAP
+
+
+WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+
+
+class ZonePropertiesPanel(QWidget):
+    """Everything about the selected zone that is not its outline.
+
+    Name, kind, when its rules apply, how long an object must be inside before
+    it counts, how long it must be gone before the presence ends, and whether an
+    uncertain position may count. Nothing is written until *Apply*; *Revert*
+    puts the fields back to the zone as stored.
+    """
+
+    #: The zone as it should now be. The owner persists it through the node.
+    changed = Signal(object)
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._zone: Zone | None = None
+
+        form = QFormLayout()
+        form.setContentsMargins(6, 4, 6, 4)
+
+        self._name = QLineEdit()
+        form.addRow("Name", self._name)
+
+        self._kind = QComboBox()
+        for kind in ZoneKind:
+            self._kind.addItem(kind.value.title(), kind.value)
+            index = self._kind.count() - 1
+            self._kind.setItemData(index, KIND_DESCRIPTIONS[kind], Qt.ItemDataRole.ToolTipRole)
+        form.addRow("Kind", self._kind)
+
+        self._scheduled = QCheckBox("Only between")
+        self._scheduled.setToolTip(
+            "Off: the zone's rules apply at all times. On: only inside this window, "
+            "on these days. A window that ends before it starts wraps midnight, "
+            "which is what every real after-hours schedule does."
+        )
+        self._start = QTimeEdit(QTime(18, 0))
+        self._end = QTimeEdit(QTime(6, 0))
+        for edit in (self._start, self._end):
+            edit.setDisplayFormat("HH:mm")
+        when = QHBoxLayout()
+        when.addWidget(self._scheduled)
+        when.addWidget(self._start)
+        when.addWidget(QLabel("and"))
+        when.addWidget(self._end)
+        when.addStretch(1)
+        form.addRow("Schedule", when)
+
+        days = QHBoxLayout()
+        self._days: list[QCheckBox] = []
+        for name in WEEKDAYS:
+            box = QCheckBox(name)
+            box.setChecked(True)
+            self._days.append(box)
+            days.addWidget(box)
+        days.addStretch(1)
+        form.addRow("", days)
+        self._scheduled.toggled.connect(self._enable_schedule)
+
+        self._dwell = QDoubleSpinBox()
+        self._dwell.setRange(0.0, 600.0)
+        self._dwell.setDecimals(1)
+        self._dwell.setSuffix(" s")
+        self._dwell.setToolTip(
+            "How long an object must be inside before it counts as present. Short "
+            "for a doorway, long for a yard where people pass through."
+        )
+        form.addRow("Count after", self._dwell)
+
+        self._exit = QDoubleSpinBox()
+        self._exit.setRange(0.0, 600.0)
+        self._exit.setDecimals(1)
+        self._exit.setSuffix(" s")
+        self._exit.setToolTip(
+            "How long an object must be gone before its presence ends. Longer than "
+            "the entry delay, or a one-frame dropout ends a presence and starts a "
+            "second one."
+        )
+        form.addRow("Release after", self._exit)
+
+        self._uncertain = QCheckBox("An uncertain position may count as inside")
+        self._uncertain.setToolTip(
+            "A position whose uncertainty disc straddles the boundary. Right for an "
+            "exclusion or interest zone; wrong for a restricted area, which must not "
+            "raise an alarm on a maybe."
+        )
+        form.addRow("", self._uncertain)
+
+        buttons = QHBoxLayout()
+        self.apply_button = QPushButton("Apply")
+        self.apply_button.clicked.connect(self.apply)
+        self.revert_button = QPushButton("Revert")
+        self.revert_button.clicked.connect(self.revert)
+        buttons.addStretch(1)
+        buttons.addWidget(self.revert_button)
+        buttons.addWidget(self.apply_button)
+
+        self._empty = QLabel("Select a zone to see its properties.")
+        self._empty.setObjectName("Caption")
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self._empty)
+        self._form_host = QWidget()
+        host = QVBoxLayout(self._form_host)
+        host.setContentsMargins(0, 0, 0, 0)
+        host.addLayout(form)
+        host.addLayout(buttons)
+        host.addStretch(1)
+        layout.addWidget(self._form_host)
+        self.show_zone(None)
+
+    # ------------------------------------------------------------------ state
+
+    @property
+    def zone(self) -> Zone | None:
+        return self._zone
+
+    def show_zone(self, zone: Zone | None) -> None:
+        self._zone = zone
+        self._form_host.setVisible(zone is not None)
+        self._empty.setVisible(zone is None)
+        if zone is None:
+            return
+        self._name.setText(zone.name)
+        self._kind.setCurrentIndex(list(ZoneKind).index(zone.kind))
+        schedule = zone.schedule
+        self._scheduled.setChecked(schedule is not None)
+        if schedule is not None:
+            self._start.setTime(QTime(schedule.start.hour, schedule.start.minute))
+            self._end.setTime(QTime(schedule.end.hour, schedule.end.minute))
+            for index, box in enumerate(self._days, start=1):
+                box.setChecked(not schedule.days or index in schedule.days)
+        else:
+            for box in self._days:
+                box.setChecked(True)
+        self._enable_schedule(schedule is not None)
+        self._dwell.setValue(zone.enter_after_millis / 1000.0)
+        self._exit.setValue(zone.exit_after_millis / 1000.0)
+        self._uncertain.setChecked(zone.accept_uncertain)
+
+    def _enable_schedule(self, on: bool) -> None:
+        for widget in (self._start, self._end, *self._days):
+            widget.setEnabled(on)
+
+    def zone_from_fields(self) -> Zone:
+        """The selected zone with the fields as they are on screen."""
+        assert self._zone is not None
+        schedule = None
+        if self._scheduled.isChecked():
+            days = frozenset(
+                index for index, box in enumerate(self._days, start=1) if box.isChecked()
+            )
+            # Every day checked means no day restriction, which is how the
+            # engine spells "every day".
+            if len(days) == len(WEEKDAYS):
+                days = frozenset()
+            start, end = self._start.time(), self._end.time()
+            schedule = Schedule(
+                start=clock(start.hour(), start.minute()),
+                end=clock(end.hour(), end.minute()),
+                days=days,
+            )
+        return replace(
+            self._zone,
+            name=self._name.text().strip() or self._zone.name,
+            kind=ZoneKind(self._kind.currentData()),
+            schedule=schedule,
+            enter_after_millis=int(round(self._dwell.value() * 1000)),
+            exit_after_millis=int(round(self._exit.value() * 1000)),
+            accept_uncertain=self._uncertain.isChecked(),
+        )
+
+    def apply(self) -> None:
+        if self._zone is None:
+            return
+        self.changed.emit(self.zone_from_fields())
+
+    def revert(self) -> None:
+        self.show_zone(self._zone)

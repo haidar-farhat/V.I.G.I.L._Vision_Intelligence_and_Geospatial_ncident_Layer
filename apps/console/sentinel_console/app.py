@@ -85,7 +85,7 @@ from .placement import PlacementDialog
 from .session import CameraSession
 from .add_camera import AddCameraDialog
 from .video_view import VideoView
-from .zones_view import ZoneDialog, ZonesView
+from .zones_view import ZoneDialog, ZonePropertiesPanel, ZonesView
 
 _log = logs.get(__name__)
 
@@ -279,12 +279,18 @@ class ConsoleWindow(QMainWindow):
 
         self.map = MapView()
         self.map.picked.connect(self._map_picked)
+        self.map.drawn.connect(self._zone_drawn)
+        self.map.edited.connect(self._zone_outline_edited)
+        self.map.zone_clicked.connect(self._zone_clicked_on_map)
         #: What the next picked map point is for: ("zone", (name, kind, radius))
         #: or ("camera", camera_id). Nothing, when nobody is picking.
         self._pick_action: tuple | None = None
         self.tracks = self._build_track_table()
         self.incidents = IncidentView()
         self.zones_view = ZonesView()
+        self.zones_view.itemSelectionChanged.connect(self._zone_selection_changed)
+        self.zone_properties = ZonePropertiesPanel()
+        self.zone_properties.changed.connect(self._zone_properties_applied)
 
         outer.addLayout(self._build_toolbar())
 
@@ -445,12 +451,24 @@ class ConsoleWindow(QMainWindow):
 
         row = QHBoxLayout()
         add = QPushButton("Add zone…")
+        add.setToolTip("A square of a chosen size, in front of the camera or at a clicked point.")
         add.clicked.connect(self._add_zone_dialog)
         row.addWidget(add)
-        self.edit_zone_button = QPushButton("Change…")
-        self.edit_zone_button.setToolTip("Rename the selected zone or change its kind.")
-        self.edit_zone_button.clicked.connect(self._edit_zone)
-        row.addWidget(self.edit_zone_button)
+        self.draw_zone_button = QPushButton("Draw zone")
+        self.draw_zone_button.setToolTip(
+            "Draw any outline on the plan view: click each corner, double-click "
+            "or Enter to close, right-click to undo a corner, Esc to abandon."
+        )
+        self.draw_zone_button.clicked.connect(self._draw_zone)
+        row.addWidget(self.draw_zone_button)
+        self.reshape_zone_button = QPushButton("Reshape")
+        self.reshape_zone_button.setToolTip(
+            "Edit the selected zone's outline on the plan view: drag a corner, "
+            "click an edge to add one, right-click a corner to remove it, drag "
+            "inside to move the whole zone. Enter applies, Esc reverts."
+        )
+        self.reshape_zone_button.clicked.connect(self._edit_outline)
+        row.addWidget(self.reshape_zone_button)
         self.remove_zone_button = QPushButton("Remove")
         self.remove_zone_button.setToolTip(
             "Forget the selected zone. Events it raised are kept and still name it."
@@ -459,7 +477,17 @@ class ConsoleWindow(QMainWindow):
         row.addWidget(self.remove_zone_button)
         row.addStretch(1)
         layout.addLayout(row)
-        layout.addWidget(self.zones_view, 1)
+
+        # The list and the properties of whichever row is selected, side by
+        # side: an operator reading a zone's schedule should not lose sight of
+        # which zone it is.
+        body = QSplitter(Qt.Orientation.Horizontal)
+        body.addWidget(self.zones_view)
+        body.addWidget(self.zone_properties)
+        body.setStretchFactor(0, 3)
+        body.setStretchFactor(1, 2)
+        body.setCollapsible(1, False)
+        layout.addWidget(body, 1)
         return panel
 
     def _build_track_table(self) -> QTreeWidget:
@@ -640,6 +668,7 @@ class ConsoleWindow(QMainWindow):
         self.map.set_cameras(placed)
         self.map.set_zones(self._zones)
         self.zones_view.show_zones(self._zones)
+        self._sync_zone_properties()
 
         if not placed:
             self.placement_label.setText("No camera placed — objects will not be located")
@@ -760,17 +789,82 @@ class ConsoleWindow(QMainWindow):
             return
         self._add_zone(name=name, kind=kind, radius=radius)
 
-    def _edit_zone(self) -> None:
-        zone_id = self.zones_view.selected_zone_id()
-        zone = next((z for z in self._zones if z.id == zone_id), None)
-        if zone is None:
-            QMessageBox.information(self, "No zone selected", "Select a zone to change.")
+    # ------------------------------------------------------- zones: outlines
+
+    def _placed_anywhere(self) -> bool:
+        return any(s.pose is not None for s in self._sessions.values())
+
+    def _draw_zone(self) -> None:
+        """Draw a zone of any shape on the plan view."""
+        if not self._placed_anywhere():
+            QMessageBox.information(
+                self,
+                "Place the camera first",
+                "A zone is an area on the ground. Until a camera is placed the map "
+                "has no origin to draw against.",
+            )
             return
-        dialog = ZoneDialog(existing=zone, parent=self)
+        self.map.begin_draw("Draw a zone")
+        self._set_status(
+            "Drawing a zone: click each corner on the plan view, double-click or "
+            "Enter to close it, right-click to undo, Esc to abandon."
+        )
+
+    def _zone_drawn(self, ring) -> None:
+        """An outline was closed on the map; ask what it is, then create it."""
+        dialog = ZoneDialog(ring_given=True, parent=self)
         dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         if dialog.exec() != QDialog.DialogCode.Accepted:
+            self._set_status("Zone abandoned.")
             return
-        self._change_zone(zone.id, name=dialog.name() or zone.name, kind=dialog.kind())
+        self._create_zone(tuple(ring), name=dialog.name() or None, kind=dialog.kind())
+
+    def _edit_outline(self) -> None:
+        zone_id = self.zones_view.selected_zone_id()
+        if zone_id is None or not self.map.begin_edit(zone_id):
+            QMessageBox.information(self, "No zone selected", "Select a zone to reshape.")
+            return
+        self.detail_tabs.setCurrentIndex(1)
+        self._set_status(
+            "Reshaping: drag a corner, click an edge to add one, right-click a "
+            "corner to remove it, drag inside to move. Enter applies, Esc reverts."
+        )
+
+    def _zone_outline_edited(self, zone_id: str, ring) -> None:
+        zone = next((z for z in self._zones if z.id == zone_id), None)
+        if zone is None:
+            return
+        try:
+            reshaped = replace(zone, ring=tuple(ring))
+        except ValueError as error:
+            # The engine refused the outline (a figure of eight, a line). The
+            # stored zone is untouched; say why, in the engine's words.
+            QMessageBox.warning(self, "Outline not usable", str(error))
+            return
+        self.node.replace_zone(reshaped)
+        self._refresh_placement()
+        self.zones_view.select(zone_id)
+        self._set_status(f"{zone.name} reshaped: {len(ring)} corners.")
+
+    def _zone_selection_changed(self) -> None:
+        zone_id = self.zones_view.selected_zone_id()
+        self.map.select_zone(zone_id)
+        self._sync_zone_properties()
+
+    def _sync_zone_properties(self) -> None:
+        zone_id = self.zones_view.selected_zone_id()
+        zone = next((z for z in self._zones if z.id == zone_id), None)
+        self.zone_properties.show_zone(zone)
+
+    def _zone_clicked_on_map(self, zone_id: str) -> None:
+        self.zones_view.select(zone_id)
+        self.detail_tabs.setCurrentIndex(1)
+
+    def _zone_properties_applied(self, zone: Zone) -> None:
+        self.node.replace_zone(zone)
+        self._refresh_placement()
+        self.zones_view.select(zone.id)
+        self._set_status(f"{zone.name} updated.")
 
     def _change_zone(self, zone_id: str, *, name: str, kind: ZoneKind) -> None:
         zone = next((z for z in self._zones if z.id == zone_id), None)
@@ -844,7 +938,12 @@ class ConsoleWindow(QMainWindow):
             destination_point(centre, bearing, radius)
             for bearing in (0.0, 90.0, 180.0, 270.0)
         )
+        self._create_zone(ring, name=name, kind=kind)
 
+    def _create_zone(
+        self, ring: tuple, *, name: str | None, kind: ZoneKind
+    ) -> Zone | None:
+        """Make a zone from an outline. Returns it, or ``None`` if refused."""
         # The first id not in use, not "count plus one": after zone-1 is
         # removed, count-plus-one names zone-2 again and the upsert silently
         # overwrites the zone that is still there.
@@ -859,16 +958,22 @@ class ConsoleWindow(QMainWindow):
                 if kind is ZoneKind.RESTRICTED
                 else f"{kind.value.title()} zone {letter}"
             )
-        zone = Zone(
-            id=f"zone-{index}",
-            name=name,
-            kind=kind,
-            ring=ring,
-            enter_after_millis=600,
-            # A zone meant to be ignored, or merely watched, may accept an
-            # uncertain position; one that raises an alarm must not.
-            accept_uncertain=kind in (ZoneKind.EXCLUSION, ZoneKind.INTEREST),
-        )
+        try:
+            zone = Zone(
+                id=f"zone-{index}",
+                name=name,
+                kind=kind,
+                ring=tuple(ring),
+                enter_after_millis=600,
+                # A zone meant to be ignored, or merely watched, may accept an
+                # uncertain position; one that raises an alarm must not.
+                accept_uncertain=kind in (ZoneKind.EXCLUSION, ZoneKind.INTEREST),
+            )
+        except ValueError as error:
+            # A figure of eight, or points on a line. The engine's own words,
+            # because they name the problem.
+            QMessageBox.warning(self, "Outline not usable", str(error))
+            return None
         # The node persists it, audits it, and — if this is the first zone —
         # rebuilds the rule set, because rules that need a zone are dead weight
         # until there is one and must not stay dead once there is.
@@ -880,6 +985,7 @@ class ConsoleWindow(QMainWindow):
         self._set_status(
             f"{len(self._zones)} zone(s). Rules apply to cameras started from now."
         )
+        return zone
 
     # ------------------------------------------------------------------ running
 

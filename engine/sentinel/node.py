@@ -425,6 +425,33 @@ class CameraRunner:
             _log.error("%s: analysis raised", self.source_id, exc_info=True)
 
 
+def _describe_zone_change(before: Zone, after: Zone) -> str:
+    """What changed, for the audit row. Every field, because a zone quietly
+    shrinking to exclude the door it was drawn around is exactly the edit an
+    audit log exists to record — and "name -> name" would have hidden it."""
+    parts: list[str] = []
+    if before.name != after.name:
+        parts.append(f"name {before.name!r} -> {after.name!r}")
+    if before.kind != after.kind:
+        parts.append(f"kind {before.kind.value} -> {after.kind.value}")
+    if before.ring != after.ring:
+        parts.append(f"outline {len(before.ring)} -> {len(after.ring)} points, moved")
+    if before.schedule != after.schedule:
+        parts.append(
+            "schedule "
+            + (before.schedule.describe() if before.schedule else "always")
+            + " -> "
+            + (after.schedule.describe() if after.schedule else "always")
+        )
+    if before.enter_after_millis != after.enter_after_millis:
+        parts.append(f"dwell {before.enter_after_millis} -> {after.enter_after_millis} ms")
+    if before.exit_after_millis != after.exit_after_millis:
+        parts.append(f"exit {before.exit_after_millis} -> {after.exit_after_millis} ms")
+    if before.accept_uncertain != after.accept_uncertain:
+        parts.append(f"accept uncertain {before.accept_uncertain} -> {after.accept_uncertain}")
+    return "; ".join(parts) if parts else "no change"
+
+
 class Node:
     """Everything a machine runs, with nothing on screen.
 
@@ -731,10 +758,7 @@ class Node:
         before = self._zones[index]
         self._zones[index] = zone
         self.store.save_zone(zone)
-        self.store.audit(
-            self._actor, "zone.changed", zone.id,
-            f"{before.name} ({before.kind.value}) -> {zone.name} ({zone.kind.value})",
-        )
+        self.store.audit(self._actor, "zone.changed", zone.id, _describe_zone_change(before, zone))
         if self._running:
             _log.warning(
                 "node %s: zone %s changed; cameras already running keep the old "

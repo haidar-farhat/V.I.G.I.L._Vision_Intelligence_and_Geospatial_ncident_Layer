@@ -95,6 +95,35 @@ class Schedule:
 ALWAYS = None
 
 
+def ring_problem(ring) -> str | None:
+    """Why a ring is not a usable area, or ``None`` if it is.
+
+    A self-intersecting outline (a figure of eight drawn by a slip of the
+    mouse) has no inside — point-in-polygon gives a different answer depending
+    on which lobe the point is in and which way the test happens to count —
+    so a zone built on one would raise or suppress events at random. Shapely
+    decides validity; that geometry is hard and its bugs are invisible until
+    one arrangement of vertices produces a wrong answer.
+    """
+    if len(ring) < 3:
+        return f"{len(ring)} points: two points are a line, not an area"
+    from shapely.geometry import Polygon
+    from shapely.validation import explain_validity
+
+    polygon = Polygon([(p.lon, p.lat) for p in ring])
+    # The hull, not the polygon: a figure of eight has two lobes whose signed
+    # areas cancel to nothing, and would otherwise be reported as a line.
+    # Collinear points have a hull that is a line, whose area is zero up to
+    # rounding — 1e-13 square degrees is about a hand's breadth squared.
+    if polygon.convex_hull.area < 1e-13:
+        return "the points lie on a line and enclose no area"
+    if not polygon.is_valid:
+        # Shapely's text names the problem and roughly where, e.g.
+        # "Self-intersection[35.5018 33.8938]". Plain enough to show an operator.
+        return explain_validity(polygon).split("[")[0].strip().lower() or "invalid outline"
+    return None
+
+
 @dataclass(frozen=True, slots=True)
 class Zone:
     """A named area on the ground.
@@ -127,6 +156,9 @@ class Zone:
                 "line, not an area, and a half-drawn zone must not start "
                 "producing intrusion events."
             )
+        problem = ring_problem(self.ring)
+        if problem is not None:
+            raise ValueError(f"Zone {self.id!r}: {problem}")
 
     def is_active(self, moment: datetime) -> bool:
         return self.schedule is None or self.schedule.covers(moment)

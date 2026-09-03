@@ -296,3 +296,42 @@ def test_one_track_in_two_zones_is_two_presences():
         changes.extend(evaluator.update([track], step * 200))
 
     assert {c.presence.zone_id for c in changes if c.kind == "ENTERED"} == {"a", "b"}
+
+
+# ------------------------------------------------------------- a usable ring
+
+
+def test_a_self_intersecting_outline_is_refused():
+    # A figure of eight has no inside: point-in-polygon flips depending on the
+    # lobe, so events would fire at random. Shapely decides, not a hand-rolled
+    # segment test.
+    from sentinel.zones import Zone, ZoneKind, ring_problem
+    from sentinel.core import LatLon
+
+    bow_tie = (
+        LatLon(33.8938, 35.5018), LatLon(33.8939, 35.5019),
+        LatLon(33.8938, 35.5019), LatLon(33.8939, 35.5018),
+    )
+    assert ring_problem(bow_tie) is not None
+    with pytest.raises(ValueError, match="self-intersection"):
+        Zone(id="z", name="Bow tie", kind=ZoneKind.RESTRICTED, ring=bow_tie)
+
+
+def test_collinear_points_are_not_an_area():
+    from sentinel.zones import ring_problem
+    from sentinel.core import LatLon
+
+    line = (LatLon(33.8938, 35.5018), LatLon(33.8939, 35.5019), LatLon(33.8940, 35.5020))
+    assert "no area" in (ring_problem(line) or "")
+
+
+def test_a_simple_outline_is_accepted_whatever_its_winding():
+    from sentinel.zones import ring_problem
+    from sentinel.core import LatLon
+
+    square = (
+        LatLon(33.8938, 35.5018), LatLon(33.8939, 35.5018),
+        LatLon(33.8939, 35.5019), LatLon(33.8938, 35.5019),
+    )
+    assert ring_problem(square) is None
+    assert ring_problem(tuple(reversed(square))) is None

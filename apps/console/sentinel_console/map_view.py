@@ -26,11 +26,12 @@ from __future__ import annotations
 
 import math
 
-from PySide6.QtCore import QPoint, QPointF, Qt, Signal
+from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import (
     QBrush,
     QColor,
     QFont,
+    QKeyEvent,
     QMouseEvent,
     QPainter,
     QPen,
@@ -58,12 +59,32 @@ class MapView(QWidget):
     #: A point the operator clicked while the view was asked to pick one, as a
     #: `LatLon`. The view knows nothing about what it is for.
     picked = Signal(object)
+    #: A closed outline the operator drew: a list of `LatLon`, three or more.
+    drawn = Signal(object)
+    #: ``(zone_id, ring)`` once the operator finished reshaping a zone.
+    edited = Signal(object, object)
+    #: The id of a zone the operator clicked.
+    zone_clicked = Signal(str)
+
+    #: How close, in pixels, a click must be to a vertex to grab it, and to an
+    #: edge to split it. Generous: a cross-hair on a 4K panel is small.
+    HANDLE_PIXELS = 9.0
+    EDGE_PIXELS = 6.0
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         #: While set, the next left click is a choice of ground point rather
         #: than the start of a drag. The text is what is drawn across the top.
         self._pick_prompt: str | None = None
+        #: Vertices of an outline being drawn, in local metres. `None` when not
+        #: drawing; an empty list when drawing has begun and nothing is placed.
+        self._draw_points: list[tuple[float, float]] | None = None
+        self._hover: QPointF | None = None
+        #: The outline being reshaped: its zone id, vertices in local metres,
+        #: the original ring (to tell a no-op from a change), and drag state.
+        self._edit: dict | None = None
+        self._selected_zone: str | None = None
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMinimumSize(280, 280)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
@@ -126,26 +147,97 @@ class MapView(QWidget):
         event.accept()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        position = event.position()
+        left = event.button() == Qt.MouseButton.LeftButton
+        right = event.button() == Qt.MouseButton.RightButton
+
         if self._pick_prompt is not None:
-            if event.button() == Qt.MouseButton.LeftButton:
-                point = self.point_at(event.position())
+            if left:
+                point = self.point_at(position)
                 self.cancel_pick()
                 if point is not None:
                     self.picked.emit(point)
-            elif event.button() == Qt.MouseButton.RightButton:
+            elif right:
                 self.cancel_pick()
             event.accept()
             return
-        if event.button() == Qt.MouseButton.LeftButton:
-            self._drag_from = event.position().toPoint()
+
+        if self._draw_points is not None:
+            if left:
+                self._draw_points.append(self._from_screen(position))
+            elif right:
+                # Undo the last vertex; with nothing placed, stop drawing.
+                if self._draw_points:
+                    self._draw_points.pop()
+                else:
+                    self.cancel_draw()
+            self.update()
+            event.accept()
+            return
+
+        if self._edit is not None:
+            edit = self._edit
+            handle = self._handle_at(position)
+            if left and handle is not None:
+                edit["drag"] = handle
+            elif right and handle is not None:
+                # Never below three: two points are a line, not an area, and the
+                # engine would refuse the result anyway — better refused here,
+                # where the operator can see the vertex stay put.
+                if len(edit["points"]) > 3:
+                    del edit["points"][handle]
+            elif left and (edge := self._edge_at(position)) is not None:
+                # Split the edge where the operator clicked and start dragging
+                # the new vertex, so one gesture both adds and places it.
+                edit["points"].insert(edge + 1, self._from_screen(position))
+                edit["drag"] = edge + 1
+            elif left and self._polygon_of(edit["points"]).containsPoint(
+                position, Qt.FillRule.OddEvenFill
+            ):
+                edit["moving"] = position
+            else:
+                # Outside the outline: an ordinary pan, so the operator can
+                # bring a far vertex into view without leaving edit mode.
+                if left:
+                    self._drag_from = position.toPoint()
+            self.update()
+            event.accept()
+            return
+
+        if left:
+            zone_id = self.zone_at(position)
+            if zone_id is not None:
+                self.select_zone(zone_id)
+                self.zone_clicked.emit(zone_id)
+            self._drag_from = position.toPoint()
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        position = event.position()
+        if self._draw_points is not None:
+            self._hover = position
+            self.update()
+            return
+        if self._edit is not None:
+            edit = self._edit
+            if edit.get("drag") is not None:
+                edit["points"][edit["drag"]] = self._from_screen(position)
+                self.update()
+                return
+            if edit.get("moving") is not None:
+                scale = self._scale()
+                delta = position - edit["moving"]
+                edit["moving"] = position
+                edit["points"] = [
+                    (e + delta.x() / scale, n - delta.y() / scale) for e, n in edit["points"]
+                ]
+                self.update()
+                return
         if self._drag_from is None:
             return
         scale = self._scale()
-        delta = event.position().toPoint() - self._drag_from
-        self._drag_from = event.position().toPoint()
+        delta = position.toPoint() - self._drag_from
+        self._drag_from = position.toPoint()
         self._view_centre = (
             self._view_centre[0] - delta.x() / scale,
             self._view_centre[1] + delta.y() / scale,
@@ -153,12 +245,202 @@ class MapView(QWidget):
         self.update()
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if self._edit is not None:
+            self._edit["drag"] = None
+            self._edit["moving"] = None
         self._drag_from = None
-        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        if self._draw_points is None and self._edit is None and self._pick_prompt is None:
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if self._draw_points is not None:
+            # The double-click's own first press placed a vertex on top of the
+            # previous one; drop it before closing.
+            if len(self._draw_points) >= 2:
+                last, before = self._draw_points[-1], self._draw_points[-2]
+                if math.hypot(last[0] - before[0], last[1] - before[1]) * self._scale() < 3.0:
+                    self._draw_points.pop()
+            self.finish_draw()
+            return
+        if self._edit is not None:
+            self.finish_edit()
+            return
         self._fit_view()
         self.update()
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802
+        key = event.key()
+        if key == Qt.Key.Key_Escape:
+            if self._draw_points is not None:
+                self.cancel_draw()
+            elif self._edit is not None:
+                self.cancel_edit()
+            elif self._pick_prompt is not None:
+                self.cancel_pick()
+            else:
+                self.select_zone(None)
+            return
+        if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            if self._draw_points is not None:
+                self.finish_draw()
+            elif self._edit is not None:
+                self.finish_edit()
+            return
+        if key == Qt.Key.Key_Backspace and self._draw_points:
+            self._draw_points.pop()
+            self.update()
+            return
+        super().keyPressEvent(event)
+
+    # ------------------------------------------------------- drawing outlines
+
+    def begin_draw(self, prompt: str = "Draw a zone") -> bool:
+        """Start an outline. Each left click places a vertex; double-click or
+        Enter closes it; right-click or Backspace removes the last vertex;
+        Escape abandons it. Needs a placed camera, like picking."""
+        if self._origin is None:
+            return False
+        self.cancel_edit()
+        self._draw_points = []
+        self._draw_prompt = prompt
+        self._hover = None
+        self.setMouseTracking(True)
+        self.setCursor(Qt.CursorShape.CrossCursor)
+        self.setFocus()
+        self.update()
+        return True
+
+    @property
+    def drawing(self) -> bool:
+        return self._draw_points is not None
+
+    @property
+    def draw_points(self) -> int:
+        return len(self._draw_points or ())
+
+    def finish_draw(self) -> bool:
+        """Close the outline. Returns whether one was produced.
+
+        Fewer than three vertices is not an area, so the outline stays open and
+        the operator keeps drawing — a half-drawn zone must never be created.
+        """
+        if self._draw_points is None or len(self._draw_points) < 3:
+            return False
+        ring = [self._from_local(e, n) for e, n in self._draw_points]
+        self.cancel_draw()
+        self.drawn.emit(ring)
+        return True
+
+    def cancel_draw(self) -> None:
+        self._draw_points = None
+        self._hover = None
+        self.setMouseTracking(False)
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self.update()
+
+    # ------------------------------------------------------ editing outlines
+
+    def begin_edit(self, zone_id: str) -> bool:
+        """Show a zone's vertices as handles. Drag one to move it, click an edge
+        to add one, right-click a handle to remove it, drag inside to move the
+        whole outline. Enter or double-click applies; Escape reverts."""
+        zone = next((z for z in self._zones if z.id == zone_id), None)
+        if zone is None or self._origin is None:
+            return False
+        self.cancel_draw()
+        self._edit = {
+            "zone_id": zone_id,
+            "points": [self._to_local(p) for p in zone.ring],
+            "original": tuple(zone.ring),
+            "drag": None,
+            "moving": None,
+        }
+        self.select_zone(zone_id)
+        self.setCursor(Qt.CursorShape.CrossCursor)
+        self.setFocus()
+        self.update()
+        return True
+
+    @property
+    def editing(self) -> str | None:
+        return None if self._edit is None else self._edit["zone_id"]
+
+    def finish_edit(self) -> bool:
+        """Apply the reshaped outline. Returns whether anything changed."""
+        if self._edit is None:
+            return False
+        edit, self._edit = self._edit, None
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self.update()
+        ring = tuple(self._from_local(e, n) for e, n in edit["points"])
+        if ring == edit["original"]:
+            return False
+        self.edited.emit(edit["zone_id"], list(ring))
+        return True
+
+    def cancel_edit(self) -> None:
+        if self._edit is None:
+            return
+        self._edit = None
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self.update()
+
+    def edit_vertex_count(self) -> int:
+        return 0 if self._edit is None else len(self._edit["points"])
+
+    # ------------------------------------------------------------- selection
+
+    def select_zone(self, zone_id: str | None) -> None:
+        if zone_id != self._selected_zone:
+            self._selected_zone = zone_id
+            self.update()
+
+    @property
+    def selected_zone(self) -> str | None:
+        return self._selected_zone
+
+    def zone_at(self, position: QPointF) -> str | None:
+        """The topmost zone under a widget position, or ``None``."""
+        if self._origin is None:
+            return None
+        for zone in reversed(self._zones):
+            polygon = QPolygonF([self._to_screen(*self._to_local(p)) for p in zone.ring])
+            if polygon.containsPoint(position, Qt.FillRule.OddEvenFill):
+                return zone.id
+        return None
+
+    def vertex_screen_position(self, index: int) -> QPointF:
+        """Where the edited outline's vertex `index` is on screen (for tests and
+        for anything that wants to point at it)."""
+        assert self._edit is not None
+        return self._to_screen(*self._edit["points"][index])
+
+    def _polygon_of(self, points) -> QPolygonF:
+        return QPolygonF([self._to_screen(e, n) for e, n in points])
+
+    def _handle_at(self, position: QPointF) -> int | None:
+        if self._edit is None:
+            return None
+        best, best_distance = None, self.HANDLE_PIXELS
+        for index, (e, n) in enumerate(self._edit["points"]):
+            screen = self._to_screen(e, n)
+            distance = math.hypot(screen.x() - position.x(), screen.y() - position.y())
+            if distance <= best_distance:
+                best, best_distance = index, distance
+        return best
+
+    def _edge_at(self, position: QPointF) -> int | None:
+        """Index of the edge (from vertex i to i+1) within reach, or ``None``."""
+        if self._edit is None:
+            return None
+        points = [self._to_screen(e, n) for e, n in self._edit["points"]]
+        best, best_distance = None, self.EDGE_PIXELS
+        for index in range(len(points)):
+            a, b = points[index], points[(index + 1) % len(points)]
+            distance = _point_to_segment(position, a, b)
+            if distance <= best_distance:
+                best, best_distance = index, distance
+        return best
 
     def _from_screen(self, point: QPointF) -> tuple[float, float]:
         scale = self._scale()
@@ -358,12 +640,31 @@ class MapView(QWidget):
         self._paint_trails(painter)
         self._paint_tracks(painter)
         self._paint_camera(painter)
+        self._paint_outline_in_progress(painter)
+        self._paint_edit_handles(painter)
         self._paint_scale_bar(painter)
-        if self._pick_prompt is not None:
-            self._paint_pick_prompt(painter)
+        banner = self._banner()
+        if banner is not None:
+            self._paint_banner(painter, banner)
         painter.end()
 
-    def _paint_pick_prompt(self, painter: QPainter) -> None:
+    def _banner(self) -> str | None:
+        if self._pick_prompt is not None:
+            return f"{self._pick_prompt} — click the map, right-click to cancel"
+        if self._draw_points is not None:
+            placed = len(self._draw_points)
+            return (
+                f"{getattr(self, '_draw_prompt', 'Draw a zone')}: {placed} point(s) — "
+                "click to add, double-click or Enter to close, right-click to undo, Esc to abandon"
+            )
+        if self._edit is not None:
+            return (
+                "Reshape: drag a corner, click an edge to add one, right-click a "
+                "corner to remove it, drag inside to move — Enter to apply, Esc to revert"
+            )
+        return None
+
+    def _paint_banner(self, painter: QPainter, text: str) -> None:
         """Say what the next click will do, across the top of the view."""
         font = QFont(painter.font())
         font.setPointSize(10)
@@ -374,10 +675,43 @@ class MapView(QWidget):
         painter.setBrush(QBrush(QColor(0, 0, 0, 170)))
         painter.drawRect(band)
         painter.setPen(QPen(theme.TEXT))
-        painter.drawText(
-            band, Qt.AlignmentFlag.AlignCenter,
-            f"{self._pick_prompt} — click the map, right-click to cancel",
-        )
+        painter.drawText(band, Qt.AlignmentFlag.AlignCenter, text)
+
+    def _paint_outline_in_progress(self, painter: QPainter) -> None:
+        if self._draw_points is None:
+            return
+        points = [self._to_screen(e, n) for e, n in self._draw_points]
+        pen = QPen(theme.TEXT, 1.6, Qt.PenStyle.DashLine)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        if len(points) >= 2:
+            painter.drawPolyline(QPolygonF(points))
+        if points and self._hover is not None:
+            painter.drawLine(points[-1], self._hover)
+            if len(points) >= 2:
+                faint = QPen(theme.TEXT_FAINT, 1.0, Qt.PenStyle.DotLine)
+                painter.setPen(faint)
+                painter.drawLine(self._hover, points[0])
+        painter.setPen(QPen(theme.TEXT, 1.0))
+        painter.setBrush(QBrush(theme.PANEL))
+        for point in points:
+            painter.drawEllipse(point, 4.0, 4.0)
+
+    def _paint_edit_handles(self, painter: QPainter) -> None:
+        if self._edit is None:
+            return
+        zone = next((z for z in self._zones if z.id == self._edit["zone_id"]), None)
+        colour = theme.zone_colour(zone.kind) if zone is not None else theme.TEXT
+        points = [self._to_screen(e, n) for e, n in self._edit["points"]]
+        painter.setPen(QPen(colour, 2.0))
+        fill = QColor(colour)
+        fill.setAlpha(40)
+        painter.setBrush(QBrush(fill))
+        painter.drawPolygon(QPolygonF(points))
+        painter.setBrush(QBrush(theme.PANEL))
+        half = 4.5
+        for point in points:
+            painter.drawRect(QRectF(point.x() - half, point.y() - half, 2 * half, 2 * half))
 
     def _paint_grid(self, painter: QPainter) -> None:
         """A metric grid, so distances are readable rather than implied."""
@@ -452,14 +786,25 @@ class MapView(QWidget):
             edge.setAlpha(150)
             fill = QColor(colour)
             fill.setAlpha(26)
-            painter.setPen(QPen(edge, 1.6, Qt.PenStyle.DashLine))
+            selected = zone.id == self._selected_zone
+            if self._edit is not None and zone.id == self._edit["zone_id"]:
+                # The handles draw the live outline; the stored one would only
+                # confuse, so it is skipped while being reshaped.
+                continue
+            painter.setPen(QPen(edge, 3.0 if selected else 1.6, Qt.PenStyle.SolidLine if selected else Qt.PenStyle.DashLine))
             painter.setBrush(QBrush(fill))
             painter.drawPolygon(polygon)
 
             painter.setPen(QPen(edge))
             centroid = polygon.boundingRect().center()
             kind = getattr(zone.kind, "value", str(zone.kind)).lower()
-            painter.drawText(centroid, f"{zone.name} · {kind}")
+            # Centred on the zone, not started at its centre: a label that runs
+            # off to the right reads as belonging to whatever is beside it.
+            painter.drawText(
+                QRectF(centroid.x() - 200, centroid.y() - 10, 400, 20),
+                Qt.AlignmentFlag.AlignCenter,
+                f"{zone.name} · {kind}",
+            )
 
     def _paint_camera(self, painter: QPainter) -> None:
         font = QFont(painter.font())
@@ -573,3 +918,14 @@ def _nice_step(span: float) -> float:
         if raw <= multiple * magnitude:
             return multiple * magnitude
     return 10.0 * magnitude
+
+
+def _point_to_segment(point: QPointF, a: QPointF, b: QPointF) -> float:
+    """Pixel distance from a point to the segment a-b."""
+    ax, ay, bx, by = a.x(), a.y(), b.x(), b.y()
+    dx, dy = bx - ax, by - ay
+    length_squared = dx * dx + dy * dy
+    if length_squared <= 1e-12:
+        return math.hypot(point.x() - ax, point.y() - ay)
+    t = max(0.0, min(1.0, ((point.x() - ax) * dx + (point.y() - ay) * dy) / length_squared))
+    return math.hypot(point.x() - (ax + t * dx), point.y() - (ay + t * dy))

@@ -24,11 +24,11 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QEventLoop, QPointF, QThread  # noqa: E402
+from PySide6.QtCore import QEventLoop, QPoint, QPointF, Qt, QThread  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 import scene  # noqa: E402
-from sentinel.core import CameraPose, LatLon  # noqa: E402
+from sentinel.core import CameraPose, LatLon, destination_point  # noqa: E402
 from sentinel.decode import VideoSource  # noqa: E402
 from sentinel.detect import MotionDetector  # noqa: E402
 from sentinel_console import theme  # noqa: E402
@@ -1460,3 +1460,239 @@ def test_the_zone_dialog_offers_every_kind_with_its_meaning(qt_app):
     grounded = ZoneDialog(can_pick=False)
     assert grounded._placement.count() == 1
     grounded.deleteLater()
+
+
+# ------------------------------------------------- drawing and reshaping zones
+
+
+def _screen(view: MapView, point: LatLon):
+    return view._to_screen(*view._to_local(point)).toPoint()
+
+
+def _placed_window(window, reference_video: Path):
+    session = window.add_camera(reference_video, "cam-07")
+    session.pose = SITE_POSE
+    window._refresh_placement()
+    QApplication.processEvents()
+    return session
+
+
+def test_an_outline_can_be_drawn_corner_by_corner(qt_app, window, reference_video: Path, monkeypatch):
+    """Three clicks and a close make a zone whose corners are where the clicks were."""
+    from PySide6.QtTest import QTest
+
+    from sentinel.core import haversine_distance
+    from sentinel.zones import ZoneKind
+
+    _placed_window(window, reference_video)
+    created = []
+    # The dialog that asks name and kind is replaced by a direct answer, so the
+    # test drives the map and not a modal.
+    monkeypatch.setattr(
+        ConsoleWindow, "_zone_drawn",
+        lambda self, ring: created.append(self._create_zone(tuple(ring), name="Yard", kind=ZoneKind.PERIMETER)),
+    )
+
+    window._draw_zone()
+    assert window.map.drawing
+
+    corners = [LatLon(33.89360, 35.50170), LatLon(33.89360, 35.50190), LatLon(33.89345, 35.50180)]
+    for corner in corners:
+        QTest.mouseClick(window.map, Qt.MouseButton.LeftButton, pos=_screen(window.map, corner))
+    assert window.map.draw_points == 3
+
+    assert window.map.finish_draw()
+    assert not window.map.drawing
+    assert created and created[0] is not None
+    zone = created[0]
+    assert zone.kind is ZoneKind.PERIMETER
+    assert len(zone.ring) == 3
+    for drawn, wanted in zip(zone.ring, corners):
+        assert haversine_distance(drawn, wanted) < 0.5, "a corner is not where it was clicked"
+    assert zone in window._zones and zone.id in {z.id for z in window.store.zones()}
+
+
+def test_a_half_drawn_outline_is_never_a_zone(qt_app, window, reference_video: Path):
+    from PySide6.QtTest import QTest
+
+    _placed_window(window, reference_video)
+    window._draw_zone()
+    QTest.mouseClick(window.map, Qt.MouseButton.LeftButton, pos=_screen(window.map, LatLon(33.89360, 35.50170)))
+    QTest.mouseClick(window.map, Qt.MouseButton.LeftButton, pos=_screen(window.map, LatLon(33.89360, 35.50190)))
+
+    assert not window.map.finish_draw(), "two points were accepted as an area"
+    assert window.map.drawing, "the outline was abandoned instead of left open"
+    assert not window._zones
+
+    # Right-click undoes the last corner; Escape abandons the outline.
+    QTest.mouseClick(window.map, Qt.MouseButton.RightButton, pos=_screen(window.map, LatLon(33.89355, 35.50180)))
+    assert window.map.draw_points == 1
+    QTest.keyClick(window.map, Qt.Key.Key_Escape)
+    assert not window.map.drawing
+    assert not window._zones
+
+
+def test_a_corner_can_be_dragged_and_the_change_is_audited(qt_app, window, reference_video: Path):
+    from PySide6.QtTest import QTest
+
+    from sentinel.core import haversine_distance
+
+    _placed_window(window, reference_video)
+    window._add_zone(radius=8.0)
+    zone = window._zones[0]
+    window.zones_view.select(zone.id)
+
+    window._edit_outline()
+    assert window.map.editing == zone.id
+    assert window.map.edit_vertex_count() == 4
+
+    start = window.map.vertex_screen_position(0).toPoint()
+    target = LatLon(33.89340, 35.50160)
+    end = _screen(window.map, target)
+    QTest.mousePress(window.map, Qt.MouseButton.LeftButton, pos=start)
+    QTest.mouseMove(window.map, pos=end)
+    QTest.mouseRelease(window.map, Qt.MouseButton.LeftButton, pos=end)
+
+    assert window.map.finish_edit()
+    assert window.map.editing is None
+    moved = next(z for z in window._zones if z.id == zone.id)
+    assert haversine_distance(moved.ring[0], target) < 0.5, "the corner did not land where it was dropped"
+    assert moved.ring[1:] == zone.ring[1:], "other corners moved too"
+    stored = next(z for z in window.store.zones() if z.id == zone.id)
+    assert stored.ring == moved.ring, "the reshaped outline was not persisted"
+    detail = next(
+        row["detail"] for row in window.store.audit_trail(limit=20) if row["action"] == "zone.changed"
+    )
+    assert "outline" in detail
+
+
+def test_corners_can_be_added_on_an_edge_and_removed_but_never_below_three(qt_app, window, reference_video: Path):
+    from PySide6.QtTest import QTest
+
+    _placed_window(window, reference_video)
+    window._add_zone(radius=8.0)
+    zone = window._zones[0]
+    window.zones_view.select(zone.id)
+    window._edit_outline()
+
+    # Clicking the middle of an edge splits it.
+    a = window.map.vertex_screen_position(0)
+    b = window.map.vertex_screen_position(1)
+    midpoint = ((a + b) / 2).toPoint()
+    QTest.mouseClick(window.map, Qt.MouseButton.LeftButton, pos=midpoint)
+    assert window.map.edit_vertex_count() == 5
+
+    # Right-clicking a corner removes it, down to three and no further.
+    for expected in (4, 3, 3):
+        QTest.mouseClick(
+            window.map, Qt.MouseButton.RightButton,
+            pos=window.map.vertex_screen_position(0).toPoint(),
+        )
+        assert window.map.edit_vertex_count() == expected
+
+    assert window.map.finish_edit()
+    assert len(next(z for z in window._zones if z.id == zone.id).ring) == 3
+
+
+def test_escape_reverts_a_reshape(qt_app, window, reference_video: Path):
+    from PySide6.QtTest import QTest
+
+    _placed_window(window, reference_video)
+    window._add_zone(radius=8.0)
+    zone = window._zones[0]
+    window.zones_view.select(zone.id)
+    window._edit_outline()
+    start = window.map.vertex_screen_position(0).toPoint()
+    QTest.mousePress(window.map, Qt.MouseButton.LeftButton, pos=start)
+    QTest.mouseMove(window.map, pos=start + QPoint(40, 40))
+    QTest.mouseRelease(window.map, Qt.MouseButton.LeftButton, pos=start + QPoint(40, 40))
+    QTest.keyClick(window.map, Qt.Key.Key_Escape)
+
+    assert window.map.editing is None
+    assert next(z for z in window._zones if z.id == zone.id).ring == zone.ring
+
+
+def test_a_self_intersecting_outline_is_refused_with_a_reason(qt_app, window, reference_video: Path, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+
+    from sentinel.zones import ZoneKind
+
+    _placed_window(window, reference_video)
+    told: list[str] = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args, **kwargs: told.append(args[2]))
+
+    bow_tie = (
+        LatLon(33.8936, 35.5017), LatLon(33.8937, 35.5019),
+        LatLon(33.8936, 35.5019), LatLon(33.8937, 35.5017),
+    )
+    assert window._create_zone(bow_tie, name="Bow tie", kind=ZoneKind.RESTRICTED) is None
+    assert not window._zones
+    assert told and "self-intersection" in told[0].lower()
+
+
+def test_zone_properties_are_applied_and_persisted(qt_app, window, reference_video: Path):
+    from PySide6.QtCore import QTime
+
+    from sentinel.zones import ZoneKind
+
+    _placed_window(window, reference_video)
+    window._add_zone(radius=8.0)
+    zone = window._zones[0]
+    window.zones_view.select(zone.id)
+    panel = window.zone_properties
+    assert panel.zone is not None and panel.zone.id == zone.id, "selecting a zone did not show it"
+
+    panel._name.setText("After-hours yard")
+    panel._kind.setCurrentIndex(list(ZoneKind).index(ZoneKind.PERIMETER))
+    panel._scheduled.setChecked(True)
+    panel._start.setTime(QTime(18, 0))
+    panel._end.setTime(QTime(6, 0))
+    for box in panel._days[5:]:      # not at weekends
+        box.setChecked(False)
+    panel._dwell.setValue(2.5)
+    panel._exit.setValue(4.0)
+    panel._uncertain.setChecked(True)
+    panel.apply()
+
+    changed = next(z for z in window._zones if z.id == zone.id)
+    assert changed.name == "After-hours yard"
+    assert changed.kind is ZoneKind.PERIMETER
+    assert changed.schedule is not None
+    assert changed.schedule.describe() == "18:00–06:00 on Mon, Tue, Wed, Thu, Fri"
+    assert changed.enter_after_millis == 2500 and changed.exit_after_millis == 4000
+    assert changed.accept_uncertain
+
+    stored = next(z for z in window.store.zones() if z.id == zone.id)
+    assert stored.schedule == changed.schedule, "the schedule was not persisted"
+    detail = next(
+        row["detail"] for row in window.store.audit_trail(limit=20) if row["action"] == "zone.changed"
+    )
+    assert "schedule" in detail and "dwell" in detail and "kind" in detail
+
+    # Revert puts the fields back to what is stored, not to what was typed.
+    panel._name.setText("scratch")
+    panel.revert()
+    assert panel._name.text() == "After-hours yard"
+
+
+def test_clicking_a_zone_on_the_map_selects_it_in_the_list(qt_app, window, reference_video: Path):
+    from PySide6.QtTest import QTest
+
+    from sentinel.zones import ZoneKind
+
+    _placed_window(window, reference_video)
+    window._add_zone(radius=6.0)
+    far = window._create_zone(
+        tuple(destination_point(LatLon(33.89340, 35.50160), b, 5.0) for b in (0.0, 120.0, 240.0)),
+        name="Far corner", kind=ZoneKind.INTEREST,
+    )
+    assert far is not None
+    window.detail_tabs.setCurrentIndex(0)
+
+    inside = _screen(window.map, LatLon(33.89340, 35.50160))
+    QTest.mouseClick(window.map, Qt.MouseButton.LeftButton, pos=inside)
+
+    assert window.map.selected_zone == far.id
+    assert window.zones_view.selected_zone_id() == far.id
+    assert window.detail_tabs.currentIndex() == 1, "the zones tab did not come forward"
+    assert window.zone_properties.zone is not None and window.zone_properties.zone.id == far.id

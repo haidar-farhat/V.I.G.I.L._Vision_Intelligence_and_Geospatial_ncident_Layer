@@ -33,26 +33,26 @@ Related: [STATUS.md](STATUS.md) — measurements and honest gaps ·
 
 ## The scoreboard
 
-379 capabilities, each with a state. Many lines cover several related things —
+383 capabilities, each with a state. Many lines cover several related things —
 "heading · pitch · roll" is one row — so this counts *claims*, not code.
 
 | | Count | Share | What it means |
 |---|---:|---:|---|
-| **`TESTED`** | 155 | 41% | A test fails if it stops working |
+| **`TESTED`** | 160 | 42% | A test fails if it stops working |
 | **`IMPL`** | 23 | 6% | Works; a regression would go unnoticed |
-| **`SKEL`** | 35 | 9% | Something is there; it does not do the job |
+| **`SKEL`** | 34 | 9% | Something is there; it does not do the job |
 | **`PLAN`** | 166 | 44% | Designed, no code |
 
 ```mermaid
 pie showData
-    title Sentinel Vision — 379 capabilities by state
-    "TESTED" : 155
+    title Sentinel Vision — 383 capabilities by state
+    "TESTED" : 160
     "IMPLEMENTED" : 23
-    "SKELETON" : 35
+    "SKELETON" : 34
     "PLANNED" : 166
 ```
 
-**Read that 41% carefully.** It is not "a third of the product is finished" — it
+**Read that 42% carefully.** It is not "a third of the product is finished" — it
 is that the part which is finished is the analytical core plus, now, the
 recording that makes its evidence real, while most of what is planned is the
 product surface around them. The parts a demonstration shows off are the parts
@@ -301,7 +301,7 @@ two identical webcams are indistinguishable by name.
 | Map snapshots | `PLAN` | |
 | Map-based incident investigation | `SKEL` | |
 | Map-based camera placement | `IMPL` | By dialog |
-| Map-based zone creation | `TESTED` | A square of chosen size, in front of the selected camera or centred on a point clicked on the plan view; five kinds, each explained in the dialog and drawn in its own colour. The engine takes any polygon; the console still draws only squares |
+| Map-based zone creation | `TESTED` | A square of chosen size, in front of the selected camera or centred on a point clicked on the plan view, or any outline drawn corner by corner; five kinds, each explained in the dialog and drawn in its own colour |
 | Outdoor · indoor · building / floor maps | `PLAN` | |
 | **Fetches nothing** | `TESTED` | Asserted: no module in the plan view references a URL or an HTTP client |
 
@@ -322,7 +322,11 @@ two identical webcams are indistinguishable by name.
 
 | Capability | State | Note |
 |---|---|---|
-| Draw zones directly on map | `SKEL` | Click-to-place the centre exists; drawing an arbitrary polygon does not |
+| Draw zones directly on map | `TESTED` | Click each corner, double-click or Enter to close, right-click to undo, Esc to abandon. Fewer than three corners is never an area; a self-intersecting outline is refused with Shapely's reason. Corners land within 0.5 m of the click |
+| Reshape a zone on the map | `TESTED` | Drag a corner, click an edge to add one, right-click a corner to remove it (never below three), drag inside to move the whole outline. Enter applies, Esc reverts. The audit row names the outline change with corner counts |
+| Zone properties panel | `TESTED` | Name, kind, schedule (wraps midnight, weekdays), dwell before counting, release after leaving, whether an uncertain position counts. Nothing written until Apply; Revert restores what is stored |
+| Zone selection linked across list and map | `TESTED` | Click a zone on the plan view and its row and properties come forward; select a row and the outline is highlighted |
+| Invalid zone outlines refused by the engine | `TESTED` | `Zone` itself rejects a figure of eight or collinear points, so no path — console, CLI, restored row — can create a zone with no inside |
 | Polygon zones | `TESTED` | Any polygon, with a minimum-area guard |
 | Rectangle · circle · line-crossing · corridor zones | `PLAN` | |
 | Restricted zones · monitoring zones | `TESTED` | |
