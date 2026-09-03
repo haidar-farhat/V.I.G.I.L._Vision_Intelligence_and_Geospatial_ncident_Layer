@@ -71,7 +71,7 @@ from sentinel.events import (
 from sentinel.evidence import ExportError, export_incident
 from sentinel.incidents import Correlator
 from sentinel.store import Store, default_database_path
-from sentinel import devices, logs
+from sentinel import devices, logs, telemetry
 from sentinel.zones import Zone, ZoneKind
 
 from . import theme
@@ -979,6 +979,8 @@ class ConsoleWindow(QMainWindow):
 
 
 def run(argv: list[str] | None = None) -> int:
+    telemetry.silence()
+
     """Start the console. The console-script and packaged entry point.
 
     Two flags only, because everything else an operator sets belongs in the

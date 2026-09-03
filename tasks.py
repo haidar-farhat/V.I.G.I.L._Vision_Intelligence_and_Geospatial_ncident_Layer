@@ -79,11 +79,20 @@ def audit() -> None:
     one an operator is actually relying on: an untested code path can still call
     home.
 
+    `binary_audit` closes the hole both of those left. `offline_audit` reads
+    *this project's* source, so a phone-home endpoint compiled into a
+    dependency was invisible to it — and one was: onnxruntime's Linux and macOS
+    wheels carry a Microsoft 1DS uploader, on by default, with a statically
+    linked TLS stack and a machine-fingerprint payload. The guard whose
+    docstring says "a dependency that phones home does so whether or not this
+    code asked it to" could not see it. This one reads the compiled bytes.
+
     `docs_lint` is here for the same reason. A mermaid diagram that fails to
     parse renders as raw text or as nothing, with no error anywhere — and every
     architectural claim in this repository is carried by one.
     """
     run([sys.executable, str(ROOT / "tools" / "offline_audit.py")], ROOT)
+    run([sys.executable, str(ROOT / "tools" / "binary_audit.py")], ROOT)
     run([sys.executable, str(ROOT / "tools" / "docs_lint.py")], ROOT)
 
 

@@ -31,6 +31,7 @@ from typing import Protocol, Sequence
 import cv2
 import numpy as np
 
+from . import telemetry
 from .core import BoundingBox, Detection
 
 #: Class id meaning "something moved and we do not know what it is".
@@ -345,14 +346,24 @@ class OnnxDetector:
         # to the operator's files.
         options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
-        # Telemetry off, explicitly. onnxruntime collects it by default on some
-        # builds, and this system tells the operator to their face that it sends
-        # nothing anywhere — a claim that has to be true of every dependency, not
-        # just of the code written here. Guarded because the call is absent on
-        # builds that never had telemetry to begin with.
-        disable = getattr(ort, "disable_telemetry_events", None)
-        if callable(disable):
-            disable()
+        # Telemetry off. The runtime API is the *second* half of this — the
+        # first is `ORT_DISABLE_TELEMETRY`, set by `telemetry.silence()` at every
+        # entry point, because the native library reads it when it initialises
+        # and Microsoft's own documentation says an initialisation event may
+        # already have been sent before any Python call can reach the switch.
+        #
+        # This is not hypothetical. The manylinux wheel of the version pinned
+        # here contains a Microsoft 1DS collector endpoint with an ingestion
+        # token, a statically linked mbedTLS stack, a persistent device-id
+        # database, and the payload fields `osDescription`, `cpuModel` and
+        # `totalMemoryMB` — verified by scanning the shipped `.so`, not by
+        # reading documentation. Telemetry is ON by default in the official
+        # builds. The host is deliberately not written here: the offline audit
+        # refuses shipped source that names a destination, and a comment is
+        # exactly how one gets in. `tools/binary_audit.py` holds the string,
+        # because finding it is that file's job.
+        telemetry.silence()
+        telemetry.silence_runtime_apis()
 
         try:
             session = ort.InferenceSession(

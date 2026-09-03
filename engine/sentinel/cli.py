@@ -26,7 +26,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import devices, logs, paths
+from . import devices, logs, paths, telemetry
 from .recording import RetentionPolicy, apply_retention
 from .core import CameraPose, LatLon
 from .decode import VideoSource
@@ -902,6 +902,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Before the parser, because the parser's imports are not the point — the
+    # point is that this runs before anything heavy loads. ONNX Runtime reads
+    # ORT_DISABLE_TELEMETRY when its native library initialises, which is
+    # earlier than any Python call can reach it.
+    telemetry.silence()
+
     args = build_parser().parse_args(argv)
 
     logs.configure(

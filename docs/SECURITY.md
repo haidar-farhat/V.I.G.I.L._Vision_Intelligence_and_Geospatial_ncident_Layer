@@ -259,11 +259,58 @@ pip install --no-index --find-links wheelhouse -r requirements.txt
 Nothing about the product changes; the packages simply arrive on a disk instead
 of over a wire.
 
+### The dependency that was already phoning home
+
+Written down because it is the case this whole section exists for, and because
+it was found *after* the policy was written rather than before.
+
+**onnxruntime — a dependency this project has shipped from the beginning —
+contains a Microsoft 1DS telemetry uploader in its Linux and macOS wheels.**
+Verified by downloading the manylinux wheel and scanning the shipped `.so`, not
+by reading documentation:
+
+| Found in `libonnxruntime.so.1.29.0` | |
+|---|---|
+| A OneCollector endpoint, with an ingestion token | ×3 |
+| `mbedtls` symbols — a statically linked TLS stack | ×127 |
+| `onnxruntime.db` — a persistent device identifier | ×1 |
+| `osDescription`, `cpuModel`, `totalMemoryMB` | the payload |
+
+Microsoft's own privacy documentation states telemetry is **on by default in
+the official builds**, and PyPI wheels are the official builds. The Windows
+wheels carry an ETW provider instead, which routes into the operating system's
+diagnostics pipeline rather than over a socket.
+
+So a Linux worker node running this engine would, by default, have posted a
+machine fingerprint to Microsoft over HTTPS — while the product told the
+operator to their face that it sends nothing anywhere.
+
+**What is done about it.** `sentinel/telemetry.py` sets `ORT_DISABLE_TELEMETRY`
+at every entry point *before* the native library initialises, and calls
+`disable_telemetry_events()` for the runtime half. Both, because neither is
+sufficient: the variable cannot reach a library already loaded, and the API
+cannot un-send an initialisation event that Microsoft's documentation says may
+already have been emitted before it becomes reachable.
+
+**What is left.** The uploader is still in the binary. Only a source build with
+`--no_telemetry` removes it, which means giving up PyPI wheels for onnxruntime
+entirely. That is a real trade and it has not been made. The offline CI job is
+what covers behaviour rather than configuration: the whole suite runs with
+outbound traffic dropped, and the drop proven first.
+
+**Why nothing caught it.** `offline_audit.py` reads `.py`, `.rs` and `.toml`.
+Its own docstring says *"a dependency that phones home does so whether or not
+this code asked it to"* — and a hostname inside a 28 MB shared object was
+invisible to it for as long as it existed. `tools/binary_audit.py` is the guard
+that reads compiled bytes, and it is why this is written in the past tense.
+
 ### What enforces this
 
 | Control | Catches | State |
 |---|---|---|
 | `tools/offline_audit.py` | A cloud SDK, an analytics or telemetry package, or a hard-coded external host named anywhere in shipped source. First CI job, before any toolchain runs | `TESTED` |
+| `tools/binary_audit.py` | A collector endpoint compiled **into a dependency**, where the source audit cannot see it. Distinguishes an inert certificate-chain URL from a live uploader, and records every acknowledged finding with what disarms it and what is left over | `TESTED` |
+| `sentinel/telemetry.py` | Disarms known-default-on telemetry before the library that would send it is loaded | `TESTED` |
 | Runtime egress guard | A camera address that resolves outside RFC 1918 / 4193 or loopback | `TESTED` |
 | Offline CI job | The whole suite with outbound traffic dropped, *after proving the drop took effect* | `TESTED` |
 | Rust core | Still has zero dependencies, and will keep them. It is arithmetic; there is nothing to import | `TESTED` |
@@ -277,12 +324,19 @@ than no control:
   on the day somebody installs. There is no Python lock file and no hash
   pinning — `core/Cargo.lock` is the only lock in the repository. Two installs a
   month apart are not the same software.
-- **The audit scans our source, not our dependency tree.** A package that is
-  clean itself but pulls in a telemetry library transitively comes in through a
-  door the guard is not watching.
+- **Neither audit reads a dependency's *Python* source.** A package that is
+  clean itself but pulls in a telemetry library transitively is caught only if
+  that library ships a compiled endpoint the binary audit recognises, or names
+  itself in a way the source audit would flag were it ours. A pure-Python
+  phone-home inside a dependency passes both today.
 - **Nothing verifies a package's runtime behaviour.** "It does not download
   anything" is currently established by reading and by reasoning, not by
-  observing a process with the network taken away.
+  observing a process with the network taken away. The binary audit reads
+  strings, which raises the cost of hiding a phone-home without making it
+  impossible: a host assembled at runtime from parts is invisible to it.
+- **The binary audit scans what is installed here, or the built bundle.** It
+  does not scan a wheel before it is installed, so a compromised package is
+  caught after it is on the machine rather than before.
 
 The offline CI job partly covers the last of these — it exercises the real
 dependencies with no route out — but only along the paths the tests reach.

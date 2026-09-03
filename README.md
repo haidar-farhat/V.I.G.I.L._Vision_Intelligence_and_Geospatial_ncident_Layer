@@ -66,7 +66,13 @@ no rule.
   [docs/SECURITY.md](docs/SECURITY.md#dependencies).
   *Enforced by:* **three checks at three different times.** `python tasks.py
   audit` — the first CI job, before any toolchain runs — scans the shipped source
-  for cloud SDKs, telemetry packages and hard-coded external hosts. The CI
+  for cloud SDKs, telemetry packages and hard-coded external hosts, *and reads
+  the compiled bytes of every dependency* for collector endpoints the source
+  scan cannot see. That second guard exists because onnxruntime — shipped here
+  from the beginning — turned out to carry a Microsoft telemetry uploader in
+  its Linux and macOS wheels, on by default; it is now disarmed before the
+  library loads, and [docs/SECURITY.md](docs/SECURITY.md#dependencies) says
+  exactly what remains. The CI
   offline job drops all outbound traffic, *proves* the drop took effect, and then
   runs every suite. At runtime, every address a camera host resolves to must be
   loopback or RFC 1918 / 4193, or the connection is refused with the address
@@ -175,7 +181,7 @@ The dividing line is **rate**, not importance.
 
 ### Scale
 
-**615 tests** — 57 Rust, 510 engine, 48 console — plus two static checks that
+**631 tests** — 57 Rust, 526 engine, 48 console — plus two static checks that
 run before any of them: an offline audit that fails the build if the shipped
 source names any destination off the site, and a lint that fails it if any of the
 36 diagrams in this documentation no longer parses. `cargo fmt` and
@@ -226,7 +232,7 @@ python -m pip install -e "engine[dev]" PySide6
 
 python tasks.py build      # build the Rust engine core
 python tasks.py audit      # no route off the site; every diagram parses
-python tasks.py test       # 615 tests, no network
+python tasks.py test       # 631 tests, no network
 python tasks.py lint       # rustfmt + clippy
 python tasks.py check      # all of the above — what CI runs
 ```
