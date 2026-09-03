@@ -284,6 +284,66 @@ class MotionDetector:
 # --------------------------------------------------------------------- ONNX
 
 
+def detector_for(
+    model_path: "str | Path | None" = None, **options
+) -> "Detector":
+    """The right detector for what the operator supplied.
+
+    One place that decides, because there are now three and the difference
+    between them is not a preference — it is what the system is capable of
+    concluding:
+
+    - **No model** gives the motion detector. It answers "what changed", which
+      includes a curtain, and it cannot see anything that has stopped moving.
+      Free, fast, and the reason a real webcam produced twenty tracks for one
+      seated person.
+    - **A model with two outputs** is instance segmentation: a mask per object,
+      a class, and a ground-contact point taken from the object's own lowest
+      pixel rather than from a rectangle's bottom edge.
+    - **A model with one output** is a detector: boxes and classes, no masks.
+
+    The choice is made by *reading the model*, not by a flag, because a flag can
+    disagree with the file and the operator would have no way to tell which won.
+    """
+    if model_path is None:
+        return MotionDetector(**options)
+
+    path = Path(model_path)
+    outputs = _output_count(path)
+
+    if outputs == 2:
+        from .segment import Segmenter
+
+        return Segmenter(path, **options)
+    return OnnxDetector(path, **options)
+
+
+def _output_count(path: "str | Path") -> int:
+    """How many tensors the model produces, without loading it for inference.
+
+    Reads the graph only. Building a full session to ask a structural question
+    would pay the optimisation cost twice.
+    """
+    from . import telemetry
+
+    telemetry.silence()
+    import onnxruntime as ort
+
+    resolved = Path(path).resolve()
+    if not resolved.is_file():
+        raise DetectionError(
+            f"No model at {resolved}. Models are supplied by the operator; "
+            "nothing is ever downloaded."
+        )
+    try:
+        session = ort.InferenceSession(
+            str(resolved), providers=["CPUExecutionProvider"]
+        )
+    except Exception as error:
+        raise DetectionError(f"Could not load the model at {resolved}: {error}") from error
+    return len(session.get_outputs())
+
+
 def _sha256(path: Path) -> str:
     import hashlib
 

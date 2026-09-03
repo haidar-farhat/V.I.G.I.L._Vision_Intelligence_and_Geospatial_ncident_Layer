@@ -147,6 +147,21 @@ def _ring(text: str) -> list[LatLon]:
     return points
 
 
+def _detector(args: argparse.Namespace):
+    """The detector this invocation asked for.
+
+    `detector_for` reads the model to decide what it is, so `--model` on a
+    segmentation graph gives masks and on a detection graph gives boxes,
+    without the operator having to say which they handed over.
+    """
+    from .detect import detector_for
+
+    model = getattr(args, "model", None)
+    if model is None:
+        return detector_for(None, detect_scale=args.detect_scale)
+    return detector_for(model)
+
+
 #: One definition, in `events.py`, shared by the CLI, the node and the console.
 #: There were two copies and a third was about to appear; rule sets that drift
 #: produce two deployments that disagree about what an incident is.
@@ -252,8 +267,10 @@ def _run(args: argparse.Namespace) -> int:
                 # per-pixel model of *its* scene; feeding it two cameras
                 # corrupts both models and every detection that comes out of
                 # them. The console gets this right by construction — one
-                # worker per camera — and this had to be made to match.
-                MotionDetector(detect_scale=args.detect_scale),
+                # worker per camera — and this had to be made to match. A model
+                # holds no per-scene state, but one session per camera keeps the
+                # rule uniform and lets them run genuinely in parallel.
+                _detector(args),
                 record_to=record_to,
                 segment_seconds=args.segment_seconds,
                 # Indexed as each segment closes rather than at the end, so a
@@ -652,7 +669,7 @@ def _node(args: argparse.Namespace) -> int:
         zones=zones,
         record_to=record_to,
         segment_seconds=args.segment_seconds,
-        detector_factory=lambda: MotionDetector(detect_scale=args.detect_scale),
+        detector_factory=lambda: _detector(args),
     )
 
     try:
@@ -883,6 +900,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     run.add_argument(
+        "--model", type=Path, default=None, metavar="FILE",
+        help=(
+            "an ONNX model to detect with, instead of motion. A model with mask "
+            "outputs segments — one instance per object, with a ground-contact "
+            "point taken from its own lowest pixel. Operator-supplied: nothing "
+            "is ever downloaded. See devtools/export_model.py."
+        ),
+    )
+    run.add_argument(
         "--detect-scale", type=float, default=0.75,
         help="detection resolution scale (default 0.75: 1.7x faster and "
              "slightly better recall — see docs/OVERVIEW.md)",
@@ -955,6 +981,8 @@ def build_parser() -> argparse.ArgumentParser:
                       help="record video to DIR, or to the data directory")
     node.add_argument("--segment-seconds", type=float, default=60.0)
     node.add_argument("--detect-scale", type=float, default=0.75)
+    node.add_argument("--model", type=Path, default=None, metavar="FILE",
+                      help="an ONNX detection or segmentation model to use instead of motion")
     node.add_argument("--node", default="local", help="this node's id")
     node.add_argument(
         "--for", dest="for_seconds", type=float, default=None, metavar="SECONDS",

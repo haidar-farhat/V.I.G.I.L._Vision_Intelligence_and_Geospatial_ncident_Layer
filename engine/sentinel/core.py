@@ -18,6 +18,8 @@ functions whose signatures may have moved underneath it.
 from __future__ import annotations
 
 import ctypes
+
+import numpy as np
 import os
 import sys
 from dataclasses import dataclass
@@ -159,6 +161,15 @@ class Detection:
     bbox: BoundingBox
     confidence: float
     class_id: int
+    #: This instance's shape, cropped to `bbox`, as 0/1 `uint8`. `None` from any
+    #: detector that produces boxes only.
+    #:
+    #: Cropped rather than full-frame because a full-frame mask per detection is
+    #: megabytes per frame at video rate, and every consumer already has the box.
+    #: It is what makes a truthful ground-contact point possible: see
+    #: `sentinel.segment.ground_contact`, which takes the lowest row that has any
+    #: of the object in it rather than assuming a rectangle's bottom edge.
+    mask: "np.ndarray | None" = None
 
 
 @dataclass(frozen=True, slots=True)
