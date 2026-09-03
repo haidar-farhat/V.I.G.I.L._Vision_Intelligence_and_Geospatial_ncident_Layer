@@ -148,10 +148,34 @@ launch check and screenshots.
 
 ---
 
-## 5. Verification record
+## 5. Verification record (2026-09-03, 17:39)
 
-Filled in at the end of the session; see the final report in the session log and
-`dist/screenshots/live-*.png`.
+- `python tasks.py ci --package`: **green**, twice on this tree's final shape
+  (once before the layout guard, once after). Stages: source audit, binary
+  audit, docs lint (41 diagrams), rustfmt, clippy, `cargo test` (60), release
+  build, engine (561), console (54), engine with the network poisoned, package,
+  and both `sentinel.exe` launch checks.
+- Console suite exit code, offscreen, on the fixed tree: **0 in 8 of 8 runs**
+  (4 with the diagnostic plugin, 3 plain, 1 inside CI). On the unfixed tree:
+  `-1073740940` in 8 of 8.
+- Executables in `dist/SentinelVision/`, each 45.1 MB, built 17:39:
+  `SentinelVision.exe`, `SentinelVision-dev.exe`, `sentinel.exe`.
+- `tools/screenshot_console.py --live --segment`, native platform, 290 font
+  families, `device:0`, a real person in frame, unattended: 1 camera, 1 zone,
+  2 tracks (`person` 0.86, `bottle` 0.58), 16 fps analysed. Looked at:
+  `live-03-running.png` — model named with digest in the toolbar, both tracks in
+  the table with class and confidence, both on the plan view, incident and track
+  panels at full height. `live-07-camera-view.png` — the mask tint follows the
+  silhouette (head, shoulder, raised arm), not the box; the contact dot sits at
+  the bottle's base and at the frame edge where the body leaves the picture;
+  no label overlaps another or the readout.
+- Track ids reached #3 and #5 within 224 frames for two stationary objects:
+  the fragmentation number to beat with appearance re-ID.
+
+**Not done by me, and worth a person doing:** close the real console and the
+packaged `SentinelVision-dev.exe` and check `$LASTEXITCODE` is 0 — the crash was
+only ever observed in the test process, and `run()` now frees its window by
+refcount, but nobody has watched the packaged binary exit.
 
 ---
 
