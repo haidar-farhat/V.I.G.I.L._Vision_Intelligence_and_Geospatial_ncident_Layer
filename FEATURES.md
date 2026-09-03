@@ -33,26 +33,26 @@ Related: [STATUS.md](STATUS.md) — measurements and honest gaps ·
 
 ## The scoreboard
 
-376 capabilities, each with a state. Many lines cover several related things —
+379 capabilities, each with a state. Many lines cover several related things —
 "heading · pitch · roll" is one row — so this counts *claims*, not code.
 
 | | Count | Share | What it means |
 |---|---:|---:|---|
-| **`TESTED`** | 151 | 40% | A test fails if it stops working |
+| **`TESTED`** | 155 | 41% | A test fails if it stops working |
 | **`IMPL`** | 23 | 6% | Works; a regression would go unnoticed |
 | **`SKEL`** | 35 | 9% | Something is there; it does not do the job |
-| **`PLAN`** | 167 | 45% | Designed, no code |
+| **`PLAN`** | 166 | 44% | Designed, no code |
 
 ```mermaid
 pie showData
-    title Sentinel Vision — 376 capabilities by state
-    "TESTED" : 151
+    title Sentinel Vision — 379 capabilities by state
+    "TESTED" : 155
     "IMPLEMENTED" : 23
     "SKELETON" : 35
-    "PLANNED" : 167
+    "PLANNED" : 166
 ```
 
-**Read that 40% carefully.** It is not "a third of the product is finished" — it
+**Read that 41% carefully.** It is not "a third of the product is finished" — it
 is that the part which is finished is the analytical core plus, now, the
 recording that makes its evidence real, while most of what is planned is the
 product surface around them. The parts a demonstration shows off are the parts
@@ -226,6 +226,9 @@ two identical webcams are indistinguishable by name.
 | Conclusions never squeezed out of sight | `TESTED` | On a short window the video shrinks, not the incident and track panels. A live screenshot had shown "2 tracked now" above a table reduced to its header row |
 | Contact point drawn in the console | `TESTED` | A dot in the track's colour where the position was projected from — on the feet with a mask, at the box's bottom-centre without. Checked as pixels, not as a call |
 | Segmentation masks drawn in the console | `TESTED` | The silhouette, at low alpha, instead of a box. An overlay that hides the pixels it describes makes the frame useless as evidence |
+| Remove a camera | `TESTED` | From the toolbar. Stopped first if running, its last events drained; its events and incidents are kept. Row, pane and picker entry go |
+| Move a camera on the map | `TESTED` | Click the plan view; height, heading and optics are kept. The first placement is the dialog's, because a click cannot say which way a camera faces |
+| Change or remove a zone | `TESTED` | Rename, change kind, remove — persisted and audited with what changed. The last zone's removal drops the zone rules. Zone ids are never reused |
 | One camera per device | `TESTED` | A second camera on the same device or stream is refused by name; a duplicate already stored is restored, faulted and never started. An operator's log had three cameras on `device:0` fighting one webcam. Files are exempt: a replay may back any number of cameras |
 | Models found beside the executables | `TESTED` | A packaged build looks in `models/` next to the `.exe`, not inside `_internal`; packaging copies any model in the checkout there; `sentinel where` prints the directory |
 | Model switching · multiple models | `TESTED` | Three detectors, interchangeable everywhere downstream. `--model` on `run`, `node` and the console; the console falls back to motion and says so |
@@ -298,7 +301,7 @@ two identical webcams are indistinguishable by name.
 | Map snapshots | `PLAN` | |
 | Map-based incident investigation | `SKEL` | |
 | Map-based camera placement | `IMPL` | By dialog |
-| Map-based zone creation | `SKEL` | Auto-placed square; the engine already takes any polygon |
+| Map-based zone creation | `TESTED` | A square of chosen size, in front of the selected camera or centred on a point clicked on the plan view; five kinds, each explained in the dialog and drawn in its own colour. The engine takes any polygon; the console still draws only squares |
 | Outdoor · indoor · building / floor maps | `PLAN` | |
 | **Fetches nothing** | `TESTED` | Asserted: no module in the plan view references a URL or an HTTP client |
 
@@ -319,7 +322,7 @@ two identical webcams are indistinguishable by name.
 
 | Capability | State | Note |
 |---|---|---|
-| Draw zones directly on map | `PLAN` | The one missing piece is the editor, not the geometry |
+| Draw zones directly on map | `SKEL` | Click-to-place the centre exists; drawing an arbitrary polygon does not |
 | Polygon zones | `TESTED` | Any polygon, with a minimum-area guard |
 | Rectangle · circle · line-crossing · corridor zones | `PLAN` | |
 | Restricted zones · monitoring zones | `TESTED` | |

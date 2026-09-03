@@ -534,6 +534,17 @@ class Store:
             "SELECT * FROM cameras ORDER BY id"
         ).fetchall()
 
+    def delete_camera(self, camera_id: str) -> bool:
+        """Forget a camera. Returns whether there was one to forget.
+
+        Its events and incidents stay: they are evidence of what was seen,
+        and a camera being taken down does not unmake what it saw. They carry
+        the camera id as text, not a foreign key, for exactly this reason.
+        """
+        with self.transaction() as connection:
+            cursor = connection.execute("DELETE FROM cameras WHERE id = ?", (camera_id,))
+            return cursor.rowcount > 0
+
     def camera_pose(self, camera_id: str):
         """The stored pose, or ``None`` if the camera was never placed."""
         from .core import CameraPose
@@ -600,6 +611,16 @@ class Store:
     def zones(self) -> list[Zone]:
         rows = self._connection.execute("SELECT * FROM zones ORDER BY id").fetchall()
         return [_zone_from_row(row) for row in rows]
+
+    def delete_zone(self, zone_id: str) -> bool:
+        """Forget a zone. Returns whether there was one to forget.
+
+        Events raised inside it keep its name in their own text; the zone
+        table is the geography as it is now, not as it was.
+        """
+        with self.transaction() as connection:
+            cursor = connection.execute("DELETE FROM zones WHERE id = ?", (zone_id,))
+            return cursor.rowcount > 0
 
     # ------------------------------------------------------------------ events
 

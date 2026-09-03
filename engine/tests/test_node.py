@@ -674,3 +674,77 @@ def test_a_duplicate_device_already_stored_is_restored_but_not_started(
         assert node.camera("integrated-camera").runner is not None
         assert twin.runner is None
         assert "same source as integrated-camera" in (twin.fault or "")
+
+
+# ------------------------------------------------------ removing what was added
+
+
+def test_a_removed_camera_is_gone_from_the_node_and_the_database(tmp_path: Path, reference_video: Path):
+    database = tmp_path / "n.db"
+    with Node(database) as node:
+        node.add_camera(reference_video, camera_id="gate")
+        node.add_camera(reference_video, camera_id="yard")
+        node.remove_camera("gate")
+        assert [c.camera_id for c in node.cameras] == ["yard"]
+        with pytest.raises(NodeError, match="no camera 'gate'"):
+            node.remove_camera("gate")
+
+    with Node(database) as again:
+        assert [c.camera_id for c in again.cameras] == ["yard"], "the row came back"
+
+    with Store(database) as store:
+        actions = [(row["action"], row["subject"]) for row in store.audit_trail(limit=50)]
+        assert ("camera.removed", "gate") in actions
+
+
+def test_removing_a_running_camera_stops_it_and_keeps_its_evidence(
+    tmp_path: Path, reference_video: Path, yard: Zone, site: CameraPose
+):
+    # What it saw stays. A camera being taken down does not unmake an incident.
+    database = tmp_path / "n.db"
+    with Node(database, zones=[yard]) as node:
+        node.add_camera(reference_video, camera_id="gate", pose=site)
+        node.start()
+        deadline = time.perf_counter() + 20.0
+        while time.perf_counter() < deadline and not node.incidents:
+            node.poll(force_correlate=True)
+            time.sleep(0.05)
+        assert node.incidents, "the reference scene produced no incident to keep"
+
+        node.remove_camera("gate")
+        assert not node.cameras
+        assert not node.is_running
+        assert node.incidents, "removing the camera discarded its incidents"
+
+    with Store(database) as store:
+        assert store.incident_count() > 0
+        assert store.event_count() > 0
+
+
+def test_a_zone_can_be_changed_and_removed(tmp_path: Path, yard: Zone):
+    database = tmp_path / "n.db"
+    with Node(database, zones=[yard]) as node:
+        assert len(node.rules) == 4, "a node with a zone has the zone rules"
+
+        renamed = Zone(
+            id=yard.id, name="Loading bay", kind=ZoneKind.EXCLUSION, ring=yard.ring,
+            enter_after_millis=yard.enter_after_millis,
+        )
+        node.replace_zone(renamed)
+        assert node.zones[0].name == "Loading bay"
+        assert node.zones[0].kind is ZoneKind.EXCLUSION
+
+        node.remove_zone(yard.id)
+        assert not node.zones
+        assert len(node.rules) == 1, "the last zone went, and the zone rules with it"
+        with pytest.raises(NodeError, match="no zone"):
+            node.remove_zone(yard.id)
+
+    with Node(database) as again:
+        assert not again.zones, "the zone row came back"
+
+    with Store(database) as store:
+        actions = [row["action"] for row in store.audit_trail(limit=50)]
+        assert "zone.changed" in actions and "zone.removed" in actions
+        detail = next(row["detail"] for row in store.audit_trail(limit=50) if row["action"] == "zone.changed")
+        assert "RESTRICTED" in detail and "EXCLUSION" in detail

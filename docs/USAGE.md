@@ -215,6 +215,30 @@ The footprint drawn on the plan view is an **annular sector**, not a pie slice �
 a downward-tilted camera cannot see the ground at its own mast, and drawing the
 slice would claim coverage it does not have.
 
+### Cameras and zones are managed from the toolbar and the Zones tab
+
+| control | what it does |
+|---|---|
+| **Remove camera** | Forgets the selected camera. If it is running it is stopped first and its last events kept. What it saw — events, incidents — stays in the database; only the camera goes |
+| **Move on map** | Click the plan view to move the selected camera there. Height, heading and optics are kept. The first placement has to be *Place…*, because a click cannot say how high a camera is or which way it faces |
+| **Add zone…** | Name, kind, size, and where: in front of the selected camera, or a point you click on the plan view |
+| **Zones tab → Change…** | Rename a zone or change its kind. Shape is fixed at creation: incidents were measured against it |
+| **Zones tab → Remove** | Forgets the zone. Events it raised keep its name |
+
+Five kinds of zone, each drawn in its own colour on the plan view so a rule to
+*ignore* a place never looks like a rule that nobody should be there:
+
+| kind | meaning | colour |
+|---|---|---|
+| restricted | nobody should be here; presence alone is an event | red |
+| perimeter | the site boundary; crossing it inbound matters | orange |
+| entry | a door, gate or lane where presence is expected | blue |
+| exclusion | ignore this: a public pavement, a tree that moves | grey |
+| interest | worth recording presence in, without implying anything is wrong | green |
+
+Every change is written to the audit log with what changed — a restricted area
+quietly becoming an exclusion zone is exactly the edit an audit log is for.
+
 ### Reading the plan view
 
 | what you see | what it means |

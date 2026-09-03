@@ -153,10 +153,37 @@ Also verified: the packaged console, closed with `taskkill /PID` (WM_CLOSE, no
 `/F`) after 8 s, **exits 0**. The shutdown path is clean in the real binary,
 not only in the test process.
 
+### The console can now take things back, and zones have kinds
+
+The user's verdict on the packaged console was blunt and right: no way to remove
+a camera, no control over zones beyond one red square, no camera positions on
+the map. Now:
+
+- `Node.remove_camera` (stops and drains first; evidence kept), `remove_zone`
+  (drops the zone rules when the last goes), `replace_zone` (audited with the
+  before/after kind). `Store.delete_camera` / `delete_zone`.
+- Toolbar: **Remove camera**, **Move on map**, **Add zone…**. Lower-right panel
+  is now tabs: *Tracked objects* | *Zones* (list with kind, size; Change…,
+  Remove).
+- `ZoneDialog`: name, the five `ZoneKind`s with a one-line meaning each, size,
+  and placement in front of the camera or by clicking the map.
+- `MapView.begin_pick()` / `picked` signal / `_from_local()` — the inverse
+  projection, tested to 5 cm round trip. Picking needs a placed camera: with
+  no origin a click is a click on nothing, and the dialog does not offer it.
+- Zones coloured by kind (`theme.zone_colour`); labels carry the kind.
+- Zone ids are the first unused, not count-plus-one, which after a removal
+  overwrote a live zone through the upsert.
+- Photographed on the reference scene: `03-running.png` (toolbar, two kinds on
+  the map), `08-zones.png` (the tab).
+
+**Still not done, honestly:** drawing an arbitrary polygon (only squares of a
+chosen half-width); moving a zone (remove and re-add, so the audit shows both);
+schedules from the GUI; a camera's first placement still needs the dialog.
+
 ### Docs
 
-FEATURES.md +5 rows (151 `TESTED` of 376). STATUS.md counts corrected (they
-were stale: 648 → 679 tests, 36 → 41 diagrams) and a row for the contact
+FEATURES.md +8 rows (155 `TESTED` of 379). STATUS.md counts corrected (they
+were stale: 648 → 693 tests, 36 → 41 diagrams) and a row for the contact
 crossing. USAGE §7 says the dot is where the position came from. README file
 map.
 
@@ -200,6 +227,12 @@ launch check and screenshots.
 
 - Packaged `SentinelVision-dev.exe` launched, closed gracefully after 8 s:
   **exit 0**, log ends `console exited with 0`.
+- After the console revamp, `--live --segment` again (`live-03-running.png`,
+  `live-08-zones.png`): toolbar with Remove camera / Move on map / Add zone…,
+  a restricted and an exclusion zone drawn in different colours and labelled
+  with their kind, the Zones tab listing both, one person at 0.86 held 146
+  frames / 9.9 s beside a couch at 0.39, 17 fps. Lower panels readable on a
+  shorter window.
 
 ---
 
@@ -218,7 +251,9 @@ launch check and screenshots.
    a similarity matrix, so the ABI change is an optional `f32` pointer per
    update, not per-detection vectors.
 2. **2.1 control plane** — `aiohttp` (see previous handoff for why not FastAPI).
-3. Console: a recording toggle, and a detector picker in the UI.
+3. Console: a recording toggle, a detector picker in the UI, polygon zone
+   drawing, and a **camera delete for stale database rows without opening
+   the console** (`sentinel cameras remove`).
 
 **Stage 3 of segmentation** (not started): use the mask for zone membership too
 (fraction of the silhouette inside the polygon rather than one point), and for

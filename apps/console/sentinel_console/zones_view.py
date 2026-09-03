@@ -1,0 +1,208 @@
+"""Zones: the rules an operator wrote about the ground, listed and edited.
+
+A zone is a claim about a place — nobody should be here, this is the boundary,
+ignore this pavement — and until this panel existed the console could make
+exactly one kind of claim (restricted), in exactly one place (in front of the
+selected camera), and could never take it back. An operator who put a zone in
+the wrong place had to delete the database.
+
+The panel lists every zone with its kind and size, and the dialog beside it
+creates or changes one. Placement is either in front of the selected camera —
+the near edge of what it can actually see, where positions are most accurate —
+or a point the operator clicks on the plan view.
+"""
+
+from __future__ import annotations
+
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QBrush, QColor
+from PySide6.QtWidgets import (
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QDoubleSpinBox,
+    QFormLayout,
+    QHeaderView,
+    QLabel,
+    QLineEdit,
+    QTreeWidget,
+    QTreeWidgetItem,
+    QVBoxLayout,
+    QWidget,
+)
+
+from sentinel.core import LatLon, haversine_distance
+from sentinel.zones import Zone, ZoneKind
+
+from . import theme
+
+#: What each kind means, in the operator's terms. Shown beside the choice,
+#: because "PERIMETER" and "ENTRY" are not self-explanatory and a zone of the
+#: wrong kind is a rule that fires for the wrong reason.
+KIND_DESCRIPTIONS: dict[ZoneKind, str] = {
+    ZoneKind.RESTRICTED: "Nobody should be here. Presence alone is an event.",
+    ZoneKind.PERIMETER: "The site boundary. Crossing it inbound matters.",
+    ZoneKind.ENTRY: "A door, gate or lane where presence is expected.",
+    ZoneKind.EXCLUSION: "Ignore this: a public pavement, a tree that moves.",
+    ZoneKind.INTEREST: "Worth recording presence in, without implying anything is wrong.",
+}
+
+#: Placement choices offered by the dialog, in order.
+IN_FRONT_OF_CAMERA = "In front of the selected camera"
+PICK_ON_MAP = "Pick the centre on the map"
+
+
+def zone_extent_meters(zone: Zone) -> float:
+    """How far across a zone is, roughly: twice the furthest vertex from the
+    centroid. Enough to tell a 6 m doorway from a 60 m yard in a list."""
+    lat = sum(p.lat for p in zone.ring) / len(zone.ring)
+    lon = sum(p.lon for p in zone.ring) / len(zone.ring)
+    centre = LatLon(lat, lon)
+    return 2.0 * max(haversine_distance(centre, p) for p in zone.ring)
+
+
+class ZonesView(QTreeWidget):
+    """Every zone on the node, one row each."""
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setColumnCount(4)
+        self.setHeaderLabels(["Zone", "Kind", "Across", "Points"])
+        self.setRootIsDecorated(False)
+        self.setAlternatingRowColors(True)
+        header = self.header()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        header.setStretchLastSection(True)
+        for index, width in enumerate((220, 120, 90)):
+            self.setColumnWidth(index, width)
+
+    def show_zones(self, zones) -> None:
+        """Replace the list, keeping the selection by id."""
+        selected = self.selected_zone_id()
+        self.clear()
+        for zone in zones:
+            item = QTreeWidgetItem([
+                zone.name,
+                zone.kind.value.lower(),
+                f"{zone_extent_meters(zone):.0f} m",
+                str(len(zone.ring)),
+            ])
+            item.setData(0, Qt.ItemDataRole.UserRole, zone.id)
+            item.setForeground(1, QBrush(theme.zone_colour(zone.kind)))
+            item.setToolTip(1, KIND_DESCRIPTIONS.get(zone.kind, ""))
+            self.addTopLevelItem(item)
+            if zone.id == selected:
+                item.setSelected(True)
+                self.setCurrentItem(item)
+
+    def selected_zone_id(self) -> str | None:
+        item = self.currentItem()
+        if item is None or not item.isSelected():
+            selected = self.selectedItems()
+            item = selected[0] if selected else None
+        return None if item is None else item.data(0, Qt.ItemDataRole.UserRole)
+
+    def select(self, zone_id: str) -> None:
+        for index in range(self.topLevelItemCount()):
+            item = self.topLevelItem(index)
+            if item.data(0, Qt.ItemDataRole.UserRole) == zone_id:
+                self.setCurrentItem(item)
+                item.setSelected(True)
+                return
+
+
+class ZoneDialog(QDialog):
+    """Create a zone, or change the name and kind of one that exists.
+
+    Shape is chosen at creation only. A zone's geometry is the fact an incident
+    was measured against; changing it under existing events would make them
+    describe a place that no longer exists. Move a zone by removing it and
+    placing a new one — the audit log then shows both.
+    """
+
+    def __init__(
+        self,
+        *,
+        default_radius: float = 10.0,
+        existing: Zone | None = None,
+        can_pick: bool = False,
+        parent: QWidget | None = None,
+    ):
+        super().__init__(parent)
+        self._existing = existing
+        self.setWindowTitle("Change zone" if existing else "Add zone")
+        self.setMinimumWidth(460)
+
+        form = QFormLayout()
+        self._name = QLineEdit(existing.name if existing else "")
+        self._name.setPlaceholderText("Loading bay, north gate, public pavement…")
+        form.addRow("Name", self._name)
+
+        self._kind = QComboBox()
+        for kind in ZoneKind:
+            # The value, not the enum: Qt hands a str-valued enum back as a
+            # plain str, and `ZoneKind(value)` is the honest way round.
+            self._kind.addItem(kind.value.title(), kind.value)
+            index = self._kind.count() - 1
+            self._kind.setItemData(index, KIND_DESCRIPTIONS[kind], Qt.ItemDataRole.ToolTipRole)
+            self._kind.setItemData(
+                index, QBrush(theme.zone_colour(kind)), Qt.ItemDataRole.ForegroundRole
+            )
+        if existing:
+            self._kind.setCurrentIndex(list(ZoneKind).index(existing.kind))
+        self._kind.currentIndexChanged.connect(self._describe)
+        form.addRow("Kind", self._kind)
+
+        self._description = QLabel("")
+        self._description.setObjectName("Caption")
+        self._description.setWordWrap(True)
+        form.addRow("", self._description)
+
+        self._radius = QDoubleSpinBox()
+        self._radius.setRange(1.0, 500.0)
+        self._radius.setSuffix(" m")
+        self._radius.setValue(zone_extent_meters(existing) / 2 if existing else default_radius)
+        self._radius.setToolTip("Half the width of the square drawn on the ground.")
+        self._radius.setEnabled(existing is None)
+        form.addRow("Half-width", self._radius)
+
+        self._placement = QComboBox()
+        self._placement.addItem(IN_FRONT_OF_CAMERA)
+        if can_pick:
+            self._placement.addItem(PICK_ON_MAP)
+        else:
+            self._placement.setToolTip(
+                "Picking on the map needs a placed camera: until one is placed "
+                "the map has no origin to measure a click against."
+            )
+        self._placement.setEnabled(existing is None)
+        form.addRow("Where", self._placement)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(buttons)
+        self._describe()
+
+    def _describe(self) -> None:
+        kind = self.kind()
+        self._description.setText(KIND_DESCRIPTIONS.get(kind, ""))
+
+    # ------------------------------------------------------------------ result
+
+    def name(self) -> str:
+        return self._name.text().strip()
+
+    def kind(self) -> ZoneKind:
+        return ZoneKind(self._kind.currentData())
+
+    def radius(self) -> float:
+        return float(self._radius.value())
+
+    def pick_on_map(self) -> bool:
+        return self._placement.currentText() == PICK_ON_MAP

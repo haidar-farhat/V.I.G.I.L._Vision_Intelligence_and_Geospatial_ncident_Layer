@@ -190,9 +190,17 @@ def main() -> int:
     )
     window._refresh_placement()
 
-    # A zone the camera can actually see, placed the way the console places one.
+    # A zone the camera can actually see, placed the way the console places one
+    # — and a second of another kind, at a picked point, because a plan view
+    # with one red square says nothing about whether kinds are told apart.
+    from sentinel.zones import ZoneKind
+
     window.zone_radius.setValue(12.0)
     window._add_zone()
+    window._add_zone(
+        name="Public pavement", kind=ZoneKind.EXCLUSION, radius=6.0,
+        centre=destination_point(session.pose.position, session.pose.heading + 28.0, 30.0),
+    )
 
     shoot(window, ("live-" if live else "") + "02-configured")
 
@@ -203,6 +211,9 @@ def main() -> int:
     shoot(window, f"{prefix}03-running")
     shoot(window.map, f"{prefix}04-plan-view")
     shoot(window.tracks, f"{prefix}05-track-table")
+    window.detail_tabs.setCurrentIndex(1)
+    shoot(window.detail_tabs, f"{prefix}08-zones")
+    window.detail_tabs.setCurrentIndex(0)
     shoot(window.incidents, f"{prefix}06-incidents")
     if window._sessions:
         shoot(next(iter(window._sessions.values())).view, f"{prefix}07-camera-view")

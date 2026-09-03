@@ -39,6 +39,23 @@ UNCERTAINTY = QColor(96, 165, 250, 40)  # the 1-sigma position disc
 ZONE_FILL = QColor(248, 113, 113, 26)
 ZONE_EDGE = QColor(248, 113, 113, 150)
 
+#: One colour per kind of zone, keyed by the kind's value so this module stays
+#: free of engine imports. A restricted area and an exclusion zone drawn alike
+#: would let an operator read "ignore this" as "nobody should be here".
+ZONE_COLOURS = {
+    "RESTRICTED": QColor(248, 113, 113),   # nobody should be here
+    "PERIMETER": QColor(251, 146, 60),     # the site boundary
+    "ENTRY": QColor(96, 165, 250),         # a door, gate or lane
+    "EXCLUSION": QColor(148, 160, 178),    # deliberately ignored
+    "INTEREST": QColor(74, 222, 128),      # worth recording, nothing implied
+}
+
+
+def zone_colour(kind) -> QColor:
+    """The colour for a zone kind (an enum or its value). Unknown kinds fall
+    back to the restricted colour, which is the alarming one on purpose."""
+    return ZONE_COLOURS.get(getattr(kind, "value", str(kind)), QColor(ZONE_EDGE))
+
 # The map.
 CAMERA = QColor(226, 232, 240)
 FOOTPRINT = QColor(96, 165, 250, 28)

@@ -647,6 +647,33 @@ class Node:
                   record.display_source)
         return record
 
+    def remove_camera(self, camera_id: str) -> None:
+        """Forget a camera. Stops it first if it is running.
+
+        Its events and incidents are kept — a camera taken down does not unmake
+        what it saw — so only the camera row, its pane and its runner go. A
+        runner that will not stop is not removed: dropping the reference to a
+        thread that is still decoding is how a decoder ends up writing into a
+        closed store.
+        """
+        record = self.camera(camera_id)
+        if record.runner is not None and record.runner.is_running:
+            if not record.runner.stop():
+                raise NodeError(
+                    f"{camera_id} did not stop within {STOP_TIMEOUT_SECONDS:.0f}s "
+                    "and was not removed; it still holds its decoder."
+                )
+            # The last events it raised are drained and correlated before the
+            # camera goes, or a run that ended on an intrusion would lose it.
+            self.poll(force_correlate=True)
+
+        del self._cameras[camera_id]
+        self.store.delete_camera(camera_id)
+        self.store.audit(self._actor, "camera.removed", camera_id, record.display_source)
+        self._running = any(r.is_running for r in self._cameras.values())
+        _log.info("node %s: removed camera %s (%s)", self._node_id, camera_id,
+                  record.display_source)
+
     def place_camera(self, camera_id: str, pose: CameraPose | None) -> None:
         """Set where a camera is and where it points, running or not."""
         record = self.camera(camera_id)
@@ -688,6 +715,57 @@ class Node:
                 "node %s: zone %s applies to cameras started from now on; "
                 "restart a camera for it to take effect there",
                 self._node_id, zone.id,
+            )
+
+    def replace_zone(self, zone: Zone) -> None:
+        """Change a zone that already exists — its name, kind, or shape.
+
+        Same id, new definition. Persisted as an upsert so the row keeps its
+        creation time, and audited with what changed, because a restricted area
+        quietly becoming an exclusion zone is exactly the edit an audit log
+        exists to record.
+        """
+        index = next((i for i, z in enumerate(self._zones) if z.id == zone.id), None)
+        if index is None:
+            raise NodeError(f"no zone {zone.id!r} on this node")
+        before = self._zones[index]
+        self._zones[index] = zone
+        self.store.save_zone(zone)
+        self.store.audit(
+            self._actor, "zone.changed", zone.id,
+            f"{before.name} ({before.kind.value}) -> {zone.name} ({zone.kind.value})",
+        )
+        if self._running:
+            _log.warning(
+                "node %s: zone %s changed; cameras already running keep the old "
+                "definition until restarted", self._node_id, zone.id,
+            )
+
+    def remove_zone(self, zone_id: str) -> None:
+        """Forget a zone, and drop the rules that need one if it was the last.
+
+        The mirror of `add_zone`: a node whose last zone has gone must not keep
+        rules that watch zones, or it carries dead weight that reports "0 events"
+        for a reason unrelated to the footage. Events already raised inside the
+        zone are kept; they name it in their own text.
+        """
+        zone = next((z for z in self._zones if z.id == zone_id), None)
+        if zone is None:
+            raise NodeError(f"no zone {zone_id!r} on this node")
+        self._zones.remove(zone)
+        self.store.delete_zone(zone_id)
+        self.store.audit(self._actor, "zone.removed", zone_id, zone.name)
+
+        if not self._zones:
+            self._rules = default_rules(self._zones)
+            _log.info(
+                "node %s: last zone removed; rule set is now %d rule(s)",
+                self._node_id, len(self._rules),
+            )
+        if self._running:
+            _log.warning(
+                "node %s: zone %s removed; cameras already running keep it until "
+                "restarted", self._node_id, zone_id,
             )
 
     def probe(self, camera_id: str) -> None:

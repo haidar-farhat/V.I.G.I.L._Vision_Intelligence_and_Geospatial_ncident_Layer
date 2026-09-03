@@ -24,7 +24,7 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QEventLoop, QThread  # noqa: E402
+from PySide6.QtCore import QEventLoop, QPointF, QThread  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 import scene  # noqa: E402
@@ -1219,12 +1219,244 @@ def test_the_conclusions_are_never_squeezed_out_of_sight(qt_app):
     win.show()
     qt_app.processEvents()
     try:
-        # Four rows of a table, roughly, plus its header and the panel title.
-        assert win.tracks.height() >= LOWER_PANEL_MINIMUM_HEIGHT - 40, (
+        # Four rows of a table, roughly, once the panel title and the tab bar
+        # above it have taken their share.
+        assert win.tracks.height() >= LOWER_PANEL_MINIMUM_HEIGHT - 70, (
             f"the track table was given {win.tracks.height()} px"
         )
-        assert win.incidents.height() >= LOWER_PANEL_MINIMUM_HEIGHT - 40, (
+        assert win.incidents.height() >= LOWER_PANEL_MINIMUM_HEIGHT - 70, (
             f"the incident panel was given {win.incidents.height()} px"
         )
     finally:
         win.close()
+
+
+# ------------------------------------------------ managing cameras and zones
+
+
+SITE_POSE = CameraPose(
+    position=LatLon(33.8938, 35.5018), mount_height=6.0, heading=180.0,
+    pitch=-22.0, horizontal_fov=62.0, vertical_fov=36.0, range_meters=90.0,
+)
+
+
+def _say_yes(monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+
+    monkeypatch.setattr(
+        QMessageBox, "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Yes,
+    )
+
+
+def test_a_camera_can_be_removed(qt_app, window, reference_video: Path, monkeypatch):
+    # There was no way to take a camera off a node. An operator who had added
+    # device:0 three times had three panes fighting one webcam, forever.
+    window.add_camera(reference_video, "cam-07")
+    window.add_camera(reference_video, "cam-08")
+    window.camera_picker.setCurrentIndex(window.camera_picker.findData("cam-07"))
+    _say_yes(monkeypatch)
+
+    window._remove_camera()
+
+    assert list(window._sessions) == ["cam-08"]
+    assert [window.camera_picker.itemData(i) for i in range(window.camera_picker.count())] == ["cam-08"]
+    assert [row["id"] for row in window.store.cameras()] == ["cam-08"], "the row survived"
+    panes = [
+        window.wall_layout.itemAt(i).widget()
+        for i in range(window.wall_layout.count())
+        if window.wall_layout.itemAt(i).widget() is not window.empty_wall
+    ]
+    assert len(panes) == 1, "the removed camera's pane is still on the wall"
+    assert window.start_button.isEnabled()
+
+
+def test_removing_the_last_camera_leaves_an_honest_empty_wall(qt_app, window, reference_video: Path, monkeypatch):
+    window.add_camera(reference_video, "cam-07")
+    _say_yes(monkeypatch)
+    window._remove_camera()
+
+    assert not window._sessions
+    assert window.empty_wall.isVisibleTo(window)
+    assert not window.start_button.isEnabled(), "Start offered with nothing to start"
+
+
+def test_a_running_camera_is_stopped_before_it_is_removed(qt_app, window, reference_video: Path, monkeypatch):
+    session = window.add_camera(reference_video, "cam-07")
+    window._start()
+    pump(qt_app, window, 1.0)
+    assert session.is_running
+    _say_yes(monkeypatch)
+
+    window._remove_camera()
+
+    assert not session.is_running, "the pipeline thread outlived its camera"
+    assert not window._sessions
+    assert not window._running
+
+
+def test_zones_come_in_kinds_and_are_drawn_apart(qt_app, window, reference_video: Path):
+    # Every zone used to be a restricted area, and every one was red. An
+    # exclusion zone — "ignore this pavement" — must not look like an alarm.
+    from sentinel.zones import ZoneKind
+
+    session = window.add_camera(reference_video, "cam-07")
+    session.pose = SITE_POSE
+    window._refresh_placement()
+
+    window._add_zone(name="Public pavement", kind=ZoneKind.EXCLUSION, radius=6.0)
+    window._add_zone(kind=ZoneKind.PERIMETER, radius=20.0)
+
+    kinds = {z.name: z.kind for z in window._zones}
+    assert kinds["Public pavement"] is ZoneKind.EXCLUSION
+    assert ZoneKind.PERIMETER in kinds.values()
+    assert window._zones[0].accept_uncertain, "an exclusion zone may accept an uncertain position"
+    assert not any(z.accept_uncertain for z in window._zones if z.kind is ZoneKind.PERIMETER)
+
+    rows = {
+        window.zones_view.topLevelItem(i).text(0): window.zones_view.topLevelItem(i).text(1)
+        for i in range(window.zones_view.topLevelItemCount())
+    }
+    assert rows["Public pavement"] == "exclusion"
+
+    colours = {theme.zone_colour(kind).name() for kind in ZoneKind}
+    assert len(colours) == len(ZoneKind), "two kinds of zone share a colour"
+
+
+def test_a_zone_can_be_changed_and_removed_and_ids_are_never_reused(
+    qt_app, window, reference_video: Path, monkeypatch
+):
+    from sentinel.zones import ZoneKind
+
+    session = window.add_camera(reference_video, "cam-07")
+    session.pose = SITE_POSE
+    window._refresh_placement()
+
+    window._add_zone(radius=8.0)           # zone-1
+    window._add_zone(radius=8.0)           # zone-2
+    first, second = window._zones[0].id, window._zones[1].id
+
+    window._change_zone(first, name="Loading bay", kind=ZoneKind.INTEREST)
+    changed = next(z for z in window._zones if z.id == first)
+    assert (changed.name, changed.kind) == ("Loading bay", ZoneKind.INTEREST)
+    assert window.store.zones()[0].kind is ZoneKind.INTEREST, "the change was not persisted"
+
+    window.zones_view.select(first)
+    _say_yes(monkeypatch)
+    window._remove_zone()
+    assert [z.id for z in window._zones] == [second]
+    assert [z.id for z in window.store.zones()] == [second]
+
+    # Count-plus-one would have named the next zone `zone-2` — the survivor —
+    # and the upsert would have overwritten it in place.
+    window._add_zone(radius=8.0)
+    assert len(window._zones) == 2
+    assert len({z.id for z in window._zones}) == 2, "a new zone reused a live id"
+
+
+def test_a_map_click_round_trips_to_the_ground(qt_app):
+    # The inverse of the projection the view draws with. A picked point that
+    # lands a few metres from where the operator clicked is a zone in the
+    # wrong place, and those produce alerts nobody expects.
+    from sentinel.core import haversine_distance
+
+    view = MapView()
+    view.resize(600, 600)
+    view.set_cameras({"cam": SITE_POSE})
+
+    target = LatLon(33.89355, 35.50190)
+    east, north = view._to_local(target)
+    back = view._from_local(east, north)
+    assert haversine_distance(target, back) < 0.05, "the inverse projection drifted"
+
+    screen = view._to_screen(east, north)
+    picked = view.point_at(screen)
+    assert picked is not None
+    assert haversine_distance(target, picked) < 0.5, "screen to ground drifted"
+
+
+def test_picking_needs_a_placed_camera(qt_app):
+    view = MapView()
+    view.resize(400, 400)
+    assert not view.begin_pick("anything"), "a map with no origin offered to pick"
+    assert view.point_at(QPointF(200, 200)) is None
+    view.set_cameras({"cam": SITE_POSE})
+    assert view.begin_pick("centre of the zone")
+    assert view.picking
+    view.cancel_pick()
+    assert not view.picking
+
+
+def test_a_zone_can_be_placed_by_clicking_the_map(qt_app, window, reference_video: Path):
+    from sentinel.core import haversine_distance
+    from sentinel.zones import ZoneKind
+
+    session = window.add_camera(reference_video, "cam-07")
+    session.pose = SITE_POSE
+    window._refresh_placement()
+
+    where = LatLon(33.89350, 35.50195)
+    window._pick_action = ("zone", ("North gate", ZoneKind.ENTRY, 5.0))
+    window.map.picked.emit(where)
+
+    zone = next(z for z in window._zones if z.name == "North gate")
+    assert zone.kind is ZoneKind.ENTRY
+    lat = sum(p.lat for p in zone.ring) / len(zone.ring)
+    lon = sum(p.lon for p in zone.ring) / len(zone.ring)
+    assert haversine_distance(where, LatLon(lat, lon)) < 0.5, "the zone is not where the click was"
+    assert window._pick_action is None
+
+
+def test_a_camera_can_be_moved_by_clicking_the_map(qt_app, window, reference_video: Path):
+    session = window.add_camera(reference_video, "cam-07")
+    session.pose = SITE_POSE
+    window._refresh_placement()
+
+    window._place_camera_on_map()
+    assert window.map.picking, "the map was not asked for a point"
+    there = LatLon(33.89370, 35.50170)
+    window.map.picked.emit(there)
+
+    assert session.pose is not None
+    assert session.pose.position == there
+    assert session.pose.heading == SITE_POSE.heading, "moving a camera changed where it faces"
+    assert session.pose.mount_height == SITE_POSE.mount_height
+    assert window.store.camera_pose("cam-07").position == there, "the move was not persisted"
+
+
+def test_an_unplaced_camera_cannot_be_moved_by_a_click(qt_app, window, reference_video: Path, monkeypatch):
+    # A click gives a position, not a height or a heading; both decide where
+    # this camera's objects land. So the first placement is the dialog's.
+    from PySide6.QtWidgets import QMessageBox
+
+    told: list[str] = []
+    monkeypatch.setattr(
+        QMessageBox, "information",
+        lambda *args, **kwargs: told.append(args[1] if len(args) > 1 else ""),
+    )
+    window.add_camera(reference_video, "cam-07")
+    window._place_camera_on_map()
+    assert not window.map.picking
+    assert told and "first" in told[0].lower()
+
+
+def test_the_zone_dialog_offers_every_kind_with_its_meaning(qt_app):
+    from sentinel.zones import ZoneKind
+    from sentinel_console.zones_view import KIND_DESCRIPTIONS, ZoneDialog
+
+    dialog = ZoneDialog(default_radius=7.5, can_pick=True)
+    kinds = [ZoneKind(dialog._kind.itemData(i)) for i in range(dialog._kind.count())]
+    assert kinds == list(ZoneKind)
+    assert all(KIND_DESCRIPTIONS[k] for k in ZoneKind), "a kind without an explanation"
+    assert dialog.radius() == 7.5
+    assert dialog.kind() is ZoneKind.RESTRICTED
+    assert not dialog.pick_on_map()
+    dialog._placement.setCurrentIndex(1)
+    assert dialog.pick_on_map()
+    dialog.deleteLater()
+
+    # With no placed camera the map cannot be picked on, and the dialog does
+    # not offer it rather than offering something that will fail.
+    grounded = ZoneDialog(can_pick=False)
+    assert grounded._placement.count() == 1
+    grounded.deleteLater()

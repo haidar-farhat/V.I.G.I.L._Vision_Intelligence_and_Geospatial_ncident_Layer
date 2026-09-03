@@ -26,8 +26,17 @@ from __future__ import annotations
 
 import math
 
-from PySide6.QtCore import QPoint, QPointF, Qt
-from PySide6.QtGui import QBrush, QFont, QMouseEvent, QPainter, QPen, QPolygonF, QWheelEvent
+from PySide6.QtCore import QPoint, QPointF, Qt, Signal
+from PySide6.QtGui import (
+    QBrush,
+    QColor,
+    QFont,
+    QMouseEvent,
+    QPainter,
+    QPen,
+    QPolygonF,
+    QWheelEvent,
+)
 from PySide6.QtWidgets import QSizePolicy, QWidget
 
 from sentinel.core import (
@@ -35,6 +44,7 @@ from sentinel.core import (
     LatLon,
     Track,
     bearing_degrees,
+    destination_point,
     field_of_view,
     haversine_distance,
 )
@@ -45,8 +55,15 @@ from . import theme
 class MapView(QWidget):
     """A north-up plan view in metres, centred on the camera."""
 
+    #: A point the operator clicked while the view was asked to pick one, as a
+    #: `LatLon`. The view knows nothing about what it is for.
+    picked = Signal(object)
+
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
+        #: While set, the next left click is a choice of ground point rather
+        #: than the start of a drag. The text is what is drawn across the top.
+        self._pick_prompt: str | None = None
         self.setMinimumSize(280, 280)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
@@ -109,6 +126,16 @@ class MapView(QWidget):
         event.accept()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if self._pick_prompt is not None:
+            if event.button() == Qt.MouseButton.LeftButton:
+                point = self.point_at(event.position())
+                self.cancel_pick()
+                if point is not None:
+                    self.picked.emit(point)
+            elif event.button() == Qt.MouseButton.RightButton:
+                self.cancel_pick()
+            event.accept()
+            return
         if event.button() == Qt.MouseButton.LeftButton:
             self._drag_from = event.position().toPoint()
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
@@ -139,6 +166,47 @@ class MapView(QWidget):
             self._view_centre[0] + (point.x() - self.width() / 2) / scale,
             self._view_centre[1] - (point.y() - self.height() / 2) / scale,
         )
+
+    # ------------------------------------------------------------------ picking
+
+    def begin_pick(self, prompt: str) -> bool:
+        """Ask for one ground point. Returns whether the view can give one.
+
+        It cannot until a camera is placed: with no placed camera the view has
+        no origin, and a click on it is a click on nothing. A zone or a camera
+        cannot be put on ground the map does not yet know where it is.
+        """
+        if self._origin is None:
+            return False
+        self._pick_prompt = prompt
+        self.setCursor(Qt.CursorShape.CrossCursor)
+        self.update()
+        return True
+
+    def cancel_pick(self) -> None:
+        self._pick_prompt = None
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self.update()
+
+    @property
+    def picking(self) -> bool:
+        return self._pick_prompt is not None
+
+    def point_at(self, position: QPointF) -> LatLon | None:
+        """The ground point under a widget position, or ``None`` with no origin."""
+        if self._origin is None:
+            return None
+        return self._from_local(*self._from_screen(position))
+
+    def _from_local(self, east: float, north: float) -> LatLon:
+        """The inverse of `_to_local`: metres east and north of the origin, back
+        to a position on the ground."""
+        assert self._origin is not None
+        distance = math.hypot(east, north)
+        if distance < 1e-9:
+            return self._origin
+        bearing = math.degrees(math.atan2(east, north)) % 360.0
+        return destination_point(self._origin, bearing, distance)
 
     # ------------------------------------------------------------------ inputs
 
@@ -291,7 +359,25 @@ class MapView(QWidget):
         self._paint_tracks(painter)
         self._paint_camera(painter)
         self._paint_scale_bar(painter)
+        if self._pick_prompt is not None:
+            self._paint_pick_prompt(painter)
         painter.end()
+
+    def _paint_pick_prompt(self, painter: QPainter) -> None:
+        """Say what the next click will do, across the top of the view."""
+        font = QFont(painter.font())
+        font.setPointSize(10)
+        font.setBold(True)
+        painter.setFont(font)
+        band = self.rect().adjusted(0, 0, 0, -(self.height() - 30))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(QColor(0, 0, 0, 170)))
+        painter.drawRect(band)
+        painter.setPen(QPen(theme.TEXT))
+        painter.drawText(
+            band, Qt.AlignmentFlag.AlignCenter,
+            f"{self._pick_prompt} — click the map, right-click to cancel",
+        )
 
     def _paint_grid(self, painter: QPainter) -> None:
         """A metric grid, so distances are readable rather than implied."""
@@ -359,13 +445,21 @@ class MapView(QWidget):
 
         for zone in self._zones:
             polygon = QPolygonF([self._to_screen(*self._to_local(p)) for p in zone.ring])
-            painter.setPen(QPen(theme.ZONE_EDGE, 1.6, Qt.PenStyle.DashLine))
-            painter.setBrush(QBrush(theme.ZONE_FILL))
+            # Coloured by kind. Every zone used to be red, which made an
+            # exclusion zone — "ignore this" — look like a restricted area.
+            colour = theme.zone_colour(zone.kind)
+            edge = QColor(colour)
+            edge.setAlpha(150)
+            fill = QColor(colour)
+            fill.setAlpha(26)
+            painter.setPen(QPen(edge, 1.6, Qt.PenStyle.DashLine))
+            painter.setBrush(QBrush(fill))
             painter.drawPolygon(polygon)
 
-            painter.setPen(QPen(theme.ZONE_EDGE))
+            painter.setPen(QPen(edge))
             centroid = polygon.boundingRect().center()
-            painter.drawText(centroid, zone.name)
+            kind = getattr(zone.kind, "value", str(zone.kind)).lower()
+            painter.drawText(centroid, f"{zone.name} · {kind}")
 
     def _paint_camera(self, painter: QPainter) -> None:
         font = QFont(painter.font())

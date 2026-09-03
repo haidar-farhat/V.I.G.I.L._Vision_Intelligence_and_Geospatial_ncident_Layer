@@ -29,6 +29,7 @@ Three cameras seeing one person must produce one row.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer
@@ -48,6 +49,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSplitter,
+    QTabWidget,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -56,6 +58,7 @@ from PySide6.QtWidgets import (
 
 from sentinel.core import (
     CameraPose,
+    LatLon,
     destination_point,
     field_of_view,
     haversine_distance,
@@ -82,6 +85,7 @@ from .placement import PlacementDialog
 from .session import CameraSession
 from .add_camera import AddCameraDialog
 from .video_view import VideoView
+from .zones_view import ZoneDialog, ZonesView
 
 _log = logs.get(__name__)
 
@@ -133,7 +137,7 @@ def _detector_summary(info) -> str:
 
 
 #: The least height the incident and track panels are ever given. See `_build`.
-LOWER_PANEL_MINIMUM_HEIGHT = 170
+LOWER_PANEL_MINIMUM_HEIGHT = 210
 
 
 class ConsoleWindow(QMainWindow):
@@ -274,8 +278,13 @@ class ConsoleWindow(QMainWindow):
         self.wall_layout.addWidget(self.empty_wall, 0, 0)
 
         self.map = MapView()
+        self.map.picked.connect(self._map_picked)
+        #: What the next picked map point is for: ("zone", (name, kind, radius))
+        #: or ("camera", camera_id). Nothing, when nobody is picking.
+        self._pick_action: tuple | None = None
         self.tracks = self._build_track_table()
         self.incidents = IncidentView()
+        self.zones_view = ZonesView()
 
         outer.addLayout(self._build_toolbar())
 
@@ -290,7 +299,13 @@ class ConsoleWindow(QMainWindow):
         # operator is here to read.
         lower = QSplitter(Qt.Orientation.Horizontal)
         lower.addWidget(_panel("INCIDENTS", self.incidents))
-        lower.addWidget(_panel("TRACKED OBJECTS", self.tracks))
+        # Tracks and zones share the right-hand panel as tabs: both are how the
+        # system reached its conclusions, one observed and one configured, and
+        # neither deserves a third of the screen all the time.
+        self.detail_tabs = QTabWidget()
+        self.detail_tabs.addTab(self.tracks, "Tracked objects")
+        self.detail_tabs.addTab(self._build_zones_panel(), "Zones")
+        lower.addWidget(_panel("TRACKED OBJECTS · ZONES", self.detail_tabs))
         lower.setStretchFactor(0, 3)
         lower.setStretchFactor(1, 2)
 
@@ -348,13 +363,31 @@ class ConsoleWindow(QMainWindow):
         self.place_button.clicked.connect(self._place_camera)
         row.addWidget(self.place_button)
 
-        self.zone_button = QPushButton("Add zone")
-        self.zone_button.setToolTip(
-            "Adds a restricted area on the ground in front of the selected "
-            "camera. Requires that camera to be placed first: a zone without a "
-            "placed camera has nothing to be measured against."
+        self.map_place_button = QPushButton("Move on map")
+        self.map_place_button.setToolTip(
+            "Move the selected camera to a point you click on the plan view. "
+            "Its height, heading and optics are kept; place it once with Place… "
+            "first, because a click cannot say which way it faces."
         )
-        self.zone_button.clicked.connect(self._add_zone)
+        self.map_place_button.clicked.connect(self._place_camera_on_map)
+        row.addWidget(self.map_place_button)
+
+        self.remove_button = QPushButton("Remove camera")
+        self.remove_button.setToolTip(
+            "Forget the selected camera. It is stopped first if it is running. "
+            "What it saw — its events and incidents — is kept."
+        )
+        self.remove_button.clicked.connect(self._remove_camera)
+        row.addWidget(self.remove_button)
+
+        self.zone_button = QPushButton("Add zone…")
+        self.zone_button.setToolTip(
+            "Adds a zone on the ground: a restricted area, the perimeter, an "
+            "entry, an exclusion, or an area of interest — in front of the "
+            "selected camera or at a point you click on the plan view. Needs a "
+            "placed camera: a zone without one has nothing to be measured against."
+        )
+        self.zone_button.clicked.connect(self._add_zone_dialog)
         row.addWidget(self.zone_button)
 
         self.export_button = QPushButton("Export incident…")
@@ -403,6 +436,31 @@ class ConsoleWindow(QMainWindow):
         row.addWidget(self.detector_label)
 
         return row
+
+    def _build_zones_panel(self) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        row = QHBoxLayout()
+        add = QPushButton("Add zone…")
+        add.clicked.connect(self._add_zone_dialog)
+        row.addWidget(add)
+        self.edit_zone_button = QPushButton("Change…")
+        self.edit_zone_button.setToolTip("Rename the selected zone or change its kind.")
+        self.edit_zone_button.clicked.connect(self._edit_zone)
+        row.addWidget(self.edit_zone_button)
+        self.remove_zone_button = QPushButton("Remove")
+        self.remove_zone_button.setToolTip(
+            "Forget the selected zone. Events it raised are kept and still name it."
+        )
+        self.remove_zone_button.clicked.connect(self._remove_zone)
+        row.addWidget(self.remove_zone_button)
+        row.addStretch(1)
+        layout.addLayout(row)
+        layout.addWidget(self.zones_view, 1)
+        return panel
 
     def _build_track_table(self) -> QTreeWidget:
         tree = QTreeWidget()
@@ -581,6 +639,7 @@ class ConsoleWindow(QMainWindow):
         }
         self.map.set_cameras(placed)
         self.map.set_zones(self._zones)
+        self.zones_view.show_zones(self._zones)
 
         if not placed:
             self.placement_label.setText("No camera placed — objects will not be located")
@@ -592,16 +651,168 @@ class ConsoleWindow(QMainWindow):
                 "the rest will not locate anything"
             )
 
-    def _add_zone(self) -> None:
-        """Put a restricted area on the ground in front of the selected camera.
+    def _remove_camera(self) -> None:
+        """Forget the selected camera, stopping it first if it is running.
 
-        A placeholder for drawing one on the plan view, and honest about being
-        one. What it is not is a default: a zone exists only because an operator
+        Asked before doing it, because the pane, the row and the placement go
+        and there is no undo — though what the camera saw is kept, and the
+        confirmation says so.
+        """
+        session = self._selected
+        if session is None:
+            QMessageBox.information(self, "No camera", "There is no camera to remove.")
+            return
+        answer = QMessageBox.question(
+            self,
+            "Remove camera",
+            f"Remove {session.camera_id} ({session.display_source})?\n\n"
+            + ("It is running and will be stopped first. " if session.is_running else "")
+            + "Its events and incidents are kept.",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.node.remove_camera(session.camera_id)
+        except NodeError as error:
+            QMessageBox.warning(self, "Not removed", str(error))
+            return
+
+        self._sessions.pop(session.camera_id, None)
+        index = self.camera_picker.findData(session.camera_id)
+        if index >= 0:
+            self.camera_picker.removeItem(index)
+        session.view.setParent(None)
+        session.view.deleteLater()
+        self._relayout_wall()
+        self._refresh_placement()
+        self.start_button.setEnabled(bool(self._sessions) and not self._running)
+        if not self._running:
+            self._teardown()
+        self._set_status(f"Removed {session.camera_id}. {len(self._sessions)} camera(s).")
+
+    def _place_camera_on_map(self) -> None:
+        """Move the selected camera to a point clicked on the plan view."""
+        session = self._selected
+        if session is None:
+            QMessageBox.information(self, "No camera", "Add a camera first.")
+            return
+        if session.pose is None:
+            QMessageBox.information(
+                self,
+                "Place it once first",
+                "A click on the map gives a position, not a height or a heading, "
+                "and both decide where this camera's objects land on the ground. "
+                "Use Place… once; after that the camera can be moved by clicking.",
+            )
+            return
+        self._pick_action = ("camera", session.camera_id)
+        if not self.map.begin_pick(f"Move {session.camera_id} to"):
+            self._pick_action = None
+            QMessageBox.information(
+                self, "The map has no origin",
+                "Place a camera with Place… first; the map cannot measure a click "
+                "until it knows where one camera is.",
+            )
+            return
+        self._set_status(f"Click the plan view where {session.camera_id} is.")
+
+    def _map_picked(self, point: LatLon) -> None:
+        """A ground point the operator clicked, for whatever asked for it."""
+        action, self._pick_action = self._pick_action, None
+        if action is None:
+            return
+        what, payload = action
+        if what == "camera":
+            session = self._sessions.get(payload)
+            if session is None or session.pose is None:
+                return
+            self.node.place_camera(payload, replace(session.pose, position=point))
+            self._refresh_placement()
+            self._set_status(f"Moved {payload}.")
+        elif what == "zone":
+            name, kind, radius = payload
+            self._add_zone(name=name, kind=kind, radius=radius, centre=point)
+
+    def _add_zone_dialog(self) -> None:
+        """Ask what kind of zone, how big, and where, then create it."""
+        if self._pose is None and not any(s.pose for s in self._sessions.values()):
+            QMessageBox.information(
+                self,
+                "Place the camera first",
+                "A zone is an area on the ground. Until a camera is placed there "
+                "is nothing to measure it against, and objects are tracked but "
+                "not located.",
+            )
+            return
+        dialog = ZoneDialog(
+            default_radius=self.zone_radius.value(),
+            can_pick=any(s.pose is not None for s in self._sessions.values()),
+            parent=self,
+        )
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        name, kind, radius = dialog.name() or None, dialog.kind(), dialog.radius()
+        if dialog.pick_on_map():
+            self._pick_action = ("zone", (name, kind, radius))
+            self.map.begin_pick(f"Centre of {name or kind.value.title()}")
+            self._set_status("Click the plan view where the zone's centre is.")
+            return
+        self._add_zone(name=name, kind=kind, radius=radius)
+
+    def _edit_zone(self) -> None:
+        zone_id = self.zones_view.selected_zone_id()
+        zone = next((z for z in self._zones if z.id == zone_id), None)
+        if zone is None:
+            QMessageBox.information(self, "No zone selected", "Select a zone to change.")
+            return
+        dialog = ZoneDialog(existing=zone, parent=self)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._change_zone(zone.id, name=dialog.name() or zone.name, kind=dialog.kind())
+
+    def _change_zone(self, zone_id: str, *, name: str, kind: ZoneKind) -> None:
+        zone = next((z for z in self._zones if z.id == zone_id), None)
+        if zone is None:
+            raise ValueError(f"no zone {zone_id!r}")
+        self.node.replace_zone(replace(zone, name=name, kind=kind))
+        self._refresh_placement()
+        self.zones_view.select(zone_id)
+        self._set_status(f"{name} is now {kind.value.lower()}.")
+
+    def _remove_zone(self) -> None:
+        zone_id = self.zones_view.selected_zone_id()
+        zone = next((z for z in self._zones if z.id == zone_id), None)
+        if zone is None:
+            QMessageBox.information(self, "No zone selected", "Select a zone to remove.")
+            return
+        answer = QMessageBox.question(
+            self, "Remove zone",
+            f"Remove {zone.name} ({zone.kind.value.lower()})? Events it raised are kept.",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self.node.remove_zone(zone.id)
+        self._refresh_placement()
+        self._set_status(f"Removed {zone.name}. {len(self._zones)} zone(s).")
+
+    def _add_zone(
+        self,
+        name: str | None = None,
+        kind: ZoneKind = ZoneKind.RESTRICTED,
+        radius: float | None = None,
+        centre: LatLon | None = None,
+    ) -> None:
+        """Put a zone on the ground: in front of the selected camera, or at
+        ``centre``.
+
+        What it is not is a default: a zone exists only because an operator
         asked for it, because a zone nobody drew is a source of alerts nobody
         expects.
         """
         pose = self._pose
-        if pose is None:
+        if pose is None and centre is None:
             QMessageBox.information(
                 self,
                 "Place the camera first",
@@ -611,7 +822,7 @@ class ConsoleWindow(QMainWindow):
             )
             return
 
-        radius = self.zone_radius.value()
+        radius = self.zone_radius.value() if radius is None else radius
 
         # Placed just beyond the near edge of what this camera can *actually*
         # see, which is not the range it claims: a 6 m mast tilted 22 degrees
@@ -620,25 +831,43 @@ class ConsoleWindow(QMainWindow):
         # accurate, because uncertainty grows super-linearly with distance — so
         # a zone there is one the system can genuinely adjudicate rather than
         # one it will mostly report as UNCERTAIN.
-        footprint = field_of_view(pose, arc_segments=16)
-        near = (
-            min(haversine_distance(pose.position, point) for point in footprint)
-            if footprint
-            else 10.0
-        )
-        centre = destination_point(pose.position, pose.heading, near + radius)
+        if centre is None:
+            assert pose is not None
+            footprint = field_of_view(pose, arc_segments=16)
+            near = (
+                min(haversine_distance(pose.position, point) for point in footprint)
+                if footprint
+                else 10.0
+            )
+            centre = destination_point(pose.position, pose.heading, near + radius)
         ring = tuple(
             destination_point(centre, bearing, radius)
             for bearing in (0.0, 90.0, 180.0, 270.0)
         )
 
-        index = len(self.node.zones) + 1
+        # The first id not in use, not "count plus one": after zone-1 is
+        # removed, count-plus-one names zone-2 again and the upsert silently
+        # overwrites the zone that is still there.
+        taken = {z.id for z in self.node.zones}
+        index = 1
+        while f"zone-{index}" in taken:
+            index += 1
+        letter = chr(64 + min(index, 26))
+        if name is None:
+            name = (
+                f"Restricted Area {letter}"
+                if kind is ZoneKind.RESTRICTED
+                else f"{kind.value.title()} zone {letter}"
+            )
         zone = Zone(
             id=f"zone-{index}",
-            name=f"Restricted Area {chr(64 + index)}",
-            kind=ZoneKind.RESTRICTED,
+            name=name,
+            kind=kind,
             ring=ring,
             enter_after_millis=600,
+            # A zone meant to be ignored, or merely watched, may accept an
+            # uncertain position; one that raises an alarm must not.
+            accept_uncertain=kind in (ZoneKind.EXCLUSION, ZoneKind.INTEREST),
         )
         # The node persists it, audits it, and — if this is the first zone —
         # rebuilds the rule set, because rules that need a zone are dead weight
@@ -646,6 +875,8 @@ class ConsoleWindow(QMainWindow):
         self.node.add_zone(zone)
 
         self.map.set_zones(self._zones)
+        self.zones_view.show_zones(self._zones)
+        self.zones_view.select(zone.id)
         self._set_status(
             f"{len(self._zones)} zone(s). Rules apply to cameras started from now."
         )
