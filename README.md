@@ -337,10 +337,10 @@ core/               Rust engine core: geometry, projection, zones, tracking
   src/tracking.rs     track lifecycle, association, motion
   src/ffi.rs          the C ABI
 engine/             Python engine
-  sentinel/core.py       ctypes bindings to the core
+  sentinel/core.py       ctypes bindings to the core; ground contact from the mask
   sentinel/decode.py     decode, credential redaction, live streams
   sentinel/detect.py     motion and ONNX detectors, and the factory that picks
-  sentinel/segment.py    instance segmentation; ground contact from the mask
+  sentinel/segment.py    instance segmentation (YOLOv8-seg via ONNX Runtime)
   sentinel/zones.py      zones, schedules, presence with hysteresis
   sentinel/events.py     rules and events, each carrying its evidence
   sentinel/incidents.py  correlation, object identity, risk scoring

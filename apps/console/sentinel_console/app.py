@@ -132,6 +132,10 @@ def _detector_summary(info) -> str:
     return f"{info.name} — {len(info.class_names)} classes{masks}{digest}"
 
 
+#: The least height the incident and track panels are ever given. See `_build`.
+LOWER_PANEL_MINIMUM_HEIGHT = 170
+
+
 class ConsoleWindow(QMainWindow):
     """The main window."""
 
@@ -157,6 +161,15 @@ class ConsoleWindow(QMainWindow):
         # — not here, where a test constructing a window would silently acquire
         # a different detector than the one it was written against.
         self._model = Path(model) if model is not None else None
+        # Bound to the *value*, never to `self`. A factory that closed over the
+        # window put the window in a reference cycle with its own node, so it
+        # was no longer freed when its last reference went but whenever the
+        # cyclic collector got to it — for the last few windows a test run
+        # creates, that is interpreter shutdown, after PySide has already torn
+        # down the QApplication. Destroying a QMainWindow at that point
+        # corrupted the heap (0xC0000374) at exit, in a run where every test had
+        # passed. A widget's lifetime has to be the plain refcount.
+        model_for_detector = self._model
 
         # The console is a *client* of this. It owns no store, no zones, no
         # rule set and no analysis thread; it owns widgets, and it calls
@@ -171,7 +184,7 @@ class ConsoleWindow(QMainWindow):
             realtime=True,
             correlate_every_millis=CORRELATE_INTERVAL_MILLIS,
             # One detector per camera, never shared, built at start.
-            detector_factory=lambda: detector_for(self._model),
+            detector_factory=lambda: detector_for(model_for_detector),
         )
 
         self._build()
@@ -286,6 +299,14 @@ class ConsoleWindow(QMainWindow):
         split.addWidget(lower)
         split.setStretchFactor(0, 3)
         split.setStretchFactor(1, 2)
+        # The conclusions must never be squeezed out of sight. A live screenshot
+        # on a short window showed the cameras taking every pixel the video's
+        # own minimum size demanded, and the incident and track panels reduced
+        # to a header row with no rows under it — "2 tracked now" in the status
+        # bar and an empty table above it. Enough for a title, a header and four
+        # rows, and the splitter cannot collapse it.
+        lower.setMinimumHeight(LOWER_PANEL_MINIMUM_HEIGHT)
+        split.setCollapsible(1, False)
 
         outer.addWidget(split, 1)
         self.setCentralWidget(central)

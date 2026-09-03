@@ -25,10 +25,10 @@ implementation was removed in `582d0a8`; its architecture documents were kept
 because the thinking in them carried over, and are being brought up to date.
 Anything below that is not yet re-established after the rewrite says so.
 
-Current suite: **648 tests** — 57 Rust, 543 engine, 48 console — plus two static
+Current suite: **675 tests** — 60 Rust, 561 engine, 54 console — plus two static
 checks that run before any of them: an offline audit that fails the build if the
 shipped source names any destination off the site, and a lint that fails it if
-any of the 36 diagrams in this documentation no longer parses. `cargo fmt` and
+any of the 41 diagrams in this documentation no longer parses. `cargo fmt` and
 `clippy -D warnings` clean. Run everything with `python tasks.py check`, or the
 Python half of it inside a container with no network at all:
 `docker compose run --rm verify`. One of them opens a real camera and is skipped unless
@@ -135,6 +135,7 @@ Geometry, projection, zones and tracking, behind a C ABI.
 | Continuous recording | `TESTED` | Segmented mp4v on a writer thread; a file loses no frames, a camera never builds a backlog; every clip hashed on close. **CLI only — the console cannot enable it yet.** |
 | Recording index and retention | `TESTED` | Migration 3. Oldest-first by age, size and free space; every deletion audited; **a segment an incident depends on is never deleted**. Dry-run by default. |
 | Instance segmentation | `TESTED` | YOLOv8n-seg through ONNX Runtime: 80 COCO classes, one mask per object, ~11–14 fps on CPU. The ground-contact point is taken from the mask's own lowest row, not the bottom edge of a box. Weights are operator-supplied and **never downloaded**. |
+| Mask contact drives the map position | `TESTED` | The contact point crosses the Rust boundary (ABI 6) as a flagged field on every detection, the projection uses it, and the track reports the point it used so the console can draw it. **Before this, the point was computed and used by nothing** — the projection still received a box. |
 | Detector chosen by reading the model | `TESTED` | No model → motion; one output → boxes; two outputs → masks. Decided from the file, because a flag can disagree with the file and the operator cannot tell which won. |
 | Live camera survives a dropped frame | `TESTED` | `VideoSource.read` returns `None` for both the end of a file and a single failed read, and the pipeline iterated a live source exactly like a file — so **one dropped frame stopped a camera for good**, logged as "analysis finished". `LiveStream` had reconnect-with-backoff all along and nothing called it. |
 | Footage in evidence | `TESTED` | Clips copied into the package with a pre-incident lead; `footage.json` states per-camera coverage and times every gap. |

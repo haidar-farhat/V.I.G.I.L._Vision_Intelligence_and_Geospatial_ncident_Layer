@@ -6,7 +6,7 @@
     python tasks.py lint       rustfmt and clippy
     python tasks.py audit      prove the source has no route off the site,
                                and that every diagram in the docs parses
-    python tasks.py console    run the operator console
+    python tasks.py console    run the operator console (pass arguments after it)
     python tasks.py cli        run the headless analyser (pass arguments after it)
     python tasks.py package    build the standalone executables
     python tasks.py db         report the database's migration state
@@ -181,8 +181,10 @@ def db_rollback() -> None:
 
 
 def console() -> None:
+    """The operator console, with everything after `console` passed through
+    (`--model FILE`, `--no-model`, `--database`, `--dev`)."""
     build()
-    run([sys.executable, str(CONSOLE / "main.py")], ROOT, python_path())
+    run([sys.executable, str(CONSOLE / "main.py"), *sys.argv[2:]], ROOT, python_path())
 
 
 def cli() -> None:
@@ -364,7 +366,7 @@ TASKS = {
 
 
 #: Tasks that take arguments of their own, passed through untouched.
-PASSTHROUGH = {"cli", "ci", "shots"}
+PASSTHROUGH = {"cli", "ci", "shots", "console"}
 
 
 def main(argv: list[str]) -> int:

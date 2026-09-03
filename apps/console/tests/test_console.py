@@ -14,8 +14,10 @@ moment:
 
 from __future__ import annotations
 
+import gc
 import os
 import time
+import weakref
 from pathlib import Path
 
 import pytest
@@ -63,6 +65,33 @@ def window(qt_app):
     win.show()
     yield win
     win.close()
+
+
+def assert_freed(ref: "weakref.ref[ConsoleWindow]") -> None:
+    """Fail if a window survived its last reference.
+
+    The caller makes the weakref, drops its own reference, and passes the
+    weakref — a helper cannot drop a reference that lives in the caller's frame.
+
+    A window kept alive by a reference cycle is destroyed whenever the cyclic
+    collector gets to it. For the last few windows a test session creates that
+    is interpreter shutdown, after PySide has torn the QApplication down, and
+    destroying a QMainWindow then corrupts the heap: the process died with
+    0xC0000374 at exit in a run where every test had passed, and nothing said
+    why. This turns that silent crash into a named failure at the test that
+    created the cycle.
+    """
+    win = ref()
+    if win is None:
+        return
+    # Say what is holding it, so the fix is a lookup rather than a bisection.
+    holders = sorted({type(r).__name__ for r in gc.get_referrers(win)} - {"frame", "list"})
+    del win
+    raise AssertionError(
+        "ConsoleWindow outlived its last reference: it is in a reference "
+        f"cycle (held by {holders}). It would be destroyed at interpreter "
+        "shutdown, after the QApplication, and corrupt the heap on exit."
+    )
 
 
 def pump(app, window, seconds: float) -> None:
@@ -299,6 +328,28 @@ def test_closing_the_window_stops_the_analysis(qt_app, reference_video: Path):
 
     win.close()
     assert not session.is_running, "a thread outlived the window that owned it"
+
+
+def test_a_closed_console_is_freed_the_moment_its_last_reference_goes(
+    qt_app, reference_video: Path
+):
+    # The console once handed its node a detector factory that closed over
+    # `self`. That put every window in a cycle with its own node, so windows
+    # were no longer freed when a test dropped them but whenever the cyclic
+    # collector ran — for the last few of a session, at interpreter shutdown,
+    # after PySide had destroyed the QApplication. Every test passed and the
+    # process then died with 0xC0000374. A window with cameras that have run
+    # is the case with the most objects hanging off it, so that is the one
+    # checked.
+    win = ConsoleWindow(":memory:")
+    win.add_camera(reference_video, "cam-07")
+    win._start()
+    pump(qt_app, win, 1.0)
+    win.close()
+
+    ref = weakref.ref(win)
+    del win
+    assert_freed(ref)
 
 
 # -------------------------------------------------------------------- redaction
@@ -1102,3 +1153,78 @@ def test_a_live_frame_is_stamped_with_a_clock_not_an_epoch():
     assert "t+" not in live
     assert live.endswith("UTC")
     assert live.count(":") == 2
+
+
+def test_a_track_is_drawn_with_the_point_its_position_came_from(qt_app):
+    """A dot on the feet, not an inference from the box.
+
+    Rendered and read back as pixels: the box outline and the contact marker
+    are the same colour, so the check is that the marker's colour appears at
+    the *contact* point, which is deliberately far from the rectangle's
+    bottom-centre — where nothing but the frame is drawn.
+    """
+    import numpy as np
+    from PySide6.QtGui import QImage
+
+    from sentinel.core import BoundingBox, ContactPoint, Track
+    from sentinel.node import Update
+    from sentinel.pipeline import FrameResult, PipelineStats
+
+    view = VideoView()
+    view.resize(640, 480)
+    view.set_detector_info(MotionDetector().info)
+
+    box = BoundingBox(0.4, 0.3, 0.2, 0.4)
+    # Bottom-left corner of the box: a mask found the foot there.
+    track = Track(
+        id=1, class_id=0, bbox=box, confidence=0.9, hits=5,
+        first_seen_millis=0, last_seen_millis=1000, position=None,
+        speed_mps=None, heading_degrees=None, contact=ContactPoint(0.41, 0.7),
+    )
+    image = np.zeros((480, 640, 3), dtype=np.uint8)  # black footage, 4:3 like the view
+    result = FrameResult(
+        index=30, timestamp_millis=1000, source_id="cam-07",
+        detections=(), tracks=(track,), ended=(), image=image,
+    )
+    view.show_update(Update(result=result, analysis_fps=30.0, skipped=0, stats=PipelineStats()))
+
+    rendered = view.grab().toImage().convertToFormat(QImage.Format.Format_RGB888)
+
+    def is_track_colour(x: int, y: int) -> bool:
+        c = rendered.pixelColor(x, y)
+        t = theme.TRACK
+        return abs(c.red() - t.red()) < 40 and abs(c.green() - t.green()) < 40 and abs(c.blue() - t.blue()) < 40
+
+    # The view is 640x480 and so is the frame, so image fractions map 1:1.
+    assert is_track_colour(int(0.41 * 640), int(0.7 * 480)), "no marker at the contact point"
+    # The rectangle's bottom-centre, three pixels above the outline, is bare
+    # footage: nothing infers a contact from the box any more.
+    assert not is_track_colour(int(0.5 * 640), int(0.7 * 480) - 4), (
+        "something was drawn at the box's bottom-centre, where nothing was measured"
+    )
+
+
+def test_the_conclusions_are_never_squeezed_out_of_sight(qt_app):
+    """A short window must shrink the video, not the tables.
+
+    A live screenshot on a laptop screen showed the status bar saying
+    "2 tracked now" above a Tracked Objects panel that was a header row with
+    nothing under it: the video's own minimum size had taken every pixel and
+    the splitter had given the conclusions what was left, which was nothing.
+    """
+    from sentinel_console.app import LOWER_PANEL_MINIMUM_HEIGHT
+
+    win = ConsoleWindow(":memory:")
+    win.resize(1100, 520)  # shorter than the panels' minimums add up to
+    win.show()
+    qt_app.processEvents()
+    try:
+        # Four rows of a table, roughly, plus its header and the panel title.
+        assert win.tracks.height() >= LOWER_PANEL_MINIMUM_HEIGHT - 40, (
+            f"the track table was given {win.tracks.height()} px"
+        )
+        assert win.incidents.height() >= LOWER_PANEL_MINIMUM_HEIGHT - 40, (
+            f"the incident panel was given {win.incidents.height()} px"
+        )
+    finally:
+        win.close()

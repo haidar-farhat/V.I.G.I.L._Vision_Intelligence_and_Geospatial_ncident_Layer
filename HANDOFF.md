@@ -1,7 +1,9 @@
-# Handoff — 2026-09-03
+# Handoff — 2026-09-03 (evening)
 
-State of the work at the end of the segmentation slice, what is unfinished, and
-the one open defect. Written to be the first thing a new session reads.
+State of the work at the end of the ground-contact slice: the console exit
+crash is resolved and explained, the mask-derived contact point now crosses the
+Rust boundary, and CI is green. Written to be the first thing a new session
+reads.
 
 ---
 
@@ -28,261 +30,180 @@ available at install time only; never at runtime.
 
 ---
 
-## 2. What was completed this session
+## 2. The exit crash — resolved, and what it actually was
 
-### Instance segmentation, end to end
+**Symptom.** The console suite passed every test and the process then died with
+`0xC0000374` (heap corruption) during interpreter shutdown. `pytest` never
+printed a summary and `tasks.py ci` failed at `console · tests`.
 
-- `engine/sentinel/segment.py` — `Segmenter` (YOLOv8n-seg via ONNX Runtime) and
-  `ground_contact()`, which takes an object's ground point from **the lowest row
-  of its mask**, not the bottom edge of its box. That point is what the entire
-  position layer rests on.
-- `engine/sentinel/detect.py` — `detector_for()` picks motion / detection /
-  segmentation by **reading the model file** (output count), never a flag,
-  because a flag can disagree with the file and the operator cannot tell which
-  won.
-- `--model FILE` on `sentinel run`, `sentinel node`, and the console.
-  `--no-model` forces motion. `paths.default_model_path()` finds a `*-seg.onnx`
-  in the models directory; only segmentation models are auto-selected.
-- `devtools/export_model.py` obtains the weights on a connected machine. The
-  product downloads nothing, ever.
-- The console draws **masks, not boxes**, and track labels no longer stack on
-  top of each other.
-- The toolbar names the detector actually running, with its SHA-256 —
-  replacing a hardcoded `"MOG2 background subtraction"` string that became a
-  false capability claim the moment a model was loaded.
+**Cause.** One line in `ConsoleWindow.__init__`:
 
-**Verified on the live laptop camera, through the console:** one person track at
-0.86 held **160 frames / 11.5 s** with speed and heading, plus two correctly
-classified stationary bottles, at ~11–14 fps on CPU. The same camera under MOG2
-produced **20 tracks and 30 events for one seated person** — face fragments,
-curtains and a wall.
-
-Model artifact: `models/yolov8n-seg.onnx`, 13.9 MB, sha256
-`f828ccfa4b69332ad8b65c4ffebdf1f36ae9dd861c48faadd6c881e63bd68699` (gitignored,
-operator-supplied).
-
-### A live camera no longer stops for good on one dropped frame
-
-This was the serious find. `VideoSource.read()` returns `None` for **both** the
-end of a file and a single failed read, and `Pipeline.run()` iterated a live
-camera exactly the way it iterated a file. One transient read failure ended the
-run, and the log said `analysis finished` — the same line a file prints when it
-is done. A security camera silently stopped watching and nothing reported a
-fault.
-
-`LiveStream` — reconnect with bounded backoff, drop counting, latest-wins queue
-— **already existed, was marked `TESTED` in FEATURES.md, and was imported by
-nothing.** The pipeline now uses it for live sources; files still iterate
-directly, which is what keeps replay deterministic.
-
-Also fixed alongside it:
-- `LiveStream._state.error` was set on failure and never cleared on a successful
-  reconnect, so a recovered stream would keep raising the outage it had already
-  survived.
-- `LiveStream.stop()` released the capture even when the join timed out — freeing
-  a `cv2.VideoCapture` under a decode thread still reading through it. It now
-  leaks the capture instead and says so.
-- `VideoSource.open/close/read` had a check-then-act race now that a source has
-  two owners.
-
-### Tests and docs
-
-- `engine/tests/test_segment.py` — 13 tests against the **real** model, plus an
-  opt-in live-camera silhouette test (`SENTINEL_TEST_CAMERA=1`), which passes.
-- `engine/tests/test_pipeline.py` — two regression tests pinning the live-camera
-  behaviour above.
-- Two pre-existing red recording tests fixed: they killed a writer with a bogus
-  fourcc, and **OpenCV 5 silently substitutes a codec** (`tag 'ZZZZ' is not
-  found ... fallback to use tag 'mp4v'`), so they stopped killing anything. The
-  failure is now injected at the seam.
-- `FEATURES.md` rescored to **146 TESTED / 23 IMPL / 35 SKEL / 167 PLAN** of 371.
-- `docs/USAGE.md` gained **§7 Detection models**; later sections renumbered.
-- `README.md` and `STATUS.md` updated, including an honest note that the
-  reconnect rows were `TESTED` while the capability was absent from the product.
-
----
-
-## 3. OPEN DEFECT — read this before doing anything else
-
-**The console test process crashes at exit with `0xC0000374`
-(STATUS_HEAP_CORRUPTION) under `QT_QPA_PLATFORM=offscreen`. Every one of the 51
-tests passes; the process then dies during interpreter shutdown, so `pytest`
-never prints its summary and the stage fails.** This makes
-`python tasks.py ci --package` fail at `console · tests`.
-
-Reproduce:
-
-```bash
-cd apps/console
-QT_QPA_PLATFORM=offscreen PYTHONPATH="../../engine:." python -m pytest -q
-echo $?     # 127 in bash; -1073740940 (0xC0000374) via PowerShell $LASTEXITCODE
+```python
+detector_factory=lambda: detector_for(self._model)
 ```
 
-What is established. **Treat any single run as noise** — the crash is
-nondeterministic (~2 in 3 early on, deterministic later), and several of my own
-bisections were invalidated by exactly that. Use 4+ runs per hypothesis.
+The closure over `self` put every window in a reference cycle with its own
+node (window → node → factory → cell → window). A window was therefore no
+longer freed when its last reference went — at fixture teardown, with the
+`QApplication` alive — but whenever the cyclic collector next ran. For the last
+few windows of a session that is interpreter shutdown, **after PySide has
+already destroyed the `QApplication`** in its own atexit cleanup. Destroying a
+`QMainWindow` at that point corrupts the heap.
 
-Bisection results, each with everything else left modified:
+**Evidence, in order.**
 
-| Reverted | Result |
-|---|---|
-| nothing (pristine `HEAD`) | **clean 4/4** — so this session caused it |
-| `pipeline.py` + `node.py` together | **clean 3/3** ← strongest lead |
-| `app.py` + `video_view.py` together | **clean 3/3** ← equally strong |
-| `decode.py` alone | crash 3/3 |
-| `node.py` alone | crash 3/3 |
-| `app.py` alone | crash 4/4 |
-| `pipeline.py` alone | crash 3/3 (also mass test failures — `node` calls the method it removes, so this run is not a clean isolation) |
-| `video_view.py` alone | 1 clean, 1 crash |
+- A pytest plugin reporting live objects at `pytest_sessionfinish`:
+  **9 `ConsoleWindow`s, 6 runners, 6 pipelines alive, every window held by a
+  `cell`**, and only `MainThread` running. (No thread leak — the handoff's
+  earlier check of `decode:` threads had missed nothing.)
+- Forcing `gc.collect()` after **every** test: exit 0, zero windows alive at
+  the end, `QApplication.instance()` already `None` by Python's atexit.
+- Binding the factory to the value instead of `self`: **4/4 runs exit 0**, zero
+  windows alive at session end. Then 3 further clean runs plus the CI run.
+- The new regression test fails against the old lambda with
+  `held by ['cell']` and passes against the fix. Verified both ways.
 
-Read together: **neither side alone is sufficient and both are necessary** —
-reverting either pair clears it, reverting any single file does not. That points
-at an interaction, not a single bad line.
+**Why the earlier bisection pointed at four files.** Whether the last windows
+were collected before or after the app died depended on when an automatic
+gen-2 collection happened to run, which depends on allocation counts — so
+reverting *any* large enough diff shifted the timing and "fixed" it. The
+`pipeline.py`+`node.py` result was that, not a cross-thread bug. The
+lock/leak changes in `decode.py` are still correct and kept.
 
-Ruled out:
-- **No decode threads leak** — verified with a per-test teardown hook that
-  enumerates threads named `decode:`.
-- Console tests use **file** sources only, so `LiveStream` is never constructed
-  by them and `Pipeline._run_live` never executes. The live-camera path is very
-  unlikely to be the trigger, which makes the `pipeline.py` + `node.py` result
-  the interesting one: for a file, the only live changes are
-  `Pipeline._stopping` / `ask_to_stop` and `CameraRunner.ask_to_stop` calling
-  into the pipeline **from the Qt thread** while the camera thread is inside
-  `pipeline.run()`.
-- `_mask_image` over a live numpy buffer. Changed to `buffer.tobytes()` and
-  re-run **6×: still crashed 6/6.** The change is correct and worth keeping, but
-  it is not the cause. (`_mask_image` is in fact never called by these tests —
-  MotionDetector produces no masks.)
+**One false lead of my own, for the record.** `pytest.ini` sets `-q` and the
+runner adds another, and at `-qq` pytest prints **no summary line at all**. A
+missing "N passed" is not evidence of a crash. Only the exit code is.
 
-Also attempted, correct, and worth keeping, but not the cause:
-- a lock around `VideoSource._capture` for `open` / `close` / `read`;
-- leaking rather than releasing a capture when the decode thread will not join.
-
-Suggested next moves, cheapest first:
-1. Revert **only** `CameraRunner.ask_to_stop`'s new call into the pipeline
-   (leave `Pipeline.ask_to_stop` in place) and run 4×. That isolates the
-   cross-thread call, which the table above implicates most directly.
-2. Bisect *within* `video_view.py` — the `numpy` import, `_mask_image`, and the
-   `placed` label-collision list are independent and removable separately.
-3. Run the suite under `python -X dev -X faulthandler` or with
-   `PYTHONMALLOC=debug` to move the abort nearer the bad free; also try
-   `-p no:randomly` to see whether test order matters.
-4. Bisect by test: split with `-k` into halves and find the minimal set that
-   still crashes at exit. Slow (~75 s a run) but conclusive.
-
-**Do not ship or commit as "green" until this is resolved.** The engine suite is
-fully green (one skip, the opt-in camera test); only the console stage fails,
-and it fails *after* passing every test.
+**Guard.** `test_a_closed_console_is_freed_the_moment_its_last_reference_goes`
+in the console suite: a weakref to a closed window with cameras that have run
+must be dead after `del`. Failure names the holder types so the fix is a lookup
+rather than a bisection. `assert_freed()` beside it is the helper.
 
 ---
 
-## 4. Current repository state
+## 3. What else was completed this session
 
-Branch `Phase2`. **Nothing from this session is committed yet.** Modified:
+### The contact point crosses the Rust boundary (ABI 5 → 6)
 
-```
-apps/console/sentinel_console/app.py          model wiring, honest detector label
-apps/console/sentinel_console/video_view.py   mask drawing, label collision
-engine/sentinel/decode.py                     LiveStream hardening, capture races
-engine/sentinel/detect.py                     detector_for(), _output_count()
-engine/sentinel/cli.py                        --model on run and node
-engine/sentinel/paths.py                      models_directory, default_model_path
-engine/sentinel/pipeline.py                   LiveStream for live sources
-engine/sentinel/node.py                       ask_to_stop reaches the pipeline
-engine/sentinel/segment.py                    NEW — Segmenter, ground_contact
-engine/tests/test_segment.py                  NEW
-engine/tests/test_pipeline.py                 live-camera regressions
-engine/tests/test_recording.py                injected writer failure
-engine/tests/test_cli.py                      patch detect.MotionDetector, not cli
-tools/screenshot_console.py                   --segment
-FEATURES.md STATUS.md README.md docs/USAGE.md
-```
+`ground_contact()` — the mask's lowest lit row, the reason segmentation exists —
+was **computed in Python and used by nothing**. The Rust projection still
+received a box. That is the **fifth** instance of the repository's recurring
+defect (correct, tested code that nothing calls). Now:
 
-Suggested commits once the console stage is green — small and separable:
+- `core/src/ffi.rs`: `CDetection` gains `has_contact: u32, contact_x, contact_y`
+  (the `_pad` slot became the flag; 48 → 64 bytes). `CTrack` gains
+  `contact_x, contact_y` (136 → 152). `ABI_VERSION = 6` on both sides; the
+  struct-size guard covers both.
+- `core/src/tracking.rs`: `Detection.contact: Vec2` (`Detection::from_box` gives
+  the bottom-centre), `Track.contact`, and `project_point()` replaces the box
+  projection everywhere. A coasting track moves its contact **with** the box
+  rather than re-deriving it from the rectangle.
+- `engine/sentinel/core.py`: `ground_contact()` moved here from `segment.py`
+  (it must run whether or not a model is installed), `ContactPoint`,
+  `Track.contact`, and `Tracker.update()` fills the flag for every detection.
+  A box-only detector sends its bottom-centre and gets **exactly** the answer it
+  always did.
+- Flag set beside a NaN is a caller's bug; the core falls back to the box rather
+  than projecting a NaN latitude. Tested.
+- `video_view.py` draws the contact as a dot in the track colour; the console
+  test reads it back **as pixels** at the contact and asserts nothing is drawn
+  at the box's bottom-centre.
 
-1. `fix: a camera that drops one frame no longer stops for good`
-   (decode, pipeline, node, test_pipeline)
-2. `feat: the system can see shapes, not just boxes`
-   (segment, detect, cli, paths, test_segment)
-3. `feat: the console runs a model, and says which one`
-   (app, video_view, screenshot_console)
-4. `fix: two recording tests stopped testing anything`
-   (test_recording, test_cli)
-5. `docs: segmentation, and a capability that was never reachable`
+Tests: 3 new Rust (60 total), 2 new engine (561), 3 new console (54). All
+green; `cargo fmt`, `clippy -D warnings`, docs lint, offline audit clean.
 
----
+### Two things the live photograph found
 
-## 5. What is next after that
+- **The lower panels could be squeezed to a header row.** On a short window
+  the video view's own minimum size took every pixel and the incident and
+  track panels got what was left: the status bar said "2 tracked now" above
+  an empty table. `LOWER_PANEL_MINIMUM_HEIGHT` and a non-collapsible
+  splitter fix it; the test fails at 85 px without the guard.
+- `python tasks.py console` refused arguments, so `--model` could not be
+  passed through the task runner. It now passes everything after `console`.
 
-**Immediate, in order:**
+(A first live run also showed three zones and overlapping zone labels. That
+was a person at the keyboard clicking the real window the tool puts on the
+desktop, not a defect — a trace of `_add_zone` calls in an unattended run
+shows exactly one. Worth knowing: the screenshot tool's window is live.)
 
-1. Resolve the console crash (§3), get `tasks.py ci --package` green, commit.
-2. Rebuild the three executables and confirm each launches
-   (`tools/local_ci.py` already has launch checks).
-3. Re-capture screenshots with `--live --segment` and look at them.
+### Docs
 
-### The executables as built on 2026-09-03 16:17
-
-`python tasks.py package` succeeded and all three are in `dist/SentinelVision/`:
-
-| Executable | Size | What it is |
-|---|---:|---|
-| `SentinelVision.exe` | 45.1 MB | the console, windowed |
-| `SentinelVision-dev.exe` | 45.1 MB | the console with developer logging |
-| `sentinel.exe` | 45.1 MB | the headless CLI |
-
-`sentinel.exe run --help` confirms `--model FILE` is wired in the packaged
-build. These were built **while the console test stage was failing at exit**
-(§3) — the tests themselves all pass, so the binaries are usable for human
-testing, but they are not a green build and should not be released as one.
-
-To exercise segmentation in the packaged console, put a `*-seg.onnx` where it
-can find it — `SENTINEL_MODELS_DIR`, or `models/` beside the install — or pass
-`--model`. With no model it runs motion detection and says so in the toolbar.
-
-**Stage 2 of segmentation (designed, not started):** carry the mask-derived
-ground contact **through the Rust FFI**. `CDetection` needs `contact_x` /
-`contact_y`, which bumps `ABI_VERSION` 5 → 6 on both sides plus the struct-size
-guard. Today the mask improves the contact point in Python and the Rust
-projection still receives a box.
-
-**Then, from ROADMAP:**
-
-- **1.3 appearance re-ID.** The tracker fragments — 17 tracks over 15 s on one
-  webcam, because association is geometric only. Masks now make appearance
-  embeddings possible, and this is the single biggest quality win available.
-- **2.1 control plane.** A survey chose `aiohttp` over FastAPI: uvicorn and
-  Hypercorn do not implement the ASGI TLS extension, so an ASGI stack cannot
-  learn which node is on an mTLS connection — and FastAPI's `/docs` fetches
-  Swagger UI from a CDN, which this product must never do.
-- Console: a recording toggle (recording is still CLI-only), and a detector
-  picker in the UI rather than only a flag.
+FEATURES.md +3 rows (149 `TESTED` of 374). STATUS.md counts corrected (they
+were stale: 648 → 675 tests, 36 → 41 diagrams) and a row for the contact
+crossing. USAGE §7 says the dot is where the position came from. README file
+map.
 
 ---
 
-## 6. Hard-won facts worth not rediscovering
+## 4. Repository state
+
+Branch `Phase2`. The previous session's work was already committed as three
+commits (`90b11c1`, `1590ec1`, `86e6783`), so the five-commit split proposed in
+the last handoff no longer applies. This session's changes are committed on top
+of them — see `git log`.
+
+The three executables were rebuilt by `tasks.py ci --package`; see §5 for the
+launch check and screenshots.
+
+---
+
+## 5. Verification record
+
+Filled in at the end of the session; see the final report in the session log and
+`dist/screenshots/live-*.png`.
+
+---
+
+## 6. What is next
+
+**Immediate:**
+
+1. **1.3 appearance re-ID.** The tracker fragments (17 tracks over 15 s on one
+   webcam) because association is geometric only. Masks now make appearance
+   embeddings possible — the mask selects the object's own pixels, not the
+   background in its box. Start with a mature pretrained embedding (OSNet /
+   a small re-ID ONNX export, obtained the same way as the segmentation model,
+   never downloaded by the product), fall back to a masked colour histogram if
+   no model is installed. Association score = geometric gate × appearance
+   similarity. Carry the embedding on `Detection`; the Rust tracker only needs
+   a similarity matrix, so the ABI change is an optional `f32` pointer per
+   update, not per-detection vectors.
+2. **2.1 control plane** — `aiohttp` (see previous handoff for why not FastAPI).
+3. Console: a recording toggle, and a detector picker in the UI.
+
+**Stage 3 of segmentation** (not started): use the mask for zone membership too
+(fraction of the silhouette inside the polygon rather than one point), and for
+occlusion-aware coasting.
+
+---
+
+## 7. Hard-won facts worth not rediscovering
 
 - **The recurring defect in this repository is correct, tested code that nothing
-  calls.** Found four times: the recorder, `RecorderStats.fault`, `LiveStream`,
-  and the segmenter before it was wired. Unit tests instantiate a class
-  directly, so they pass whether or not the product ever constructs it. Before
+  calls.** Now found five times: the recorder, `RecorderStats.fault`,
+  `LiveStream`, the segmenter before it was wired, and `ground_contact`. Before
   marking anything `TESTED`, grep for importers outside its own module and
   tests.
+- **A `QWidget` in a Python reference cycle is a shutdown crash waiting to
+  happen.** Its lifetime must be the plain refcount. Never close over `self`
+  in a callable you hand to something `self` owns; bind the value.
+- **`-qq` prints no pytest summary.** The exit code is the only evidence. Treat
+  a single run of anything nondeterministic as noise; use four or more, and
+  capture `$LASTEXITCODE` in PowerShell — Git Bash's `$?` after a pipe is the
+  exit of `tail`.
+- **Git Bash does not split a colon-separated `PYTHONPATH` for Windows
+  Python.** Use PowerShell with `;`, or rely on `pytest.ini`'s `pythonpath`.
+- **Heredocs are mangled here.** Write patch scripts with the Write tool and run
+  them; a `<<'EOF'` with `\n` inside failed to parse.
+- `core.py` already had an `ImagePoint` (field-of-view). Grep before naming.
 - **Verify the premise, not just the result.** `strings` does not exist on this
-  machine — a binary scan silently returned 0 matches for everything and "the
-  binaries are clean" was worthless; redone in Python it found live Microsoft
-  telemetry endpoints in `libonnxruntime.so`. OpenCV 5 substitutes codecs.
-  A test hooked to `cli.MotionDetector` counted nothing after the call moved.
-  Offscreen Qt has **0 font families** vs 290 native and renders all text as
-  tofu — nearly reported as a product defect.
-- **onnxruntime ships a Microsoft 1DS/OneCollector telemetry uploader** in the
-  manylinux and macOS wheels, on by default. It is disarmed in
-  `engine/sentinel/telemetry.py`, called at every entry point, and
-  `tools/binary_audit.py` exists because the source audit can never see a
-  hostname inside a 28 MB `.so`.
+  machine; OpenCV 5 substitutes codecs; offscreen Qt has 0 font families and
+  renders all text as tofu.
+- **onnxruntime ships a Microsoft telemetry uploader**, disarmed in
+  `engine/sentinel/telemetry.py`; `tools/binary_audit.py` exists because the
+  source audit cannot see a hostname inside a `.so`.
 - **Only the thread that owns the node touches the store.** SQLite connections
-  belong to their creating thread; this was violated three times. Everything
-  else queues.
-- The Rust core is **C ABI + ctypes, not PyO3** — a GNU-toolchain cdylib against
-  an MSVC CPython is a real hazard.
-- Heredocs mangle `\n`; write patch scripts with the Write tool instead.
+  belong to their creating thread.
+- The Rust core is **C ABI + ctypes, not PyO3** — a GNU-toolchain cdylib
+  against an MSVC CPython is a real hazard.

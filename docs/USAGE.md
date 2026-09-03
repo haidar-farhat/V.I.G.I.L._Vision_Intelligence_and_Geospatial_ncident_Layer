@@ -565,7 +565,9 @@ That last column is the whole reason to bother. Every position this system
 reports comes from one point per object — where it meets the ground — and
 without a mask that point is the bottom-centre of a rectangle, which is only
 correct for someone upright, unoccluded, and tightly boxed. With a mask it is
-the object's own lowest pixel.
+the object's own lowest pixel. The console draws that point as a small dot in
+the track's colour, so you can see for yourself where the map position came
+from: on the feet with a model, at the bottom of the box without one.
 
 The line beside the toolbar always names what is actually running, with the
 model's SHA-256 abbreviated. That digest is recorded on every event, so a

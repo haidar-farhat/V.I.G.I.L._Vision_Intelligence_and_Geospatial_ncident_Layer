@@ -64,6 +64,10 @@ def _stamp(millis: int) -> str:
 #: frame useless for the one job it has.
 MASK_ALPHA = 90
 
+#: Radius, in pixels, of the dot marking where a track meets the ground. Small,
+#: because it marks one measured point; big enough to be seen against footage.
+CONTACT_RADIUS = 4.0
+
 
 def _mask_image(mask: "np.ndarray", colour: QColor) -> QImage:
     """A translucent, single-colour image of one instance's silhouette.
@@ -243,6 +247,26 @@ class VideoView(QWidget):
             box = track.bbox
             rect = to_screen(box.x, box.y, box.w, box.h)
             painter.drawRect(rect)
+
+            # The one point the map position was projected from, drawn where
+            # it actually is. With a mask this sits on the feet; with a box it
+            # sits at the bottom-centre. The difference is the whole argument
+            # for segmentation, and an operator should be able to see it
+            # rather than take it on trust.
+            contact = getattr(track, "contact", None)
+            if contact is not None:
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QBrush(colour))
+                painter.drawEllipse(
+                    QPointF(
+                        target.x() + contact.x * target.width(),
+                        target.y() + contact.y * target.height(),
+                    ),
+                    CONTACT_RADIUS,
+                    CONTACT_RADIUS,
+                )
+                painter.setPen(pen)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
 
             label = self._label_for(track)
             self._draw_label(

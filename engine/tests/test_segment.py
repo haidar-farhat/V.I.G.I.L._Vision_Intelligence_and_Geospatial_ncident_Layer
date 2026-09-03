@@ -23,7 +23,8 @@ import pytest
 from sentinel import logs
 from sentinel.core import BoundingBox, Detection
 from sentinel.detect import DetectionError, MotionDetector, OnnxDetector, detector_for
-from sentinel.segment import MINIMUM_MASK_PIXELS, Segmenter, ground_contact
+from sentinel.core import ground_contact
+from sentinel.segment import MINIMUM_MASK_PIXELS, Segmenter
 
 ROOT = Path(__file__).resolve().parents[2]
 MODEL = ROOT / "models" / "yolov8n-seg.onnx"
@@ -72,7 +73,7 @@ def test_contact_comes_from_the_lowest_lit_row_not_the_box():
     mask[9, 0:3] = 1        # its foot
 
     box = BoundingBox(x=0.0, y=0.0, w=1.0, h=1.0)
-    x, y = ground_contact(mask_detection(mask, box), 100, 100)
+    x, y = ground_contact(mask_detection(mask, box))
 
     assert y == pytest.approx(1.0, abs=1e-6)
     # Centre of the lit columns on that row: (0+1+2)/3 = 1, +0.5, /10.
@@ -88,7 +89,7 @@ def test_contact_uses_the_lowest_row_not_the_whole_mask_centre():
     mask[0:8, 4:6] = 1      # torso, centred
     mask[8:10, 7:9] = 1     # a leading foot, off to the right
 
-    x, _ = ground_contact(mask_detection(mask, BoundingBox(0, 0, 1, 1)), 100, 100)
+    x, _ = ground_contact(mask_detection(mask, BoundingBox(0, 0, 1, 1)))
 
     assert x == pytest.approx(0.80, abs=1e-6)
 
@@ -99,7 +100,7 @@ def test_contact_falls_back_to_the_box_without_a_mask():
     box = BoundingBox(x=0.2, y=0.1, w=0.4, h=0.6)
     plain = Detection(bbox=box, confidence=0.9, class_id=0)
 
-    assert ground_contact(plain, 100, 100) == (0.4, pytest.approx(0.7))
+    assert tuple(ground_contact(plain)) == (0.4, pytest.approx(0.7))
 
 
 def test_contact_is_inside_the_box():
@@ -111,7 +112,7 @@ def test_contact_is_inside_the_box():
         if not mask.any():
             continue
         box = BoundingBox(x=0.3, y=0.25, w=0.2, h=0.35)
-        x, y = ground_contact(mask_detection(mask, box), 640, 480)
+        x, y = ground_contact(mask_detection(mask, box))
 
         assert box.x <= x <= box.x + box.w
         assert box.y <= y <= box.y + box.h
@@ -174,7 +175,7 @@ def test_a_real_person_gets_a_silhouette_not_a_rectangle(segmenter):
 
     # And the contact point must have moved off the box's bottom-centre, or the
     # whole reason for segmenting is unspent.
-    x, y = ground_contact(person, width, height)
+    x, y = ground_contact(person)
     assert person.bbox.y + person.bbox.h - 1e-6 <= y <= person.bbox.y + person.bbox.h
 
 

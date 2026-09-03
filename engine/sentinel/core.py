@@ -27,7 +27,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Iterable, Sequence
 
-ABI_VERSION = 5
+ABI_VERSION = 6
 
 # --------------------------------------------------------------------- structs
 
@@ -49,6 +49,14 @@ class CPose(ctypes.Structure):
 
 
 class CDetection(ctypes.Structure):
+    """A detection crossing into the core.
+
+    ``has_contact`` is 1 when ``contact_x`` / ``contact_y`` carry a measured
+    ground-contact point (ABI 6). With it 0 the core uses the box's
+    bottom-centre, which is what every position was projected from before
+    segmentation existed.
+    """
+
     _fields_ = [
         ("x", ctypes.c_double),
         ("y", ctypes.c_double),
@@ -56,7 +64,9 @@ class CDetection(ctypes.Structure):
         ("h", ctypes.c_double),
         ("confidence", ctypes.c_double),
         ("class_id", ctypes.c_uint32),
-        ("_pad", ctypes.c_uint32),
+        ("has_contact", ctypes.c_uint32),
+        ("contact_x", ctypes.c_double),
+        ("contact_y", ctypes.c_double),
     ]
 
 
@@ -83,6 +93,8 @@ class CTrack(ctypes.Structure):
         ("_pad2", ctypes.c_uint32),
         ("speed_mps", ctypes.c_double),
         ("heading_degrees", ctypes.c_double),
+        ("contact_x", ctypes.c_double),
+        ("contact_y", ctypes.c_double),
     ]
 
 
@@ -157,6 +169,18 @@ class BoundingBox:
 
 
 @dataclass(frozen=True, slots=True)
+class ContactPoint:
+    """A point in normalised image coordinates: 0..1 across, 0..1 down."""
+
+    x: float
+    y: float
+
+    def __iter__(self):
+        yield self.x
+        yield self.y
+
+
+@dataclass(frozen=True, slots=True)
 class Detection:
     bbox: BoundingBox
     confidence: float
@@ -167,9 +191,52 @@ class Detection:
     #: Cropped rather than full-frame because a full-frame mask per detection is
     #: megabytes per frame at video rate, and every consumer already has the box.
     #: It is what makes a truthful ground-contact point possible: see
-    #: `sentinel.segment.ground_contact`, which takes the lowest row that has any
-    #: of the object in it rather than assuming a rectangle's bottom edge.
+    #: :func:`ground_contact`, which takes the lowest row that has any of the
+    #: object in it rather than assuming a rectangle's bottom edge.
     mask: "np.ndarray | None" = None
+
+
+def ground_contact(detection: Detection) -> ContactPoint:
+    """Where this object meets the ground, in normalised frame coordinates.
+
+    **This is the reason segmentation is worth having.** Everything downstream —
+    the projection to a map position, the zone test, the distance between two
+    cameras' observations — rests on one point per object, and until now that
+    point was the bottom-centre of a rectangle. That is correct only for a
+    tight box around an upright, unoccluded person. For anybody leaning,
+    carrying something, or half behind a car, the bottom-centre of the box is in
+    the air or inside the obstacle, and the position it produces is confidently
+    wrong.
+
+    With a mask the answer is measurable: the lowest row that has any of this
+    object in it, and the horizontal centre *of that row* — not of the whole
+    mask, because a person mid-stride has their feet somewhere other than under
+    their centre of mass.
+
+    Falls back to the box's bottom-centre when there is no mask, which is what
+    every detector without one has always produced.
+
+    Lives here rather than beside the segmenter because the tracker calls it for
+    every detection: it is the one place the mask influences the position, and
+    it has to run whether or not a model is installed.
+    """
+    box = detection.bbox
+    if detection.mask is None or detection.mask.size == 0:
+        return ContactPoint(box.x + box.w / 2.0, box.y + box.h)
+
+    rows = np.flatnonzero(detection.mask.any(axis=1))
+    if rows.size == 0:
+        return ContactPoint(box.x + box.w / 2.0, box.y + box.h)
+
+    lowest = int(rows[-1])
+    columns = np.flatnonzero(detection.mask[lowest])
+    centre = float(columns.mean()) if columns.size else detection.mask.shape[1] / 2.0
+
+    height, width = detection.mask.shape
+    return ContactPoint(
+        box.x + box.w * (centre + 0.5) / width,
+        box.y + box.h * (lowest + 1) / height,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,6 +271,11 @@ class Track:
     #: ``None`` when the object is not moving: a heading derived from jitter
     #: would be worse than admitting there is none.
     heading_degrees: float | None
+    #: Where the object last met the ground — the point its map position was
+    #: projected from. Measured from the silhouette when the detector could see
+    #: one, the box's bottom-centre when it could not. The core always reports
+    #: it; ``None`` only for a track built by hand without one.
+    contact: ContactPoint | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -704,9 +776,16 @@ class Tracker:
         if count:
             buffer = (CDetection * count)()
             for index, detection in enumerate(detections):
+                # The one place a mask changes a position. For a detection
+                # without one this is the box's bottom-centre, so a detector
+                # that produces boxes only gets exactly the answer it always
+                # did — and a foreign caller that passes the flag clear does
+                # too.
+                contact = ground_contact(detection)
                 buffer[index] = CDetection(
                     detection.bbox.x, detection.bbox.y, detection.bbox.w, detection.bbox.h,
-                    detection.confidence, detection.class_id, 0,
+                    detection.confidence, detection.class_id, 1,
+                    contact.x, contact.y,
                 )
             pointer = buffer
         else:
@@ -763,4 +842,5 @@ def _to_track(c: CTrack) -> Track:
         position=position,
         speed_mps=c.speed_mps if c.has_speed else None,
         heading_degrees=c.heading_degrees if c.has_heading else None,
+        contact=ContactPoint(c.contact_x, c.contact_y),
     )

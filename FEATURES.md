@@ -33,26 +33,26 @@ Related: [STATUS.md](STATUS.md) — measurements and honest gaps ·
 
 ## The scoreboard
 
-371 capabilities, each with a state. Many lines cover several related things —
+374 capabilities, each with a state. Many lines cover several related things —
 "heading · pitch · roll" is one row — so this counts *claims*, not code.
 
 | | Count | Share | What it means |
 |---|---:|---:|---|
-| **`TESTED`** | 146 | 39% | A test fails if it stops working |
+| **`TESTED`** | 149 | 40% | A test fails if it stops working |
 | **`IMPL`** | 23 | 6% | Works; a regression would go unnoticed |
 | **`SKEL`** | 35 | 9% | Something is there; it does not do the job |
 | **`PLAN`** | 167 | 45% | Designed, no code |
 
 ```mermaid
 pie showData
-    title Sentinel Vision — 371 capabilities by state
-    "TESTED" : 146
+    title Sentinel Vision — 374 capabilities by state
+    "TESTED" : 149
     "IMPLEMENTED" : 23
     "SKELETON" : 35
     "PLANNED" : 167
 ```
 
-**Read that 39% carefully.** It is not "a third of the product is finished" — it
+**Read that 40% carefully.** It is not "a third of the product is finished" — it
 is that the part which is finished is the analytical core plus, now, the
 recording that makes its evidence real, while most of what is planned is the
 product surface around them. The parts a demonstration shows off are the parts
@@ -222,6 +222,9 @@ two identical webcams are indistinguishable by name.
 | Animal · bag · package · smoke · fire detection | `PLAN` | |
 | Custom detection classes | `TESTED` | Class names are read from the model's own metadata; a model that carries none reports no labels rather than inventing them |
 | Instance segmentation | `TESTED` | Per-object masks from a two-output model. The ground-contact point comes from the mask's own lowest row — not the bottom edge of a rectangle, which is what the whole position layer used to rest on |
+| Mask-derived contact drives the map position | `TESTED` | The point crosses the Rust boundary (ABI 6) and is what the projection uses; a box-only detector sends its bottom-centre and gets exactly the answer it always did. Until this row existed the contact was computed in Python and **used by nothing** — the fifth instance of correct, tested code that nothing called |
+| Conclusions never squeezed out of sight | `TESTED` | On a short window the video shrinks, not the incident and track panels. A live screenshot had shown "2 tracked now" above a table reduced to its header row |
+| Contact point drawn in the console | `TESTED` | A dot in the track's colour where the position was projected from — on the feet with a mask, at the box's bottom-centre without. Checked as pixels, not as a call |
 | Segmentation masks drawn in the console | `TESTED` | The silhouette, at low alpha, instead of a box. An overlay that hides the pixels it describes makes the frame useless as evidence |
 | Model switching · multiple models | `TESTED` | Three detectors, interchangeable everywhere downstream. `--model` on `run`, `node` and the console; the console falls back to motion and says so |
 | GPU inference | `PLAN` | |
@@ -650,7 +653,7 @@ acknowledgement, alert history, escalation rules.
 | Pluggable VLM · local LLM | `PLAN` | |
 | Pluggable map sources · worker nodes | `PLAN` | |
 | Versioned APIs · versioned worker protocol | `PLAN` | |
-| Versioned ABI across the Rust boundary | `TESTED` | Version- and layout-checked before a single call |
+| Versioned ABI across the Rust boundary | `TESTED` | Version- and layout-checked before a single call. At 6: `CDetection` carries a flagged contact point, `CTrack` reports the one it used |
 
 ---
 
