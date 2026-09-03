@@ -556,7 +556,7 @@ What the export refuses to do:
 
 ## 14. Test topology
 
-**585 tests**, plus two static checks that run before any of them. Where they
+**608 tests**, plus two static checks that run before any of them. Where they
 sit and what only they can catch:
 
 ```mermaid
@@ -570,7 +570,7 @@ flowchart TB
         T["tracking.rs · 20<br/><i>identity and motion</i>"]
         F["ffi.rs · 11<br/><i>null tolerance, layout, truncation</i>"]
     end
-    subgraph eng["engine · 480 tests"]
+    subgraph eng["engine · 503 tests"]
         C["test_core · 36<br/><i>does the boundary lie?</i>"]
         DE["test_decode · 41<br/><i>credentials, timestamps, thread death</i>"]
         OG["test_offline_guarantee · 29<br/><i>watches the guard fail</i>"]

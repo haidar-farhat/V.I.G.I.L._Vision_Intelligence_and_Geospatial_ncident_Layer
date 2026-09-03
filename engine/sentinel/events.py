@@ -500,6 +500,27 @@ class RapidMovementRule(Rule):
         ]
 
 
+def default_rules(zones: Sequence[Zone] = ()) -> list[Rule]:
+    """The rule set a caller gets when it does not choose one.
+
+    Matched to what is actually configured. Without a zone there is nothing to
+    be inside, so the zone rules would be dead weight — and worse, a run would
+    report "0 events" for a reason that has nothing to do with the footage.
+
+    One definition, because there were two: the console and the CLI each had
+    their own copy, and a third was about to appear in the node. Rule sets that
+    drift produce two deployments that disagree about what an incident is.
+    """
+    if not zones:
+        return [RapidMovementRule(speed_mps=6.0)]
+    return [
+        ZoneEntryRule(),
+        AfterHoursRule(),
+        LoiteringRule(dwell_millis=8000),
+        RapidMovementRule(speed_mps=6.0),
+    ]
+
+
 # -------------------------------------------------------------------- engine
 
 

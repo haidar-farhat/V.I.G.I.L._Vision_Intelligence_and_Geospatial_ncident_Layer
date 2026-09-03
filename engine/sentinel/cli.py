@@ -38,13 +38,8 @@ from .evidence import (
     coverage_for,
     export_incident,
 )
-from .events import (
-    AfterHoursRule,
-    LoiteringRule,
-    RapidMovementRule,
-    Severity,
-    ZoneEntryRule,
-)
+from .events import Severity, default_rules
+from .node import Node
 from .incidents import Correlator
 from .pipeline import Pipeline
 from .store import Store, default_database_path
@@ -131,21 +126,10 @@ def _zone(text: str) -> Zone:
     )
 
 
-def _rules(zones: list[Zone]) -> list:
-    """The rule set, matched to what is actually configured.
-
-    Without a zone there is nothing to be inside, so the zone rules would be
-    dead weight and would let the run report "0 events" for a reason that has
-    nothing to do with the footage.
-    """
-    if not zones:
-        return [RapidMovementRule(speed_mps=6.0)]
-    return [
-        ZoneEntryRule(),
-        AfterHoursRule(),
-        LoiteringRule(dwell_millis=8000),
-        RapidMovementRule(speed_mps=6.0),
-    ]
+#: One definition, in `events.py`, shared by the CLI, the node and the console.
+#: There were two copies and a third was about to appear; rule sets that drift
+#: produce two deployments that disagree about what an incident is.
+_rules = default_rules
 
 
 # --------------------------------------------------------------------- run
@@ -542,6 +526,77 @@ def _bytes(count: int) -> str:
     return f"{count} bytes"
 
 
+def _node(args: argparse.Namespace) -> int:
+    """Run cameras unattended until stopped.
+
+    The difference from `run` is not the analysis — it is the same pipeline —
+    but the shape. `run` processes what it is given to completion and exits, so
+    a replay is reproducible. `node` keeps cameras going, correlates across all
+    of them on a cadence, and is what a machine with no display in a cupboard
+    actually does.
+    """
+    zones = list(args.zone or [])
+
+    if args.place and len(args.place) not in (1, len(args.source)):
+        print(
+            f"error: {len(args.place)} --place for {len(args.source)} source(s). "
+            "Give one, applied to every source, or one per source.",
+            file=sys.stderr,
+        )
+        return 2
+    if args.id and len(args.id) != len(args.source):
+        print("error: --id must be given once per source, or not at all",
+              file=sys.stderr)
+        return 2
+    if args.for_seconds is not None and args.for_seconds <= 0:
+        print("error: --for must be greater than zero", file=sys.stderr)
+        return 2
+
+    record_to = None
+    if args.record is not None:
+        record_to = Path(args.record) if args.record else paths.recordings_directory()
+        record_to.mkdir(parents=True, exist_ok=True)
+
+    node = Node(
+        args.database or default_database_path(),
+        node_id=args.node,
+        zones=zones,
+        record_to=record_to,
+        segment_seconds=args.segment_seconds,
+        detector_factory=lambda: MotionDetector(detect_scale=args.detect_scale),
+    )
+
+    try:
+        for index, source in enumerate(args.source):
+            pose = None
+            if args.place:
+                pose = args.place[index] if len(args.place) > 1 else args.place[0]
+            node.add_camera(
+                source,
+                camera_id=args.id[index] if args.id else None,
+                pose=pose,
+            )
+
+        deadline = time.monotonic() + args.for_seconds if args.for_seconds else None
+        print(f"node {args.node}: {len(node.cameras)} camera(s), "
+              f"{len(node.zones)} zone(s), {len(node.rules)} rule(s)")
+        if deadline is None:
+            # On Windows an external SIGINT does not reach a Python process at
+            # all — measured — so a scheduled job or a container needs --for.
+            print("Running until every camera ends or you press Ctrl-C. "
+                  "For a scheduled job use --for SECONDS.", file=sys.stderr)
+
+        node.run_forever(
+            until=(lambda _: time.monotonic() >= deadline) if deadline else None
+        )
+
+        print()
+        print(node.summary())
+        return 0
+    finally:
+        node.close()
+
+
 def _retention(args: argparse.Namespace) -> int:
     """Report or apply the recording retention policy.
 
@@ -662,6 +717,7 @@ def build_parser() -> argparse.ArgumentParser:
             "      --place 33.8942,35.5018,6,0,-22 \\\n"
             "      --zone 'Yard:33.8940,35.5016;33.8940,35.5020;"
             "33.8936,35.5020;33.8936,35.5016'\n"
+            "  sentinel node gate.mp4 north.mp4 --record --for 3600\n"
             "  sentinel devices --probe\n"
             "  sentinel run device:0 --place 33.8938,35.5018,3,90,-15\n"
             "  sentinel incidents\n"
@@ -783,6 +839,28 @@ def build_parser() -> argparse.ArgumentParser:
     coverage.add_argument("--zone-radius", type=float, default=12.0, metavar="METRES")
     coverage.add_argument("--zone-name", default="Restricted Area A")
     coverage.set_defaults(handler=_coverage)
+
+    node = commands.add_parser(
+        "node", help="run cameras unattended, with no display — what a worker runs"
+    )
+    node.add_argument("source", nargs="+", help="video files, rtsp:// URLs, or device:N")
+    node.add_argument("--id", action="append", default=None,
+                      help="camera id, once per source")
+    node.add_argument("--place", action="append", type=_pose, default=None,
+                      help="lat,lon,height,heading,pitch[,hfov,vfov,range]")
+    node.add_argument("--zone", action="append", type=_zone, default=None,
+                      help="name:lat,lon;lat,lon;lat,lon")
+    node.add_argument("--record", metavar="DIR", nargs="?", const="", default=None,
+                      help="record video to DIR, or to the data directory")
+    node.add_argument("--segment-seconds", type=float, default=60.0)
+    node.add_argument("--detect-scale", type=float, default=0.75)
+    node.add_argument("--node", default="local", help="this node's id")
+    node.add_argument(
+        "--for", dest="for_seconds", type=float, default=None, metavar="SECONDS",
+        help="stop after this long. A camera has no end, and Ctrl-C is not "
+             "available to a scheduled job or a container",
+    )
+    node.set_defaults(handler=_node)
 
     retention = commands.add_parser(
         "retention", help="delete recorded video the policy no longer covers"

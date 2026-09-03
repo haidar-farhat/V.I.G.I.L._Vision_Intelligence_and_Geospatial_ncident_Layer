@@ -157,14 +157,18 @@ geometry.
       scheduled retention, and true decode/analytic independence — the last is
       1.2's job, and the recorder is already shaped for it (fed before analysis,
       behind a bounded queue).
-- [ ] **1.2 · A headless engine daemon.** Today the console *is* the
-      application: `ConsoleWindow` owns the store, the rules, the sessions and
-      the correlation loop in 963 lines. That is fine for a demo and wrong for a
-      deployment — analysis must run unattended, and the console must be a client
-      of it. This is the structural item that gates most of Tier 2.
-      *Done when:* `python -m sentinel.node` runs cameras, raises incidents and
-      writes evidence with no Qt import anywhere in the process, and the console
-      attaches to it.
+- [~] **1.2 · A headless engine daemon.** **The engine half is done,
+      2026-09-03.** `sentinel node` runs cameras unattended, correlates across
+      all of them on a cadence, records, persists and audits, with **no Qt
+      import anywhere in the process** — asserted by two tests that import the
+      node, and then every engine module, in a subprocess and fail if `PySide`
+      appears in `sys.modules`.
+      *Still open:* the console does not yet attach to it. `ConsoleWindow`
+      keeps its own `Store`, its own correlation loop and its own `QThread`
+      worker, so the analysis loop now exists twice and can drift. That is the
+      next slice, and it is a deletion rather than an addition — the mapping is
+      written down, seam by seam, and the console shrinks to widgets plus a
+      33 ms repaint that calls `node.poll()`.
 - [ ] **1.3 · Appearance-based association.** The tracker reports 4 objects for
       3 people and switches identity 7 times in 388 observations, because
       position and box geometry are all it has. A small appearance descriptor —
