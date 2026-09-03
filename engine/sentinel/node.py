@@ -44,6 +44,13 @@ from typing import Iterator, Sequence
 from .core import CameraPose
 from .decode import DecodeError, VideoSource
 from .detect import Detector, DetectorInfo, MotionDetector
+from .decode import REDACTED
+from .evidence import (
+    DEFAULT_LEAD_SECONDS,
+    DEFAULT_TRAIL_SECONDS,
+    coverage_for,
+    export_incident,
+)
 from .events import Event, Rule, default_rules
 from .incidents import Correlator, Incident
 from .logs import get as _get_logger
@@ -421,6 +428,7 @@ class Node:
         segment_seconds: float = 60.0,
         keep_images: bool = False,
         realtime: bool = False,
+        restore_cameras: bool = True,
         correlate_every_millis: int = DEFAULT_CORRELATE_MILLIS,
         event_retention: int = 5000,
         actor: str = ACTOR,
@@ -434,6 +442,16 @@ class Node:
         ``rules`` defaults to :func:`~sentinel.events.default_rules` over the
         zones given, so a node configured with no rules still does something
         sensible rather than nothing silently.
+
+        ``zones`` left empty means *load whatever this node already had*, not
+        *watch nothing* — a restarted node must come back watching what it was
+        watching. Passing zones explicitly replaces that.
+
+        ``restore_cameras`` brings back the cameras and, crucially, their poses.
+        Placements were written to the database and never read, so a console
+        restart silently lost every one of them while zones survived: the
+        cameras came back, unplaced, and reported objects as *not placed* with
+        no indication that anything had been forgotten.
         """
         self.store = Store(database if database is not None else default_database_path())
         self._node_id = node_id
@@ -452,14 +470,27 @@ class Node:
         self._actor = actor
 
         self._cameras: dict[str, CameraRecord] = {}
+        self._restored_cameras = 0
         self._incidents: tuple[Incident, ...] = ()
         self._persisted: set[str] = set()
         self._last_correlated = 0.0
         self._running = False
         self._stop = threading.Event()
 
-        for zone in self._zones:
-            self.store.save_zone(zone)
+        if zones:
+            for zone in self._zones:
+                self.store.save_zone(zone)
+        else:
+            # Nothing was passed, so take what this node already had. A daemon
+            # restarted at 03:00 must come back watching the same zones it was
+            # watching at 02:59, and asking the caller to re-supply them makes
+            # every caller responsible for remembering.
+            self._zones = list(self.store.zones())
+            if self._zones:
+                self._rules = default_rules(self._zones)
+
+        if restore_cameras:
+            self._restore_cameras()
 
         self.store.audit(self._actor, "node.started", node_id)
         _log.info(
@@ -499,6 +530,46 @@ class Node:
             return self._cameras[camera_id]
         except KeyError:
             raise NodeError(f"no camera {camera_id!r} on this node") from None
+
+    def _restore_cameras(self) -> None:
+        """Bring back the cameras this node had, with their placements."""
+        for row in self.store.cameras():
+            camera_id = row["id"]
+            if camera_id in self._cameras:
+                continue
+            # `source` is the *redacted* form — the raw one, credential and all,
+            # was never persisted and must not be. A network camera therefore
+            # comes back needing its password again, and says so rather than
+            # failing at connect time with something unhelpful.
+            self._cameras[camera_id] = CameraRecord(
+                camera_id=camera_id,
+                source=row["source"],
+                pose=self.store.camera_pose(camera_id),
+            )
+            self._restored_cameras += 1
+
+        if self._restored_cameras:
+            placed = sum(1 for r in self._cameras.values() if r.pose is not None)
+            _log.info(
+                "node %s: restored %d camera(s), %d placed",
+                self._node_id, self._restored_cameras, placed,
+            )
+
+    @property
+    def restored_cameras(self) -> int:
+        """How many cameras came back from the database rather than being added."""
+        return self._restored_cameras
+
+    def needs_credentials(self, camera_id: str) -> bool:
+        """Whether this camera cannot be started without its password again.
+
+        A restored network camera carries the redacted source, because the real
+        one was never stored — that is the point of the credential rule. It has
+        to be re-entered, and an interface should say so *before* the operator
+        presses Start rather than after the connection fails.
+        """
+        record = self.camera(camera_id)
+        return REDACTED in record.source
 
     # ---------------------------------------------------------------- cameras
 
@@ -782,6 +853,48 @@ class Node:
         finally:
             self.stop()
             self.poll(force_correlate=True)
+
+    def export_incident(
+        self, incident_id: str, destination: str | Path,
+        *, lead_seconds: float = DEFAULT_LEAD_SECONDS,
+        trail_seconds: float = DEFAULT_TRAIL_SECONDS,
+    ):
+        """Write an evidence package, with the footage that shows it.
+
+        One implementation for every caller. The console's own export had
+        neither half — no `footage=`, no `preserve_segments` — so a package
+        produced from the interface contained no video, and the clips it was
+        built from stayed deletable by the next retention pass.
+
+        Preservation happens before the copy and stands even if the copy then
+        fails. Over-preserving costs disk; under-preserving destroys evidence.
+        """
+        incident = next(
+            (found for found in self._incidents if found.id == incident_id), None
+        ) or self.store.incident(incident_id)
+        if incident is None:
+            raise NodeError(f"no incident {incident_id!r}")
+
+        coverage = coverage_for(
+            self.store, incident,
+            lead_seconds=lead_seconds, trail_seconds=trail_seconds,
+        )
+
+        clips = [segment.path for cover in coverage for segment in cover.segments]
+        if clips:
+            preserved = self.store.preserve_segments(clips)
+            self.store.audit(
+                self._actor, "recording.preserved", incident.id,
+                f"{preserved} segment(s) held as evidence and exempted from retention",
+            )
+
+        export = export_incident(
+            incident, Path(destination), exported_by=self._actor, footage=coverage
+        )
+        self.store.audit(
+            self._actor, "incident.exported", incident.id, str(export.directory)
+        )
+        return export, coverage
 
     def summary(self) -> str:
         """What happened, for a person to read."""

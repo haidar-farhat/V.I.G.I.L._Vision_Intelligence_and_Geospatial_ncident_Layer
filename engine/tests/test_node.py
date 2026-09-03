@@ -484,3 +484,133 @@ def test_the_node_audits_as_itself(tmp_path: Path, reference_video: Path):
         actors = {row["actor"] for row in store.audit_trail(limit=500)}
 
     assert actors == {ACTOR}
+
+
+# ------------------------------------------------------------- remembering
+
+
+def test_a_restarted_node_comes_back_watching_the_same_zones(
+    tmp_path: Path, yard: Zone
+):
+    # A daemon restarted at 03:00 must come back watching what it was watching
+    # at 02:59. Asking the caller to re-supply the zones makes every caller
+    # responsible for remembering, and one of them will forget.
+    with Node(tmp_path / "n.db", zones=[yard]) as node:
+        assert len(node.zones) == 1
+
+    with Node(tmp_path / "n.db") as restarted:
+        assert [zone.id for zone in restarted.zones] == ["yard"]
+        # And the rule set that goes with having a zone, not the one for none.
+        assert any("zone" in type(rule).__name__.lower() for rule in restarted.rules)
+
+
+def test_a_restarted_node_remembers_where_its_cameras_are(
+    tmp_path: Path, site: CameraPose
+):
+    # Placements were written to the database and never read back, so a restart
+    # lost every one of them while zones survived — the cameras returned
+    # unplaced, and reported objects as "not placed" with nothing saying that
+    # anything had been forgotten.
+    with Node(tmp_path / "n.db") as node:
+        node.add_camera("gate.mp4", camera_id="gate", pose=site)
+        node.add_camera("yard.mp4", camera_id="yard")
+
+    with Node(tmp_path / "n.db") as restarted:
+        assert restarted.restored_cameras == 2
+        assert {record.camera_id for record in restarted.cameras} == {"gate", "yard"}
+
+        gate = restarted.camera("gate")
+        assert gate.pose is not None
+        assert gate.pose.position.lat == pytest.approx(site.position.lat)
+        assert gate.pose.heading == pytest.approx(site.heading)
+        assert gate.pose.pitch == pytest.approx(site.pitch)
+        # An unplaced camera stays unplaced. There is deliberately no default.
+        assert restarted.camera("yard").pose is None
+
+
+def test_a_restored_network_camera_says_it_needs_its_password_again(tmp_path: Path):
+    # The raw URL was never persisted — that is the whole point of the
+    # credential rule — so a restored network camera cannot connect. An
+    # interface should be able to say so *before* the operator presses Start,
+    # rather than after the connection fails with something unhelpful.
+    secret = "hunter2-not-a-real-password"
+    with Node(tmp_path / "n.db") as node:
+        node.add_camera(
+            f"rtsp://admin:{secret}@10.20.30.40:554/s", camera_id="net"
+        )
+        node.add_camera("gate.mp4", camera_id="file")
+
+    with Node(tmp_path / "n.db") as restarted:
+        assert restarted.needs_credentials("net") is True
+        assert restarted.needs_credentials("file") is False
+        assert secret not in restarted.camera("net").source
+
+
+def test_explicit_zones_replace_what_was_stored(tmp_path: Path, yard: Zone):
+    # Loading is the default, not the law. A caller that names its zones means it.
+    other = Zone(
+        id="dock", name="Dock", kind=ZoneKind.RESTRICTED,
+        ring=yard.ring, enter_after_millis=600,
+    )
+    with Node(tmp_path / "n.db", zones=[yard]):
+        pass
+
+    with Node(tmp_path / "n.db", zones=[other]) as node:
+        assert [zone.id for zone in node.zones] == ["dock"]
+
+
+# ------------------------------------------------------- export, with footage
+
+
+def test_the_node_exports_an_incident_with_its_footage(
+    tmp_path: Path, reference_video: Path, yard: Zone, site: CameraPose
+):
+    # The console's own export had neither half — no footage, no preservation —
+    # so a package produced from the interface contained no video and the clips
+    # it was built from stayed deletable by the next retention pass. One
+    # implementation now, for every caller.
+    with Node(
+        tmp_path / "n.db", zones=[yard],
+        record_to=tmp_path / "rec", segment_seconds=2.0,
+    ) as node:
+        node.add_camera(reference_video, camera_id="gate", pose=site)
+        node.run_forever()
+
+        assert node.incidents
+        export, coverage = node.export_incident(
+            node.incidents[0].id, tmp_path / "out"
+        )
+
+        clips = sorted(export.directory.glob("*.mp4"))
+        assert clips, "the package has no video in it"
+        assert (export.directory / "footage.json").is_file()
+        assert coverage and coverage[0].camera_id == "gate"
+
+        # And the originals are now protected from retention.
+        assert node.store.recorded_bytes(preserved=True) > 0
+        actions = [row["action"] for row in node.store.audit_trail(limit=500)]
+        assert "recording.preserved" in actions
+        assert "incident.exported" in actions
+
+
+def test_exporting_an_unknown_incident_says_so(tmp_path: Path):
+    with Node(tmp_path / "n.db") as node:
+        with pytest.raises(NodeError, match="no incident"):
+            node.export_incident("inc_nothing", tmp_path / "out")
+
+
+def test_an_incident_can_be_exported_long_after_the_run(
+    tmp_path: Path, reference_video: Path, yard: Zone, site: CameraPose
+):
+    # An evidence package is a thing you produce when somebody asks, not a thing
+    # you must remember to produce at the time.
+    with Node(tmp_path / "n.db", zones=[yard]) as node:
+        node.add_camera(reference_video, camera_id="gate", pose=site)
+        node.run_forever()
+        incident_id = node.incidents[0].id
+
+    with Node(tmp_path / "n.db") as later:
+        export, _ = later.export_incident(incident_id, tmp_path / "out")
+
+    assert (export.directory / "incident.json").is_file()
+    assert (export.directory / "report.txt").is_file()
