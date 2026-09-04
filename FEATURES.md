@@ -33,20 +33,20 @@ Related: [STATUS.md](STATUS.md) — measurements and honest gaps ·
 
 ## The scoreboard
 
-468 capabilities, each with a state. Many lines cover several related things —
+469 capabilities, each with a state. Many lines cover several related things —
 "heading · pitch · roll" is one row — so this counts *claims*, not code.
 
 | | Count | Share | What it means |
 |---|---:|---:|---|
-| **`TESTED`** | 187 | 40% | A test fails if it stops working |
+| **`TESTED`** | 188 | 40% | A test fails if it stops working |
 | **`IMPL`** | 23 | 5% | Works; a regression would go unnoticed |
 | **`SKEL`** | 32 | 7% | Something is there; it does not do the job |
 | **`PLAN`** | 226 | 48% | Designed, no code |
 
 ```mermaid
 pie showData
-    title Sentinel Vision — 468 capabilities by state
-    "TESTED" : 187
+    title Sentinel Vision — 469 capabilities by state
+    "TESTED" : 188
     "IMPLEMENTED" : 23
     "SKELETON" : 32
     "PLANNED" : 226
@@ -171,7 +171,7 @@ the engine already computes.
 | Bitrate monitoring | `PLAN` | |
 | Dropped-frame monitoring | `TESTED` | Counted, because a system silently discarding half its input is worse than one that says so |
 | Decode-error monitoring | `IMPL` | Every failure is logged with its type |
-| Reconnection monitoring | `TESTED` | Counted, with bounded backoff, and now reported in the run summary — a camera that lost half its input no longer prints the same line as one that lost none |
+| Reconnection monitoring | `TESTED` | Counted, with bounded backoff, and reported in the run summary — a camera that lost half its input no longer prints the same line as one that lost none. **And a starved live run fails**: a run that got no frame, or under one analysed frame a second after five seconds, prints `STARVED … is another program using the camera?` beside its summary and exits 1. Measured: two `sentinel run device:0` processes at once through the packaged binary — the second reconnected once, analysed one frame in ten seconds, printed a summary and exited 0, which to a scheduled job was a run that worked |
 | Stream-profile selection · main/sub-stream | `PLAN` | |
 | Codec detection | `PLAN` | |
 | Connection testing | `TESTED` | Socket probe before the decoder — OpenCV's own 30 s timeout cannot be changed |
@@ -226,7 +226,7 @@ two identical webcams are indistinguishable by name.
 | Animal · bag · package · smoke · fire detection | `PLAN` | |
 | Custom detection classes | `TESTED` | Class names are read from the model's own metadata; a model that carries none reports no labels rather than inventing them |
 | Instance segmentation | `TESTED` | Per-object masks from a two-output model. The ground-contact point comes from the mask's own lowest row — not the bottom edge of a rectangle, which is what the whole position layer used to rest on |
-| Mask-derived contact drives the map position | `TESTED` | The point crosses the Rust boundary (ABI 6) and is what the projection uses; a box-only detector sends its bottom-centre and gets exactly the answer it always did. Until this row existed the contact was computed in Python and **used by nothing** — the fifth instance of correct, tested code that nothing called |
+| Mask-derived contact drives the map position | `TESTED` | The point crosses the Rust boundary (ABI 6) and is what the projection uses; a box-only detector sends its bottom-centre and gets exactly the answer it always did. **And the frame's edge is respected**: a box whose lower side sits on the bottom of the frame is one the frame truncated — the feet are below the picture — and its contact is the frame's lowest row, not the object's. Measured on the laptop camera: a person seated half a metre from the lens had every contact between rows 0.989 and 1.0 and was projected to 2.16 m ± 0.13 m, inside a zone that began at 2 m, and 'entered' it without leaving their chair. Such a position is now a bound tagged `FRAME_EDGE` — the middle of the stretch between the camera and the edge's ground point, with a radius reaching both ends — so a zone that begins inside the stretch sees an uncertain membership rather than a confident one, and the console says 'feet below the frame — between the camera and 2.2 m' |
 | Conclusions never squeezed out of sight | `TESTED` | On a short window the video shrinks, not the incident and track panels. A live screenshot had shown "2 tracked now" above a table reduced to its header row |
 | Contact point drawn in the console | `TESTED` | A dot in the track's colour where the position was projected from — on the feet with a mask, at the box's bottom-centre without. Checked as pixels, not as a call |
 | Segmentation masks drawn in the console | `TESTED` | The silhouette, at low alpha, instead of a box. An overlay that hides the pixels it describes makes the frame useless as evidence |
@@ -268,6 +268,7 @@ two identical webcams are indistinguishable by name.
 | Track position samples persisted at 1 Hz for replay and heatmaps | `PLAN` | Migration: `track_samples (camera_id, track_id, at_millis, lat, lon, uncertainty_m, class_label)` written by the node from `poll()` at most once per second per track — about 100 bytes × tracks × 86,400 per camera per day, stated in the docs as a budget. Retention by age, except that samples inside a preserved incident window are preserved like segments and never deleted, and the evidence package includes them as `tracks.jsonl`. Turns 'trails are context, not a recording' into replayable trails and a heatmap of movement rather than of alerts. |
 | Track fragmentation, measured | `TESTED` | `tools/measure_fragmentation.py` runs the reference scene and reports tracks per true object from the scene's own ground truth, and optionally a live camera. Measured: 4 tracks for 3 walkers (1.33 — identity swaps at the crossing, not temporal splits), and 7 tracks for one person over 15 s on the laptop camera with the segmenter. This is the number appearance re-ID has to beat, and until it existed every figure quoted for it was incidental |
 | Post-hoc fragment linking by appearance, gap and position | `TESTED` | `sentinel.reid` — masked HSV descriptor, EMA per track, `link_fragments` joining only when gap, distance and appearance agree. **Now used**: `Correlator.correlate` joins consecutive same-camera fragments into one object (stricter — shorter gap, closer position — when no appearance travels on the evidence, so time and place alone never merge two people passing one spot), records each join as an Association with its reasons, and counts distinct objects from the merged groups. One person split into three fragments is one object and one 'group' risk factor. It reconciles the count after the fact; carrying appearance into the Rust tracker (ABI 7) is what would stop the splits |
+| Run summary names every track and calls them tracks | `TESTED` | `track 1   person   observed in 344 frames, spanning 19.2s` — each track line carries the detector's label (`unclassified` from a motion detector, never a guess), and the count reads `distinct tracks … (ids issued; one object can hold several)` rather than 'distinct objects'. A 60 s run on the laptop camera analysed 970 frames, issued 12 ids and raised nothing, and the old summary could not say whether a person-only zone had ignored a person or the camera had never seen one |
 
 ## 🧑 People: named identity, opt-in
 
@@ -428,7 +429,7 @@ claim on someone than their face.
 | Zone duration rules | `TESTED` | |
 | Zone confidence thresholds | `PLAN` | |
 | Zone cooldowns | `TESTED` | |
-| Enter · exit · dwell detection | `TESTED` | Hysteresis on both edges; exit slower than entry |
+| Enter · exit · dwell detection | `TESTED` | Hysteresis on both edges; exit slower than entry so a detector blink is not a departure. **A stay now survives a track split**: when a young track of the same class appears within a plausible walk of where a stay's own track went quiet (no detection supporting it this frame, within three seconds of its last), it inherits the stay — no second ENTERED, the dwell timer continues, and the superseded id cannot reopen what it passed on. Two tracks both supported in one frame are two objects, however close; an established track walking in is its own stay. Measured before: three objects over 30 s became 7, 13 and 3 tracks on the laptop camera, and every split inside a zone was a fresh ENTERED after the entry delay |
 | Direction violations | `PLAN` | |
 | Zone validation against what the cameras can actually adjudicate | `TESTED` | `coverage.zone_report` gives covered / confident fractions, the cameras that see it, best and worst 1σ and the area; `zones.zone_warnings` turns those into an ordered list: nothing can see it, most of it beyond confident range, same-kind overlap with its area, silenced by an exclusion, a schedule covering no time, under a square metre. Warnings, never refusals — the operator may be about to place the camera that fixes it. Shown live in the map band while drawing, as a Covered column with a warning glyph in the zone list, and in the properties panel |
 | Versioned zone geometry — an edit creates a new version, never overwrites the ring | `PLAN` | Migration v4: `zone_versions (zone_id, version, ring, kind, name, schedule, enter/exit millis, accept_uncertain, valid_from, superseded_at, actor, sha256)` written on every save; `zones` becomes the current version; remove marks `superseded_at` instead of deleting; `Zone` gains `version` defaulted so every existing constructor call still works; `events.zone_version` is nullable so v3 rows read back. The migration round-trips up and down on a populated database. This is what lets the reshape that already ships stay honest: last month's alarm keeps pointing at the ring it was measured against. |
@@ -446,7 +447,7 @@ claim on someone than their face.
 
 | Capability | State | Note |
 |---|---|---|
-| Loitering detection | `TESTED` | |
+| Loitering detection | `TESTED` | Fires once per *stay*, keyed on the stay's identity rather than the track id carrying it — so a loiterer whose track splits is reported once, and a loiterer whose track split every few seconds (timer back at zero each time) is reported at all. One seated person on the laptop camera: one ZONE_ENTRY at 1 s, one LOITERING at 8 s, nothing else in 20 s |
 | Restricted-area entry | `TESTED` | |
 | After-hours entry | `TESTED` | |
 | Rapid movement | `TESTED` | Silent when the position is not confident enough to support the speed |

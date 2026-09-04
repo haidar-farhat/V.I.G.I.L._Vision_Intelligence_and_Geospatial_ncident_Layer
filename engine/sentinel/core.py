@@ -251,7 +251,10 @@ class PositionEstimate:
 
     point: LatLon
     radius_meters: float
-    #: "GROUND_PROJECTION" or "CAMERA_FALLBACK".
+    #: "GROUND_PROJECTION" (the contact, projected), "FRAME_EDGE" (the frame
+    #: cut the contact off — the object is somewhere between the camera and
+    #: the point the edge projects to; see `FRAME_EDGE_TOLERANCE`) or
+    #: "CAMERA_FALLBACK" (the projection failed; this is the camera).
     source: str
 
 
@@ -707,6 +710,15 @@ def destination_point(origin: LatLon, bearing_deg: float, distance_meters: float
 
 _MAX_TRACKS = 256
 
+#: How close to the frame's bottom edge a box's lower side may sit before its
+#: contact is taken as cut off by the frame rather than measured. Two per cent
+#: of the frame height — about ten rows at 480p — because a detector rarely
+#: lands a truncated box on exactly the last row. Measured on the laptop
+#: camera: a person seated at the desk, half a metre from the lens with their
+#: feet below the picture, had every contact between rows 0.989 and 1.0 and
+#: was projected to 2.16 m ± 0.13 m, whatever their true distance.
+FRAME_EDGE_TOLERANCE = 0.02
+
 
 class Tracker:
     """A single camera's tracker, living in Rust.
@@ -716,7 +728,7 @@ class Tracker:
     long-running worker cycling cameras is a slow leak nobody notices.
     """
 
-    __slots__ = ("_handle", "_lib", "_track_buffer", "_ended_buffer", "_closed")
+    __slots__ = ("_handle", "_lib", "_track_buffer", "_ended_buffer", "_closed", "_pose")
 
     def __init__(
         self,
@@ -741,6 +753,9 @@ class Tracker:
         # Allocated once and reused: this is called per frame per camera.
         self._track_buffer = (CTrack * _MAX_TRACKS)()
         self._ended_buffer = (ctypes.c_uint64 * _MAX_TRACKS)()
+        #: Kept so a position can be judged against the camera's own location:
+        #: see `_bounded_by_the_frame_edge`.
+        self._pose = pose
 
     def __enter__(self) -> "Tracker":
         return self
@@ -767,6 +782,7 @@ class Tracker:
         self._check()
         c_pose = ctypes.byref(pose.to_c()) if pose is not None else None
         self._lib.sentinel_tracker_set_pose(self._handle, c_pose)
+        self._pose = pose
 
     def update(self, detections: Sequence[Detection], at_millis: int) -> list[Track]:
         """Feed one frame and receive the confirmed tracks."""
@@ -801,7 +817,7 @@ class Tracker:
         if written < 0:
             raise CoreError("could not read tracks")
 
-        return [_to_track(self._track_buffer[i]) for i in range(written)]
+        return [_to_track(self._track_buffer[i], self._pose) for i in range(written)]
 
     def ended(self) -> list[int]:
         """Track ids closed by the most recent update."""
@@ -820,7 +836,43 @@ class Tracker:
             raise CoreError("this tracker has been closed")
 
 
-def _to_track(c: CTrack) -> Track:
+def _bounded_by_the_frame_edge(
+    c: CTrack, position: PositionEstimate, pose: CameraPose
+) -> PositionEstimate:
+    """Widen a projection whose contact the frame cut off.
+
+    A box whose lower side sits on the bottom edge of the frame is a box the
+    frame truncated: the feet are below the picture, and the lowest visible row
+    is the frame's, not the object's. Projecting that row gives the nearest
+    ground the camera sees — the same distance for everybody it happens to,
+    with the small uncertainty of a nearby point. The laptop camera showed it:
+    a person seated half a metre from the lens was placed at 2.16 m ± 0.13 m,
+    inside a zone that began at 2 m, and "entered" it without leaving their
+    chair.
+
+    What the geometry supports is a bound: the object is somewhere between the
+    camera and that point. So the estimate becomes the middle of that stretch
+    with a radius reaching both ends, tagged ``FRAME_EDGE``, and a zone that
+    begins inside the stretch sees an uncertain membership rather than a
+    confident one. The core is not changed — it reports what it measured — and
+    this is the one place the frame's edge is known to be the reason.
+    """
+    if position.source != "GROUND_PROJECTION":
+        return position
+    if c.y + c.h < 1.0 - FRAME_EDGE_TOLERANCE:
+        return position
+    far = haversine_distance(pose.position, position.point)
+    if far <= 0.0:
+        return position
+    bearing = bearing_degrees(pose.position, position.point)
+    return PositionEstimate(
+        point=destination_point(pose.position, bearing, far / 2.0),
+        radius_meters=far / 2.0 + position.radius_meters,
+        source="FRAME_EDGE",
+    )
+
+
+def _to_track(c: CTrack, pose: CameraPose | None = None) -> Track:
     position = (
         PositionEstimate(
             point=LatLon(c.lat, c.lon),
@@ -830,6 +882,8 @@ def _to_track(c: CTrack) -> Track:
         if c.has_position
         else None
     )
+    if position is not None and pose is not None:
+        position = _bounded_by_the_frame_edge(c, position, pose)
 
     return Track(
         id=int(c.id),

@@ -44,7 +44,20 @@ from datetime import datetime, time, timezone, tzinfo
 from enum import Enum
 from typing import Iterable, Sequence
 
-from .core import LatLon, Track, ZoneMembership, zone_membership
+from .core import LatLon, Track, ZoneMembership, haversine_distance, zone_membership
+
+#: How long after a stay's track was last supported by a detection a new id
+#: appearing nearby may inherit the stay, and how far away it may appear. The
+#: tracker gives a lost object two seconds before it issues a new id; the
+#: linker in `reid` allows five. Three, with two metres plus a plausible walk,
+#: covers a split without reaching the next person along. Measured before this
+#: existed: one seated person held one id for 19 s on the laptop camera, but
+#: three objects over 30 s became 7, 13 and 3 tracks — and every split inside a
+#: zone was a fresh ENTERED after the entry delay, with a loiter timer back at
+#: nothing.
+HANDOFF_GAP_MILLIS = 3000
+HANDOFF_BASE_METERS = 2.0
+HANDOFF_SPEED_MPS = 4.0
 
 
 class ZoneKind(str, Enum):
@@ -374,6 +387,23 @@ class Presence:
     uncertain_observations: int = 0
     #: Set when the presence closes.
     ended_millis: int | None = None
+    #: What the track was, and where and when it was last supported by a
+    #: detection — enough for a new id appearing where this one went quiet to
+    #: be recognised as the same stay. See `ZoneEvaluator._adopt`.
+    class_id: int | None = None
+    last_point: LatLon | None = None
+    last_supported_millis: int | None = None
+    #: The id of the track that opened this stay. Stable across a hand-off,
+    #: so a rule that fires once per stay has something to key on.
+    origin_track_id: int | None = None
+    #: How many track ids this stay has been carried across. Zero for most.
+    handoffs: int = 0
+
+    @property
+    def identity(self) -> tuple[str, int, int]:
+        """What makes this stay this stay, whichever track id carries it now."""
+        origin = self.origin_track_id if self.origin_track_id is not None else self.track_id
+        return (self.zone_id, origin, self.started_millis)
 
     @property
     def duration_millis(self) -> int:
@@ -410,7 +440,7 @@ class ZoneEvaluator:
     observation. Feed it every frame's tracks; it reports only the transitions.
     """
 
-    __slots__ = ("_zones", "_open", "_last_seen", "_site_tz")
+    __slots__ = ("_zones", "_open", "_last_seen", "_site_tz", "_hits", "_superseded")
 
     def __init__(self, zones: Iterable[Zone], *, site_tz: tzinfo | None = None):
         """
@@ -424,6 +454,15 @@ class ZoneEvaluator:
         #: (zone_id, track_id) -> Presence
         self._open: dict[tuple[str, int], Presence] = {}
         self._last_seen: dict[tuple[str, int], int] = {}
+        #: Each live track's hit count last frame. A track whose count rose is
+        #: supported by a detection this frame; one whose count did not is
+        #: coasting on prediction. `last_seen_millis` cannot tell the two
+        #: apart — the tracker advances it while coasting too.
+        self._hits: dict[int, int] = {}
+        #: Track ids whose stay was handed to a newer id, and when. A coasting
+        #: box the tracker has not yet given up on must not reopen the stay it
+        #: just passed on; lifted the moment a detection supports it again.
+        self._superseded: dict[int, int] = {}
 
     @property
     def zones(self) -> tuple[Zone, ...]:
@@ -441,6 +480,17 @@ class ZoneEvaluator:
             when = when.astimezone(self._site_tz)
         changes: list[PresenceChange] = []
         live = {track.id for track in tracks}
+        supported = {
+            track.id for track in tracks if track.hits > self._hits.get(track.id, 0)
+        }
+        self._hits = {track.id: track.hits for track in tracks}
+        # A superseded id the tracker has dropped needs no guard; one a
+        # detection supports again is a track in its own right once more.
+        self._superseded = {
+            id: since
+            for id, since in self._superseded.items()
+            if id in live and id not in supported
+        }
 
         for zone in self._zones.values():
             if not zone.is_active(when):
@@ -451,12 +501,18 @@ class ZoneEvaluator:
                 continue
 
             for track in tracks:
+                if track.id in self._superseded:
+                    continue
                 key = (zone.id, track.id)
                 membership = zone.membership_of(track)
 
                 if zone.accepts(membership):
+                    if key not in self._open:
+                        self._adopt(zone, track, supported, at_millis)
                     self._last_seen[key] = at_millis
-                    change = self._observe(zone, track, membership, at_millis)
+                    change = self._observe(
+                        zone, track, membership, at_millis, supported=track.id in supported
+                    )
                     if change is not None:
                         changes.append(change)
 
@@ -464,8 +520,66 @@ class ZoneEvaluator:
 
         return changes
 
+    def _adopt(
+        self, zone: Zone, track: Track, supported: set[int], at_millis: int
+    ) -> Presence | None:
+        """Hand a stay whose track went quiet to a track that just appeared there.
+
+        The tracker splits: a detection fails to associate with its own
+        track's prediction, a new id is issued, and the old one coasts and
+        dies. Keyed by track id, that was a new stay — a second ENTERED after
+        the entry delay for a person who had not moved, and a loiter timer
+        back at zero, so a loiterer whose track split every few seconds was
+        never reported at all.
+
+        A stay is handed on only when everything a split looks like holds at
+        once: the new track is young, the stay's own track has no detection
+        supporting it this frame, the gap since it last had one is short, the
+        classes agree, and the new track is within a plausible walk of where
+        the stay was last seen. Any of these failing is two objects, and two
+        objects are two stays.
+        """
+        if track.position is None:
+            return None
+        if at_millis - track.first_seen_millis > HANDOFF_GAP_MILLIS:
+            return None
+
+        best: tuple[float, tuple[str, int], Presence] | None = None
+        for key, presence in self._open.items():
+            if key[0] != zone.id or presence.track_id in supported:
+                continue
+            if presence.class_id is not None and presence.class_id != track.class_id:
+                continue
+            if presence.last_point is None or presence.last_supported_millis is None:
+                continue
+            gap = at_millis - presence.last_supported_millis
+            if gap < 0 or gap > HANDOFF_GAP_MILLIS:
+                continue
+            separation = haversine_distance(presence.last_point, track.position.point)
+            if separation > HANDOFF_BASE_METERS + HANDOFF_SPEED_MPS * gap / 1000.0:
+                continue
+            if best is None or separation < best[0]:
+                best = (separation, key, presence)
+
+        if best is None:
+            return None
+        _, old_key, presence = best
+        del self._open[old_key]
+        self._last_seen.pop(old_key, None)
+        self._superseded[presence.track_id] = at_millis
+        presence.track_id = track.id
+        presence.handoffs += 1
+        self._open[(zone.id, track.id)] = presence
+        return presence
+
     def _observe(
-        self, zone: Zone, track: Track, membership: ZoneMembership, at_millis: int
+        self,
+        zone: Zone,
+        track: Track,
+        membership: ZoneMembership,
+        at_millis: int,
+        *,
+        supported: bool = True,
     ) -> PresenceChange | None:
         key = (zone.id, track.id)
         presence = self._open.get(key)
@@ -476,11 +590,17 @@ class ZoneEvaluator:
                 track_id=track.id,
                 started_millis=at_millis,
                 last_present_millis=at_millis,
+                class_id=track.class_id,
+                origin_track_id=track.id,
             )
             self._open[key] = presence
 
         presence.last_present_millis = at_millis
         presence.observations += 1
+        if track.position is not None:
+            presence.last_point = track.position.point
+        if supported:
+            presence.last_supported_millis = at_millis
         if membership is ZoneMembership.UNCERTAIN:
             presence.uncertain_observations += 1
 
@@ -502,10 +622,12 @@ class ZoneEvaluator:
             presence = self._open[key]
             gone_for = at_millis - self._last_seen.get(key, presence.last_present_millis)
 
-            # A track the tracker has dropped entirely cannot come back under the
-            # same id, so there is nothing to wait for.
-            track_gone = presence.track_id not in live
-            if gone_for < zone.exit_after_millis and not track_gone:
+            # A track the tracker has dropped cannot come back under the same
+            # id — but the object can come back under a new one, and for the
+            # exit delay the stay waits for that (`_adopt`). It used to close
+            # the moment the id died, which made every split a LEFT and an
+            # ENTERED for somebody who had not moved.
+            if gone_for < zone.exit_after_millis:
                 continue
 
             del self._open[key]

@@ -291,6 +291,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="seconds to watch the camera (default 20)")
     parser.add_argument("--objects", type=int, default=None,
                         help="how many objects were actually in front of the camera")
+    parser.add_argument("--reference", action="store_true",
+                        help="also run the synthetic reference scene (the default when no --device is given)")
     parser.add_argument("--model", type=Path, default=None,
                         help="an operator-supplied .onnx to detect with instead of motion")
     args = parser.parse_args(argv)
@@ -299,7 +301,11 @@ def main(argv: list[str] | None = None) -> int:
 
     logs.configure(level="WARNING", file="")
 
-    print(render(measure_reference()))
+    # The reference scene is the control, not the subject. With a camera named
+    # it is skipped unless asked for: a person told "use the camera, not the
+    # video" should not see the video's numbers first.
+    if args.device is None or args.reference:
+        print(render(measure_reference()))
 
     if args.device is not None:
         print()

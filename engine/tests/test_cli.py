@@ -420,7 +420,9 @@ def test_a_device_source_is_not_mistaken_for_a_missing_file(monkeypatch, databas
 
     monkeypatch.setattr(cli, "Pipeline", FakePipeline)
 
-    assert cli.main(["--database", str(database), "--quiet", "run", "device:0"]) == 0
+    # Opened and run — a missing-file refusal is 2 and opens nothing. The run
+    # then got no frame from a live source, which is a starved run: 1.
+    assert cli.main(["--database", str(database), "--quiet", "run", "device:0"]) == 1
     assert opened == ["cam-01"]
 
 
@@ -854,3 +856,42 @@ def test_a_negative_identifier_retention_is_refused(database: Path):
     assert cli.main([
         "--database", str(database), "--quiet", "retention", "--face-days", "-1",
     ]) == 2
+
+
+class _Source:
+    def __init__(self, live: bool):
+        self.is_live = live
+        self.display_url = "device:0"
+
+
+def test_a_live_run_that_got_no_frames_is_called_starved():
+    """Two processes on one camera: the second reconnected, analysed one frame in
+    ten seconds, printed its summary and exited 0 — a run that worked, to a
+    scheduled job. Measured through the packaged binary."""
+    assert cli._starvation(_Source(live=True), 0, 12.0) is not None
+    assert "another program" in cli._starvation(_Source(live=True), 1, 10.0)
+    # A healthy camera, a short bounded run, and a file are not starved.
+    assert cli._starvation(_Source(live=True), 150, 10.0) is None
+    assert cli._starvation(_Source(live=True), 1, 1.0) is None
+    assert cli._starvation(_Source(live=False), 0, 60.0) is None
+
+
+def test_a_starved_live_run_exits_non_zero_and_says_so(
+    reference_video: Path, database: Path, monkeypatch, capsys
+):
+    from sentinel import decode
+    from sentinel.pipeline import Pipeline
+
+    def nothing(self):
+        return iter(())
+
+    monkeypatch.setattr(Pipeline, "run", nothing)
+    monkeypatch.setattr(decode.VideoSource, "is_live", property(lambda self: True))
+
+    code = cli.main([
+        "--database", str(database), "--quiet",
+        "run", str(reference_video), "--frames", "3",
+    ])
+
+    assert code == 1
+    assert "STARVED" in capsys.readouterr().err

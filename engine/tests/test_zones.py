@@ -610,3 +610,122 @@ def test_the_filter_is_not_judged_when_the_detector_is_unknown():
 
     assert zone_warnings(people, FakeReport()) == ()
     assert zone_warnings(any_class, FakeReport(), labels=()) == ()
+
+
+def _supported(track_id: int, at: int, *, first: int, hits: int, class_id: int = 0, point=None) -> Track:
+    """A track as the tracker reports one that a detection confirmed at `at`."""
+    from dataclasses import replace
+
+    return replace(
+        make_track(track_id, point if point is not None else SITE, first=first, last=at, class_id=class_id),
+        hits=hits,
+    )
+
+
+def _coasting(track_id: int, at: int, *, first: int, hits: int) -> Track:
+    """The same track a frame later, held on prediction: the hit count did not rise."""
+    return _supported(track_id, at, first=first, hits=hits)
+
+
+def test_a_track_split_inside_a_zone_is_one_stay_not_two():
+    """Measured before this: 7, 13 and 3 tracks for three objects in 30 s.
+
+    Every split inside a zone was a fresh ENTERED after the entry delay for a
+    person who had not moved. When a new id appears where the old one went
+    quiet — young, same class, close, within the gap — it inherits the stay.
+    """
+    evaluator = ZoneEvaluator([zone(enter_after_millis=400, exit_after_millis=2000)])
+    entered = []
+    for step in range(6):
+        at = step * 200
+        entered += [c for c in evaluator.update([_supported(1, at, first=0, hits=step + 1)], at)
+                    if c.kind == "ENTERED"]
+    assert [c.presence.track_id for c in entered] == [1]
+
+    # The split: id 1 coasts (hits unchanged), id 2 is new and supported.
+    changes = evaluator.update(
+        [_coasting(1, 1200, first=0, hits=6), _supported(2, 1200, first=1100, hits=2)], 1200
+    )
+    assert changes == []
+    (stay,) = evaluator.open_presences()
+    assert stay.track_id == 2 and stay.origin_track_id == 1 and stay.handoffs == 1
+    assert stay.started_millis == 0
+
+    # Only id 2 from here on. No second ENTERED, no LEFT, one continuous stay.
+    for step in range(7, 16):
+        at = step * 200
+        changes = evaluator.update([_supported(2, at, first=1100, hits=step)], at)
+        assert changes == [], changes
+    (stay,) = evaluator.open_presences()
+    assert stay.duration_millis == 3000 and stay.identity == ("zone-a", 1, 0)
+
+
+def test_a_stay_is_not_handed_to_a_track_that_is_not_a_split():
+    """Every condition failing is two objects, and two objects are two stays."""
+    evaluator = ZoneEvaluator([zone(enter_after_millis=400, exit_after_millis=2000)])
+    for step in range(6):
+        at = step * 200
+        evaluator.update([_supported(1, at, first=0, hits=step + 1)], at)
+
+    # An established track walking in while id 1 coasts: not young, so its own.
+    changes = evaluator.update(
+        [_coasting(1, 1200, first=0, hits=6), _supported(9, 1200, first=-20_000, hits=40)], 1200
+    )
+    assert changes == []
+    assert {p.track_id for p in evaluator.open_presences()} == {1}
+    for step in range(7, 10):
+        at = step * 200
+        changes = evaluator.update(
+            [_coasting(1, at, first=0, hits=6), _supported(9, at, first=-20_000, hits=40 + step)], at
+        )
+    assert {p.track_id for p in evaluator.open_presences()} == {1, 9}
+
+    # A young track of another class where id 1 went quiet: not the same object.
+    other = ZoneEvaluator([zone(enter_after_millis=400, exit_after_millis=2000)])
+    for step in range(6):
+        at = step * 200
+        other.update([_supported(1, at, first=0, hits=step + 1)], at)
+    other.update([_coasting(1, 1200, first=0, hits=6), _supported(2, 1200, first=1100, hits=2, class_id=7)], 1200)
+    assert {(p.track_id, p.handoffs) for p in other.open_presences()} == {(1, 0)}
+
+    # Two tracks both supported this frame are two objects, however close.
+    both = ZoneEvaluator([zone(enter_after_millis=400, exit_after_millis=2000)])
+    for step in range(4):
+        at = step * 200
+        both.update([_supported(1, at, first=0, hits=step + 1), _supported(2, at, first=0, hits=step + 1)], at)
+    assert len(both.open_presences()) == 2
+
+
+def test_a_stay_survives_the_tracker_dropping_the_id_and_issuing_a_new_one():
+    """The id dies outright, and the object comes back under a new one."""
+    evaluator = ZoneEvaluator([zone(enter_after_millis=400, exit_after_millis=2000)])
+    for step in range(6):
+        at = step * 200
+        evaluator.update([_supported(1, at, first=0, hits=step + 1)], at)
+
+    # Gone for two frames: the stay waits the exit delay rather than closing.
+    assert evaluator.update([], 1200) == []
+    assert evaluator.update([], 1400) == []
+    assert len(evaluator.open_presences()) == 1
+
+    changes = evaluator.update([_supported(2, 1600, first=1500, hits=2)], 1600)
+    assert changes == []
+    (stay,) = evaluator.open_presences()
+    assert stay.track_id == 2 and stay.started_millis == 0 and stay.handoffs == 1
+
+
+def test_a_superseded_id_does_not_reopen_the_stay_it_passed_on():
+    """The old box coasts on for a while after the split; it must not become a second stay."""
+    evaluator = ZoneEvaluator([zone(enter_after_millis=400, exit_after_millis=2000)])
+    for step in range(6):
+        at = step * 200
+        evaluator.update([_supported(1, at, first=0, hits=step + 1)], at)
+    evaluator.update([_coasting(1, 1200, first=0, hits=6), _supported(2, 1200, first=1100, hits=2)], 1200)
+
+    for step in range(7, 12):
+        at = step * 200
+        changes = evaluator.update(
+            [_coasting(1, at, first=0, hits=6), _supported(2, at, first=1100, hits=step)], at
+        )
+        assert changes == [], changes
+    assert [p.track_id for p in evaluator.open_presences()] == [2]

@@ -3602,3 +3602,42 @@ def test_the_audit_tab_is_in_the_window_and_reads_the_nodes_store(qt_app, window
     window._add_zone(radius=5.0)
     window.audit.refresh()
     assert window.audit.listed_row_ids(), "the audit tab shows nothing after an audited action"
+
+
+def test_hovering_a_frame_edge_position_says_the_feet_were_below_the_frame(qt_app):
+    """The laptop camera's finding, in the operator's words.
+
+    A person seated at the desk had every contact on the frame's bottom edge and
+    was projected to 2.16 m ± 0.13 m. The engine now reports such a position as
+    a bound between the camera and where the edge projects; the map must say so
+    and must not read it out as a measured range.
+    """
+    view, _, where = _map_with_a_track(source="FRAME_EDGE", radius=1.1)
+    _move(view, view._to_screen(*view._to_local(where)))
+
+    tip = view.toolTip()
+    assert "feet below the frame" in tip
+    assert "between the camera and" in tip
+    assert "from the camera" not in tip
+    assert "not located" not in tip
+
+
+def test_a_frame_edge_position_is_drawn_hollow_like_a_bound(qt_app):
+    from PySide6.QtGui import QImage
+
+    def marker_pixels(source: str) -> int:
+        view, _, where = _map_with_a_track(source=source, radius=0.2)
+        view.show_legend = False
+        view.show()
+        qt_app.processEvents()
+        rendered = view.grab().toImage().convertToFormat(QImage.Format.Format_RGB888)
+        at = view._to_screen(*view._to_local(where))
+        count = 0
+        for dx in range(-3, 4):
+            for dy in range(-3, 4):
+                colour = rendered.pixelColor(int(at.x()) + dx, int(at.y()) + dy)
+                if abs(colour.green() - theme.TRACK.green()) < 60 and colour.green() > colour.red():
+                    count += 1
+        return count
+
+    assert marker_pixels("GROUND_PROJECTION") > marker_pixels("FRAME_EDGE")

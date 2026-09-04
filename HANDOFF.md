@@ -501,6 +501,58 @@ photographed verifying real rows, not only its own fixtures.
 site record has no console screen; the audit chain still covers only rows that
 carry a hash.
 
+### The harsh camera battery, and the three things it found
+
+Four phases through the packaged binaries on `device:0`, nothing simulated,
+every number below measured (`scratchpad/harsh_camera_battery.py`; a
+person-only RESTRICTED zone `Room` beginning 2 m in front of the camera):
+
+- **A.** 60 s, one seated person: 970 of 1787 frames analysed (16 fps), 12
+  track ids, **0 events**. A 20 s re-run: 345 frames, 5 ids, `A person
+  entered Room` at 1 s and `remained for 8 s` at 8 s, one incident, nothing
+  else — no flapping for a seated person; one id held 19.2 s.
+- **B.** Five open/close cycles of `SentinelVision-dev.exe --start`: exit
+  codes `[0, 0, 0, 0, 0]`, nothing killed, no process left.
+- **C.** Two `sentinel run device:0` at once: the second reconnected once,
+  analysed **one frame in ten seconds, and exited 0**.
+- **D.** Fragmentation, 3 × 30 s, one person plus furniture (`--objects 3`):
+  7, 13 and 3 tracks; 1.33, 2.67 and 1.0 per object after linking.
+
+Then a ten-second probe of *where* the person's contact landed, which is the
+finding that matters: **every person sample sat on the frame's bottom edge
+(rows 0.989–1.0) and every one projected to 2.16 m ± 0.13 m.** The person was
+at the desk, half a metre from the lens, feet below the picture. The zone
+began at 2 m. `A person entered Room` was somebody who never left their chair,
+placed confidently two metres away by the nearest ground the camera could see.
+
+What changed, each with a test that fails without it:
+
+- **`FRAME_EDGE`** (`core.py`): a box whose lower side sits within 2 % of the
+  frame's bottom is one the frame truncated; its projection becomes a bound —
+  the middle of the camera-to-edge stretch, radius reaching both ends — and a
+  zone beginning inside the stretch sees UNCERTAIN, not INSIDE. No ABI change:
+  the Python tracker keeps the pose and judges the core's answer. The console
+  words it ("feet below the frame — between the camera and 2.2 m") and draws
+  it hollow; the linker keeps it (it is about the object, unlike a fallback).
+- **A stay survives a track split** (`zones.py`): a young same-class track
+  appearing within a plausible walk of where a stay's own track went quiet
+  (no detection this frame, ≤ 3 s since its last) inherits the stay. No second
+  ENTERED, the dwell continues, the superseded id cannot reopen it, and a stay
+  whose id died waits the exit delay for the object to come back. Loitering is
+  keyed on `Presence.identity` (zone, origin track, start), so it fires once
+  per stay whichever id carries it. Phase D is why: every split inside a zone
+  was a fresh ENTERED and a loiter timer back at zero.
+- **The summary names its tracks** (`pipeline.py`): `track 1   person …`, and
+  `distinct tracks … (ids issued; one object can hold several)` instead of
+  "distinct objects". Phase A's silence was unreadable without it.
+- **A starved live run fails** (`cli.py`): no frame, or under 1 fps after 5 s,
+  prints `STARVED … is another program using the camera?` and exits 1. Phase C.
+
+Not fixed, recorded: the core's speed comes from the raw projection, so a
+subject with feet below the frame reads as standing still whatever they do;
+the OS shares a webcam between processes and the one-camera guard is per node
+only; the linker leaves 1.3–2.7 tracks per object on a moving scene — ABI 7.
+
 **Immediate:**
 
 1. **1.3 appearance re-ID.** The tracker fragments (17 tracks over 15 s on one

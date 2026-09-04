@@ -181,7 +181,7 @@ def test_tracks_land_on_the_map_with_uncertainty(run_over_reference):
 
     for track in placed:
         assert track.position.radius_meters > 0.0, "a position without uncertainty is a lie"
-        assert track.position.source in ("GROUND_PROJECTION", "CAMERA_FALLBACK")
+        assert track.position.source in ("GROUND_PROJECTION", "FRAME_EDGE", "CAMERA_FALLBACK")
 
 
 def test_projected_positions_are_within_the_camera_range(
@@ -208,7 +208,10 @@ def test_uncertainty_grows_with_distance_from_the_camera(
         (haversine_distance(reference_pose.position, t.position.point), t.position.radius_meters)
         for r in results
         for t in r.tracks
-        if t.position is not None
+        # The projection's own property. A FRAME_EDGE position is a bound —
+        # wide by construction, centred short of the edge — and would say
+        # nothing about how a projection degrades with range.
+        if t.position is not None and t.position.source == "GROUND_PROJECTION"
     ]
     assert len(samples) > 100
 
@@ -1295,3 +1298,37 @@ def test_a_plate_model_that_fails_does_not_stop_the_camera(plate_models):
     assert fault is not None and fault.startswith("RuntimeError:")
     assert len(errors) == 1, "one fault produced no line, or a line per frame"
     assert "the recogniser fell over" in errors[0].getMessage()
+
+
+def test_the_summary_names_each_track_and_calls_them_tracks():
+    """"track 1 observed in 344 frames" said nothing about what track 1 was.
+
+    A 60 s run on the laptop camera analysed 970 frames, issued 12 ids and
+    raised nothing, and the summary could not say whether a person had been
+    ignored by a person-only zone or never seen. Every track line carries the
+    detector's label, and the count is called what it is — ids issued — not
+    "distinct objects".
+    """
+    from sentinel.pipeline import PipelineStats
+
+    stats = PipelineStats()
+    stats.frames = 10
+    stats.objects_seen = 2
+    stats.track_ids = {1, 3}
+    stats.observations = {1: 10, 3: 4}
+    stats.spans = {1: (0, 9000), 3: (2000, 5000)}
+    stats.labels = {1: "person", 3: "couch"}
+
+    text = stats.summary()
+    assert "distinct tracks       2" in text
+    assert "distinct objects" not in text
+    assert "track 1   person" in text
+    assert "track 3   couch" in text
+
+
+def test_a_run_labels_its_tracks_from_the_detector(run_over_reference):
+    _, stats = run_over_reference
+    assert stats.labels, "no track was labelled"
+    assert set(stats.labels) == set(stats.track_ids)
+    # The motion detector cannot classify, and says so rather than guessing.
+    assert set(stats.labels.values()) == {"unclassified"}

@@ -433,7 +433,7 @@ class LoiteringRule(Rule):
     def __init__(self, dwell_millis: int = 30_000, still_speed_mps: float = 0.5):
         self._dwell = dwell_millis
         self._still = still_speed_mps
-        self._fired: set[tuple[str, int]] = set()
+        self._fired: set[tuple[str, int, int]] = set()
 
     def on_frame(self, context: RuleContext) -> list[Event]:
         presence, zone, track = context.presence, context.zone, context.track
@@ -444,7 +444,11 @@ class LoiteringRule(Rule):
             # neither raises nor uses up the one firing this presence gets.
             return []
 
-        key = (zone.id, track.id)
+        # Keyed by the stay, not by the track id carrying it. A stay handed
+        # across a track split keeps its identity (see `Presence.identity`),
+        # so a loiter already reported is not reported again under the new
+        # id — and a loiterer whose track splits is still one loiterer.
+        key = presence.identity
         if key in self._fired:
             return []
         if presence.duration_millis < self._dwell:
@@ -477,8 +481,8 @@ class LoiteringRule(Rule):
             )
         ]
 
-    def forget(self, zone_id: str, track_id: int) -> None:
-        self._fired.discard((zone_id, track_id))
+    def forget(self, identity: tuple[str, int, int]) -> None:
+        self._fired.discard(identity)
 
 
 class AfterHoursRule(Rule):

@@ -544,3 +544,48 @@ def test_a_contact_point_survives_the_round_trip_through_the_core():
     assert track.contact is not None
     assert track.contact.x == pytest.approx(0.4 + 0.2 * 8.0 / 10.0, abs=1e-9)
     assert track.contact.y == pytest.approx(0.8, abs=1e-9)
+
+
+def test_a_box_on_the_frames_bottom_edge_yields_a_bound_not_a_confident_point():
+    """The laptop camera's finding: feet below the frame, a confident wrong place.
+
+    A person seated half a metre from the lens had every contact on the frame's
+    bottom edge and was projected to 2.16 m ± 0.13 m — inside a zone that began
+    at 2 m — and "entered" it without leaving their chair. The geometry supports
+    a bound, not a point: somewhere between the camera and where the edge
+    projects. So the estimate must reach the camera at one end and the edge's
+    ground point at the other, and say which kind of estimate it is.
+    """
+    from sentinel.core import (
+        CameraPose, Detection, BoundingBox, LatLon, Tracker, haversine_distance,
+        project_to_ground,
+    )
+
+    site = LatLon(33.8938, 35.5018)
+    pose = CameraPose(position=site, mount_height=3.0, heading=0.0, pitch=-30.0)
+    truncated = Detection(bbox=BoundingBox(0.4, 0.5, 0.2, 0.5), confidence=0.9, class_id=0)
+    whole = Detection(bbox=BoundingBox(0.4, 0.3, 0.2, 0.4), confidence=0.9, class_id=0)
+
+    with Tracker(pose, min_hits_to_confirm=1) as tracker:
+        (bounded,) = tracker.update([truncated], 0)
+    with Tracker(pose, min_hits_to_confirm=1) as tracker:
+        (measured,) = tracker.update([whole], 0)
+
+    assert measured.position is not None and measured.position.source == "GROUND_PROJECTION"
+
+    assert bounded.position is not None
+    assert bounded.position.source == "FRAME_EDGE"
+    edge = project_to_ground(pose, 0.5, 1.0)
+    assert edge is not None
+    far = edge.ground_distance_meters
+    centre = haversine_distance(site, bounded.position.point)
+    reach = bounded.position.radius_meters
+    # Covers the camera at one end and the edge's ground point at the other,
+    # and is not the small uncertainty of a nearby point.
+    assert centre - reach <= 0.05
+    assert centre + reach >= far - 0.05
+    assert reach > edge.uncertainty_meters * 3
+    # And an unplaced tracker still locates nothing, rather than bounding it.
+    with Tracker(None, min_hits_to_confirm=1) as tracker:
+        (unplaced,) = tracker.update([truncated], 0)
+    assert unplaced.position is None

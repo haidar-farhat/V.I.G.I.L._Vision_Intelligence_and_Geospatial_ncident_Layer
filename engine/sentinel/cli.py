@@ -289,6 +289,35 @@ _rules = default_rules
 # --------------------------------------------------------------------- run
 
 
+#: A live run that averaged fewer analysed frames per second than this, after
+#: at least this many seconds, was not watching. One frame in ten seconds is
+#: what a camera another program holds looks like — the driver hands over a
+#: frame on reconnect and nothing after — and until this existed such a run
+#: printed its summary and exited 0, which to a scheduled job is a run that
+#: worked. Measured: two `sentinel run device:0` processes at once, the
+#: second reconnected once, analysed one frame, and exited 0.
+STARVED_BELOW_FPS = 1.0
+STARVED_AFTER_SECONDS = 5.0
+
+
+def _starvation(source, frames: int, elapsed: float) -> str | None:
+    """Why a live run's frame count means it was not watching, or ``None``."""
+    if not source.is_live:
+        return None
+    if frames == 0:
+        return (
+            f"no frame arrived from {source.display_url} in {elapsed:.0f}s. "
+            "Is another program using the camera?"
+        )
+    if elapsed >= STARVED_AFTER_SECONDS and frames / elapsed < STARVED_BELOW_FPS:
+        return (
+            f"{frames} frame(s) in {elapsed:.0f}s ({frames / elapsed:.1f}/s) from "
+            f"{source.display_url}. A camera delivering this little is usually "
+            "held by another program."
+        )
+    return None
+
+
 def _run(args: argparse.Namespace) -> int:
     explicit, refusal = _apply_zone_classes(
         list(args.zone or []), list(args.zone_classes or [])
@@ -359,6 +388,7 @@ def _run(args: argparse.Namespace) -> int:
     store = Store(args.database or default_database_path())
     all_events = []
     recording_failed = False
+    starved = False
 
     try:
         # Explicit wins; otherwise the database's own zones, the way `Node`
@@ -428,6 +458,7 @@ def _run(args: argparse.Namespace) -> int:
                     else None
                 )
 
+                started = time.monotonic()
                 for count, result in enumerate(pipeline.run(), start=1):
                     events.extend(result.events)
 
@@ -447,6 +478,17 @@ def _run(args: argparse.Namespace) -> int:
 
                 print(f"\n{source.source_id}  ({source.display_url})")
                 print(pipeline.stats.summary())
+
+                # A live source that delivered nothing, or next to nothing, is
+                # a run that did not watch — said on stderr beside the summary
+                # and carried into the exit code, because a scheduled job
+                # reads only the exit code.
+                starvation = _starvation(
+                    source, pipeline.stats.frames, time.monotonic() - started
+                )
+                if starvation is not None:
+                    print(f"  STARVED             {starvation}", file=sys.stderr)
+                    starved = True
 
                 # Only when recording was actually asked for. Reading the
                 # attribute otherwise says nothing and couples this reporting
@@ -486,7 +528,7 @@ def _run(args: argparse.Namespace) -> int:
             print("\nNo events. Nothing crossed a rule.")
             # A failed recording is a failed run even when the analysis found
             # nothing: a scheduled job that exits 0 is a job nobody looks at.
-            return 1 if recording_failed else 0
+            return 1 if recording_failed or starved else 0
 
         # Across every source, deliberately: a camera correlating only its own
         # events raises one incident per camera for one intrusion, which is the
@@ -503,7 +545,7 @@ def _run(args: argparse.Namespace) -> int:
         if args.export:
             _export_all(incidents, Path(args.export), store)
 
-        return 1 if recording_failed else 0
+        return 1 if recording_failed or starved else 0
     finally:
         store.close()
         for source in sources:

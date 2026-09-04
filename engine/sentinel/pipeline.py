@@ -220,6 +220,11 @@ class PipelineStats:
     observations: dict[int, int] = field(default_factory=dict)
     #: Per track: first and last timestamp.
     spans: dict[int, tuple[int, int]] = field(default_factory=dict)
+    #: Per track: what the detector called it. Without this the summary read
+    #: "track 1 observed in 344 frames" and an operator could not tell a
+    #: person from the sofa behind them — nor whether a silent run had
+    #: ignored a person or never seen one.
+    labels: dict[int, str] = field(default_factory=dict)
     #: Frames where a track was held open with no detection supporting it.
     held_without_detection: int = 0
     #: Zone presences opened and closed.
@@ -253,7 +258,13 @@ class PipelineStats:
             f"frames                {self.frames}",
             f"frames with detections{self.frames_with_detections:>6}",
             f"detections            {self.detections}",
-            f"distinct objects      {self.distinct_objects}",
+            # Ids the tracker issued, which is not a count of objects: one
+            # object can hold several when the tracker loses and re-finds it.
+            # It was labelled "distinct objects" for a long time, and a person
+            # reading "12 distinct objects" about one colleague stops
+            # believing counts.
+            f"distinct tracks       {self.distinct_objects}"
+            "   (ids issued; one object can hold several)",
             f"zone presences        {self.presences_started}",
             f"events                {self.events}",
         ]
@@ -262,7 +273,8 @@ class PipelineStats:
         for track_id in sorted(self.track_ids):
             seen = self.observations.get(track_id, 0)
             lines.append(
-                f"  track {track_id:<3} observed in {seen:>4} frames, "
+                f"  track {track_id:<3} {self.labels.get(track_id, ''):<12} "
+                f"observed in {seen:>4} frames, "
                 f"spanning {self.duration_millis(track_id) / 1000:.1f}s"
             )
         return "\n".join(lines)
@@ -574,7 +586,7 @@ class Pipeline:
             # At INFO because this is the line an operator sends when asked what
             # the system saw, and it is one line per run rather than per frame.
             _log.info(
-                "%s: analysis finished: %d frames, %d detections, %d object(s), "
+                "%s: analysis finished: %d frames, %d detections, %d track(s), "
                 "%d event(s)%s",
                 self._source.source_id,
                 self.stats.frames,
@@ -954,11 +966,13 @@ class Pipeline:
                 stats.track_ids.discard(id)
                 stats.observations.pop(id, None)
                 stats.spans.pop(id, None)
+                stats.labels.pop(id, None)
 
         for track in tracks:
             if track.id not in stats.track_ids:
                 stats.objects_seen += 1
                 stats.track_ids.add(track.id)
+                stats.labels[track.id] = self._detector.info.label_for(track.class_id)
             stats.observations[track.id] = stats.observations.get(track.id, 0) + 1
             span = stats.spans.get(track.id)
             if span is None:

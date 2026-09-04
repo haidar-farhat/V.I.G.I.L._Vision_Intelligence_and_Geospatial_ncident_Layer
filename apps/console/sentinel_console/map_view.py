@@ -429,19 +429,31 @@ class MapView(QWidget):
                 lines = [f"#{track.id} on {hover.camera_id}"]
                 if track.position is not None:
                     projected = track.position.source == "GROUND_PROJECTION"
+                    bounded = track.position.source == "FRAME_EDGE"
                     # Range and bearing only for a real projection. A fallback
                     # sits *on* the camera, so it would read "0.0 m at 0°" — a
                     # measurement, of nothing, that the operator would believe.
-                    if projected and hover.camera_id in self._cameras:
+                    if (projected or bounded) and hover.camera_id in self._cameras:
                         origin = self._cameras[hover.camera_id].position
-                        lines.append(
-                            f"{haversine_distance(origin, track.position.point):.1f} m "
-                            f"at {bearing_degrees(origin, track.position.point):.0f}° from the camera"
-                        )
+                        distance = haversine_distance(origin, track.position.point)
+                        bearing = bearing_degrees(origin, track.position.point)
+                        if bounded:
+                            # The feet were below the frame. The point is the
+                            # middle of what the geometry allows, not a place,
+                            # so the range is given as the stretch it covers.
+                            reach = distance + track.position.radius_meters
+                            lines.append(
+                                "feet below the frame — between the camera and "
+                                f"{reach:.1f} m at {bearing:.0f}°"
+                            )
+                        else:
+                            lines.append(f"{distance:.1f} m at {bearing:.0f}° from the camera")
                     lines.append(f"±{track.position.radius_meters:.1f} m (1σ)")
                     lines.append(
                         "projected onto the ground"
                         if projected
+                        else "bounded by the frame's edge, not measured"
+                        if bounded
                         else "projection failed — shown at the camera, not located"
                     )
                 else:
@@ -1970,7 +1982,10 @@ class MapView(QWidget):
                 # not a position: the projection failed and all the system can say
                 # is "something, at this camera". Drawn as a filled dot beside a
                 # real one it would be a claim the geometry never made.
-                fallback = track.position.source != "GROUND_PROJECTION"
+                fallback = track.position.source == "CAMERA_FALLBACK"
+                # A bound, not a point: hollow like a fallback, but solid,
+                # because unlike a fallback it is about the object.
+                bounded = track.position.source == "FRAME_EDGE"
                 if self._selection is not None and self._selection.is_track(
                     camera_id, track.id
                 ):
@@ -1988,6 +2003,10 @@ class MapView(QWidget):
                     painter.setPen(QPen(theme.TRACK, 1.5, Qt.PenStyle.DashLine))
                     painter.setBrush(Qt.BrushStyle.NoBrush)
                     painter.drawEllipse(point, 6, 6)
+                elif bounded:
+                    painter.setPen(QPen(theme.TRACK, 2))
+                    painter.setBrush(Qt.BrushStyle.NoBrush)
+                    painter.drawEllipse(point, 5, 5)
                 else:
                     painter.setPen(QPen(theme.TRACK, 2))
                     painter.setBrush(QBrush(theme.TRACK.darker(220)))

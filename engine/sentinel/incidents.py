@@ -326,12 +326,17 @@ def _ground_position(event: Event) -> PositionEstimate | None:
     walked past next. So it is dropped here, and a fragment without a ground
     position is never linked — an unplaced camera keeps its inflated count
     rather than being given a flattering one.
+
+    A ``FRAME_EDGE`` position is the object's own — bounded by the frame's
+    bottom edge rather than measured, so wide, but wide *about the object* —
+    and it is kept: two fragments of one person seated close to the lens
+    share it, and the place gate is what lets them be one.
     """
     evidence = event.evidence
     if (
         evidence.latitude is None
         or evidence.longitude is None
-        or evidence.position_source != "GROUND_PROJECTION"
+        or evidence.position_source not in ("GROUND_PROJECTION", "FRAME_EDGE")
     ):
         return None
     return PositionEstimate(

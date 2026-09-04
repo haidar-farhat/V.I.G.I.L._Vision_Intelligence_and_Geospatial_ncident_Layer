@@ -795,3 +795,51 @@ def test_every_rule_names_the_class_the_same_way():
                     detector=MODEL, frame_index=60),
     )
     assert after_hours.summary.startswith("A person was in")
+
+
+def test_a_loiter_is_reported_once_per_stay_however_many_track_ids_carry_it():
+    """A stay handed across a track split keeps its identity.
+
+    Keyed by track id, the rule fired again under the new id for the same
+    loiterer — and, worse, a loiterer whose track split every few seconds had
+    the timer restarted each time and was never reported at all. The
+    evaluator now carries the stay across; the rule must key on the stay.
+    """
+    rule = LoiteringRule(dwell_millis=2000)
+    zone = restricted()
+    active = engine(rule)
+    stay = Presence("zone-a", 1, 0, 0, confirmed=True, observations=1, origin_track_id=1)
+
+    produced = []
+    for step in range(15):
+        at = step * 200
+        stay.last_present_millis = at
+        stay.observations += 1
+        produced += active.on_frame(
+            [stay], {zone.id: zone}, {1: make_track(1, SITE)},
+            at_millis=at, moment=MOMENT, detector=MOTION, frame_index=step,
+        )
+    assert len(produced) == 1
+
+    # The split: the same stay, now carried by id 2.
+    stay.track_id = 2
+    stay.handoffs = 1
+    for step in range(15, 30):
+        at = step * 200
+        stay.last_present_millis = at
+        produced += active.on_frame(
+            [stay], {zone.id: zone}, {2: make_track(2, SITE)},
+            at_millis=at, moment=MOMENT, detector=MOTION, frame_index=step,
+        )
+    assert len(produced) == 1
+
+    # A different stay by the same track id is its own loiter.
+    another = Presence("zone-a", 2, 8000, 8000, confirmed=True, observations=1, origin_track_id=2)
+    for step in range(40, 55):
+        at = step * 200
+        another.last_present_millis = at
+        produced += active.on_frame(
+            [another], {zone.id: zone}, {2: make_track(2, SITE)},
+            at_millis=at, moment=MOMENT, detector=MOTION, frame_index=step,
+        )
+    assert len(produced) == 2

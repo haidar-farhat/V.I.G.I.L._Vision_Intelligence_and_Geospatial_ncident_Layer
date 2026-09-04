@@ -1723,7 +1723,7 @@ class Node:
                 lines.append(
                     f"    frames        {stats.frames}, "
                     f"{stats.detections} detection(s), "
-                    f"{stats.distinct_objects} object(s)"
+                    f"{stats.distinct_objects} track(s)"
                 )
             lines.append(f"    events        {len(record.events)}")
         lines.append(f"  incidents       {len(self._incidents)}")

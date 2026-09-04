@@ -1885,11 +1885,12 @@ class ConsoleWindow(QMainWindow):
         if track.position is not None:
             where = f"{track.position.point.lat:+.6f}, {track.position.point.lon:+.6f}"
             radius = f"±{track.position.radius_meters:.1f} m"
-            origin = (
-                "projected"
-                if track.position.source == "GROUND_PROJECTION"
-                else "fallback"
-            )
+            origin = {
+                "GROUND_PROJECTION": "projected",
+                # The feet were below the frame: a bound, not a point. See
+                # FRAME_EDGE in the engine's core.
+                "FRAME_EDGE": "frame edge",
+            }.get(track.position.source, "fallback")
         else:
             # Never blank: a blank cell reads as zero. This is a statement.
             where, radius, origin = "not placed", "—", "no pose"
