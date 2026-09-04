@@ -249,3 +249,16 @@ def test_a_detection_model_is_not_mistaken_for_a_segmentation_one(tmp_path: Path
     from sentinel.detect import _output_count
 
     assert _output_count(MODEL) == 2
+
+
+@needs_model
+def test_the_security_watch_list_narrows_the_vocabulary_the_zones_are_offered():
+    from sentinel.detect import WATCHED_LABELS
+    from sentinel.segment import Segmenter
+
+    watching = Segmenter(MODEL, classes=WATCHED_LABELS)
+    names = set(watching.info.class_names.values())
+    assert names == set(WATCHED_LABELS)
+    assert watching.info.classifies is True
+    with pytest.raises(DetectionError, match="unicorn"):
+        Segmenter(MODEL, classes={"unicorn"})

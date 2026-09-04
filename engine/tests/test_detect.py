@@ -346,3 +346,13 @@ def test_the_scale_is_part_of_the_detector_identity():
     # provenance has to be able to say which one produced it.
     assert MotionDetector(detect_scale=1.0).info.name != MotionDetector(detect_scale=0.5).info.name
     assert "0.5" in MotionDetector(detect_scale=0.5).info.name
+
+
+def test_a_motion_detector_ignores_a_watch_list_rather_than_refusing_it():
+    # It cannot name a class, so it cannot watch one; the console applies its
+    # watch list to whatever detector it has, and motion-only is not an error.
+    from sentinel.detect import WATCHED_LABELS, MotionDetector, detector_for
+
+    assert isinstance(detector_for(None, classes=WATCHED_LABELS), MotionDetector)
+    assert "person" in WATCHED_LABELS and "car" in WATCHED_LABELS
+    assert "bottle" not in WATCHED_LABELS

@@ -54,10 +54,10 @@ def qt_app():
 
 
 @pytest.fixture
-def window(qt_app):
+def window(qt_app, tmp_path):
     # In memory, always. A test that wrote to the operator's real database
     # would leave fabricated incidents in an evidence trail.
-    win = ConsoleWindow(":memory:")
+    win = ConsoleWindow(":memory:", settings=_isolated_settings(tmp_path))
     win.resize(1280, 800)
     # Shown, because a child widget's isVisible() is False while its top-level
     # window is hidden — a test against an unshown window cannot tell a widget
@@ -92,6 +92,16 @@ def assert_freed(ref: "weakref.ref[ConsoleWindow]") -> None:
         f"cycle (held by {holders}). It would be destroyed at interpreter "
         "shutdown, after the QApplication, and corrupt the heap on exit."
     )
+
+
+MODEL_PATH = Path(__file__).resolve().parents[3] / "models" / "yolov8n-seg.onnx"
+
+
+def _isolated_settings(directory: Path):
+    """A QSettings that reaches nothing on the machine: an INI in a temp dir."""
+    from PySide6.QtCore import QSettings
+
+    return QSettings(str(directory / "console.ini"), QSettings.Format.IniFormat)
 
 
 def pump(app, window, seconds: float) -> None:
@@ -3641,3 +3651,116 @@ def test_a_frame_edge_position_is_drawn_hollow_like_a_bound(qt_app):
         return count
 
     assert marker_pixels("GROUND_PROJECTION") > marker_pixels("FRAME_EDGE")
+
+
+# ------------------------------------------------ the toolbar, readable
+
+
+def test_no_toolbar_button_is_narrower_than_its_own_text(qt_app, window):
+    """The operator's screenshot: "d camer", "ve on m", "onfigur".
+
+    One row of twelve buttons, a picker, a spin box, a checkbox and two
+    captions was wider than a laptop's screen at its display scale, and Qt
+    squeezed every button below its text. Two rows, and the captions in the
+    status bar, must leave every button at least as wide as its size hint at
+    a width a laptop actually has.
+    """
+    window.resize(1280, 800)
+    window.show()
+    QApplication.processEvents()
+    buttons = [
+        window.open_button, window.start_button, window.stop_button,
+        window.place_button, window.map_place_button, window.remove_button,
+        window.configure_button, window.zone_button, window.export_button,
+        *window.mode_buttons.values(),
+    ]
+    narrow = [
+        (b.text(), b.width(), b.sizeHint().width())
+        for b in buttons if b.width() < b.sizeHint().width()
+    ]
+    assert not narrow, f"clipped: {narrow}"
+    window.close()
+
+
+def test_the_captions_live_in_the_status_bar_not_the_toolbar(window):
+    assert window.placement_label.parentWidget() is window.status
+    assert window.detector_label.parentWidget() is window.status
+
+
+def test_a_locked_control_says_why_it_is_disabled(qt_app, window):
+    """A greyed button with no reason is "a button that does nothing"."""
+    assert not window._configuring
+    assert not window.place_button.isEnabled()
+    assert "Configure" in window.place_button.toolTip()
+    assert "Where this camera is" in window.place_button.toolTip(), "the description was lost"
+    assert "Configure" in window.map_place_button.toolTip()
+
+    window.configure_button.setChecked(True)
+    assert window.place_button.isEnabled()
+    assert "Locked" not in window.place_button.toolTip()
+    assert "Where this camera is" in window.place_button.toolTip()
+    assert "No incident to export yet" in window.export_button.toolTip()
+    window.configure_button.setChecked(False)
+
+
+# ------------------------------------------------ the watch list
+
+
+def test_the_console_watches_people_and_vehicles_by_default_and_remembers_a_change(qt_app, tmp_path):
+    """A jar on a shelf became a "bottle" track. Nobody asked for bottles.
+
+    The default is the security set; a change is applied to the factory the
+    node builds detectors from and survives a restart of the console on the
+    same machine — and reaches nothing outside the INI the test hands in.
+    """
+    from sentinel.detect import WATCHED_LABELS
+
+    first = ConsoleWindow(":memory:", settings=_isolated_settings(tmp_path))
+    assert first._watched == WATCHED_LABELS
+    assert first._detector_factory.classes == WATCHED_LABELS
+    first._set_watched({"person"})
+    assert first._detector_factory.classes == frozenset({"person"})
+    first.close()
+
+    second = ConsoleWindow(":memory:", settings=_isolated_settings(tmp_path))
+    assert second._watched == frozenset({"person"})
+    second.close()
+    del first, second
+    gc.collect()
+
+
+def test_a_motion_only_console_has_nothing_to_watch_and_says_so(window):
+    assert window._vocabulary() == []
+    assert window._detector_labels() == []
+
+
+@pytest.mark.skipif(not MODEL_PATH.is_file(), reason="no segmentation model on this machine")
+def test_with_a_model_the_zone_picker_offers_only_what_is_watched(qt_app, tmp_path):
+    from sentinel.detect import WATCHED_LABELS
+
+    win = ConsoleWindow(":memory:", model=MODEL_PATH, settings=_isolated_settings(tmp_path))
+    try:
+        assert len(win._vocabulary()) == 80
+        assert win._detector_labels() == sorted(WATCHED_LABELS)
+        win._set_watched({"person", "dog"})
+        assert win._detector_labels() == ["dog", "person"]
+        assert win.zone_properties._vocabulary == ["dog", "person"]
+    finally:
+        win.close()
+
+
+def test_the_watched_classes_dialog_refuses_to_watch_nothing(qt_app):
+    from PySide6.QtWidgets import QDialogButtonBox
+    from sentinel_console.watch_dialog import WatchedClassesDialog
+
+    dialog = WatchedClassesDialog(["person", "bottle", "car"], {"person"}, defaults={"person", "car"})
+    assert dialog.chosen() == frozenset({"person"})
+    dialog._use_defaults()
+    assert dialog.chosen() == frozenset({"person", "car"})
+    dialog._use_all()
+    assert dialog.chosen() == frozenset({"person", "bottle", "car"})
+    dialog._set_all(frozenset())
+    assert dialog.chosen() == frozenset()
+    assert not dialog.buttons.button(QDialogButtonBox.StandardButton.Ok).isEnabled()
+    dialog.deleteLater()
+

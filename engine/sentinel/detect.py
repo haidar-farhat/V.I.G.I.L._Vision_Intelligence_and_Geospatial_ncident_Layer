@@ -26,7 +26,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol, Sequence
+from typing import Iterable, Protocol, Sequence
 
 import cv2
 import numpy as np
@@ -284,6 +284,55 @@ class MotionDetector:
 # --------------------------------------------------------------------- ONNX
 
 
+#: What a security console watches by default when a model can name classes:
+#: people and the vehicles they arrive in. Measured on the laptop camera with
+#: every COCO class tracked: a jar on a shelf and a phone on the desk became
+#: "bottle" and "cell phone" tracks at 0.43–0.51 confidence, labelled in the
+#: same green as the person, and the operator's word for them was
+#: "hallucinations". They were not — the model saw a jar — but they were noise,
+#: and a system measured by how little it says must not track what nobody asked
+#: it to watch. Nothing is lost: the whole vocabulary stays available, and a
+#: site that wants "dog" adds it.
+WATCHED_LABELS = frozenset({"person", "bicycle", "car", "motorcycle", "bus", "truck"})
+
+
+def _restrict_vocabulary(
+    names: dict[int, str], classes: "Iterable[str] | None"
+) -> "tuple[dict[int, str], np.ndarray | None]":
+    """The part of a model's vocabulary an operator asked to watch.
+
+    Returns the names to report and the class ids to keep — ``None`` for the
+    ids when nothing was asked, which keeps everything, as before. The reported
+    names shrink with the filter on purpose: a zone's class picker reads them,
+    and offering "bottle" to a zone on a site whose detector drops bottles would
+    be a filter that silently disarms that zone.
+
+    A name the model does not know is refused rather than ignored: ignoring it
+    would let a typo in "person" watch nothing and say nothing about it. So is
+    an empty list, because "watch nothing" is never what anybody meant.
+    """
+    if classes is None:
+        return dict(names), None
+    wanted = {str(label).strip().lower() for label in classes if str(label).strip()}
+    if not wanted:
+        raise DetectionError(
+            "asked to watch no class at all; leave the watch list unset to watch everything"
+        )
+    if not names:
+        raise DetectionError(
+            f"asked to watch {', '.join(sorted(wanted))}, but this model names no classes"
+        )
+    known = {name.strip().lower(): class_id for class_id, name in names.items()}
+    unknown = sorted(wanted - set(known))
+    if unknown:
+        raise DetectionError(
+            f"asked to watch {', '.join(unknown)}, which this model does not name; "
+            f"it knows {', '.join(sorted(known))}"
+        )
+    kept = {known[label]: names[known[label]] for label in sorted(wanted)}
+    return kept, np.asarray(sorted(kept), dtype=np.int64)
+
+
 def detector_for(
     model_path: "str | Path | None" = None, **options
 ) -> "Detector":
@@ -306,6 +355,11 @@ def detector_for(
     disagree with the file and the operator would have no way to tell which won.
     """
     if model_path is None:
+        # A motion detector cannot name a class, so it cannot watch one. The
+        # list is dropped rather than refused: the console applies its watch
+        # list to whatever detector it has, and a motion-only site is not an
+        # error.
+        options.pop("classes", None)
         return MotionDetector(**options)
 
     path = Path(model_path)
@@ -379,7 +433,7 @@ class OnnxDetector:
     that produced it.
     """
 
-    __slots__ = ("_session", "_input_name", "_input_size", "_layout", "_info",
+    __slots__ = ("_watched_ids", "_session", "_input_name", "_input_size", "_layout", "_info",
                  "_confidence", "_iou", "_letterbox")
 
     def __init__(
@@ -391,6 +445,7 @@ class OnnxDetector:
         class_names: dict[int, str] | None = None,
         providers: Sequence[str] | None = None,
         letterbox: bool = True,
+        classes: "Iterable[str] | None" = None,
     ):
         import onnxruntime as ort
 
@@ -459,6 +514,9 @@ class OnnxDetector:
         self._layout = _infer_layout(session.get_outputs()[0].shape, path.name)
 
         names = dict(class_names) if class_names else _names_from_metadata(session)
+        # `classes` is what the operator asked to watch; everything else the
+        # model can see is dropped below, before it can become a track.
+        names, self._watched_ids = _restrict_vocabulary(names, classes)
         self._info = DetectorInfo(
             kind="onnx",
             name=path.stem,
@@ -529,6 +587,8 @@ class OnnxDetector:
         confidences = scores[np.arange(scores.shape[0]), class_ids]
 
         keep = confidences >= self._confidence
+        if self._watched_ids is not None:
+            keep &= np.isin(class_ids, self._watched_ids)
         if not np.any(keep):
             return []
 

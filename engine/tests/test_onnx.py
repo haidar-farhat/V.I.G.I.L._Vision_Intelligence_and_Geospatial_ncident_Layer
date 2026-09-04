@@ -308,3 +308,33 @@ def test_the_detector_never_reaches_for_a_model_it_does_not_have(tmp_path: Path)
     # operator as the source of models — not a cue to go and find one.
     with pytest.raises(DetectionError, match="nothing is ever downloaded"):
         OnnxDetector(tmp_path / "absent.onnx")
+
+
+def test_a_watch_list_drops_what_nobody_asked_to_watch(model_path: Path):
+    """Measured on the laptop camera: a jar became a "bottle" track at 0.43.
+
+    The model is allowed to see it; the site did not ask to watch it. Asked to
+    watch a class this model has but the picture lacks, the detector reports
+    only that class and finds nothing; asked to watch the class that is there,
+    it finds it — and the vocabulary it reports is the watch list, so a zone's
+    class picker never offers what the detector will drop.
+    """
+    ignoring = OnnxDetector(
+        model_path, class_names={0: "bright_region", 1: "other"}, classes={"other"}
+    )
+    assert ignoring.info.class_names == {1: "other"}
+    assert ignoring.detect(square(320, 240, 100, 80, 60)) == []
+
+    watching = OnnxDetector(
+        model_path, class_names={0: "bright_region", 1: "other"}, classes={"bright_region"}
+    )
+    assert watching.info.class_names == {0: "bright_region"}
+    assert watching.detect(square(320, 240, 100, 80, 60)), "the watched class vanished too"
+
+
+def test_a_watch_list_naming_a_class_the_model_lacks_is_refused(model_path: Path):
+    # Ignoring it would let a typo in "person" watch nothing and say nothing.
+    with pytest.raises(DetectionError, match="unicorn"):
+        OnnxDetector(model_path, classes={"unicorn"})
+    with pytest.raises(DetectionError, match="no class at all"):
+        OnnxDetector(model_path, classes=set())

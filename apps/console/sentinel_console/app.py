@@ -33,7 +33,7 @@ from __future__ import annotations
 from dataclasses import replace
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QSettings, Qt, QTimer
 from PySide6.QtGui import QKeySequence, QShortcut, QAction, QCloseEvent, QFont
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -67,6 +67,7 @@ from sentinel.core import (
 )
 from sentinel.decode import DecodeError, VideoSource
 from sentinel.detect import DetectionError, detector_for
+from sentinel.detect import WATCHED_LABELS
 from sentinel.events import (
     AfterHoursRule,
     LoiteringRule,
@@ -92,6 +93,7 @@ from .video_view import VideoView
 from .selection import CAMERA as CAMERA_KIND, Selection, SelectionBus
 from .audit_view import AuditPanel
 from .investigation import InvestigationPanel
+from .watch_dialog import WatchedClassesDialog
 from .zones_view import ZoneDialog, ZonePropertiesPanel, ZonesView
 
 _log = logs.get(__name__)
@@ -140,7 +142,12 @@ def _detector_summary(info) -> str:
         return f"{info.name} — does not classify, and cannot see a stationary object"
     masks = " with masks" if info.kind.endswith("segment") else ", boxes only"
     digest = f" · {info.model_sha256[:12]}" if info.model_sha256 else ""
-    return f"{info.name} — {len(info.class_names)} classes{masks}{digest}"
+    names = sorted(set(info.class_names.values()))
+    if len(names) <= 8:
+        # Few enough to say: the watch list, not a count, is what an operator
+        # wants to check when a jar on a shelf stops being tracked.
+        return f"{info.name} — watching {', '.join(names)}{masks}{digest}"
+    return f"{info.name} — {len(names)} classes{masks}{digest}"
 
 
 #: Who the console is, in the audit log. Not `node.ACTOR`: the node acts on
@@ -148,6 +155,35 @@ def _detector_summary(info) -> str:
 #: site is a different actor doing a different thing. A trail that cannot tell
 #: them apart cannot answer "who changed this".
 CONSOLE_ACTOR = "console"
+
+#: Why a control is greyed in Monitor mode, on the control itself. The operator
+#: reported that "the buttons do nothing"; a greyed button with no reason is
+#: exactly that, and the lock was invisible to somebody who had not read the
+#: manual. Qt shows a tooltip on a disabled widget, so the reason goes there.
+LOCKED_REASON = "Locked. Press Configure to change the site — cameras, placement and zones."
+
+
+class _DetectorFactory:
+    """What the node builds a detector from, holding no reference to the window.
+
+    A plain object rather than a lambda so the watch list can change after the
+    node exists: the node keeps the factory for its lifetime, and a factory
+    bound to a frozen set could never learn that the operator stopped watching
+    bottles. Mutated in one place, `ConsoleWindow._set_watched`, and read on
+    the next Start — a running camera keeps the detector it started with, and
+    the status line says so. Bound to values and never to the window, because
+    a closure over `self` handed to the node is the reference cycle that once
+    kept a closed console alive until interpreter shutdown.
+    """
+
+    __slots__ = ("model", "classes")
+
+    def __init__(self, model, classes):
+        self.model = model
+        self.classes = classes
+
+    def __call__(self):
+        return detector_for(self.model, classes=self.classes)
 
 #: How long the console stays in Configure with nobody touching it. A lock
 #: that never re-arms is a lock somebody props open on the first day.
@@ -177,7 +213,10 @@ class ConsoleWindow(QMainWindow):
     """The main window."""
 
     def __init__(
-        self, database: str | Path | None = None, model: str | Path | None = None
+        self,
+        database: str | Path | None = None,
+        model: str | Path | None = None,
+        settings: QSettings | None = None,
     ):
         """
         ``database`` is the path to persist to. ``":memory:"`` runs the console
@@ -206,7 +245,12 @@ class ConsoleWindow(QMainWindow):
         # down the QApplication. Destroying a QMainWindow at that point
         # corrupted the heap (0xC0000374) at exit, in a run where every test had
         # passed. A widget's lifetime has to be the plain refcount.
-        model_for_detector = self._model
+        # Per-machine preferences — today, what the detector watches. Tests
+        # hand in an INI in a temporary directory so nothing they do reaches
+        # the operator's registry.
+        self._settings = settings if settings is not None else QSettings()
+        self._watched = self._load_watched()
+        self._detector_factory = _DetectorFactory(self._model, self._watched)
 
         # The console is a *client* of this. It owns no store, no zones, no
         # rule set and no analysis thread; it owns widgets, and it calls
@@ -221,7 +265,7 @@ class ConsoleWindow(QMainWindow):
             realtime=True,
             correlate_every_millis=CORRELATE_INTERVAL_MILLIS,
             # One detector per camera, never shared, built at start.
-            detector_factory=lambda: detector_for(model_for_detector),
+            detector_factory=self._detector_factory,
         )
 
         self._build()
@@ -443,6 +487,10 @@ class ConsoleWindow(QMainWindow):
         copy = QShortcut(QKeySequence.StandardKey.Copy, self)
         copy.setContext(Qt.ShortcutContext.WindowShortcut)
         copy.activated.connect(self._copy_ground)
+        # The captions the toolbar used to hold. Permanent, so a transient
+        # status message never pushes "no camera placed" off the screen.
+        self.status.addPermanentWidget(self.placement_label)
+        self.status.addPermanentWidget(self.detector_label)
         self.status.addPermanentWidget(self.ground_label)
         self._ground_text = ""
 
@@ -457,9 +505,23 @@ class ConsoleWindow(QMainWindow):
         # among the things being locked.
         self._set_configuring(False)
 
-    def _build_toolbar(self) -> QHBoxLayout:
+    def _build_toolbar(self) -> QVBoxLayout:
+        """Two rows, not one.
+
+        One row held twelve buttons, a picker, a spin box, a checkbox and two
+        captions, and at a laptop's display scale that was wider than the
+        screen: Qt squeezed every button below its text and the operator read
+        "d camer", "ve on m" and "onfigur" — and reported that the buttons did
+        nothing, which a control nobody can read might as well. The first row
+        is the cameras, with the lock at its end; the second is the map and the
+        zones; the captions live in the status bar, which is where a caption
+        belongs. A test holds every button at least as wide as its text.
+        """
+        rows = QVBoxLayout()
+        rows.setSpacing(4)
         row = QHBoxLayout()
         row.setSpacing(8)
+        rows.addLayout(row)
 
         self.open_button = QPushButton("Add camera…")
         self.open_button.clicked.connect(self._choose_source)
@@ -467,16 +529,17 @@ class ConsoleWindow(QMainWindow):
 
         self.start_button = QPushButton("Start")
         self.start_button.setEnabled(False)
+        self._explain(self.start_button, "Add a camera first.")
         self.start_button.clicked.connect(self._start)
         row.addWidget(self.start_button)
 
         self.stop_button = QPushButton("Stop")
         self.stop_button.setEnabled(False)
+        self._explain(self.stop_button, "Nothing is running.")
         self.stop_button.clicked.connect(self._stop)
         row.addWidget(self.stop_button)
 
         row.addSpacing(12)
-
         row.addWidget(QLabel("camera"))
         self.camera_picker = QComboBox()
         self.camera_picker.setMinimumWidth(140)
@@ -484,14 +547,15 @@ class ConsoleWindow(QMainWindow):
             "Which camera the placement dialog applies to. Every camera is "
             "analysed whichever is selected here."
         )
-        # The picker and the camera list are two views of one choice. This is
-        # the half that carries a change made here out to the bus; the other
-        # half is in `_selection_changed`, which brings a change made anywhere
-        # else back to the picker.
         self.camera_picker.currentIndexChanged.connect(self._picker_changed)
         row.addWidget(self.camera_picker)
 
         self.place_button = QPushButton("Place…")
+        self.place_button.setToolTip(
+            "Where this camera is and which way it looks: position, height, "
+            "heading, pitch and optics. Until a camera is placed nothing it sees "
+            "can be put on the ground, so this comes before zones and measuring."
+        )
         self.place_button.clicked.connect(self._place_camera)
         row.addWidget(self.place_button)
 
@@ -512,26 +576,14 @@ class ConsoleWindow(QMainWindow):
         self.remove_button.clicked.connect(self._remove_camera)
         row.addWidget(self.remove_button)
 
+        self.fault_label = QLabel("")
+        self.fault_label.setStyleSheet(f"color: {theme.FAULT.name()}; font-weight: 600;")
+        self.fault_label.setVisible(False)
         row.addSpacing(12)
+        row.addWidget(self.fault_label)
+        row.addStretch(1)
 
-        # What the next click on the map does, as three buttons that are
-        # visibly one choice. Before this the same click panned, moved a camera
-        # or dropped a zone corner depending on state nothing on screen showed.
-        self.mode_buttons: dict[str, QPushButton] = {}
-        for mode, label, tip in (
-            (MODE_SELECT, "Select", "Click to select, drag to pan, wheel to zoom."),
-            (MODE_DRAW, "Draw", "Click each corner of a zone on the plan view."),
-            (MODE_MEASURE, "Measure",
-             "Click two points to measure the ground between them. Changes nothing."),
-        ):
-            button = QPushButton(label)
-            button.setCheckable(True)
-            button.setToolTip(tip)
-            button.setChecked(mode == MODE_SELECT)
-            button.clicked.connect(self._mode_button_clicked)
-            self.mode_buttons[mode] = button
-            row.addWidget(button)
-
+        # The lock sits at the end of the camera row: it governs both rows.
         self.configure_button = QPushButton("Configure")
         self.configure_button.setCheckable(True)
         self.configure_button.setToolTip(
@@ -543,8 +595,27 @@ class ConsoleWindow(QMainWindow):
         self.configure_button.toggled.connect(self._set_configuring)
         row.addWidget(self.configure_button)
 
-        row.addSpacing(12)
+        row2 = QHBoxLayout()
+        row2.setSpacing(8)
+        rows.addLayout(row2)
 
+        self.mode_buttons: dict[str, QPushButton] = {}
+        for mode, label, tip in (
+            (MODE_SELECT, "Select", "Click to select, drag to pan, wheel to zoom."),
+            (MODE_DRAW, "Draw", "Click each corner of a zone on the plan view."),
+            (MODE_MEASURE, "Measure",
+             "Click two points to measure the ground between them. Changes nothing."),
+        ):
+            button = QPushButton(label)
+            button.setCheckable(True)
+            button.setToolTip(tip)
+            button.setChecked(mode == MODE_SELECT)
+            # `sender()` rather than a lambda over `self`: see HANDOFF §7.
+            button.clicked.connect(self._mode_button_clicked)
+            self.mode_buttons[mode] = button
+            row2.addWidget(button)
+
+        row2.addSpacing(12)
         self.zone_button = QPushButton("Add zone…")
         self.zone_button.setToolTip(
             "Adds a zone on the ground: a restricted area, the perimeter, an "
@@ -553,8 +624,17 @@ class ConsoleWindow(QMainWindow):
             "placed camera: a zone without one has nothing to be measured against."
         )
         self.zone_button.clicked.connect(self._add_zone_dialog)
-        row.addWidget(self.zone_button)
+        row2.addWidget(self.zone_button)
 
+        self.zone_radius = QDoubleSpinBox()
+        self.zone_radius.setRange(2.0, 200.0)
+        self.zone_radius.setValue(10.0)
+        self.zone_radius.setSuffix(" m")
+        self.zone_radius.setMinimumWidth(104)
+        self.zone_radius.setToolTip("The radius of a zone added in front of the camera.")
+        row2.addWidget(self.zone_radius)
+
+        row2.addSpacing(12)
         self.export_button = QPushButton("Export incident…")
         self.export_button.setEnabled(False)
         self.export_button.setToolTip(
@@ -562,45 +642,41 @@ class ConsoleWindow(QMainWindow):
             "to a folder, with a SHA-256 for every file so any later alteration "
             "is detectable."
         )
+        self._explain(self.export_button, "No incident to export yet.")
         self.export_button.clicked.connect(self._export_incident)
-        row.addWidget(self.export_button)
+        row2.addWidget(self.export_button)
 
-        self.zone_radius = QDoubleSpinBox()
-        self.zone_radius.setRange(2.0, 200.0)
-        self.zone_radius.setValue(10.0)
-        self.zone_radius.setSuffix(" m")
-        # Wide enough for "200.00 m" plus the arrows. At 80 px a screenshot of
-        # the real thing showed "12.0(" — the value cut off mid-number, which
-        # reads as a broken control rather than a narrow one.
-        self.zone_radius.setMinimumWidth(104)
-        row.addWidget(self.zone_radius)
-
-        row.addSpacing(12)
-
+        row2.addSpacing(12)
         self.show_detections = QCheckBox("Show raw detections")
         self.show_detections.setChecked(True)
         self.show_detections.toggled.connect(self._toggle_detections)
-        row.addWidget(self.show_detections)
+        row2.addWidget(self.show_detections)
+        row2.addStretch(1)
 
-        # Hidden until something breaks. A permanently visible status area that
-        # says "OK" trains an operator to stop reading it.
-        self.fault_label = QLabel("")
-        self.fault_label.setStyleSheet(f"color: {theme.FAULT.name()}; font-weight: 600;")
-        self.fault_label.setVisible(False)
-        row.addWidget(self.fault_label)
-
-        row.addStretch(1)
-
+        # Captions, for the status bar: what is placed and what is detecting.
         self.placement_label = QLabel("No camera placed — objects will not be located")
         self.placement_label.setObjectName("Caption")
-        row.addWidget(self.placement_label)
-
-        row.addSpacing(14)
         self.detector_label = QLabel("")
         self.detector_label.setObjectName("Caption")
-        row.addWidget(self.detector_label)
+        return rows
 
-        return row
+    @staticmethod
+    def _explain(control, reason: str | None) -> None:
+        """Say, on the control itself, why it is disabled.
+
+        The description a control carries is kept the first time this is
+        called; a reason is put in front of it while the control is disabled
+        and taken away again when it is not. Qt shows a tooltip on a disabled
+        widget, which is the one way a greyed button can still answer "why".
+        """
+        described = control.property("describedAs")
+        if described is None:
+            described = control.toolTip() or ""
+            control.setProperty("describedAs", described)
+        if reason:
+            control.setToolTip(f"{reason}\n\n{described}".strip())
+        else:
+            control.setToolTip(described)
 
     def _build_zones_panel(self) -> QWidget:
         panel = QWidget()
@@ -697,6 +773,15 @@ class ConsoleWindow(QMainWindow):
         quit_action.setShortcut("Ctrl+Q")
         quit_action.triggered.connect(self.close)
         file_menu.addAction(quit_action)
+
+        detection_menu = self.menuBar().addMenu("&Detection")
+        self.watch_action = QAction("&Watched classes…", self)
+        self.watch_action.setStatusTip(
+            "Which of the model's classes are tracked at all. The rest are dropped "
+            "at the detector — a shelf of jars is not a security event."
+        )
+        self.watch_action.triggered.connect(self._choose_watched)
+        detection_menu.addAction(self.watch_action)
 
         help_menu = self.menuBar().addMenu("&Help")
         about = QAction("&About this build", self)
@@ -875,6 +960,7 @@ class ConsoleWindow(QMainWindow):
         was, self._configuring = self._configuring, bool(on)
         for control in self._configure_only():
             control.setEnabled(self._configuring)
+            self._explain(control, None if self._configuring else LOCKED_REASON)
         # Dragging a mast on the plan view is a configuration change, so it is
         # behind the same lock and not a second, quieter one. Turning it off
         # mid-gesture reverts the gesture: the lock coming back is not the
@@ -931,10 +1017,70 @@ class ConsoleWindow(QMainWindow):
         if self._model is None:
             return []
         try:
+            info = detector_for(self._model, classes=self._watched).info
+        except DetectionError:
+            return []
+        return sorted(set(info.class_names.values())) if info.classifies else []
+
+    def _vocabulary(self) -> list[str]:
+        """Every class the model can name, watched or not. Empty for motion."""
+        if self._model is None:
+            return []
+        try:
             info = detector_for(self._model).info
         except DetectionError:
             return []
         return sorted(set(info.class_names.values())) if info.classifies else []
+
+    def _load_watched(self) -> frozenset[str]:
+        """The watch list this machine last saved, or the security default."""
+        stored = self._settings.value("detection/watched", None)
+        if stored is None:
+            return WATCHED_LABELS
+        if isinstance(stored, str):
+            stored = [stored]
+        try:
+            labels = frozenset(str(label).strip() for label in stored if str(label).strip())
+        except TypeError:
+            return WATCHED_LABELS
+        return labels or WATCHED_LABELS
+
+    def _set_watched(self, labels) -> None:
+        """Change what the detector watches. Applies at the next Start.
+
+        Persisted per machine, not per site, and that is a limit rather than a
+        design: what a site watches belongs in its record, alongside its
+        identity switch, and moves there when the site record grows a screen.
+        """
+        self._watched = frozenset(str(label) for label in labels)
+        self._detector_factory.classes = self._watched
+        self._settings.setValue("detection/watched", sorted(self._watched))
+        self._settings.sync()
+        self.zone_properties.set_classes(self._detector_labels())
+        if self._running:
+            self._set_status(
+                "Watch list saved. Stop and Start for the cameras to use it."
+            )
+        else:
+            self._set_status(f"Watching {', '.join(sorted(self._watched))}.")
+
+    def _choose_watched(self) -> None:
+        """Detection → Watched classes…"""
+        vocabulary = self._vocabulary()
+        if not vocabulary:
+            QMessageBox.information(
+                self,
+                "Nothing to choose",
+                "The motion detector names no classes, so there is nothing to "
+                "watch or to ignore. Supply a detection model to choose.",
+            )
+            return
+        dialog = WatchedClassesDialog(vocabulary, self._watched, defaults=WATCHED_LABELS, parent=self)
+        accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        chosen = dialog.chosen()
+        dialog.deleteLater()
+        if accepted and chosen:
+            self._set_watched(chosen)
 
     def _toggle_detections(self, show: bool) -> None:
         for session in self._sessions.values():
@@ -1728,7 +1874,7 @@ class ConsoleWindow(QMainWindow):
         # operator cannot see, leaving a window that started and shows nothing.
         if self._model is not None:
             try:
-                detector_for(self._model)
+                detector_for(self._model, classes=self._watched)
             except DetectionError as error:
                 QMessageBox.warning(self, "Cannot load the detection model", str(error))
                 return
@@ -1752,6 +1898,7 @@ class ConsoleWindow(QMainWindow):
         self._timer.start()
 
         self.open_button.setEnabled(False)
+        self._explain(self.open_button, "Stop the analysis before adding a camera.")
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
         self._set_status(f"Running {started} camera(s).")
@@ -1788,6 +1935,7 @@ class ConsoleWindow(QMainWindow):
         # Only if the site is unlocked. This used to re-enable it flatly, so
         # stopping a camera silently undid the lock for Add camera.
         self.open_button.setEnabled(self._configuring)
+        self._explain(self.open_button, None if self._configuring else LOCKED_REASON)
         self.start_button.setEnabled(bool(self._sessions))
         self.stop_button.setEnabled(False)
 
@@ -1818,6 +1966,7 @@ class ConsoleWindow(QMainWindow):
         self._refresh_cameras()
         self.incidents.show_incidents(self._incidents)
         self.export_button.setEnabled(bool(self.node.incidents))
+        self._explain(self.export_button, None if self.node.incidents else "No incident to export yet.")
 
         if updates:
             self._refresh_tracks()

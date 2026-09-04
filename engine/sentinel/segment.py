@@ -30,7 +30,7 @@ knows the box.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Sequence
+from typing import Iterable, Sequence
 
 import cv2
 import numpy as np
@@ -41,6 +41,7 @@ from .detect import (
     DetectionError,
     DetectorInfo,
     _names_from_metadata,
+    _restrict_vocabulary,
     _non_max_suppression,
     _sha256,
 )
@@ -69,6 +70,7 @@ class Segmenter:
     """
 
     __slots__ = (
+        "_watched_ids",
         "_session", "_input_name", "_input_size", "_info", "_confidence",
         "_iou", "_mask_threshold", "_outputs", "_proto_index", "_pred_index",
     )
@@ -82,6 +84,7 @@ class Segmenter:
         mask_threshold: float = MASK_THRESHOLD,
         class_names: dict[int, str] | None = None,
         providers: Sequence[str] | None = None,
+        classes: "Iterable[str] | None" = None,
     ):
         # Before onnxruntime loads. See `sentinel/telemetry.py`: the manylinux
         # wheels carry a collector that is on by default, and the environment
@@ -158,6 +161,9 @@ class Segmenter:
         self._outputs = [output.name for output in outputs]
 
         names = dict(class_names) if class_names else _names_from_metadata(session)
+        # What the operator asked to watch. The rest is dropped in `detect`
+        # before it can become a track: see `detect.WATCHED_LABELS`.
+        names, self._watched_ids = _restrict_vocabulary(names, classes)
         self._info = DetectorInfo(
             kind="onnx-segment",
             name=f"{path.stem} instance segmentation",
@@ -251,6 +257,8 @@ class Segmenter:
         confidences = scores[np.arange(scores.shape[0]), class_ids]
 
         keep = confidences >= self._confidence
+        if self._watched_ids is not None:
+            keep &= np.isin(class_ids, self._watched_ids)
         if not np.any(keep):
             return []
 

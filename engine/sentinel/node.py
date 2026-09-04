@@ -1739,7 +1739,7 @@ class Node:
                 # a switched-on face path over results that carried nothing
                 # to look at. The image travels in the latest-wins slot and is
                 # dropped after the poll; nothing here stores it.
-                keep_images=self._keep_images,
+                keep_images=self._keep_images or record.identity.faces,
                 realtime=self._realtime,
                 record_to=self._record_to,
                 segment_seconds=self._segment_seconds,
@@ -2608,4 +2608,4 @@ class Node:
             f"  chain head      {head}" if head
             else "  chain head      none — nothing chained has been written yet"
         )
-        return "\n".j
+        return "\n".join(lines)

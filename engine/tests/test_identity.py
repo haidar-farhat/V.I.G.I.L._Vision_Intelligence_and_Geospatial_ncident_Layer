@@ -1146,8 +1146,15 @@ def test_a_camera_restarted_in_the_same_process_forgets_the_old_runs_tracks(tmp_
         assert node.templates_for("gate", 1) == (), "the new run inherited the old run's faces"
         node.poll()
         held = node.templates_for("gate", 1)
+        # The lookup above is keyed by run, so it would read empty even if the
+        # old run's templates were still sitting in memory. They must not be: a
+        # camera restarted every few minutes for a month would otherwise hold
+        # the faces of every track of every run that ever ended, which is
+        # biometric data kept for tracks that no longer exist.
+        runs_held = {key[1] for key in node._face_tracks if key[0] == "gate"}
 
     assert len(held) == 1
+    assert runs_held == {gate.run}, f"face state survived from earlier runs: {runs_held}"
 
 
 def test_the_whole_engine_still_imports_no_qt_with_identity_wired():
