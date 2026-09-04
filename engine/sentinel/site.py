@@ -30,6 +30,17 @@ not been drawn is a normal state, and an empty ring stored as though it were a
 real one would report the whole site as one uncovered gap. Stored as JSON in the
 same shape zones store theirs, so one reader serves both.
 
+**An identity switch**, :class:`Identity`, and it is here rather than in the
+register or the pipeline because it is a fact about the *site*: whether this
+place reads plates and whether it looks at faces is a decision an operator
+takes for a deployment, under a lawful basis they can name, and it has to live
+in the one row that describes the deployment. A switch kept in memory would be
+off again after every restart — which sounds safe and is not, because an
+operator who turned faces on for a contractor list would find the register
+silently matching nobody on Monday. A switch in a configuration file would be a
+change nobody audited. In the site row it survives a restart and every flip of
+it is an audit row with a before and an after.
+
 :class:`SiteFrame` is the conversion between latitude/longitude and metres east
 and north of that origin. It is intended to replace both
 ``sentinel.coverage._Frame`` and ``MapView._to_local``, which are today the same
@@ -89,6 +100,57 @@ class FrameKind(str, Enum):
 
 
 @dataclass(frozen=True, slots=True)
+class Identity:
+    """Which of the identity features this site has switched on. All off by default.
+
+    Three booleans rather than one, because they are three different claims on
+    the people who walk past a camera. A plate is a legally displayed identifier
+    photographed in public; a face template is a measurement of somebody's body;
+    a face crop is a photograph of it. Each needs its own justification, so each
+    is its own decision, and a site that reads plates has not thereby agreed to
+    anything about faces.
+
+    ``face_crops`` is stored and audited and does nothing else in this build.
+    That is deliberate and it is not a loose end: the flag exists so that the
+    decision to keep photographs — the one that needs the most justification —
+    is recorded as a decision the moment somebody takes it, and it is refused
+    any effect until the code that would keep a crop under its own retention
+    and its own audit row exists. Nothing reads it to store anything.
+
+    Off is the value every site starts with, and off means *nothing runs*: no
+    face is detected, no template computed, no plate cropped. It does not mean
+    a column is hidden. That is enforced where the work happens — the node
+    builds no face engine and hands no plate reader to a pipeline — and a test
+    proves the models were shown no pixels.
+    """
+
+    #: Plate reading inside vehicle tracks. Needs the operator's plate models.
+    plates: bool = False
+    #: Face templates inside person tracks. Needs the operator's YuNet and
+    #: SFace models. A template is 128 floats, not an image.
+    faces: bool = False
+    #: A separate opt-in for keeping the crop a template was taken from.
+    #: Recorded and audited; **not implemented** beyond that in this build, and
+    #: :meth:`describe` says so rather than reading as a feature.
+    face_crops: bool = False
+
+    def describe(self) -> str:
+        """The switch as one short phrase: ``off``, ``plates``, ``faces``, ``plates, faces``.
+
+        The crop flag is named separately and honestly when it is set, because
+        an operator reading ``faces`` on a status strip must not be left
+        believing photographs are being kept when nothing keeps them.
+        """
+        parts = [name for name in ("plates", "faces") if getattr(self, name)]
+        if not parts:
+            return "off"
+        described = ", ".join(parts)
+        if self.face_crops:
+            described += " (face crops recorded as on; not kept in this build)"
+        return described
+
+
+@dataclass(frozen=True, slots=True)
 class Site:
     """The place being watched, as one record.
 
@@ -110,6 +172,10 @@ class Site:
     #: :meth:`clock`.
     timezone: str = DEFAULT_TIMEZONE
     boundary: tuple[LatLon, ...] = ()
+    #: What this site has agreed to identify. :class:`Identity` — everything
+    #: off — for every site that has never been asked, which is every site
+    #: written before the switch existed as well as every new one.
+    identity: Identity = Identity()
 
     def __post_init__(self) -> None:
         """Refuse a ring of one or two points at the door.

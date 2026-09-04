@@ -52,7 +52,7 @@ from .events import Event, Evidence, EventType, Severity, utc_from_millis
 from .incidents import Association, Incident, Risk, RiskFactor
 from .registry import DEFAULT_PLATE_FORMAT, PlateFormat, Register
 from .registry import SCHEMA as _REGISTER_SCHEMA
-from .site import DEFAULT_SITE_ID, FrameKind, Site
+from .site import DEFAULT_SITE_ID, FrameKind, Identity, Site
 from .zones import Schedule, Zone, ZoneKind
 
 from . import paths
@@ -66,7 +66,7 @@ _log = _get_logger(__name__)
 #: Schema version this build expects. A database at a different version is
 #: migrated forward, never opened as-is: opening a schema you do not understand
 #: and hoping the columns line up is how evidence is silently corrupted.
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 
 #: The audit column's zero, for rebuilding a millisecond timestamp exactly.
@@ -503,6 +503,45 @@ MIGRATIONS: tuple[Migration, ...] = (
         down="""
         DROP INDEX IF EXISTS plate_reads_by_time;
         DROP TABLE IF EXISTS plate_reads;
+        """,
+    ),
+    Migration(
+        version=9,
+        name="site_identity",
+        up="""
+        -- The per-site identity switch: whether this site reads plates, looks
+        -- at faces, and has agreed to keep face crops. On the site row rather
+        -- than in memory or in a file, because a switch that is off again
+        -- after every restart is a register that silently matches nobody on
+        -- Monday, and a switch in a file is a change nobody audited.
+        --
+        -- Three columns rather than one, because they are three different
+        -- claims on the people a camera sees and each is its own decision. A
+        -- site that reads plates has agreed to nothing about faces.
+        --
+        -- NOT NULL DEFAULT 0 is the load-bearing part. Every site row written
+        -- before this migration is a site nobody asked, and the only honest
+        -- reading of "nobody asked" is off. NULL would have to be interpreted
+        -- by every reader, and one of them would interpret it as on.
+        --
+        -- identity_face_crops is stored and audited and read by nothing in
+        -- this build. It exists so the decision to keep photographs is
+        -- recorded as a decision the moment somebody takes it; nothing keeps a
+        -- crop until the code that would retain and audit one exists.
+        ALTER TABLE sites ADD COLUMN identity_plates INTEGER NOT NULL DEFAULT 0
+            CHECK (identity_plates IN (0, 1));
+        ALTER TABLE sites ADD COLUMN identity_faces INTEGER NOT NULL DEFAULT 0
+            CHECK (identity_faces IN (0, 1));
+        ALTER TABLE sites ADD COLUMN identity_face_crops INTEGER NOT NULL DEFAULT 0
+            CHECK (identity_face_crops IN (0, 1));
+        """,
+        down="""
+        -- A build that predates the switch cannot honour it, so the flags go
+        -- with the columns: a site rolled back is a site with identity off,
+        -- which is the safe direction to fail in. The site itself survives.
+        ALTER TABLE sites DROP COLUMN identity_face_crops;
+        ALTER TABLE sites DROP COLUMN identity_faces;
+        ALTER TABLE sites DROP COLUMN identity_plates;
         """,
     ),
 )
@@ -956,6 +995,13 @@ class Store:
         different screens — the first says coverage cannot be computed, the
         second says none of the site is covered — and collapsing them is how a
         site with no outline gets reported as entirely unwatched.
+
+        The identity switch is written with the rest of the row, as three
+        integers the schema constrains to 0 or 1. Saving a site therefore
+        saves its switch: a caller editing the boundary carries the identity it
+        read back, and an edit that lost it would turn faces off — or on — as
+        a side effect of moving a corner. `Node.set_identity` is the only
+        caller that means to change it, and it audits the change.
         """
         now = _now()
         with self.transaction() as connection:
@@ -963,8 +1009,9 @@ class Store:
                 """
                 INSERT INTO sites (
                     id, name, origin_lat, origin_lon, frame, timezone,
-                    boundary_ring, created_at, updated_at
-                ) VALUES (?,?,?,?,?,?,?,?,?)
+                    boundary_ring, identity_plates, identity_faces,
+                    identity_face_crops, created_at, updated_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(id) DO UPDATE SET
                     name = excluded.name,
                     origin_lat = excluded.origin_lat,
@@ -972,6 +1019,9 @@ class Store:
                     frame = excluded.frame,
                     timezone = excluded.timezone,
                     boundary_ring = excluded.boundary_ring,
+                    identity_plates = excluded.identity_plates,
+                    identity_faces = excluded.identity_faces,
+                    identity_face_crops = excluded.identity_face_crops,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -986,6 +1036,9 @@ class Store:
                         if site.boundary
                         else None
                     ),
+                    1 if site.identity.plates else 0,
+                    1 if site.identity.faces else 0,
+                    1 if site.identity.face_crops else 0,
                     now, now,
                 ),
             )
@@ -1861,6 +1914,12 @@ def _site_from_row(row: sqlite3.Row) -> Site:
     fail quietly: a site read back as GEOGRAPHIC when it is a floor plan prints
     coordinates that mean nothing, and one read back as UTC evaluates an
     after-hours schedule in the wrong clock.
+
+    The identity switch is the third field a reader could drop, and it would
+    fail in the safe direction — a site read back with everything off runs no
+    face model — which is exactly why it would go unnoticed: a register the
+    operator switched on would match nobody and nothing would say so. Read
+    from the row, never defaulted here.
     """
     ring = row["boundary_ring"]
     return Site(
@@ -1873,6 +1932,11 @@ def _site_from_row(row: sqlite3.Row) -> Site:
         # not the same as one whose boundary is empty.
         boundary=(
             tuple(LatLon(lat, lon) for lat, lon in json.loads(ring)) if ring else ()
+        ),
+        identity=Identity(
+            plates=bool(row["identity_plates"]),
+            faces=bool(row["identity_faces"]),
+            face_crops=bool(row["identity_face_crops"]),
         ),
     )
 

@@ -1070,6 +1070,231 @@ def _where(args: argparse.Namespace) -> int:
     return 0
 
 
+# --------------------------------------------------------------------- basemap
+
+
+#: Frames per second, per camera, that feed the basemap median. The median
+#: needs its samples separated in time — a walker has to *leave* a cell between
+#: two of them to be outvoted — and sampling one frame onto the default
+#: quarter-metre grid costs 79 ms, measured, so feeding every frame of a 15 fps
+#: camera would both fill the ring with one half-second and fall behind it.
+BASEMAP_FRAMES_PER_SECOND = 4.0
+
+
+def _source_problem(source: str) -> str | None:
+    """Why a source string cannot be opened, said before anything is opened.
+
+    The two checks `run` makes inline: a malformed device index is a mistyped
+    command, and a file that is not there is a typo. Both are worth a sentence
+    and exit 2 rather than a traceback half way through opening cameras.
+    """
+    if devices.is_device_source(source):
+        try:
+            devices.device_index(source)
+        except devices.DeviceError as error:
+            return str(error)
+        return None
+    if "://" not in source and not Path(source).exists():
+        return f"no such file: {source}"
+    return None
+
+
+def _feed_basemap(
+    builder, source: VideoSource, pose: CameraPose, *, duration: float | None,
+    per_second: float,
+) -> tuple[int, float]:
+    """Feed one source to the builder at most ``per_second`` frames a second.
+
+    Thinned on the source's own clock — the wall clock for a camera, media
+    time for a file — so a recording of the yard is sub-sampled exactly as the
+    camera that made it would have been. ``duration`` bounds a camera by the
+    wall clock and a file by its media time; ``None`` lets a file run to its
+    end. A camera is read through `LiveStream`, the same reader `run` uses, so
+    a dropped frame is a gap and not an ending.
+
+    Returns frames *read* and seconds elapsed, which is what starvation is
+    judged on: a camera delivering one frame in ten seconds is held by another
+    program whether or not that frame was fed.
+    """
+    from .decode import LiveStream
+
+    interval = 1000.0 / per_second
+    started = time.monotonic()
+    read = 0
+    last_kept: int | None = None
+
+    def wanted(timestamp_millis: int) -> bool:
+        nonlocal last_kept
+        if last_kept is not None and timestamp_millis - last_kept < interval:
+            return False
+        last_kept = timestamp_millis
+        return True
+
+    if source.is_live:
+        assert duration is not None, "a live source is refused without --for before it is opened"
+        deadline = started + duration
+        with LiveStream(source) as stream:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                # Bounded by what is left rather than the reader's own ten
+                # seconds: a --for 5 that then waited ten more for a silent
+                # camera would not be a bound.
+                frame = stream.read(timeout=min(1.0, remaining))
+                if frame is None:
+                    continue
+                read += 1
+                if wanted(frame.timestamp_millis):
+                    # A live frame is already stamped with the wall clock.
+                    builder.feed(
+                        source.source_id, pose, frame.image, frame.timestamp_millis / 1000.0
+                    )
+    else:
+        source.open()
+        for frame in source:
+            if duration is not None and frame.timestamp_millis > duration * 1000.0:
+                break
+            read += 1
+            if wanted(frame.timestamp_millis):
+                # A file carries no wall clock of its own. What is honest is
+                # when this system looked at it, which is what the asset's
+                # per-cell age then measures from.
+                builder.feed(source.source_id, pose, frame.image, time.time())
+    return read, time.monotonic() - started
+
+
+def _basemap_build(args: argparse.Namespace) -> int:
+    """Build the site's basemap from its own cameras and keep it.
+
+    The same sources and placements `run` takes, fed one after another for
+    ``--for`` seconds each — the shape `run` has, one decode thread at a time,
+    so two cameras and ``--for 60`` is a two-minute build. Nothing but the
+    ground raster and its provenance is written: no frame, and no source URL,
+    because a camera URL carries a credential and a basemap is meant to be
+    copied about.
+    """
+    from .basemap import BasemapBuilder, BasemapError, basemap_directory, save_basemap
+    from .decode import is_live_source
+
+    if len(args.place) not in (1, len(args.source)):
+        print(
+            f"error: {len(args.place)} --place for {len(args.source)} source(s). "
+            "Give one, applied to every source, or one per source.",
+            file=sys.stderr,
+        )
+        return 2
+    if args.id and len(args.id) != len(args.source):
+        print(
+            f"error: {len(args.id)} --id for {len(args.source)} source(s). "
+            "Give one per source, or none and take cam-01, cam-02, ...",
+            file=sys.stderr,
+        )
+        return 2
+    if args.duration is not None and args.duration <= 0:
+        print("error: --for must be greater than zero", file=sys.stderr)
+        return 2
+    if args.cell <= 0:
+        print("error: --cell must be greater than zero", file=sys.stderr)
+        return 2
+    for source in args.source:
+        problem = _source_problem(source)
+        if problem is not None:
+            print(f"error: {problem}", file=sys.stderr)
+            return 2
+        if args.duration is None and is_live_source(source):
+            # Refused rather than warned about, unlike `run`: an unbounded run
+            # at least keeps analysing, but a basemap is built once at the
+            # end, and a build that never ends builds nothing.
+            print(
+                f"error: {source} is a camera, which has no end. Give --for SECONDS "
+                "so the build can finish; a minute is a reasonable start.",
+                file=sys.stderr,
+            )
+            return 2
+
+    sources = [
+        VideoSource(source, source_id=args.id[index] if args.id else f"cam-{index + 1:02d}")
+        for index, source in enumerate(args.source)
+    ]
+    builder = BasemapBuilder(cell_size_m=args.cell)
+    starved = False
+
+    try:
+        for index, source in enumerate(sources):
+            pose = args.place[index] if len(args.place) > 1 else args.place[0]
+            print(f"\n{source.source_id}  ({source.display_url})")
+            read, elapsed = _feed_basemap(
+                builder, source, pose, duration=args.duration,
+                per_second=BASEMAP_FRAMES_PER_SECOND,
+            )
+            fed = builder.frames_fed().get(source.source_id, 0)
+            print(f"  {read} frame(s) read in {elapsed:.0f}s, {fed} fed to the median")
+
+            starvation = _starvation(source, read, elapsed)
+            if starvation is not None:
+                print(f"  STARVED             {starvation}", file=sys.stderr)
+                starved = True
+
+        for camera_id in builder.blind_cameras():
+            print(
+                f"  {camera_id}: sees no ground — the bottom of its frame is above "
+                "the horizon — and contributed nothing",
+                file=sys.stderr,
+            )
+
+        try:
+            asset = builder.build()
+        except BasemapError as error:
+            print(f"\nerror: {error}", file=sys.stderr)
+            return 1
+
+        directory = Path(args.out) if args.out else basemap_directory()
+        png_path, json_path = save_basemap(asset, directory)
+
+        print()
+        print(asset.describe())
+        for camera_id in asset.cameras:
+            print(f"  {camera_id:<12} {asset.cells_from(camera_id):,} cell(s)")
+        print()
+        print(f"written   {png_path}")
+        print(f"          {json_path}")
+        print(
+            "Only the ground plane is correct. Anything with height is smeared "
+            "along the ray from the camera that saw it, so this is a basemap, "
+            "not a photograph."
+        )
+        return 1 if starved else 0
+    finally:
+        for source in sources:
+            source.close()
+
+
+def _basemap_show(args: argparse.Namespace) -> int:
+    """Describe the basemap on disk — after verifying it is the one it claims to be."""
+    from .basemap import BasemapError, basemap_directory, load_basemap
+
+    directory = Path(args.dir) if args.dir else basemap_directory()
+    try:
+        asset = load_basemap(directory)
+    except BasemapError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    if asset is None:
+        print(
+            f"no basemap in {directory}. Build one with: sentinel basemap build "
+            "SOURCE --place lat,lon,height,heading,pitch --for 60"
+        )
+        return 1
+
+    print(asset.describe())
+    for camera_id in asset.cameras:
+        print(f"  {camera_id:<12} {asset.cells_from(camera_id):,} cell(s)")
+    print(f"fingerprint  {asset.fingerprint}")
+    print(f"files        {directory}")
+    return 0
+
+
 # ---------------------------------------------------------------------- parser
 
 
@@ -1095,6 +1320,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  sentinel node gate.mp4 north.mp4 --record --for 3600\n"
             "  sentinel devices --probe\n"
             "  sentinel run device:0 --place 33.8938,35.5018,3,90,-15\n"
+            "  sentinel basemap build device:0 --place 33.8938,35.5018,3,90,-15 --for 60\n"
             "  sentinel incidents\n"
             "  sentinel export INC-abc123 --to ./evidence\n"
             "  sentinel where\n"
@@ -1324,6 +1550,63 @@ def build_parser() -> argparse.ArgumentParser:
 
     where = commands.add_parser("where", help="print every path this build uses")
     where.set_defaults(handler=_where)
+
+    basemap = commands.add_parser(
+        "basemap",
+        help="build the site's own basemap from its cameras, or show the one it has",
+    )
+    basemap_commands = basemap.add_subparsers(dest="basemap_command", required=True)
+    build = basemap_commands.add_parser(
+        "build",
+        help="feed each source for a while and keep the median ground as the basemap",
+        description=(
+            "Samples each camera's frames onto a metric ground grid through the "
+            "same projection its positions come from, keeps a running median per "
+            "cell so whatever moved through is removed, composites the cameras "
+            "cell by cell, and writes basemap.png and basemap.json. Only the "
+            "ground plane is correct; anything with height is smeared along its "
+            "ray. No frame is written, and no source URL."
+        ),
+    )
+    build.add_argument(
+        "source", nargs="+",
+        help="video files, rtsp:// URLs, or device:N — the same sources `run` takes",
+    )
+    build.add_argument(
+        "--id", action="append", default=None,
+        help="camera id, once per source (default: cam-01, cam-02, ...)",
+    )
+    build.add_argument(
+        "--place", action="append", type=_pose, required=True,
+        help=(
+            "lat,lon,height,heading,pitch[,hfov,vfov,range] — once, or once per "
+            "source. Required: the basemap is the inverse of this projection."
+        ),
+    )
+    build.add_argument(
+        "--for", dest="duration", type=float, default=None, metavar="SECONDS",
+        help=(
+            "feed each camera for this long; required for a camera, which has "
+            "no end. For a file, this much of the recording (default: all of it)."
+        ),
+    )
+    build.add_argument(
+        "--cell", type=float, default=0.25, metavar="METRES",
+        help="ground cell size (default 0.25)",
+    )
+    build.add_argument(
+        "--out", default=None, metavar="DIR",
+        help="where to write basemap.png and basemap.json (default: basemap/ "
+             "under the data directory)",
+    )
+    build.set_defaults(handler=_basemap_build)
+
+    show = basemap_commands.add_parser(
+        "show", help="describe the basemap on disk, after verifying its fingerprint"
+    )
+    show.add_argument("--dir", default=None, metavar="DIR",
+                      help="where it was written (default: basemap/ under the data directory)")
+    show.set_defaults(handler=_basemap_show)
 
     return parser
 

@@ -27,6 +27,21 @@ is the whole point: a camera correlating only its own events raises one incident
 per camera for one intrusion, which is the duplication this system exists to
 remove.
 
+**Identity is a site switch, and the node is where it is enforced.** Faces and
+plates each existed as tested modules that nothing called: `sentinel.faces` had
+an engine with a switch, `sentinel.plates` had a reader the pipeline would take,
+and no production path built either — so the register could be enrolled into
+and matched against nobody. The switch lives on the site row (`Site.identity`),
+survives a restart, and every flip is an audit row with a before and an after.
+Off means nothing runs, and the tests prove it the only way that counts: the
+stand-in models were shown no pixels. On means the node hands a plate reader to
+each pipeline it starts and examines person tracks for faces itself, on its own
+thread, because the register is a database and the database belongs to this
+thread. Face work is confined to the box of a track the detector labelled a
+person, at most once every :data:`FACE_STRIDE_FRAMES` frames per track, and the
+templates it produces live only as long as the track does unless an operator
+names it.
+
 What is deliberately *not* here: any network listener. A node that other machines
 can talk to needs a control plane, mTLS and pairing, and none of that exists yet
 — see ROADMAP 2.1. This is the half that had to come first, because there was no
@@ -37,16 +52,19 @@ from __future__ import annotations
 
 import threading
 import time
+import uuid
+from collections import deque
 from datetime import datetime, timezone
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 
 import numpy as np
 from pathlib import Path
 from typing import Iterator, Sequence
 
+from . import paths
 from .auditing import MISSING, AuditRecord
-from .core import CameraPose
+from .core import CameraPose, LatLon, Track
 from .decode import REDACTED, DecodeError, VideoSource, is_live_source
 from .detect import Detector, DetectorInfo, MotionDetector
 from .evidence import (
@@ -56,10 +74,22 @@ from .evidence import (
     export_incident,
 )
 from .events import Event, Rule, default_rules
+from .faces import (
+    EnrolledPerson,
+    FaceBackend,
+    FaceEngine,
+    FaceError,
+    FaceTemplate,
+    TrackIdentity,
+    Verdict,
+)
 from .incidents import Correlator, Incident
 from .logs import get as _get_logger
 from .pipeline import FrameResult, Pipeline, PipelineStats, TrackPlate
-from .registry import Confidence, RegistryError, Subject
+from .plates import PlateModels, PlateReader
+from .registry import Confidence, Forgotten, Plate, RegistryError, Subject, SubjectKind
+from .registry import FaceTemplate as StoredFaceTemplate
+from .site import DEFAULT_SITE_ID, Identity, Site
 from .store import Store, default_database_path
 from .zones import Zone
 
@@ -83,6 +113,39 @@ DARK_AFTER_SECONDS = 30.0
 #: to name; recording the truth beats inventing an operator, because an audit
 #: trail with a false entry is worse than no audit trail.
 ACTOR = "node"
+
+#: Frames between face examinations of one person track.
+#:
+#: Face work is a detector and an embedder per person per frame, and at thirty
+#: frames a second that is sixty model calls a second for one person standing
+#: still — paid on the node's thread, which is also the thread that persists
+#: events and correlates. Adjacent frames are not independent evidence either:
+#: two frames a thirtieth of a second apart are two samples of one instant's
+#: pose and lighting, and `faces.identify_track` wants corroboration across the
+#: track, not agreement between neighbours. Every fifth frame keeps the cost
+#: fixed per person and spreads the frames that do get examined across the
+#: time the person is actually in shot. Per track rather than per frame, so
+#: twelve people do not all come due at once and turn a rate limit into a
+#: periodic stall.
+FACE_STRIDE_FRAMES = 5
+
+#: Face templates held per live person track, for enrolment and identification.
+#:
+#: Held in memory only, dropped when the track ends, and never written unless
+#: an operator names the track — this is the whole difference between a
+#: register and a gallery of strangers. Twelve is enough that the operator
+#: naming a track gets its best-quality face rather than its first, and that
+#: identification has :data:`~sentinel.faces.FRAMES_FOR_A_MATCH` several times
+#: over; it is few enough that a hundred people in shot cost a few hundred
+#: kilobytes rather than the frames they were seen in.
+FRAMES_KEPT_FOR_ENROLMENT = 12
+
+#: The two files the face path expects in the models directory. Both are the
+#: operator's to supply; nothing here fetches them.
+FACE_MODEL_FILES = ("yunet.onnx", "sface.onnx")
+
+#: The three files the plate path expects in the models directory.
+PLATE_MODEL_FILES = ("plate-detector.onnx", "plate-recogniser.onnx", "plate-charset.txt")
 
 
 class NodeError(RuntimeError):
@@ -287,6 +350,15 @@ class CameraRecord:
     #: sighted, and nothing said so.
     run: int = field(default=0, init=False)
     runner: "CameraRunner | None" = None
+    #: The identity switch as it stood when this camera's runner was built.
+    #: Snapshotted at `Node.start` because the plate reader is handed to the
+    #: pipeline then and cannot be added to or taken from a running one, so
+    #: what a running camera does about identity is what it was started with —
+    #: with one exception, deliberately: switching faces *off* stops face work
+    #: on every camera at the next poll, because that work runs on the node's
+    #: thread and a switch-off that waited for a restart would leave a face
+    #: model running on a site that had just said no.
+    identity: Identity = Identity()
     #: Events this camera has raised, kept so correlation can run across the
     #: whole node rather than within one camera.
     events: list[Event] = field(default_factory=list)
@@ -334,7 +406,7 @@ class CameraRunner:
         "_segment_seconds", "_thread", "_lock", "_stopping",
         "_latest", "_skipped", "_pending_pose", "_pose_changed", "_fault",
         "_pipeline", "_new_events", "_new_segments", "_site_tz",
-        "_started_at", "_last_frame_at", "_analysis_fps",
+        "_started_at", "_last_frame_at", "_analysis_fps", "_plate_reader",
     )
 
     def __init__(
@@ -351,6 +423,7 @@ class CameraRunner:
         record_to: Path | None = None,
         segment_seconds: float = 60.0,
         site_tz=None,
+        plate_reader: PlateReader | None = None,
     ):
         """
         ``keep_images`` is off by default. A node with nobody watching has no use
@@ -360,6 +433,11 @@ class CameraRunner:
         ``realtime`` paces a file to its own timeline. Off by default, because a
         node analysing recorded footage should go as fast as it can; a *viewer*
         wants it paced, and turns this on.
+
+        ``plate_reader`` goes to the pipeline as it is. `Pipeline` has accepted
+        one since the plate path was built, and until the node passed it
+        nothing did, so plate reading was dead in every production run while
+        every test of it passed. ``None`` is the off state and costs nothing.
         """
         self._source = source
         self._detector = detector
@@ -372,6 +450,7 @@ class CameraRunner:
         self._record_to = record_to
         self._segment_seconds = segment_seconds
         self._site_tz = site_tz
+        self._plate_reader = plate_reader
 
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
@@ -640,6 +719,7 @@ class CameraRunner:
             segment_seconds=self._segment_seconds,
             on_segment=self._collect_segment,
             site_tz=self._site_tz,
+            plate_reader=self._plate_reader,
         )
         self._pipeline = pipeline
 
@@ -811,6 +891,38 @@ def _describe_zone_change(before: Zone, after: Zone) -> str:
     return "; ".join(parts) if parts else "no change"
 
 
+@dataclass
+class _TrackFaces:
+    """What the node holds about one live person track's face, and only that.
+
+    Templates, not crops: the frame is examined and dropped, and what remains
+    is the last :data:`FRAMES_KEPT_FOR_ENROLMENT` vectors, which cannot be
+    rendered or inverted. The whole record dies with the track — `Node.poll`
+    pops it on the frame that ends the track, and on any change of runner —
+    so a stranger who walked through leaves nothing behind. That is not a
+    cache policy; it is the difference between a register and a gallery.
+    """
+
+    templates: deque = field(
+        default_factory=lambda: deque(maxlen=FRAMES_KEPT_FOR_ENROLMENT)
+    )
+    #: The frame index at which this track may next be examined. Per track,
+    #: so a crowd does not all come due on one frame.
+    next_index: int = 0
+    #: The last verdict over everything held, or ``None`` before the first.
+    identity: TrackIdentity | None = None
+
+
+def _new_subject_id(kind: str) -> str:
+    """An id for a subject the operator is about to name.
+
+    Random rather than derived from the name — the id goes into audit rows
+    that outlive a `forget`, and an id built from a name would put the name
+    back into the one log that is supposed to have lost it.
+    """
+    return f"{kind}-{uuid.uuid4().hex[:12]}"
+
+
 class Node:
     """Everything a machine runs, with nothing on screen.
 
@@ -837,12 +949,23 @@ class Node:
         event_retention: int = 5000,
         actor: str = ACTOR,
         site_tz=None,
+        face_backend: FaceBackend | None = None,
+        plate_reader: PlateReader | None = None,
     ):
         """
         ``detector_factory`` is called once per camera. One detector per camera,
         never shared: MOG2 carries a per-pixel model of *its* scene, and feeding
         it two cameras corrupts both models and every detection that comes out
         of them.
+
+        ``face_backend`` and ``plate_reader`` are the seams the tests inject
+        through, and they change nothing about the switch: with a backend given,
+        faces run when — and only when — the site's identity has faces on, and
+        the model files are simply not consulted. Without them the node looks in
+        :func:`paths.models_directory` for the operator's files, and when they
+        are absent it runs nothing and says so in :attr:`identity_status`
+        rather than raising: a camera must start whether or not the site's face
+        models have arrived.
 
         ``rules`` defaults to :func:`~sentinel.events.default_rules` over the
         zones given, so a node configured with no rules still does something
@@ -907,6 +1030,31 @@ class Node:
         self._running = False
         self._stop = threading.Event()
 
+        # The identity machinery. `_identity` mirrors the site row and is the
+        # switch every decision below reads; it is set from the store once the
+        # cameras are back, because the default site's origin is the first
+        # placed camera. `_faces` is the one face engine on this node — built
+        # only while faces are on, used only on this thread — and `_face_tracks`
+        # is everything held about live person tracks, keyed like a sighting
+        # plus the run, for the same reason `_sighted` is.
+        self._face_backend = face_backend
+        self._injected_plate_reader = plate_reader
+        self._identity = Identity()
+        self._faces: FaceEngine | None = None
+        self._face_status = ""
+        self._plate_status = ""
+        self._face_fault: str | None = None
+        self._face_tracks: dict[tuple[str, int, int], _TrackFaces] = {}
+        # Frames that reached face work with no image attached. Counted and
+        # reported rather than silently skipped, because a node built without
+        # `keep_images` would otherwise run a switched-on face path that never
+        # looked at anything, and nothing on any screen would say so.
+        self._frames_without_image = 0
+        # Person encounters audited, keyed with the confidence: a possible
+        # match that later becomes a match is two claims, and the log records
+        # both once rather than the first forever or the second every poll.
+        self._face_sighted: set[tuple[str, str, int, int, str]] = set()
+
         if zones:
             for zone in self._zones:
                 self.store.save_zone(zone)
@@ -922,11 +1070,18 @@ class Node:
         if restore_cameras:
             self._restore_cameras()
 
+        # After the cameras, because the default site's origin is the first
+        # placed one. The switch comes from the row, never from a default here:
+        # a site that turned faces on yesterday must come back with them on, or
+        # the register it enrolled into matches nobody and nothing says so.
+        self._identity = self.site().identity
+        self._rebuild_identity()
+
         self.store.audit(self._actor, "node.started", node_id)
         _log.info(
-            "node %s: %d zone(s), %d rule(s), recording %s",
+            "node %s: %d zone(s), %d rule(s), recording %s, identity %s",
             node_id, len(self._zones), len(self._rules),
-            self._record_to or "off",
+            self._record_to or "off", self.identity_status,
         )
 
     # ------------------------------------------------------------------ state
@@ -975,6 +1130,269 @@ class Node:
             return self._cameras[camera_id]
         except KeyError:
             raise NodeError(f"no camera {camera_id!r} on this node") from None
+
+    # ------------------------------------------------------------------- site
+
+    def site(self) -> Site:
+        """The site this node watches: the stored row, or a default never persisted.
+
+        The default exists so that every caller — the identity switch, the
+        interface, an export — has a site to read without first asking whether
+        one was ever saved, and it is deliberately *not* written by this call:
+        a row that appears because somebody looked would be a site nobody
+        declared, with an origin nobody chose. Its origin is the first placed
+        camera, or nowhere, which is the honest interim `site.py` argues
+        against for anything that lasts — and it lasts only until
+        :meth:`set_identity` or a site editor writes a real one.
+        """
+        stored = self.store.site()
+        if stored is not None:
+            return stored
+        placed = next(
+            (record.pose.position for record in self._cameras.values()
+             if record.pose is not None),
+            None,
+        )
+        return Site(
+            id=DEFAULT_SITE_ID,
+            name="Site",
+            origin=placed if placed is not None else LatLon(0.0, 0.0),
+        )
+
+    def set_identity(self, identity: Identity, *, reason: str) -> Site:
+        """Flip the site's identity switch, audited, with the reason recorded.
+
+        The one path by which a site starts or stops reading plates or looking
+        at faces. It writes the site row — so the decision survives a restart —
+        and an audit row with both states, so "who turned faces on, when, and
+        why" is answerable from the log rather than from memory. ``reason`` is
+        required and refused when blank for the same reason the register
+        refuses a blank lawful basis: a switch that starts biometric processing
+        for no recorded reason is the entry an auditor asks about first.
+
+        **What takes effect when.** Plates apply to cameras started from now
+        on: the reader is handed to a pipeline when it is built and a running
+        pipeline keeps the one it has, or its absence, until that camera is
+        restarted. Faces *on* likewise applies to cameras started from now on,
+        so that one rule covers both. Faces *off* is the exception and takes
+        effect at the next poll on every camera, because that work runs here
+        on the node's thread and a switch-off that waited for a restart would
+        leave a face model running on a site that had just said no. The held
+        templates go with it. The warning logged when cameras are running says
+        exactly this, and :attr:`identity_status` reads the new state at once.
+
+        Returns the site as it now stands; the caller holds nothing stale.
+        """
+        if not reason or not reason.strip():
+            raise NodeError(
+                "changing what a site identifies needs a reason to record; a "
+                "switch flipped for no stated reason is the audit row nobody "
+                "can defend"
+            )
+        before = self.site()
+        after = replace(before, identity=identity)
+        self.store.save_site(after)
+        # Structured before/after of the switch alone — three booleans — with
+        # the reason in the prose. Chained, so the row that turned faces on
+        # cannot be edited afterwards without the chain saying so.
+        self._audit(
+            "site.identity", DEFAULT_SITE_ID,
+            before=before.identity, after=identity,
+            detail=(
+                f"identity {before.identity.describe()} -> {identity.describe()}: "
+                f"{reason.strip()}"
+            ),
+        )
+        self._identity = identity
+        self._rebuild_identity()
+
+        running = [r.camera_id for r in self._cameras.values() if r.is_running]
+        if running:
+            _log.warning(
+                "node %s: identity is now %s; plates%s apply to cameras started "
+                "from now on and %s keep what they were started with until "
+                "restarted%s",
+                self._node_id, identity.describe(),
+                " and faces" if identity.faces else "",
+                ", ".join(running),
+                "; faces off stops face work on every camera at the next poll"
+                if not identity.faces else "",
+            )
+        _log.info("node %s: identity %s", self._node_id, self.identity_status)
+        return after
+
+    @property
+    def identity(self) -> Identity:
+        """The switch as this node currently reads it."""
+        return self._identity
+
+    @property
+    def identity_status(self) -> str:
+        """One honest line about what the identity switch is actually doing.
+
+        Not what it is set to — what it is *doing*. A site with faces on and no
+        face models is running no face model, and an interface that printed
+        "faces: on" for it would be describing a configuration rather than the
+        system. So the line names the models directory and the files expected
+        in it, the backend when one is loaded, the fault when one stopped it,
+        and the frames that arrived with no image to examine. "off" is the
+        whole line when nothing is switched on, and it means nothing runs.
+        """
+        parts: list[str] = []
+        if self._identity.plates:
+            parts.append(self._plate_status)
+        if self._identity.faces:
+            line = self._face_status
+            if self._face_fault is not None:
+                line += f" — stopped: {self._face_fault}"
+            if self._frames_without_image:
+                line += (
+                    f" — {self._frames_without_image} frame(s) arrived without "
+                    "an image and were not examined"
+                )
+            parts.append(line)
+        if self._identity.face_crops:
+            parts.append(
+                "face crops: recorded as on, but nothing in this build keeps a "
+                "crop; templates only"
+            )
+        return "; ".join(parts) if parts else "off"
+
+    def _rebuild_identity(self) -> None:
+        """Build, or tear down, what the switch says should exist.
+
+        Called at start-up and on every flip. The face engine is rebuilt rather
+        than toggled because `FaceEngine` has no ``enable()`` on purpose: an
+        engine is on or off from construction, so there is never a reference
+        that holds a frame and the wrong answer about the switch. Turning faces
+        off drops every held template with the engine — nothing biometric
+        outlives the decision to stop.
+
+        A missing model is a status line and a warning, never an exception. A
+        node has to start whether or not the operator's files have arrived,
+        and it has to say which files it is waiting for and where.
+        """
+        self._face_fault = None
+        if not self._identity.faces:
+            self._faces = None
+            self._face_tracks.clear()
+            self._face_status = ""
+        else:
+            self._faces, self._face_status = self._build_face_engine()
+
+        if not self._identity.plates:
+            self._plate_status = ""
+        else:
+            self._plate_status = self._describe_plate_readiness()
+
+    def _build_face_engine(self) -> tuple[FaceEngine | None, str]:
+        """The engine for a site with faces on, or ``None`` and the reason."""
+        backend = self._face_backend
+        if backend is not None:
+            engine = FaceEngine(enabled=True, backend=backend)
+            return engine, f"faces: on ({backend.name})"
+
+        directory = paths.models_directory()
+        detector, embedder = (directory / name for name in FACE_MODEL_FILES)
+        if not (detector.is_file() and embedder.is_file()):
+            expected = " and ".join(FACE_MODEL_FILES)
+            _log.warning(
+                "node %s: faces are on for this site but no models are in %s "
+                "(expecting %s); no face will be examined until they are there. "
+                "Nothing is downloaded.",
+                self._node_id, directory, expected,
+            )
+            return None, (
+                f"faces: on but no models in {directory} — expecting {expected}; "
+                "no face is examined until they are there"
+            )
+        try:
+            engine = FaceEngine(
+                enabled=True, detector_model=detector, embedder_model=embedder
+            )
+        except Exception as error:  # noqa: BLE001 - third-party model files
+            # The files are the operator's and their failure modes are not
+            # ours. The camera still runs; the status says what happened.
+            _log.error(
+                "node %s: the face models in %s could not be loaded (%s); no "
+                "face will be examined",
+                self._node_id, directory, type(error).__name__, exc_info=True,
+            )
+            return None, (
+                f"faces: on but the models in {directory} could not be loaded "
+                f"({type(error).__name__}); no face is examined"
+            )
+        return engine, f"faces: on ({engine.info.backend})"
+
+    def _plate_models(self) -> PlateModels:
+        directory = paths.models_directory()
+        detector, recogniser, charset = (directory / name for name in PLATE_MODEL_FILES)
+        return PlateModels(detector, recogniser, charset)
+
+    def _describe_plate_readiness(self) -> str:
+        """What the plate path will do for the next camera started."""
+        reader = self._injected_plate_reader
+        if reader is not None:
+            info = getattr(reader, "info", None)
+            if info is not None:
+                return (
+                    f"plates: on ({Path(info.detector_path).name} + "
+                    f"{Path(info.recogniser_path).name}, {info.country})"
+                )
+            return f"plates: on ({type(reader).__name__})"
+
+        models = self._plate_models()
+        missing = models.missing()
+        if missing:
+            directory = paths.models_directory()
+            expected = ", ".join(PLATE_MODEL_FILES)
+            _log.warning(
+                "node %s: plates are on for this site but no models are in %s "
+                "(expecting %s); no plate will be read until they are there. "
+                "Nothing is downloaded.",
+                self._node_id, directory, expected,
+            )
+            return (
+                f"plates: on but no models in {directory} — expecting {expected}; "
+                "no plate is read until they are there"
+            )
+        return (
+            f"plates: on ({models.detector_path.name} + {models.recogniser_path.name} "
+            f"from {models.detector_path.parent}); a reader is built for each "
+            "camera when it starts"
+        )
+
+    def _plate_reader_for(self, record: CameraRecord) -> PlateReader | None:
+        """The reader a camera about to start gets, or ``None`` and no plates.
+
+        One reader per camera, never shared, for the reason detectors are not
+        shared: the reader holds two OpenCV networks, and a network driven from
+        two threads at once is undefined. The injected reader is the exception
+        and is a test's to share. A reader that cannot be built — the model
+        files are the operator's and may be anything — is logged and becomes
+        a camera without plates, not a camera that failed to start.
+        """
+        if not record.identity.plates:
+            return None
+        if self._injected_plate_reader is not None:
+            return self._injected_plate_reader
+        models = self._plate_models()
+        if models.missing():
+            return None
+        try:
+            return PlateReader(models)
+        except Exception as error:  # noqa: BLE001 - third-party model files
+            _log.error(
+                "node %s: camera %s: the plate reader could not be built (%s); "
+                "the camera runs without plates",
+                self._node_id, record.camera_id, type(error).__name__,
+                exc_info=True,
+            )
+            self._plate_status = (
+                f"plates: on but the reader could not be built "
+                f"({type(error).__name__}); no plate is read"
+            )
+            return None
 
     def _restore_cameras(self) -> None:
         """Bring back the cameras this node had, with their placements."""
@@ -1303,6 +1721,10 @@ class Node:
             if record.fault is not None and record.fault.startswith("same source as"):
                 continue
             record.fault = None
+            # The switch as it stands now is what this run gets. See
+            # `CameraRecord.identity` for what a later flip does and does not
+            # change about a running camera.
+            record.identity = self._identity
             source = VideoSource(record.source, source_id=record.camera_id)
             record.runner = CameraRunner(
                 source,
@@ -1312,11 +1734,17 @@ class Node:
                 zones=self._zones,
                 rules=self._rules,
                 node_id=self._node_id,
-                keep_images=self._keep_images,
+                # Face work needs the frame. A daemon keeps no images because
+                # nobody is watching, and with faces on it would otherwise run
+                # a switched-on face path over results that carried nothing
+                # to look at. The image travels in the latest-wins slot and is
+                # dropped after the poll; nothing here stores it.
+                keep_images=self._keep_images or record.identity.faces,
                 realtime=self._realtime,
                 record_to=self._record_to,
                 segment_seconds=self._segment_seconds,
                 site_tz=self._site_tz,
+                plate_reader=self._plate_reader_for(record),
             )
             record.runner.start()
             started += 1
@@ -1370,6 +1798,10 @@ class Node:
             )
 
         self._running = False
+        # No track is live once its camera has stopped, and the templates were
+        # only ever the last few faces of a live track. They go now rather
+        # than when the next runner replaces them.
+        self._face_tracks.clear()
         self.store.audit(self._actor, "analysis.stopped")
         _log.info("node %s: stopped", self._node_id)
         return ended
@@ -1412,6 +1844,12 @@ class Node:
                 if update.result.plates:
                     # On this thread, for the same reason as the segments.
                     self._note_plates(record, update.result)
+                if record.identity.faces and self._faces is not None:
+                    # Gated twice on purpose: the run's own snapshot says
+                    # faces were on when it started, and the live engine says
+                    # they still are. Either alone is a way to examine a face
+                    # on a site that said no.
+                    self._note_faces(record, update)
 
             for segment in record.runner.take_segments():
                 # On this thread, which is the only one allowed to write.
@@ -1548,6 +1986,435 @@ class Node:
                 self._node_id, subject.id, camera_id, plate.track_id,
                 plate.agreement, plate.reads,
             )
+
+    def _note_faces(self, record: CameraRecord, update: Update) -> None:
+        """Examine the person tracks on one frame for faces, and match them.
+
+        Everything the People feature promises is kept or broken here, so the
+        promises are the structure of the method:
+
+        **Only inside a person's box.** The engine is handed the frame and one
+        track's box, and crops for itself; a track the detector did not label
+        ``person`` is never handed over at all. A motion detector labels
+        nothing, so a node running on motion alone examines nobody however the
+        switch is set — the test that proves the stand-in models saw no pixels
+        runs against exactly that.
+
+        **At most once every :data:`FACE_STRIDE_FRAMES` frames per track.** The
+        frame index carries the cadence rather than the poll, so a viewer that
+        polls slowly does not examine every frame it happens to collect and a
+        fast one does not examine every frame there is.
+
+        **Held for the track, and dropped with it.** Templates go into the
+        track's deque and the deque goes when the track ends, or when the run
+        does. A person who walked through and was named by nobody has left
+        nothing on this node by the time their box closes.
+
+        **A verdict is over the track, never a frame.** Everything held is
+        re-identified together, so a match rests on the median of several
+        frames and a single flattering frame cannot make it. A MATCH or a
+        POSSIBLE becomes a sighting on the register, with its confidence and
+        its score, and the first of each is audited by subject id. NONE writes
+        nothing anywhere.
+
+        **A broken model stops the faces, not the camera.** A backend raising
+        on a crop is logged with its type, the engine is dropped, and the
+        status line says so; the poll and the camera carry on.
+        """
+        result = update.result
+        camera_id = record.camera_id
+        run = record.run
+
+        # A new runner starts its track ids again, so anything held under an
+        # older run for this camera describes tracks that no longer exist.
+        for key in [k for k in self._face_tracks if k[0] == camera_id and k[1] != run]:
+            del self._face_tracks[key]
+        for track_id in result.ended:
+            self._face_tracks.pop((camera_id, run, track_id), None)
+
+        image = update.image
+        if image is None:
+            self._frames_without_image += 1
+            return
+
+        engine = self._faces
+        assert engine is not None  # the caller gated on it
+        info = record.runner.detector_info if record.runner is not None else None
+        if info is None:
+            return
+        now = int(time.time() * 1000)
+        enrolled: list[tuple[EnrolledPerson, tuple[str, ...]]] | None = None
+
+        for track in result.tracks:
+            if info.label_for(track.class_id).strip().lower() != "person":
+                continue
+            key = (camera_id, run, track.id)
+            state = self._face_tracks.get(key)
+            if state is None:
+                state = _TrackFaces()
+                self._face_tracks[key] = state
+            if result.index < state.next_index:
+                continue
+            state.next_index = result.index + FACE_STRIDE_FRAMES
+
+            try:
+                templates = engine.templates_in(
+                    image, track.bbox,
+                    source=f"{camera_id}/{track.id}",
+                    timestamp_unix_millis=now,
+                )
+            except FaceError as error:
+                # A box the engine refuses — no area, or not normalised — is a
+                # fact about this track on this frame, not about the model.
+                _log.debug("node %s: camera %s track %d: %s",
+                           self._node_id, camera_id, track.id, error)
+                continue
+            except Exception as error:  # noqa: BLE001 - the operator's models
+                self._face_fault = type(error).__name__
+                self._faces = None
+                self._face_tracks.clear()
+                _log.error(
+                    "node %s: FACE WORK STOPPED — %s. Cameras keep running; no "
+                    "face is examined until identity is set again.",
+                    self._node_id, self._face_fault, exc_info=True,
+                )
+                return
+            if not templates:
+                continue
+
+            state.templates.extend(templates)
+            if enrolled is None:
+                enrolled = self._enrolled_people(engine)
+            identity = engine.identify_track(
+                tuple(state.templates), [person for person, _ in enrolled]
+            )
+            state.identity = identity
+            if identity.person_id is not None and identity.verdict in (
+                Verdict.MATCH, Verdict.POSSIBLE
+            ):
+                self._note_face_sighting(record, track, state, identity, enrolled)
+
+    def _enrolled_people(
+        self, engine: FaceEngine
+    ) -> list[tuple[EnrolledPerson, tuple[str, ...]]]:
+        """Everybody enrolled for this backend, rebuilt from the register.
+
+        Rebuilt per poll rather than cached, for the reason `faces._Register`
+        gives: a cached copy of the site's biometrics is a second register
+        that outlives the `forget` that was supposed to delete them. One query
+        per poll that examined a face is the price, and it is small.
+
+        Filtered to the engine's own model by the register itself — a template
+        from another encoder is a number that looks like a score — and each
+        person's enrolment ids travel beside their templates in the same
+        order, so a sighting can cite the enrolment it actually matched.
+        """
+        register = self.store.register
+        backend = engine.info.backend or ""
+        held: dict[str, list[tuple[str, FaceTemplate]]] = {}
+        for identifier in register.templates(model=backend):
+            if identifier.template is None:
+                continue
+            vector = np.frombuffer(identifier.template, dtype=np.float32)
+            try:
+                template = FaceTemplate(
+                    vector=tuple(float(v) for v in vector),
+                    quality=float(np.clip(identifier.quality or 0.0, 0.0, 1.0)),
+                    model=identifier.model or backend,
+                    source=(
+                        f"{identifier.source_camera}/{identifier.source_track}"
+                        if identifier.source_camera is not None else ""
+                    ),
+                    created_unix_millis=identifier.enrolled_at_millis,
+                )
+            except FaceError as error:
+                # A stored template this engine cannot read is skipped, not
+                # matched: comparing against it would score nobody honestly.
+                _log.warning(
+                    "node %s: enrolment %s is unusable and was not compared: %s",
+                    self._node_id, identifier.id, error,
+                )
+                continue
+            held.setdefault(identifier.subject_id, []).append((identifier.id, template))
+
+        people: list[tuple[EnrolledPerson, tuple[str, ...]]] = []
+        for subject_id, enrolments in held.items():
+            subject = register.subject(subject_id)
+            if subject is None:
+                continue
+            people.append((
+                EnrolledPerson(
+                    person_id=subject_id,
+                    name=subject.display_name,
+                    templates=tuple(template for _, template in enrolments),
+                ),
+                tuple(identifier_id for identifier_id, _ in enrolments),
+            ))
+        return people
+
+    def _note_face_sighting(
+        self,
+        record: CameraRecord,
+        track: Track,
+        state: _TrackFaces,
+        identity: TrackIdentity,
+        enrolled: Sequence[tuple[EnrolledPerson, tuple[str, ...]]],
+    ) -> None:
+        """Record a matched or possibly-matched person track on the register.
+
+        Mirrors `_note_sighting` for plates: the window is the track's own
+        first and last observation and widens on every poll, the register
+        keeps one row per track, and the confidence is the verdict's — MATCH
+        for MATCH, POSSIBLE for POSSIBLE, so the *possible match* rendering
+        survives into the movement history and a later panel cannot show the
+        certain form of a name this one hedged. The score is the track median
+        `faces.identify_track` reached, not the best frame.
+
+        The enrolment cited is the one of this person's that the track's held
+        templates resemble most, so "why does it think this is her" has a row
+        to point at. Audited once per encounter per confidence, by subject id
+        and camera, never by name: the audit log outlives a forget.
+        """
+        camera_id = record.camera_id
+        person = next(
+            ((p, ids) for p, ids in enrolled if p.person_id == identity.person_id), None
+        )
+        if person is None:
+            return
+        enrolled_person, identifier_ids = person
+
+        # Which of their enrolments this track resembles most: one small
+        # matrix product, the same arithmetic `faces` uses.
+        held = np.asarray([t.vector for t in state.templates], dtype=np.float64)
+        theirs = np.asarray([t.vector for t in enrolled_person.templates], dtype=np.float64)
+        cited = identifier_ids[int(np.argmax((held @ theirs.T).max(axis=0)))]
+
+        confidence = (
+            Confidence.MATCH if identity.verdict is Verdict.MATCH else Confidence.POSSIBLE
+        )
+        first_seen, last_seen = track.first_seen_millis, track.last_seen_millis
+        try:
+            self.store.register.record_sighting(
+                subject_id=identity.person_id,
+                camera_id=camera_id,
+                track_id=track.id,
+                first_seen_millis=min(first_seen, last_seen),
+                last_seen_millis=max(first_seen, last_seen),
+                confidence=confidence,
+                score=identity.score,
+                identifier_id=cited,
+            )
+        except RegistryError as error:
+            # The subject was forgotten between the rebuild and now, or the
+            # enrolment was swept. A sighting of nobody is not recorded.
+            _log.warning("node %s: sighting not recorded: %s", self._node_id, error)
+            return
+
+        encounter = (identity.person_id, camera_id, record.run, track.id, confidence.value)
+        if encounter not in self._face_sighted:
+            self._face_sighted.add(encounter)
+            word = "match" if confidence is Confidence.MATCH else "possible match"
+            self.store.audit(
+                self._actor, "person.sighted", identity.person_id,
+                f"camera {camera_id}, track {track.id}: {word}, "
+                f"{identity.score:.2f} over {identity.frames} frame(s)",
+            )
+            _log.info(
+                "node %s: subject %s sighted on camera %s track %d (%s, %.2f over "
+                "%d frame(s))",
+                self._node_id, identity.person_id, camera_id, track.id, word,
+                identity.score, identity.frames,
+            )
+
+    # --------------------------------------------------------- the register
+
+    def identity_of(self, camera_id: str, track_id: int) -> TrackIdentity | None:
+        """What the node currently says about who a live person track is.
+
+        ``None`` when faces are off, when the track is not one this node holds
+        a face for, or before its first examination — those are all "nothing
+        has been decided", and an interface must draw nothing for them. A
+        :class:`~sentinel.faces.TrackIdentity` otherwise, verdict and all;
+        ``verdict is Verdict.NONE`` is a decision that this is nobody enrolled.
+        """
+        record = self.camera(camera_id)
+        state = self._face_tracks.get((camera_id, record.run, track_id))
+        return state.identity if state is not None else None
+
+    def templates_for(self, camera_id: str, track_id: int) -> tuple[FaceTemplate, ...]:
+        """The templates held for a live person track, newest last.
+
+        At most :data:`FRAMES_KEPT_FOR_ENROLMENT`, empty when faces are off or
+        the track has ended, and never persisted by anything but
+        :meth:`enrol_person`. An interface offers "name this person" exactly
+        when this is non-empty.
+        """
+        record = self.camera(camera_id)
+        state = self._face_tracks.get((camera_id, record.run, track_id))
+        return tuple(state.templates) if state is not None else ()
+
+    def enrol_person(
+        self,
+        name: str,
+        camera_id: str,
+        track_id: int,
+        *,
+        basis: str,
+        notes: str | None = None,
+        subject_id: str | None = None,
+    ) -> str:
+        """Name a live person track, storing its best face template. Returns the subject id.
+
+        The only path from a face to the register, and it is an operator's
+        act on a track they can see: nothing is enrolled by being observed.
+        The best-quality template held for the track — the detector's own
+        confidence that this was a face — is stored as the enrolment, packed
+        as float32 with the backend that produced it named beside it, so the
+        register can refuse to compare it against another model's output.
+
+        Refused, with a plain message, when faces are off for the site or no
+        engine is running, when the track has no templates held, and when the
+        name is blank; the register refuses a blank basis itself. Each is a
+        `RegistryError`, because each is the register declining a write.
+
+        ``subject_id`` names an existing person to add a second template to —
+        the register adds to a subject and does not rename it — and must be a
+        person already enrolled; without it a new subject is created.
+
+        Audited by subject id, camera and track. The name and the vector are
+        deliberately absent from the audit detail: the log is append-only and
+        read by more people than the register, and a name in it would outlive
+        the forget this register exists to make possible.
+        """
+        if not self._identity.faces or self._faces is None:
+            raise RegistryError(
+                "faces are off for this site, or no face engine is running "
+                f"({self.identity_status}), so there is no template to enrol. "
+                "Turn faces on for the site and let the person be seen first."
+            )
+        if not name or not name.strip():
+            raise RegistryError(
+                "a person needs a display name: an entry nobody can recognise "
+                "cannot be reviewed, renamed or forgotten on purpose"
+            )
+        templates = self.templates_for(camera_id, track_id)
+        if not templates:
+            raise RegistryError(
+                f"camera {camera_id} track {track_id} has no face held: the track "
+                "must be live and its face seen before it can be named. A track "
+                "that has ended cannot be enrolled from memory, because nothing "
+                "of it is kept."
+            )
+        register = self.store.register
+        if subject_id is not None:
+            existing = register.subject(subject_id)
+            if existing is None or existing.kind is not SubjectKind.PERSON:
+                raise RegistryError(
+                    f"no person {subject_id!r} to add a template to; enrol "
+                    "without a subject id to create one"
+                )
+
+        best = max(templates, key=lambda template: template.quality)
+        stored = StoredFaceTemplate(
+            vector=np.asarray(best.vector, dtype=np.float32).tobytes(),
+            model=best.model,
+            quality=best.quality,
+        )
+        subject = subject_id if subject_id is not None else _new_subject_id("person")
+        enrolment = register.enrol(
+            subject_id=subject,
+            display_name=name.strip(),
+            identifier=stored,
+            actor=self._actor,
+            basis=basis,
+            notes=notes,
+            source_camera=camera_id,
+            source_track=track_id,
+        )
+        self.store.audit(
+            self._actor, "person.enrolled", subject,
+            f"camera {camera_id}, track {track_id}: enrolment "
+            f"{enrolment.identifier.id}, best of {len(templates)} template(s) "
+            f"held (quality {best.quality:.2f}), "
+            f"{'new subject' if enrolment.created_subject else 'added to subject'}; "
+            "basis recorded",
+        )
+        _log.info(
+            "node %s: subject %s enrolled from camera %s track %d (%d template(s) "
+            "held, best quality %.2f)",
+            self._node_id, subject, camera_id, track_id, len(templates), best.quality,
+        )
+        return subject
+
+    def enrol_vehicle(
+        self,
+        name: str,
+        plate: str,
+        *,
+        basis: str,
+        notes: str | None = None,
+        camera_id: str | None = None,
+        track_id: int | None = None,
+    ) -> str:
+        """Name a vehicle by its plate. Returns the subject id.
+
+        Does not need plates to be on: a contractor's van is listed from the
+        paperwork before any model reads it, and the register normalises the
+        text to the site's plate format so ``B 7421`` and ``B-7421`` are one
+        vehicle. The register refuses a blank name or basis, an unresolved
+        read, and a plate already enrolled to somebody else.
+
+        Audited by subject id only — never the plate text, for the reason
+        `_note_sighting` gives.
+        """
+        subject = _new_subject_id("vehicle")
+        enrolment = self.store.register.enrol(
+            subject_id=subject,
+            display_name=name,
+            identifier=Plate(plate),
+            actor=self._actor,
+            basis=basis,
+            notes=notes,
+            source_camera=camera_id,
+            source_track=track_id,
+        )
+        self.store.audit(
+            self._actor, "vehicle.enrolled", subject,
+            f"enrolment {enrolment.identifier.id}"
+            + (f", from camera {camera_id}, track {track_id}"
+               if camera_id is not None else ", typed in")
+            + "; basis recorded",
+        )
+        _log.info("node %s: subject %s enrolled (vehicle)", self._node_id, subject)
+        return subject
+
+    def forget_subject(self, subject_id: str) -> Forgotten:
+        """Erase a subject: every identifier, every sighting, the row itself.
+
+        The register does the deleting and reports what went; this audits it
+        with counts and ids only — `Forgotten.detail` carries no name — and
+        drops any live verdict that named the subject, so a track on screen
+        does not keep saying a name the register no longer holds.
+        """
+        forgotten = self.store.register.forget(subject_id)
+        self.store.audit(self._actor, "subject.forgotten", subject_id, forgotten.detail())
+        for state in self._face_tracks.values():
+            if state.identity is not None and state.identity.person_id == subject_id:
+                state.identity = None
+        _log.info(
+            "node %s: subject %s forgotten (%d identifier(s), %d sighting(s))",
+            self._node_id, subject_id, forgotten.identifiers_deleted,
+            forgotten.sightings_unlinked,
+        )
+        return forgotten
+
+    def pin_subject(self, subject_id: str, pinned: bool) -> None:
+        """Exempt a subject from the retention sweep, or stop exempting it. Audited."""
+        pinning = self.store.register.set_pinned(subject_id, pinned, actor=self._actor)
+        self.store.audit(
+            self._actor, "subject.pinned" if pinned else "subject.unpinned",
+            subject_id, pinning.detail(),
+        )
 
     def _enrolment_matching(self, subject: Subject, text: str) -> str | None:
         """The id of the plate enrolment this read matched, to cite as evidence.
@@ -1727,6 +2594,9 @@ class Node:
                 )
             lines.append(f"    events        {len(record.events)}")
         lines.append(f"  incidents       {len(self._incidents)}")
+        # What the switch is doing, in the run's own summary: a site that turned
+        # faces on and has no models must read it here, not discover it.
+        lines.append(f"  identity        {self.identity_status}")
 
         written, chained = self.store.audit_totals()
         lines.append(

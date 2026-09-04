@@ -31,20 +31,31 @@ which is which.
 **A camera delivering nothing covers nothing.** Its footprint is hatched rather
 than filled and carries no error bands, because a filled wedge under a camera
 that has stopped is a claim that ground is being watched.
+
+**The ground under the grid is the site's own.** When the cameras have drawn a
+basemap of the yard (``sentinel.basemap``), it is painted beneath the grid:
+transparent wherever no camera covered the ground, and faded and hatched
+wherever a cell has not been re-sampled in a day. It is a picture of the ground
+plane and of nothing above it, made from footage the site already has, and
+nothing is fetched to produce it either. See `set_basemap`.
 """
 
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import replace
 from functools import lru_cache
+from typing import TYPE_CHECKING
 
+import numpy as np
 from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import (
     QBrush,
     QColor,
     QFont,
     QFontMetricsF,
+    QImage,
     QKeyEvent,
     QMouseEvent,
     QPainter,
@@ -67,6 +78,9 @@ from sentinel.core import (
 
 from . import theme
 from .selection import Selection
+
+if TYPE_CHECKING:  # pragma: no cover - the asset is only named here, never built
+    from sentinel.basemap import BasemapAsset
 
 
 #: What the next click on the map will do. A click that sometimes pans,
@@ -92,6 +106,33 @@ _FAR_EDGE_TOLERANCE_M = 0.05
 #: The hatch a dark camera's ground is drawn in: the idle grey rather than the
 #: footprint blue, because blue in this view means a camera is seeing.
 _DARK_HATCH = QColor(theme.IDLE.red(), theme.IDLE.green(), theme.IDLE.blue(), 110)
+
+#: A basemap cell whose newest sample is older than this is drawn as stale.
+#: A day, because a yard changes on a daily cycle — what is parked, what has
+#: been unloaded, where the shadows fall — so ground not re-sampled since
+#: yesterday is yesterday's yard, and an operator judging "was that pallet
+#: there" against it must be able to see that it may not be today's. Judged
+#: against the clock at paint time, not against the build: an asset loaded
+#: from disk a week after it was built carries an age of nought for every
+#: cell and is a week old. See `_rebuild_basemap_image`.
+BASEMAP_STALE_AFTER_SECONDS = 24 * 3600.0
+
+#: How stale ground is drawn: at under half the alpha of fresh ground, with a
+#: diagonal hatch of near-transparent cells cut through it every
+#: `_STALE_HATCH_PERIOD` cells. The hatch is the vocabulary this view already
+#: uses for ground nobody is watching, and it survives the zoom — at a
+#: quarter-metre cell and the fitted scale the diagonals are a few pixels
+#: apart, which reads as a texture rather than as a pattern of holes.
+_STALE_ALPHA = 120
+_STALE_HATCH_ALPHA = 30
+_STALE_HATCH_PERIOD = 4
+
+#: The stale mask is a function of the clock, so it is re-evaluated as time
+#: passes — but at most this often. Each cell crosses the threshold at its own
+#: moment, and rebuilding the image for every one of them would rebuild it
+#: every few seconds on a basemap sampled over an afternoon. A cell shows as
+#: stale within a minute of becoming so, which is close enough to a day.
+_STALE_RECHECK_SECONDS = 60.0
 
 
 class MapView(QWidget):
@@ -163,6 +204,27 @@ class MapView(QWidget):
         #: Cameras that are placed but delivering nothing. Their ground is
         #: hatched and carries no bands. See `set_dark_cameras`.
         self._dark: set[str] = set()
+        #: The site's own map, drawn under everything else. See `set_basemap`.
+        self._basemap: BasemapAsset | None = None
+        #: Its rendering, built once per asset and once per change of the
+        #: stale mask, never per repaint. `_basemap_restale_at` is the wall
+        #: clock at which that mask next changes; `_basemap_bounds` is the
+        #: row and column extent of the cells that are ground, for `_fit_view`.
+        self._basemap_image: QImage | None = None
+        self._basemap_restale_at = math.inf
+        self._basemap_bounds: tuple[int, int, int, int] | None = None
+        self._basemap_opacity = 0.85
+        #: Whether the basemap is drawn at all. A plain flag, like
+        #: `show_legend`: off means nothing of it is drawn, described in the
+        #: legend or reported under the pointer — not a fainter version of it.
+        self.show_basemap = True
+        #: The last basemap tooltip put up, so the pointer sweeping across one
+        #: cell does not re-set the same text at mouse-move rate.
+        self._basemap_tip: str | None = None
+        #: The wall clock. An attribute so a test can hold it still or move it
+        #: forward: staleness is a claim about time, and it has to be testable
+        #: without waiting a day.
+        self.clock = time.time
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMinimumSize(280, 280)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -369,7 +431,18 @@ class MapView(QWidget):
             if hover != self._hover:
                 self._hover = hover
                 self.setToolTip(self._hover_text(hover) or "")
+                self._basemap_tip = None
                 self.update()
+            if hover is None:
+                # Nothing of the console's own is under the pointer, so the
+                # ground itself gets to say where it came from. Checked on
+                # every move rather than on a change of hover, because the
+                # hover stays `None` across a whole sweep of bare ground while
+                # the cell under the pointer does not.
+                tip = self.basemap_text_at(position)
+                if tip != self._basemap_tip:
+                    self._basemap_tip = tip
+                    self.setToolTip(tip or "")
         if self._draw_points is not None:
             self._draw_cursor = position
             self.update()
@@ -1014,6 +1087,227 @@ class MapView(QWidget):
         if drag.get("bands") is not None:
             self._bands[camera_id] = drag["bands"]
 
+    # ----------------------------------------------------------- the basemap
+
+    def set_basemap(self, asset: "BasemapAsset | None") -> None:
+        """Draw the site's own map under the plan, or take it away with ``None``.
+
+        The asset is what ``sentinel.basemap`` builds from the cameras' own
+        footage: a north-up metric raster whose ``valid`` mask says which
+        cells some camera actually covered. Everything the mask excludes is
+        drawn as nothing — the panel shows through — because a cell no camera
+        looked at is not ground this view may claim, and black is what asphalt
+        at dusk looks like, so the colour is never consulted for emptiness.
+
+        The same asset given twice is a no-op, and that is what keeps the
+        rendering cached: the console re-sends what it holds on every refresh.
+        A malformed asset — arrays that do not match their grid — is refused
+        with a `ValueError` before anything is stored, so a half-written file
+        never reaches the paint path, where an exception keeps the widget
+        alive.
+
+        The view is not refitted. `set_cameras` is the one call that refits,
+        and a map that jumped to a new scale because an asset finished
+        building behind it would move the ground under a pointer that was
+        about to click on it. Double-click, and `_fit_view` includes it.
+        """
+        if asset is self._basemap:
+            return
+        if asset is not None:
+            _check_basemap(asset)
+        self._basemap = asset
+        self._basemap_image = None
+        self._basemap_restale_at = math.inf
+        self._basemap_bounds = None if asset is None else _valid_bounds(asset.valid)
+        self._basemap_tip = None
+        if asset is not None:
+            self._rebuild_basemap_image()
+        self.update()
+
+    @property
+    def basemap(self) -> "BasemapAsset | None":
+        return self._basemap
+
+    @property
+    def basemap_opacity(self) -> float:
+        """How strongly the basemap is drawn: 0 is not at all, 1 is opaque.
+
+        0.85 by default — enough that the yard reads as a photograph, and
+        enough panel through it that the grid rings, which are drawn over it,
+        stay legible against a bright surface.
+        """
+        return self._basemap_opacity
+
+    @basemap_opacity.setter
+    def basemap_opacity(self, value: float) -> None:
+        value = max(0.0, min(1.0, float(value)))
+        if value != self._basemap_opacity:
+            self._basemap_opacity = value
+            self.update()
+
+    def basemap_shown(self) -> bool:
+        """Whether the basemap is being drawn: there is one, it is switched on,
+        it is not fully transparent, and the view has an origin to place it by.
+
+        The legend rows and the hover text both follow this, so neither
+        describes a map that is not on the screen.
+        """
+        return (
+            self._basemap is not None
+            and bool(self.show_basemap)
+            and self._basemap_opacity > 0.0
+            and self._origin is not None
+        )
+
+    def basemap_rect(self) -> QRectF | None:
+        """Where the basemap lands on screen, or ``None`` when it is not drawn.
+
+        Georeferenced from one point: the grid's origin is its north-west
+        corner, which goes through the same `_to_local` and `_to_screen` as
+        every camera and track, and the size follows from the cell count and
+        the cell size at the current scale. Nothing else may place it — a
+        second path from the ground to the screen is how a map ends up a
+        metre from the tracks drawn on top of it.
+        """
+        if not self.basemap_shown():
+            return None
+        grid = self._basemap.grid
+        scale = self._scale()
+        corner = self._to_screen(*self._to_local(grid.origin))
+        return QRectF(corner.x(), corner.y(), grid.width_m * scale, grid.height_m * scale)
+
+    def basemap_cell_at(self, position: QPointF) -> tuple[int, int] | None:
+        """The basemap cell under a widget position, if it is ground.
+
+        ``None`` off the asset and over its empty cells alike: an empty cell
+        is not a place with nothing on it, it is a place nobody has seen.
+        """
+        if not self.basemap_shown():
+            return None
+        point = self.point_at(position)
+        if point is None:
+            return None
+        cell = self._basemap.grid.cell_of(point)
+        if cell is None or not bool(self._basemap.valid[cell]):
+            return None
+        return cell
+
+    def basemap_text_at(self, position: QPointF) -> str | None:
+        """What the ground under the pointer is: which camera drew it, how
+        well that camera knew where it was, and how long ago it looked.
+
+        Only when nothing of the console's own is under the pointer — a track
+        or a camera there has more to say — and only over ground the asset
+        holds. There is nothing to report about ground nobody has seen.
+        """
+        cell = self.basemap_cell_at(position)
+        if cell is None:
+            return None
+        asset = self._basemap
+        index = int(asset.source[cell])
+        camera = asset.cameras[index] if 0 <= index < len(asset.cameras) else "an unknown camera"
+        sigma = float(asset.sigma_m[cell])
+        error = f"±{sigma:.1f} m" if math.isfinite(sigma) else "error unknown"
+        age = self._basemap_cell_age(cell)
+        sampled = (
+            "sampled at a time nobody recorded" if age is None else f"sampled {_relative_age(age)}"
+        )
+        return f"ground from {camera}, {error}, {sampled}"
+
+    def _basemap_cell_age(self, cell: tuple[int, int]) -> float | None:
+        """Seconds since the cell's newest sample, as of now.
+
+        The asset records each cell's age at the moment it was built; the time
+        since the build is added, because "sampled 5 min ago" on a map built
+        last week is a lie by a week.
+        """
+        asset = self._basemap
+        age = float(asset.age_seconds[cell])
+        if not math.isfinite(age):
+            return None
+        return age + max(0.0, self.clock() - asset.built_at_millis / 1000.0)
+
+    def _basemap_qimage(self) -> QImage | None:
+        """The cached rendering, rebuilt only once the stale mask has moved on."""
+        if self._basemap is None:
+            return None
+        if self._basemap_image is None or self.clock() >= self._basemap_restale_at:
+            self._rebuild_basemap_image()
+        return self._basemap_image
+
+    def _rebuild_basemap_image(self) -> None:
+        """Turn the asset into an ARGB image: its colour where there is ground,
+        transparent where there is none, faded and hatched where the ground is
+        stale.
+
+        Only the alpha channel carries any treatment; the colour is the
+        asset's own, BGR swapped to RGB. The opacity is not baked in here —
+        the painter applies it at draw time — so an operator sliding the map's
+        strength does not rebuild a hundred-thousand-cell image on every tick,
+        and the cache is keyed on nothing but the asset and the clock.
+
+        Staleness is measured from the clock, and the moment at which the
+        oldest still-fresh cell will cross the threshold is recorded so the
+        paint path knows when to come back. A valid cell whose age is not a
+        number is not known to be fresh, and is drawn as stale rather than as
+        fresh: the treatment says "this may not be today's ground", and that
+        is the truth about a cell nobody dated.
+        """
+        asset = self._basemap
+        now = self.clock()
+        since_build = max(0.0, now - asset.built_at_millis / 1000.0)
+        valid = np.asarray(asset.valid, dtype=bool)
+        age = np.asarray(asset.age_seconds, dtype=np.float64) + since_build
+        fresh = valid & np.isfinite(age) & (age <= BASEMAP_STALE_AFTER_SECONDS)
+        stale = valid & ~fresh
+
+        rows, columns = valid.shape
+        alpha = np.zeros((rows, columns), dtype=np.uint8)
+        alpha[fresh] = 255
+        alpha[stale] = _STALE_ALPHA
+        diagonal = (
+            np.arange(rows)[:, None] + np.arange(columns)[None, :]
+        ) % _STALE_HATCH_PERIOD == 0
+        alpha[stale & diagonal] = _STALE_HATCH_ALPHA
+
+        rgba = np.empty((rows, columns, 4), dtype=np.uint8)
+        rgba[..., :3] = np.asarray(asset.colour)[..., ::-1]
+        rgba[..., 3] = alpha
+        # Built byte-ordered, so the layout is the same on every machine, and
+        # converted to the painter's native ARGB32 once here rather than on
+        # every draw. The conversion also gives the image memory of its own;
+        # the bytes it was built from are gone by the next line.
+        image = QImage(rgba.tobytes(), columns, rows, columns * 4, QImage.Format.Format_RGBA8888)
+        self._basemap_image = image.convertToFormat(QImage.Format.Format_ARGB32)
+
+        fresh_ages = age[fresh]
+        if fresh_ages.size:
+            crossing = now + (BASEMAP_STALE_AFTER_SECONDS - float(fresh_ages.max()))
+            self._basemap_restale_at = max(crossing, now + _STALE_RECHECK_SECONDS)
+        else:
+            self._basemap_restale_at = math.inf
+
+    def _paint_basemap(self, painter: QPainter) -> None:
+        """The site's own map, under the grid.
+
+        One image, scaled by the painter into its georeferenced rectangle with
+        smooth transformation off: a cell is a claim about one square of
+        ground, and interpolating between two cells invents a colour on the
+        boundary that neither camera saw. At high zoom the cells show as
+        squares, which is the honest picture of what the asset knows.
+        """
+        rect = self.basemap_rect()
+        if rect is None:
+            return
+        image = self._basemap_qimage()
+        if image is None:
+            return
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
+        painter.setOpacity(self._basemap_opacity)
+        painter.drawImage(rect, image)
+        painter.restore()
+
     # ------------------------------------------------------------- selection
 
     def select_zone(self, zone_id: str | None) -> None:
@@ -1261,6 +1555,11 @@ class MapView(QWidget):
     #: came out 451 px wide on a 600 px view and the legend sits on the ground.
     _LEGEND_FAR_EDGE = ("solid edge: range", "dashed edge: horizon")
     _LEGEND_DARK = "hatched: no frames"
+    #: The legend must never take more than this share of the view's width:
+    #: it overlays the ground it explains. The rows the basemap adds carry
+    #: camera names of any length, so they are elided to it; the console
+    #: tests measure the rectangle against the same number.
+    _LEGEND_MAX_FRACTION = 0.45
 
     def _legend_captions(self) -> tuple[str, ...]:
         """The caption rows, and only the ones describing something on screen.
@@ -1274,7 +1573,36 @@ class MapView(QWidget):
             captions.extend(self._LEGEND_FAR_EDGE)
         if any(camera_id in self._footprints for camera_id in self._dark):
             captions.append(self._LEGEND_DARK)
+        if self.basemap_shown():
+            captions.extend(self._basemap_captions())
         return tuple(captions) or (self._LEGEND_CAPTION,)
+
+    def _basemap_captions(self) -> tuple[str, ...]:
+        """Three short rows about the map under the plan: when it was built,
+        how much of its grid is ground, and which cameras drew it.
+
+        Three rows rather than one because the measured one-line version came
+        out 528 px wide on a 600 px view in the console's legend font, and each
+        row is elided to the legend's width budget — a site with nine long
+        camera names reads "from gate, yard, …" rather than growing a legend
+        across the whole map. The coverage is counted here from the mask, so
+        the words "of grid" say exactly what was counted.
+        """
+        asset = self._basemap
+        valid = np.asarray(asset.valid, dtype=bool)
+        coverage = float(np.count_nonzero(valid)) / max(1, valid.size)
+        since = max(0.0, self.clock() - asset.built_at_millis / 1000.0)
+        cameras = ", ".join(asset.cameras) if asset.cameras else "no camera"
+        rows = (
+            f"map: built {_relative_age(since)}",
+            f"{coverage:.0%} of grid",
+            f"from {cameras}",
+        )
+        metrics = QFontMetricsF(self._legend_font())
+        budget = self.width() * self._LEGEND_MAX_FRACTION - 16.0
+        return tuple(
+            metrics.elidedText(row, Qt.TextElideMode.ElideRight, budget) for row in rows
+        )
 
     def legend_rect(self) -> QRectF:
         """Sized to the text it holds, and sitting clear of the scale bar.
@@ -1398,6 +1726,17 @@ class MapView(QWidget):
         # warning exists for — was off the edge of the only view that could have
         # shown the operator why it will never fire.
         points += [self._to_local(point) for zone in self._zones for point in zone.ring]
+        # And the ground the site has drawn of itself — the part that is
+        # ground, not the grid's empty margin, which would shrink the site to
+        # fit air around it. Only once there is an origin to measure it from.
+        if self._basemap_bounds is not None and self.basemap_shown():
+            grid = self._basemap.grid
+            top, bottom, left, right = self._basemap_bounds
+            points += [
+                self._to_local(grid.cell_centre(row, column))
+                for row in (top, bottom)
+                for column in (left, right)
+            ]
         if len(points) < 2:
             self._view_centre = (0.0, 0.0)
             self._span_meters = 60.0
@@ -1455,6 +1794,10 @@ class MapView(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.fillRect(self.rect(), theme.PANEL)
 
+        # The site's own map goes down first, under the grid: the metric lines
+        # are what make a distance readable, and a photograph of the yard
+        # painted over them takes that away.
+        self._paint_basemap(painter)
         self._paint_grid(painter)
 
         if not self._cameras:
@@ -1477,7 +1820,7 @@ class MapView(QWidget):
         self._paint_measure(painter)
         # Footprints without bands still need the legend: the far edge means
         # two different things whether or not the error has been computed.
-        if self.show_legend and (self._bands or self._footprints):
+        if self.show_legend and (self._bands or self._footprints or self.basemap_shown()):
             self._paint_legend(painter)
         banner = self._banner()
         if banner is not None:
@@ -2076,6 +2419,64 @@ def _far_edge_kind(pose: CameraPose) -> str | None:
     if far.ground_distance_meters >= pose.range_meters - _FAR_EDGE_TOLERANCE_M:
         return FAR_EDGE_RANGE
     return FAR_EDGE_HORIZON
+
+
+def _check_basemap(asset) -> None:
+    """Refuse an asset whose arrays do not match its grid, before it is stored.
+
+    Every array is addressed by the grid's row and column, and numpy would
+    index a smaller one without complaint until the paint path reached the
+    row that is not there — inside `paintEvent`, where an exception keeps the
+    widget alive. Said plainly here instead, with the two shapes in the
+    message, so the operator's report names the file rather than the console.
+    """
+    grid = asset.grid
+    shape = (grid.rows, grid.columns)
+    expected = f"{grid.rows} rows by {grid.columns} columns"
+    colour = np.asarray(asset.colour)
+    if colour.shape != (*shape, 3):
+        raise ValueError(
+            f"the basemap's colour is {'×'.join(map(str, colour.shape))} but its grid is {expected}"
+        )
+    if colour.dtype != np.uint8:
+        raise ValueError(f"the basemap's colour must be 8-bit, not {colour.dtype}")
+    for name in ("valid", "age_seconds", "sigma_m", "source"):
+        actual = np.asarray(getattr(asset, name)).shape
+        if actual != shape:
+            raise ValueError(
+                f"the basemap's {name} is {'×'.join(map(str, actual))} but its grid is {expected}"
+            )
+
+
+def _valid_bounds(valid) -> tuple[int, int, int, int] | None:
+    """``(top, bottom, left, right)`` rows and columns holding ground, inclusive,
+    or ``None`` when the asset holds none at all."""
+    valid = np.asarray(valid, dtype=bool)
+    rows = np.flatnonzero(valid.any(axis=1))
+    columns = np.flatnonzero(valid.any(axis=0))
+    if rows.size == 0 or columns.size == 0:
+        return None
+    return (int(rows[0]), int(rows[-1]), int(columns[0]), int(columns[-1]))
+
+
+def _relative_age(seconds: float) -> str:
+    """How long ago, in the coarsest unit that is still honest: "just now",
+    "42 s ago", "5 min ago", "3 h ago", "2 d ago".
+
+    Coarse on purpose. A legend reading "built 7203 s ago" is precise about a
+    number nobody reads that way, and the question it answers — is this map
+    from this shift, today, or last week — needs one unit.
+    """
+    seconds = max(0.0, float(seconds))
+    if seconds < 10.0:
+        return "just now"
+    if seconds < 60.0:
+        return f"{seconds:.0f} s ago"
+    if seconds < 3600.0:
+        return f"{seconds / 60.0:.0f} min ago"
+    if seconds < 86400.0:
+        return f"{seconds / 3600.0:.0f} h ago"
+    return f"{seconds / 86400.0:.0f} d ago"
 
 
 def _angle_difference(a: float, b: float) -> float:
