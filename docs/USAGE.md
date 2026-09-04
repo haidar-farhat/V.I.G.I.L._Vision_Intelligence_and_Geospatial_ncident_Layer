@@ -215,13 +215,48 @@ The footprint drawn on the plan view is an **annular sector**, not a pie slice �
 a downward-tilted camera cannot see the ground at its own mast, and drawing the
 slice would claim coverage it does not have.
 
-### Opening the console already running
+### Driving the console from the command line
 
 `SentinelVision.exe --start` (or `python tasks.py console -- --start`) starts
 every camera the node restored as soon as the window is up. For a control room
 that is the difference between a site watched from the moment the shift begins
 and one unwatched until somebody finds the Start button. With no cameras it says
 so in the status bar rather than looking busy.
+
+The rest of the flags exist because **the packaged binary is the thing under
+test**, and a test cannot click. They take the same syntax as `sentinel run`:
+
+| flag | does |
+|---|---|
+| `--camera SOURCE` | Has this camera — `device:0`, an `rtsp://` URL, a file. Added if the node lacks it, kept if it has it. Repeatable |
+| `--place SPEC` | `lat,lon,height,heading,pitch[,hfov,vfov,range]`, applied to every camera named by `--camera` in the same command — a camera restored unplaced is placed |
+| `--zone SPEC` | `name:lat,lon;lat,lon;lat,lon`, a restricted polygon, added unless a zone of that name is stored. Repeatable |
+| `--zone-classes NAME=label,label` | Which labels a `--zone` in this command acts on |
+| `--watch LABELS` | The classes tracked *this run* — `person,car` — instead of the machine's setting. Not remembered; refused before the window opens if the model does not name one |
+| `--confidence X` | The floor *this run*, 0.10–0.95. Not remembered |
+| `--settings FILE` | Keep the per-machine settings in this INI instead of the registry, so a test run leaves the operator's alone |
+| `--for SECONDS` | Close after this long and print what was concluded: every camera's frames, tracks by class, events, incidents, the audit chain head |
+| `--screenshots DIR` | With `--for`: photograph the window and every panel into DIR first |
+| `--model FILE` / `--no-model` | Which detector; see §7 |
+| `--database FILE` | Which database |
+
+Every change these make goes through the node and is audited exactly as a
+clicked one is; a flag is a deliberate act by whoever launched the process, so
+it does not pass through the Configure lock that guards a screen from a stray
+click.
+
+An unattended run on the real camera, the way the product is tested:
+
+```bash
+SentinelVision-dev.exe --settings %TEMP%\t.ini --camera device:0 ^
+    --place 33.8938,35.5018,1.2,180,-15 ^
+    --zone "Room:33.893836,35.501780;33.893836,35.501820;33.893800,35.501820;33.893800,35.501780" ^
+    --zone-classes Room=person --start --for 30 --screenshots evidence\run-1
+```
+
+`python tasks.py exetest` does exactly that against `dist/`, in an isolated
+data directory, and reads the summary back into one table with a PASS or a
+FAIL — see §10.
 
 ### Cameras and zones are managed from the toolbar and the Zones tab
 
@@ -305,9 +340,17 @@ copies that object's position.
 The console opens in **Monitor**: watch, select, hover, pan, zoom, measure.
 Anything that changes the site — adding or removing a camera, placing one,
 drawing, reshaping or removing a zone, editing zone properties — needs
-**Configure**, which you turn on in the toolbar. It turns itself off on Escape
-or after ten idle minutes, abandoning anything half-drawn, and both edges are
-written to the audit log.
+**Configure**, which you turn on in the toolbar. The status bar says which of
+the two you are in at all times. Configure turns itself off after ten idle
+minutes, abandoning anything half-drawn, or when you press the button again;
+both edges are written to the audit log. Escape abandons a drawing or clears a
+selection and does **not** relock.
+
+**A greyed button still answers a click.** Clicking *Place…*, *Add zone…*,
+*Remove camera* or any other locked control while the site is locked says what
+that control does, that the site is locked, and offers to unlock it and carry
+on — one question, then the dialog you asked for. Decline and nothing changes.
+*Draw* does the same.
 
 Undo helps the operator who notices a mis-drag. A lock protects against the one
 who does not.
@@ -670,6 +713,27 @@ The line beside the toolbar always names what is actually running, with the
 model's SHA-256 abbreviated. That digest is recorded on every event, so a
 detection can be traced to the exact file months later.
 
+### What is watched, and how sure it must be
+
+A model that names eighty classes will track a jar on a shelf as a *bottle* and
+a sofa as a *couch*, in the same green as a person — and on a laptop camera it
+did, with "1 couch in Room (HIGH)" as the incident. The operator's word for it
+was "hallucinations". They are not: the model saw a jar. But a security console
+must not track what nobody asked it to watch, so two things are decided per
+machine, from **Detection → Watched classes and confidence…**, and applied at
+the next *Start*:
+
+| setting | default | what it does |
+|---|---|---|
+| **Watched classes** | person, bicycle, car, motorcycle, bus, truck | Every other class is dropped at the detector, before it can become a track, a zone event or an incident. *Security default* and *Everything* are one click each, and the list offers only what the model can actually name |
+| **Minimum confidence** | 0.50 | A detection scoring below it is dropped. The model's own convention is 0.35; on the laptop camera the person held 0.86 while the couch, the jar and the phone scored 0.39–0.51. Lower it for a site whose people are small and far; raise it for a busy room |
+
+The status bar names both beside the model — `watching bicycle, bus, car,
+motorcycle, person, truck with masks · ≥ 0.50 · f828ccfa4b69` — so a row
+reading `person 0.52` in the track table can be seen to have cleared the bar.
+The motion detector takes neither: it names nothing, and its "confidence" is
+how much of a box moved, not a probability.
+
 ### Getting a model
 
 **Nothing is ever downloaded by the product.** Not on first run, not as a
@@ -872,6 +936,30 @@ needs the log to say what happened.
 Not a debug build — the same code with its output visible, plus `--verbose`
 forced on.
 
+### Testing the shipped binary on the camera
+
+The product is tested through the real camera and the binary in `dist/`, never
+through a prerecorded file and never through a checkout — the unit suites use a
+rendered scene because they must be deterministic, and three defects were found
+only by a person running the packaged console on the laptop camera. So:
+
+```bash
+python tasks.py package          # the three executables
+python tasks.py exetest          # 30 s on device:0, a person in frame
+python tasks.py exetest --seconds 60 --watch person --confidence 0.6
+```
+
+`exetest` seeds a camera, a placement and a person-only restricted zone two
+metres in front of it, runs the dev executable with `--start --for N
+--screenshots`, and leaves `dist/exetest/<stamp>/` holding the pictures of
+every panel, `stdout.txt` with the summary, `stderr.txt`, and the run's own
+`sentinel.log`. It then reads the summary back: frames analysed, every track
+with its class and duration, events, incidents — and says PASS only when
+frames flowed and pictures were taken, with a caveat when nobody was in front
+of the camera. **Look at the pictures before believing it.** The run is
+isolated in a temporary data directory and settings file; the operator's
+database, log and watch list are untouched.
+
 It exists because a packaged Qt application on Windows has nowhere to print. An
 exception raised before the window appears leaves no trace at all, and *"it just
 closes"* is the least actionable bug report there is. The developer executable
@@ -905,6 +993,8 @@ modules or open a socket.
 | what you see | why | what to do |
 |---|---|---|
 | **No events at all** | The zone is somewhere the camera cannot see. This is the most common cause by a distance | `sentinel coverage --place …` and use the zone it hands you |
+| **The buttons are grey and do nothing** | The site is locked: the console opens in Monitor, and the status bar says so | Click the button anyway — it says what it does and offers to unlock — or press *Configure* |
+| **Jars, sofas and phones are tracked in green** | Every class the model names was being watched, at the model's own 0.35 floor | Detection → *Watched classes and confidence…*: the security default watches people and vehicles at 0.50 or better. Stop and Start for it to take effect |
 | **Objects tracked but "not placed"** | The camera has no pose. There is no default, deliberately | Place it — console *Place camera*, or `--place` |
 | **A huge uncertainty circle at the camera** | Projection failed, so it fell back to "something is happening at this camera" | Check the pitch. A camera near level sees the horizon, where a pixel is hundreds of metres |
 | **Objects reported near the horizon with metre-scale error** | Uncertainty grows **super-linearly** with distance; this is honest, not broken | Put zones near the camera. That is where the geometry is worth anything |

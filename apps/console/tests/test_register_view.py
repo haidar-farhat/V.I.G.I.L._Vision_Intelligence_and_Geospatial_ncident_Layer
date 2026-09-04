@@ -24,6 +24,13 @@ indefensible:
   buttons are clicked here, through the widgets; the dialog is driven by
   patching its ``exec`` on the class, the way the console's own tests answer
   a ``QMessageBox``, so a button wired to nothing fails.
+- **The surface the panel asks of the node must be the surface the node has.**
+  The first version of this panel required a `register` attribute the node
+  never had, every fake here supplied one, and forty tests passed over a wire
+  that would have failed on the first real refresh. So the surface is now
+  checked against a real `sentinel.node.Node` — built over a temporary
+  database, no camera started, no model anywhere — and the panel reads and
+  writes through it, audit rows and all.
 
 The register underneath is the real one — `Store(":memory:").register`, the
 same object the node hands the console — and the node is stood in for by
@@ -38,8 +45,10 @@ from __future__ import annotations
 import gc
 import os
 import re
+import typing
 import weakref
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -59,8 +68,9 @@ from sentinel.registry import (  # noqa: E402
     RetentionPolicy,
     SubjectKind,
 )
+from sentinel.node import Node  # noqa: E402
 from sentinel.site import DEFAULT_SITE_ID, Site  # noqa: E402
-from sentinel.store import Store  # noqa: E402
+from sentinel.store import Store, StoreError  # noqa: E402
 
 from sentinel_console.register_view import (  # noqa: E402
     HISTORY_CAMERA_COLUMN,
@@ -70,13 +80,16 @@ from sentinel_console.register_view import (  # noqa: E402
     HISTORY_SCORE_COLUMN,
     HISTORY_TRACK_COLUMN,
     IDENTIFIERS_COLUMN,
+    IDENTITY_SURFACE,
     LAST_SEEN_COLUMN,
     NAME_COLUMN,
     NOTHING,
     PINNED_COLUMN,
     SIGHTINGS_COLUMN,
     EnrolDialog,
+    IdentityActions,
     RegisterPanel,
+    missing_from,
 )
 from sentinel_console.selection import Selection, SelectionBus  # noqa: E402
 
@@ -125,10 +138,12 @@ def utc(millis: int) -> str:
 class FakeActions:
     """The node's identity surface, over the real register.
 
-    Implements `IdentityActions` exactly, and records every write it is asked
-    for, so a test can assert what the panel passed through — the name, the
-    basis, the notes, the track — rather than only that something happened.
-    Refuses the way the node does: a blank name, a track with no templates.
+    Implements `IdentityActions` exactly — the register reachable only as
+    `store.register`, the way `Node` keeps it, so the fake cannot offer the
+    panel a member the node lacks — and records every write it is asked for,
+    so a test can assert what the panel passed through: the name, the basis,
+    the notes, the track. Refuses the way the node does: a blank name, a track
+    with no templates.
     """
 
     def __init__(self, store: Store, *, status: str = "faces: on (stand-in)"):
@@ -145,10 +160,6 @@ class FakeActions:
             id=DEFAULT_SITE_ID, name="Site", origin=LatLon(33.8938, 35.5018)
         )
         self.calls: list[tuple] = []
-
-    @property
-    def register(self):
-        return self.store.register
 
     def site(self):
         return self.site_record
@@ -172,7 +183,7 @@ class FakeActions:
             raise RegistryError(f"no face templates for {camera_id} #{track_id}")
         best = max(templates, key=lambda t: t.quality)
         subject_id = "person-" + re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
-        self.register.enrol(
+        self.store.register.enrol(
             subject_id=subject_id,
             display_name=name,
             identifier=FaceTemplate(
@@ -194,7 +205,7 @@ class FakeActions:
         if not name.strip():
             raise ValueError("a name is required")
         subject_id = "vehicle-" + re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
-        self.register.enrol(
+        self.store.register.enrol(
             subject_id=subject_id,
             display_name=name,
             identifier=Plate(plate),
@@ -209,11 +220,11 @@ class FakeActions:
 
     def forget_subject(self, subject_id):
         self.calls.append(("forget_subject", subject_id))
-        return self.register.forget(subject_id, now_millis=NOW + 20 * MINUTE)
+        return self.store.register.forget(subject_id, now_millis=NOW + 20 * MINUTE)
 
     def pin_subject(self, subject_id, pinned):
         self.calls.append(("pin_subject", subject_id, pinned))
-        self.register.set_pinned(subject_id, pinned, actor="operator:test")
+        self.store.register.set_pinned(subject_id, pinned, actor="operator:test")
 
 
 class RefusingActions(FakeActions):
@@ -894,18 +905,183 @@ def test_a_blank_name_refused_by_the_node_reads_as_a_refusal(people, actions):
     assert isinstance(people.last_failure, ValueError)
 
 
-def test_a_register_that_cannot_be_read_is_reported_rather_than_raised(qt_app, store):
-    class Gone(FakeActions):
-        @property
-        def register(self):
-            raise RuntimeError("the store at site.db is closed; its register closed with it")
-
+def test_a_register_whose_store_has_closed_is_reported_rather_than_raised(qt_app):
+    # The real failure, not a stand-in for it: `Store.register` raises after
+    # `close()`, naming the store, and a panel holding a node whose store has
+    # gone is the case that docstring was written for. The node still has the
+    # right shape — `store` is there, it just cannot be read — so this must
+    # reach the status line as a read failure, not as a refused node.
+    closed = Store(":memory:")
+    closed.close()
     widget = RegisterPanel(SubjectKind.PERSON)
-    widget.set_actions(Gone(store))
+    widget.set_actions(FakeActions(closed))
+    print("status:", widget.status_text())
     assert widget.listed_subject_ids() == []
-    assert "could not be read" in widget.status_text()
-    assert "closed" in widget.status_text()
+    assert widget.status_text().startswith("The register could not be read:")
+    assert "is closed; its register closed with it" in widget.status_text()
+    assert isinstance(widget.last_failure, StoreError)
     widget.refresh_button.click()  # and again through the slot
+    assert "could not be read" in widget.status_text()
+
+
+# ---------------------------------------------------------- the node's surface
+
+
+def test_the_surface_the_panel_checks_is_the_protocol_it_declares():
+    # `IDENTITY_SURFACE` is spelled out so the check cannot pass vacuously on
+    # an interpreter without `get_protocol_members`; this is what keeps the
+    # spelling honest. A member added to the protocol and not the tuple — or
+    # the other way round — is a member the panel would never check for.
+    assert set(IDENTITY_SURFACE) == typing.get_protocol_members(IdentityActions)
+    assert len(set(IDENTITY_SURFACE)) == len(IDENTITY_SURFACE)
+
+
+def test_a_node_shaped_the_old_way_is_refused_by_name_not_reported_on_every_refresh(
+    qt_app, store
+):
+    # The shape the first version of this panel demanded: a `register`
+    # attribute and no `store`. The real node has never had it. Such an object
+    # must be refused at `set_actions`, with the missing member named, rather
+    # than accepted and then reported as "the register could not be read" on
+    # every refresh — which is what the fake-only tests let through.
+    old_shape = FakeActions(store)
+    old_shape.register = store.register
+    del old_shape.store
+    assert missing_from(old_shape) == ("store",)
+
+    # Connected to a good node first, so a refusal that kept the old node
+    # would be visible: the list must empty, not stay as it was.
+    widget = RegisterPanel(SubjectKind.PERSON)
+    widget.set_actions(FakeActions(store))
+    assert widget.listed_subject_ids() == ["person-ali", "person-rana"]
+    widget.set_actions(old_shape)
+    print("status:", widget.status_text(), "| capability:", widget.capability_text())
+    assert widget.status_text().startswith("That node cannot be used: it has no 'store'")
+    assert isinstance(widget.last_failure, TypeError)
+    assert "no node is connected" in widget.capability_text().lower()
+    assert widget.listed_subject_ids() == []
+    assert not widget.enrol_button.isEnabled()
+
+    # Refresh does not quietly reconnect: the panel is not holding the object.
+    widget.refresh_button.click()
+    assert widget.listed_subject_ids() == []
+    assert "could not be read" not in widget.status_text()
+
+    # The check reads the shape without touching it. A node whose `store` is
+    # a property that raises — one mid-shutdown, say — has the right shape;
+    # `missing_from` must not evaluate the property (a `getattr` would, and
+    # would raise out of the check), and the panel must accept the node and
+    # report the read failing in the guarded place, with the node's reason.
+    class Shutting(FakeActions):
+        @property
+        def store(self):
+            raise RuntimeError("the node is shutting down")
+
+    shutting = Shutting.__new__(Shutting)  # no __init__: it would assign over the property
+    shutting.identity_status = "off"
+    assert missing_from(shutting) == ()
+    widget.set_actions(shutting)
+    print("shutting:", widget.status_text())
+    assert widget.status_text() == "The register could not be read: the node is shutting down"
+    assert "Identity: off." in widget.capability_text()
+
+
+def test_the_real_node_satisfies_the_surface_and_the_panel_reads_and_writes_through_it(
+    qt_app, tmp_path: Path, monkeypatch
+):
+    """The wire to the real node, end to end, with nothing stood in.
+
+    `FakeActions` proves what the panel passes through; it cannot prove the
+    node has the members the panel calls, and once it did not. So: a real
+    `Node` over a temporary database, no camera started, identity off, no
+    model anywhere (the models directory is an empty temporary one, so "no
+    models" is a fact about this test and not about the checkout). The
+    vehicles panel enrols, pins and forgets through the node — the acts that
+    do not need a face engine — and the audit rows the node writes are read
+    back, by id and never by name. The people panel asks the real
+    `templates_for` for a track on a camera the node has, and the real
+    `identity_status` is the line at the top. Then the node closes, and the
+    panel reports the closed store rather than raising from the slot.
+    """
+    models = tmp_path / "models"
+    models.mkdir()
+    monkeypatch.setenv("SENTINEL_MODELS_DIR", str(models))
+    accept_dialog_with(
+        monkeypatch, name="Contractor van", basis="site access list", plate="B 7421"
+    )
+    asked: list[str] = []
+    answer_question(monkeypatch, QMessageBox.StandardButton.Yes, asked)
+
+    with Node(tmp_path / "console.db", node_id="console-test", actor="operator:test") as node:
+        node.add_camera(tmp_path / "gate.mp4", camera_id="gate")  # added, never opened
+        assert missing_from(node) == (), "the panel's surface is not the node's"
+        assert isinstance(node, IdentityActions)
+
+        people = RegisterPanel(SubjectKind.PERSON)
+        people.set_actions(node)
+        assert people.last_failure is None, people.last_failure
+        assert people.status_text() == "", people.status_text()
+        assert node.identity_status in people.capability_text()
+        assert "Identity: off." in people.capability_text()
+        assert people.listed_subject_ids() == []
+        people.set_editable(True)
+        people.set_selection(Selection.track("gate", 3))
+        # The real `templates_for`: no engine, no templates, and the button
+        # says so; a person cannot be enrolled through this node as it stands.
+        assert not people.enrol_button.isEnabled()
+        assert "no face templates" in people.enrol_button.toolTip().lower()
+        assert people.last_failure is None, people.last_failure
+
+        vehicles = RegisterPanel(SubjectKind.VEHICLE)
+        vehicles.set_actions(node)
+        vehicles.set_editable(True)
+        vehicles.set_selection(Selection.track("gate", 3))
+        assert vehicles.enrol_button.isEnabled()
+        vehicles.enrol_button.click()
+        print("enrol:", vehicles.status_text())
+        assert vehicles.status_text().startswith("Enrolled 'Contractor van' as vehicle vehicle-")
+        assert "from track #3 on gate" in vehicles.status_text()
+        (subject_id,) = vehicles.listed_subject_ids()
+        assert vehicles.selected_subject_id() == subject_id
+        assert vehicles.subject_row_texts(subject_id)[IDENTIFIERS_COLUMN] == "B 7421"
+        register = node.store.register
+        found = register.find_plate("B-7421")
+        assert found is not None and found.id == subject_id
+        (identifier,) = register.identifiers(subject_id)
+        assert identifier.basis == "site access list"
+        assert (identifier.source_camera, identifier.source_track) == ("gate", 3)
+
+        vehicles.pin_button.click()
+        assert register.subject(subject_id).pinned is True
+        assert vehicles.pin_button.text() == "Unpin"
+
+        vehicles.forget_button.click()
+        print("asked:", asked, "| forget:", vehicles.status_text())
+        assert len(asked) == 1 and "'Contractor van'" in asked[0]
+        assert vehicles.status_text().startswith("Forgot 'Contractor van'")
+        assert register.subject(subject_id) is None
+        assert vehicles.listed_subject_ids() == []
+
+        # The node's audit rows, one per act, by id and never by name or plate.
+        actions = [
+            (row["action"], row["detail"])
+            for row in node.store.audit_trail(limit=50)
+            if row["action"] in ("vehicle.enrolled", "subject.pinned", "subject.forgotten")
+        ]
+        print("audit:", actions)
+        assert [action for action, _ in actions] == [
+            "subject.forgotten", "subject.pinned", "vehicle.enrolled"
+        ], "newest first: forget, pin, enrol"
+        for _action, detail in actions:
+            assert "Contractor van" not in detail
+            assert "7421" not in detail
+        assert "from camera gate, track 3" in actions[-1][1]
+
+    # The node has closed; its store says so, and the panel repeats it.
+    vehicles.refresh_button.click()
+    print("after close:", vehicles.status_text())
+    assert vehicles.status_text().startswith("The register could not be read:")
+    assert "is closed; its register closed with it" in vehicles.status_text()
 
 
 # ------------------------------------------------------------------ the clock
@@ -926,6 +1102,31 @@ def test_times_are_shown_in_the_sites_clock_and_the_caption_says_which(qt_app, a
     assert first == shifted.strftime("%Y-%m-%d %H:%M:%S")
     assert first != utc(NOW + MINUTE)
     assert "Asia/Beirut" in widget.clock_caption.text()
+
+
+def test_a_refresh_reads_the_sites_clock_once_for_the_rows_and_the_history(qt_app, store):
+    # Each read of the site is a row from the store. A refresh was measured
+    # reading it twice — once for the subject rows, once again inside the
+    # history — and the second read is the one this pins down.
+    class CountingActions(FakeActions):
+        def __init__(self, store):
+            super().__init__(store)
+            self.site_reads = 0
+
+        def site(self):
+            self.site_reads += 1
+            return self.site_record
+
+    counting = CountingActions(store)
+    widget = RegisterPanel(SubjectKind.PERSON)
+    widget.set_actions(counting)
+    widget.select_subject("person-ali")
+    assert len(widget.history_rows()) == 3, "the history must be filled for this to mean anything"
+    counting.site_reads = 0
+    widget.refresh_button.click()
+    print("site reads during one refresh:", counting.site_reads)
+    assert len(widget.history_rows()) == 3
+    assert counting.site_reads == 1
 
 
 def test_a_site_clock_that_cannot_be_resolved_falls_back_to_utc_and_says_so(qt_app, actions):

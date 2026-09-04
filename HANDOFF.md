@@ -21,6 +21,17 @@ reads.
    frame, not a synthetic fixture.
 7. Conventional commits (§126). Honest capability states (§130). No fake
    implementations (§135).
+8. **Test through the camera and the shipped binary — always.** Every check
+   of the product runs `dist/SentinelVision/SentinelVision-dev.exe` against
+   `device:0` with a real person in frame: never a prerecorded file, never
+   `python tasks.py console`. `python tasks.py exetest` is that check — it
+   seeds a camera, a placement and a person-only zone, runs for N seconds,
+   photographs every panel, prints the summary and copies the log beside it
+   into `dist/exetest/<stamp>/`. The console's command line exists for this
+   (`--camera --place --zone --zone-classes --watch --confidence --settings
+   --start --for --screenshots`; see USAGE §3), and anything the console
+   grows must be reachable from it. The rendered reference scene stays for
+   the unit suites and nowhere else.
 
 Non-negotiable product constraints (§132) are unchanged: no cloud dependency, no
 mandatory facial recognition, no autonomous enforcement, no hidden telemetry, **no
@@ -562,6 +573,35 @@ Not fixed, recorded: the core's speed comes from the raw projection, so a
 subject with feet below the frame reads as standing still whatever they do;
 the OS shares a webcam between processes and the one-camera guard is per node
 only; the linker leaves 1.3–2.7 tracks per object on a moving scene — ABI 7.
+
+### What the operator's screenshot said: unreadable buttons, unasked-for bottles
+
+Two complaints, both right. The toolbar at a laptop's display scale read
+`d camer`, `ve on m`, `onfigur` — twelve buttons, a picker, a spin box, a
+checkbox and two captions in one `QHBoxLayout`, wider than the screen, every
+button squeezed below its text. And a jar on the shelf and a phone on the desk
+were tracked as `bottle` and `cell phone` at 0.43–0.51 in the same green as
+the person. Fixed, with tests:
+
+- **Toolbar in two rows** (cameras + the Configure lock; map + zones), captions
+  in the status bar, a test that no button is narrower than its size hint at
+  1280 px, and a **reason in every disabled control's tooltip** (`Locked. Press
+  Configure…`, `Stop the analysis before adding a camera.`, `No incident to
+  export yet.`). Qt shows a tooltip on a disabled widget; that was the one
+  channel a greyed button had.
+- **Watched classes** at the detector (`classes=` on both ONNX detectors,
+  `detect.WATCHED_LABELS` = person and five vehicle classes as the console
+  default, Detection → Watched classes… with a per-machine `QSettings`
+  INI, applied at the next Start). The detector's reported vocabulary shrinks
+  with the list so the zone picker cannot offer a class the detector drops;
+  an unknown name is refused. Seen live from source: `segmenter ready … 6
+  class name(s)`.
+
+**Deferred, on purpose:** `sentinel run --classes` — `cli.py` was owned by
+the basemap builder while this was done; add the flag (default
+`WATCHED_LABELS` when a model is given) and a test. The watch list belongs on
+the **site record** beside the identity switch, not in a per-machine INI;
+move it when the site screen exists.
 
 **Immediate:**
 

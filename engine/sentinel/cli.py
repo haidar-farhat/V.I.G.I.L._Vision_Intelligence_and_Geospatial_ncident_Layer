@@ -1131,7 +1131,16 @@ def _feed_basemap(
         return True
 
     if source.is_live:
-        assert duration is not None, "a live source is refused without --for before it is opened"
+        if duration is None:
+            # A contract, not an assertion: an `assert` here vanished under
+            # `python -O` and the next line computed ``started + None``. The
+            # command line refuses a camera without --for before opening it;
+            # this is for any other caller.
+            raise ValueError(
+                f"{source.display_url} is a live source, which has no end; "
+                "_feed_basemap needs a duration for it (the command line "
+                "refuses a camera without --for before opening it)"
+            )
         deadline = started + duration
         with LiveStream(source) as stream:
             while True:
@@ -1191,6 +1200,18 @@ def _basemap_build(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    if args.id and len(set(args.id)) != len(args.id):
+        # Refused here, before a source is opened. Two sources under one id
+        # were either refused by the builder half way through the build, with
+        # the first source already fed for --for seconds, or — with the same
+        # placement — silently merged into one camera's median.
+        repeated = sorted({camera_id for camera_id in args.id if args.id.count(camera_id) > 1})
+        print(
+            f"error: --id {', '.join(repeated)} given more than once. Every source "
+            "needs its own id: each cell of the basemap names the camera it came from.",
+            file=sys.stderr,
+        )
+        return 2
     if args.duration is not None and args.duration <= 0:
         print("error: --for must be greater than zero", file=sys.stderr)
         return 2
@@ -1228,7 +1249,9 @@ def _basemap_build(args: argparse.Namespace) -> int:
                 builder, source, pose, duration=args.duration,
                 per_second=BASEMAP_FRAMES_PER_SECOND,
             )
-            fed = builder.frames_fed().get(source.source_id, 0)
+            # Sampled, not offered: a camera that sees no ground has frames
+            # taken and none of them reach a median, and this line said they had.
+            fed = builder.frames_sampled().get(source.source_id, 0)
             print(f"  {read} frame(s) read in {elapsed:.0f}s, {fed} fed to the median")
 
             starvation = _starvation(source, read, elapsed)

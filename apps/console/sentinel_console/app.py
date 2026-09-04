@@ -30,12 +30,15 @@ Three cameras seeing one person must produce one row.
 
 from __future__ import annotations
 
+import sys
+import weakref
 from dataclasses import replace
 from pathlib import Path
 
-from PySide6.QtCore import QSettings, Qt, QTimer
+from PySide6.QtCore import QEvent, QSettings, Qt, QTimer
 from PySide6.QtGui import QKeySequence, QShortcut, QAction, QCloseEvent, QFont
 from PySide6.QtWidgets import (
+    QAbstractButton,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -65,7 +68,7 @@ from sentinel.core import (
     field_of_view,
     haversine_distance,
 )
-from sentinel.decode import DecodeError, VideoSource
+from sentinel.decode import DecodeError, VideoSource, redact_url
 from sentinel.detect import DetectionError, detector_for
 from sentinel.detect import WATCHED_LABELS
 from sentinel.events import (
@@ -128,26 +131,32 @@ def _panel(title: str, body: QWidget) -> QFrame:
     return frame
 
 
-def _detector_summary(info) -> str:
+def _detector_summary(info, confidence: float | None = None) -> str:
     """One line describing what is drawing the conclusions.
 
     Says what the detector *cannot* do as plainly as what it can. An operator
     reading "does not classify" beside a track labelled `unclassified` learns
     something; one reading a model name beside the same track would assume the
     model looked and found nothing recognisable, which is the opposite of true.
+
+    ``confidence`` is the floor a classifier's detections had to clear, named
+    beside the watch list because the two together are what the site agreed
+    to be told — and a person reading "person 0.41" in the table should be able
+    to see at a glance that 0.41 was over the bar, not under it.
     """
     if info is None:
         return "No detector running"
     if not info.classifies:
         return f"{info.name} — does not classify, and cannot see a stationary object"
     masks = " with masks" if info.kind.endswith("segment") else ", boxes only"
+    floor = f" · ≥ {confidence:.2f}" if confidence is not None else ""
     digest = f" · {info.model_sha256[:12]}" if info.model_sha256 else ""
     names = sorted(set(info.class_names.values()))
     if len(names) <= 8:
         # Few enough to say: the watch list, not a count, is what an operator
         # wants to check when a jar on a shelf stops being tracked.
-        return f"{info.name} — watching {', '.join(names)}{masks}{digest}"
-    return f"{info.name} — {len(names)} classes{masks}{digest}"
+        return f"{info.name} — watching {', '.join(names)}{masks}{floor}{digest}"
+    return f"{info.name} — {len(names)} classes{masks}{floor}{digest}"
 
 
 #: Who the console is, in the audit log. Not `node.ACTOR`: the node acts on
@@ -169,25 +178,48 @@ class _DetectorFactory:
     A plain object rather than a lambda so the watch list can change after the
     node exists: the node keeps the factory for its lifetime, and a factory
     bound to a frozen set could never learn that the operator stopped watching
-    bottles. Mutated in one place, `ConsoleWindow._set_watched`, and read on
-    the next Start — a running camera keeps the detector it started with, and
-    the status line says so. Bound to values and never to the window, because
+    bottles. Mutated in two places, `ConsoleWindow._set_watched` and
+    `_set_confidence`, and read on the next Start — a running camera keeps the
+    detector it started with, and the status line says so. Bound to values and never to the window, because
     a closure over `self` handed to the node is the reference cycle that once
     kept a closed console alive until interpreter shutdown.
     """
 
-    __slots__ = ("model", "classes")
+    __slots__ = ("model", "classes", "confidence")
 
-    def __init__(self, model, classes):
+    def __init__(self, model, classes, confidence=None):
         self.model = model
         self.classes = classes
+        #: The score a classifier's detection must reach to be tracked at all.
+        #: ``None`` keeps the engine's own default; the console always sets one.
+        self.confidence = confidence
 
     def __call__(self):
-        return detector_for(self.model, classes=self.classes)
+        options = {"classes": self.classes}
+        if self.confidence is not None:
+            options["confidence_threshold"] = self.confidence
+        return detector_for(self.model, **options)
 
 #: How long the console stays in Configure with nobody touching it. A lock
 #: that never re-arms is a lock somebody props open on the first day.
 CONFIGURE_IDLE_MILLIS = 10 * 60 * 1000
+
+#: The score a classifying detector's detection must reach before it is tracked
+#: at all, when the operator has not said otherwise. The engine's own default is
+#: 0.35 — the exporter's convention, tuned for recall on a benchmark. Measured
+#: on the laptop camera with a real person in shot: the person held 0.86; the
+#: couch that became "1 couch in Room (HIGH)" scored 0.39, the jar 0.43–0.51,
+#: the phone 0.51. Half keeps the person and drops the furniture, and it is a
+#: per-machine setting (Detection → Watched classes and confidence…) rather
+#: than a constant, because a site whose people are small and far needs it
+#: lower and a busy room needs it higher. Classifiers only: the motion
+#: detector's "confidence" is how much of a box moved, not a probability.
+DEFAULT_CONFIDENCE = 0.50
+
+#: The range the floor may be set to. Below a tenth a detector reports every
+#: anchor that twitched; above 0.95 it reports almost nothing, and both read
+#: as a broken camera rather than as a setting.
+CONFIDENCE_RANGE = (0.10, 0.95)
 
 def _plate_cell(plate) -> str:
     """The plate column for one track: the reading with its evidence.
@@ -217,12 +249,21 @@ class ConsoleWindow(QMainWindow):
         database: str | Path | None = None,
         model: str | Path | None = None,
         settings: QSettings | None = None,
+        watched=None,
+        confidence: float | None = None,
     ):
         """
         ``database`` is the path to persist to. ``":memory:"`` runs the console
         without keeping anything, which is right for a test and wrong for a
         deployment — a system whose output is evidence that forgets on restart
         has not really produced evidence at all.
+
+        ``watched`` and ``confidence`` override what this machine's settings
+        hold, for this window only: nothing is written back. They are what
+        ``--watch`` and ``--confidence`` hand in, so a test run of the packaged
+        binary can decide what it watches without changing the operator's
+        machine, and a run that names a class is not a run that quietly
+        reconfigured the site.
         """
         super().__init__()
         self.setWindowTitle("Sentinel Vision — Console")
@@ -249,8 +290,22 @@ class ConsoleWindow(QMainWindow):
         # hand in an INI in a temporary directory so nothing they do reaches
         # the operator's registry.
         self._settings = settings if settings is not None else QSettings()
-        self._watched = self._load_watched()
-        self._detector_factory = _DetectorFactory(self._model, self._watched)
+        self._watched = (
+            frozenset(str(label).strip() for label in watched if str(label).strip())
+            or self._load_watched()
+            if watched is not None
+            else self._load_watched()
+        )
+        self._confidence = (
+            self._clamp_confidence(confidence)
+            if confidence is not None
+            else self._load_confidence()
+        )
+        self._detector_factory = _DetectorFactory(
+            self._model, self._watched, self._confidence
+        )
+        #: Where a timed run photographs itself before closing; see `end_after`.
+        self._screenshots: Path | None = None
 
         # The console is a *client* of this. It owns no store, no zones, no
         # rule set and no analysis thread; it owns widgets, and it calls
@@ -359,6 +414,9 @@ class ConsoleWindow(QMainWindow):
         # The site is locked until somebody says otherwise. Set before the
         # toolbar is built, because the buttons read it as they are created.
         self._configuring = False
+        #: The locked controls this window is filtering clicks on. See
+        #: `eventFilter`: a click on a greyed control is answered, not dropped.
+        self._guarded: set = set()
         self._idle_timer = QTimer(self)
         self._idle_timer.setSingleShot(True)
         self._idle_timer.timeout.connect(self._relock)
@@ -489,6 +547,13 @@ class ConsoleWindow(QMainWindow):
         copy.activated.connect(self._copy_ground)
         # The captions the toolbar used to hold. Permanent, so a transient
         # status message never pushes "no camera placed" off the screen.
+        # Whether the site can be changed right now, on screen at all times.
+        # The lock used to show itself only as greyed buttons and a tooltip
+        # that appears to whoever waits for it, and the operator's report of
+        # that was "the buttons do nothing". Written by `_set_configuring`.
+        self.lock_label = QLabel("")
+        self.lock_label.setObjectName("Caption")
+        self.status.addPermanentWidget(self.lock_label)
         self.status.addPermanentWidget(self.placement_label)
         self.status.addPermanentWidget(self.detector_label)
         self.status.addPermanentWidget(self.ground_label)
@@ -589,8 +654,9 @@ class ConsoleWindow(QMainWindow):
         self.configure_button.setToolTip(
             "Unlock the controls that change the site: adding and removing "
             "cameras, placing them, and drawing, reshaping or removing zones. "
-            f"Returns to Monitor on Escape, or after "
-            f"{CONFIGURE_IDLE_MILLIS // 60000} idle minutes."
+            "Press it again to relock; it relocks itself after "
+            f"{CONFIGURE_IDLE_MILLIS // 60000} idle minutes. Escape abandons a "
+            "drawing or clears a selection — it does not relock."
         )
         self.configure_button.toggled.connect(self._set_configuring)
         row.addWidget(self.configure_button)
@@ -775,10 +841,11 @@ class ConsoleWindow(QMainWindow):
         file_menu.addAction(quit_action)
 
         detection_menu = self.menuBar().addMenu("&Detection")
-        self.watch_action = QAction("&Watched classes…", self)
+        self.watch_action = QAction("&Watched classes and confidence…", self)
         self.watch_action.setStatusTip(
-            "Which of the model's classes are tracked at all. The rest are dropped "
-            "at the detector — a shelf of jars is not a security event."
+            "Which of the model's classes are tracked at all, and how sure the "
+            "model must be. The rest are dropped at the detector — a shelf of "
+            "jars is not a security event, and neither is a coat at 0.4."
         )
         self.watch_action.triggered.connect(self._choose_watched)
         detection_menu.addAction(self.watch_action)
@@ -896,6 +963,15 @@ class ConsoleWindow(QMainWindow):
         button = self.sender()
         for mode, candidate in self.mode_buttons.items():
             if candidate is button:
+                if mode == MODE_DRAW and not self._configuring:
+                    # The one mode the lock refuses. Offered the key rather
+                    # than refused in the status bar alone: a button that lit
+                    # and unlit itself was, to the operator, a button that did
+                    # nothing. Yes unlocks and clicks it again; no falls
+                    # through to the refusal, which resets the buttons and
+                    # says why.
+                    if self._offer_unlock(button):
+                        return
                 self._choose_mode(mode)
                 return
 
@@ -961,6 +1037,22 @@ class ConsoleWindow(QMainWindow):
         for control in self._configure_only():
             control.setEnabled(self._configuring)
             self._explain(control, None if self._configuring else LOCKED_REASON)
+            if isinstance(control, QWidget) and control not in self._guarded:
+                # A disabled widget still runs its event filters, so a click
+                # on a greyed control can be answered — see `eventFilter`. A
+                # menu action is not a widget and cannot be clicked greyed.
+                control.installEventFilter(self)
+                self._guarded.add(control)
+        self.lock_label.setText(
+            "CONFIGURE — the site can be changed"
+            if self._configuring
+            else "MONITOR — site locked; press Configure to change it"
+        )
+        self.lock_label.setStyleSheet(
+            f"color: {theme.STALE.name()}; font-weight: 600;"
+            if self._configuring
+            else f"color: {theme.TEXT_MUTED.name()};"
+        )
         # Dragging a mast on the plan view is a configuration change, so it is
         # behind the same lock and not a second, quieter one. Turning it off
         # mid-gesture reverts the gesture: the lock coming back is not the
@@ -1003,6 +1095,57 @@ class ConsoleWindow(QMainWindow):
         if self._configuring:
             self._idle_timer.start(CONFIGURE_IDLE_MILLIS)
 
+    def eventFilter(self, watched, event) -> bool:  # noqa: N802 - Qt naming
+        """A click on a greyed control is answered, not swallowed.
+
+        Qt delivers nothing to a disabled widget, but it still runs the
+        widget's event filters first, so the press can be seen here. Only a
+        left press on a control the lock disabled is taken; everything else
+        goes on to whoever it was for.
+        """
+        if (
+            event.type() == QEvent.Type.MouseButtonPress
+            and event.button() == Qt.MouseButton.LeftButton
+            and isinstance(watched, QWidget)
+            and not watched.isEnabled()
+            and not self._configuring
+            and watched in self._guarded
+        ):
+            self._offer_unlock(watched)
+            return True
+        return super().eventFilter(watched, event)
+
+    def _offer_unlock(self, control) -> bool:
+        """A locked control was clicked. Say why, and offer the key.
+
+        A greyed button that swallows a click is "a button that does nothing"
+        — the operator's exact words — and the tooltip that explains it only
+        appears to somebody who stops and waits. So the click is answered with
+        what the control does, that the site is locked, and one question. Yes
+        unlocks, which is audited like every entry to Configure, and then does
+        what was asked; no leaves the site exactly as it was and says where the
+        key is. Returns whether the site was unlocked.
+        """
+        described = control.property("describedAs") or control.toolTip() or ""
+        first = described.split(". ")[0].strip().rstrip(".")
+        name = control.text().rstrip("…").strip() or "This"
+        answer = QMessageBox.question(
+            self,
+            "The site is locked",
+            f"{name} changes the site, and the site is locked (Monitor).\n\n"
+            + (f"{first}.\n\n" if first else "")
+            + "Unlock it now and continue? Configure relocks itself after "
+            f"{CONFIGURE_IDLE_MILLIS // 60000} idle minutes.",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            self._set_status(LOCKED_REASON)
+            return False
+        self.configure_button.setChecked(True)
+        if isinstance(control, QAbstractButton) and control.isEnabled():
+            # The click that was refused, delivered now that it is allowed.
+            control.click()
+        return True
+
     def _detector_labels(self) -> list[str]:
         """The labels the site's detector can actually produce, sorted.
 
@@ -1017,7 +1160,9 @@ class ConsoleWindow(QMainWindow):
         if self._model is None:
             return []
         try:
-            info = detector_for(self._model, classes=self._watched).info
+            info = detector_for(
+                self._model, classes=self._watched, confidence_threshold=self._confidence
+            ).info
         except DetectionError:
             return []
         return sorted(set(info.class_names.values())) if info.classifies else []
@@ -1062,7 +1207,51 @@ class ConsoleWindow(QMainWindow):
                 "Watch list saved. Stop and Start for the cameras to use it."
             )
         else:
-            self._set_status(f"Watching {', '.join(sorted(self._watched))}.")
+            self._set_status(
+                f"Watching {', '.join(sorted(self._watched))} at "
+                f"{self._confidence:.2f} confidence or better."
+            )
+
+    @staticmethod
+    def _clamp_confidence(value: float) -> float:
+        low, high = CONFIDENCE_RANGE
+        return round(min(high, max(low, float(value))), 2)
+
+    def _load_confidence(self) -> float:
+        """The floor this machine last saved, or the security default.
+
+        Anything unreadable — a word, a number outside the range — falls back
+        rather than raising: a corrupted INI must not stop the console opening,
+        and the default is the safe answer, not the permissive one.
+        """
+        stored = self._settings.value("detection/confidence", None)
+        if stored is None:
+            return DEFAULT_CONFIDENCE
+        try:
+            value = float(stored)
+        except (TypeError, ValueError):
+            return DEFAULT_CONFIDENCE
+        low, high = CONFIDENCE_RANGE
+        return value if low <= value <= high else DEFAULT_CONFIDENCE
+
+    def _set_confidence(self, value: float) -> None:
+        """Change the floor. Applies at the next Start, like the watch list.
+
+        Persisted per machine for the same reason and with the same limit as
+        the watch list; the two travel together to the site record when it
+        grows a screen.
+        """
+        self._confidence = self._clamp_confidence(value)
+        self._detector_factory.confidence = self._confidence
+        self._settings.setValue("detection/confidence", self._confidence)
+        self._settings.sync()
+        if self._running:
+            self._set_status(
+                f"Minimum confidence {self._confidence:.2f} saved. Stop and "
+                "Start for the cameras to use it."
+            )
+        else:
+            self._set_status(f"Minimum confidence {self._confidence:.2f}.")
 
     def _choose_watched(self) -> None:
         """Detection → Watched classes…"""
@@ -1075,12 +1264,20 @@ class ConsoleWindow(QMainWindow):
                 "watch or to ignore. Supply a detection model to choose.",
             )
             return
-        dialog = WatchedClassesDialog(vocabulary, self._watched, defaults=WATCHED_LABELS, parent=self)
+        dialog = WatchedClassesDialog(
+            vocabulary, self._watched, defaults=WATCHED_LABELS,
+            confidence=self._confidence, parent=self,
+        )
         accepted = dialog.exec() == QDialog.DialogCode.Accepted
         chosen = dialog.chosen()
+        confidence = dialog.confidence()
         dialog.deleteLater()
-        if accepted and chosen:
-            self._set_watched(chosen)
+        if not accepted or not chosen:
+            return
+        if confidence is not None and confidence != self._confidence:
+            self._set_confidence(confidence)
+        # Last, so its status line — which names both — is the one left.
+        self._set_watched(chosen)
 
     def _toggle_detections(self, show: bool) -> None:
         for session in self._sessions.values():
@@ -1828,6 +2025,150 @@ class ConsoleWindow(QMainWindow):
             RapidMovementRule(speed_mps=6.0),
         ]
 
+    def seed_site(self, cameras=(), pose: CameraPose | None = None, zones=()) -> list[str]:
+        """Cameras, a placement and zones given on the command line.
+
+        The console is drivable from a terminal so that the packaged binary,
+        not a checkout, can be the medium of testing: `SentinelVision-dev.exe
+        --camera device:0 --place … --zone … --start --for 30 --screenshots …`
+        runs the real thing on the real camera and leaves the evidence behind.
+        Each flag is a deliberate act by whoever launched the process, so this
+        does not pass through the Configure lock — which guards a person at a
+        screen from a stray click — but every change goes through the node
+        and is audited exactly as a clicked one is.
+
+        A camera the node already has under the same source is kept and named,
+        never duplicated; ``pose`` applies to every camera this call names,
+        placed or not, so one restored unplaced from an earlier run is placed
+        rather than skipped; a zone whose id is already stored is left as it
+        is, because a flag re-run every morning must not multiply zones.
+        Returns the ids of the cameras named, restored or added.
+        """
+        named: list[str] = []
+        for source in cameras:
+            text = str(source)
+            display = redact_url(text)
+            existing = next(
+                (
+                    session for session in self._sessions.values()
+                    if session.source == text or session.display_source == display
+                ),
+                None,
+            )
+            if existing is not None:
+                named.append(existing.camera_id)
+                continue
+            try:
+                session = self.add_camera(text)
+            except NodeError as error:
+                # The node's message names the camera it already has, and
+                # carries the redacted source only.
+                _log.warning("--camera %s: %s", display, error)
+                continue
+            named.append(session.camera_id)
+
+        if pose is not None:
+            for camera_id in named:
+                self.node.place_camera(camera_id, pose)
+
+        held = {zone.id for zone in self.node.zones}
+        added = 0
+        for zone in zones:
+            if zone.id in held:
+                _log.info("--zone %s: already stored; kept as it is", zone.name)
+                continue
+            self.node.add_zone(zone)
+            held.add(zone.id)
+            added += 1
+
+        if named or added:
+            self._refresh_placement()
+            self.start_button.setEnabled(bool(self._sessions) and not self._running)
+        return named
+
+    def end_after(self, seconds: float, screenshots: str | Path | None = None) -> None:
+        """Close this window after ``seconds``, photographing it first if asked.
+
+        A camera has no end, so an unattended run needs to be told when it is
+        done — the same `--for` the headless analyser has. What it leaves
+        behind is what a person would otherwise gather by hand: the pictures,
+        and the summary on stdout. A bound method on the timer, never a lambda
+        — see the freeing test.
+        """
+        self._screenshots = Path(screenshots) if screenshots else None
+        QTimer.singleShot(int(max(0.0, float(seconds)) * 1000), self._finish_timed_run)
+
+    def _finish_timed_run(self) -> None:
+        if self._screenshots is not None:
+            try:
+                for written in self.photograph(self._screenshots):
+                    print(f"screenshot  {written}", flush=True)
+            except Exception:  # noqa: BLE001 - a lost picture must not lose the summary
+                _log.exception("could not photograph the console")
+        if self._running:
+            self._stop()
+        print(self.report(), flush=True)
+        self.close()
+
+    def report(self) -> str:
+        """What this run concluded, for a terminal: the node's summary and,
+        per camera, every track with its class.
+
+        The per-track lines are the ones a person reads to answer "was the
+        person tracked as a person, and for how long?" — the question every
+        camera test is actually asking — and the node's summary alone cannot.
+        """
+        lines = [self.node.summary()]
+        for session in self._sessions.values():
+            runner = session.record.runner
+            if runner is None or runner.stats is None:
+                continue
+            lines.append("")
+            lines.append(
+                f"{session.camera_id}: "
+                f"{_detector_summary(runner.detector_info, self._confidence)}"
+            )
+            lines.append(runner.stats.summary())
+        return "\n".join(lines)
+
+    def photograph(self, directory: str | Path) -> list[Path]:
+        """PNGs of the window and every panel, named for what they show.
+
+        The whole window first, then each panel on its own so a detail the
+        window shot squeezes — a label, a column — can be read. The Zones tab
+        is shown for its picture and the operator's tab put back afterwards.
+        """
+        directory = Path(directory)
+        directory.mkdir(parents=True, exist_ok=True)
+        current = self.detail_tabs.currentIndex()
+        subjects: list[tuple[str, QWidget]] = [
+            ("console", self),
+            ("plan-view", self.map),
+            ("incidents", self.incidents),
+            ("tracks", self.tracks),
+        ]
+        for camera_id, session in self._sessions.items():
+            subjects.append((f"camera-{camera_id}", session.view))
+        written: list[Path] = []
+        for name, widget in subjects:
+            written.extend(self._shoot(directory, name, widget))
+        self.detail_tabs.setCurrentIndex(1)
+        written.extend(self._shoot(directory, "zones", self.detail_tabs))
+        self.detail_tabs.setCurrentIndex(current)
+        return written
+
+    @staticmethod
+    def _shoot(directory: Path, name: str, widget: QWidget) -> list[Path]:
+        pixmap = widget.grab()
+        if pixmap.isNull() or pixmap.width() < 8 or pixmap.height() < 8:
+            _log.warning("%s: nothing usable to photograph (%dx%d)", name, pixmap.width(), pixmap.height())
+            return []
+        target = directory / f"{name}.png"
+        if not pixmap.save(str(target)):
+            _log.warning("%s: could not write %s", name, target)
+            return []
+        return [target]
+
     def start_on_launch(self) -> None:
         """`--start`: run whatever the node restored, and say so if it is nothing.
 
@@ -1874,7 +2215,10 @@ class ConsoleWindow(QMainWindow):
         # operator cannot see, leaving a window that started and shows nothing.
         if self._model is not None:
             try:
-                detector_for(self._model, classes=self._watched)
+                detector_for(
+                    self._model, classes=self._watched,
+                    confidence_threshold=self._confidence,
+                )
             except DetectionError as error:
                 QMessageBox.warning(self, "Cannot load the detection model", str(error))
                 return
@@ -1894,7 +2238,7 @@ class ConsoleWindow(QMainWindow):
             info = runner.detector_info if runner is not None else None
             session.view.set_detector_info(info)
 
-        self.detector_label.setText(_detector_summary(info))
+        self.detector_label.setText(_detector_summary(info, self._confidence))
         self._timer.start()
 
         self.open_button.setEnabled(False)
@@ -2159,26 +2503,80 @@ class ConsoleWindow(QMainWindow):
         event.accept()
 
 
-def run(argv: list[str] | None = None) -> int:
-    telemetry.silence()
+#: The window the process is showing, for `_report_uncaught` to name a
+#: failure on. A weak reference: the hook must never be what keeps a closed
+#: window alive.
+_ACTIVE_WINDOW = None
 
-    """Start the console. The console-script and packaged entry point.
 
-    Two flags only, because everything else an operator sets belongs in the
-    window rather than on a command line they will not see:
+def _report_uncaught(exc_type, exc_value, exc_traceback) -> None:
+    """What happens when a slot raises: the log gets it, the screen says so,
+    and nothing holds on to it.
 
-    ``--verbose`` turns on developer logging — DEBUG, with thread, file and
-    line. It is what the ``-dev`` executable passes, and it is why that
-    executable exists: a packaged operator build has no terminal to read.
+    Qt cannot propagate a Python exception out of a slot, so PySide prints it
+    to stderr — which the packaged console does not have — and the button that
+    raised looks, to the operator, like a button that did nothing. PySide also
+    leaves the exception on ``sys.last_*`` (it calls ``PyErr_Print``), and that
+    traceback holds every frame's locals, the widget included: a window pinned
+    that way is destroyed at interpreter shutdown, after the QApplication, and
+    corrupts the heap on the way out (HANDOFF §7). The log line here goes
+    through the redacting filter like every other, so a traceback that was
+    built from a camera URL cannot carry its password.
+    """
+    _log.critical(
+        "unhandled exception in the console", exc_info=(exc_type, exc_value, exc_traceback)
+    )
+    window = _ACTIVE_WINDOW() if _ACTIVE_WINDOW is not None else None
+    if window is not None:
+        try:
+            window._set_status(
+                f"Something went wrong ({exc_type.__name__}). The log has the "
+                "details — `sentinel where` prints its path."
+            )
+        except Exception:  # noqa: BLE001 - the window may be half destroyed
+            pass
+    for name in ("last_type", "last_value", "last_traceback", "last_exc"):
+        if hasattr(sys, name):
+            try:
+                setattr(sys, name, None)
+            except Exception:  # noqa: BLE001
+                pass
 
-    ``--database`` points at a specific database, which is how two deployments
-    share a machine.
+
+def _labels(text: str | None):
+    """``--watch person,car`` → the set, or ``None`` when the flag was not given."""
+    if text is None:
+        return None
+    return frozenset(label.strip() for label in text.split(",") if label.strip())
+
+
+def _confidence_argument(text: str) -> float:
+    import argparse
+
+    try:
+        value = float(text)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(f"--confidence: {error}") from error
+    low, high = CONFIDENCE_RANGE
+    if not low <= value <= high:
+        raise argparse.ArgumentTypeError(
+            f"--confidence must be between {low:.2f} and {high:.2f}, not {value}"
+        )
+    return round(value, 2)
+
+
+def build_parser():
+    """The console's command line, in one place.
+
+    Everything an operator sets belongs in the window; everything a *test*
+    sets belongs here, because the packaged binary is the thing under test
+    and a test cannot click. The flags mirror `sentinel run` — the same
+    `--place`, `--zone`, `--zone-classes` and `--for`, parsed by the same
+    functions — so what was typed for one is right for the other.
     """
     import argparse
-    import sys
 
-    from PySide6.QtWidgets import QApplication
-    from sentinel import logs
+    from sentinel import cli
 
     parser = argparse.ArgumentParser(
         prog="sentinel-console", description="Sentinel Vision operator console."
@@ -2189,6 +2587,14 @@ def run(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--database", default=None, help="database to open")
     parser.add_argument(
+        "--settings", default=None, metavar="FILE",
+        help=(
+            "an INI file for the per-machine settings (watch list, confidence) "
+            "instead of this machine's registry. What a test run uses, so it "
+            "leaves the operator's settings alone."
+        ),
+    )
+    parser.add_argument(
         "--model", default=None, metavar="FILE",
         help=(
             "an ONNX model to detect with. Defaults to a *-seg.onnx in the "
@@ -2197,17 +2603,103 @@ def run(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
-        "--start", action="store_true",
-        help=(
-            "start every restored camera as soon as the window is up. For a "
-            "control room, where a console left idle until somebody finds the "
-            "Start button is a site unwatched for that long"
-        ),
-    )
-    parser.add_argument(
         "--no-model", action="store_true",
         help="ignore any installed model and detect motion only",
     )
+    parser.add_argument(
+        "--watch", default=None, metavar="LABELS",
+        help=(
+            "comma-separated classes to track this run — person,car — instead "
+            "of what the machine's settings hold. Not remembered. Refused before "
+            "the window opens if the model does not name one of them."
+        ),
+    )
+    parser.add_argument(
+        "--confidence", type=_confidence_argument, default=None, metavar="X",
+        help=(
+            f"the score a detection must reach this run, "
+            f"{CONFIDENCE_RANGE[0]:.2f}–{CONFIDENCE_RANGE[1]:.2f}; the machine's "
+            f"setting, or {DEFAULT_CONFIDENCE:.2f}, otherwise. Not remembered."
+        ),
+    )
+    parser.add_argument(
+        "--camera", action="append", default=None, metavar="SOURCE",
+        help=(
+            "a camera to have: device:N, an rtsp:// URL, or a file. Added if the "
+            "node does not already have it, kept if it does. Repeatable."
+        ),
+    )
+    parser.add_argument(
+        "--place", type=cli._pose, default=None, metavar="SPEC",
+        help=(
+            "lat,lon,height,heading,pitch[,hfov,vfov,range] — applied to every "
+            "camera named by --camera in this command, as `sentinel run --place` "
+            "is. A camera restored unplaced is placed, not skipped."
+        ),
+    )
+    parser.add_argument(
+        "--zone", action="append", type=cli._zone, default=None, metavar="SPEC",
+        help=(
+            "name:lat,lon;lat,lon;lat,lon — a restricted polygon, added unless a "
+            "zone of that name is already stored. Repeatable."
+        ),
+    )
+    parser.add_argument(
+        "--zone-classes", action="append", type=cli._zone_classes, default=None,
+        metavar="NAME=label,label",
+        help="which labels a --zone in this command acts on, as `sentinel run` takes it",
+    )
+    parser.add_argument(
+        "--start", action="store_true",
+        help=(
+            "start every camera as soon as the window is up. For a control "
+            "room, where a console left idle until somebody finds the Start "
+            "button is a site unwatched for that long"
+        ),
+    )
+    parser.add_argument(
+        "--for", dest="duration", type=float, default=None, metavar="SECONDS",
+        help=(
+            "close the console after this long, printing what it concluded — "
+            "every camera's frames, tracks by class, events, incidents and the "
+            "audit chain head. With --start, an unattended run on the real "
+            "camera: the packaged binary as the test medium."
+        ),
+    )
+    parser.add_argument(
+        "--screenshots", default=None, metavar="DIR",
+        help="with --for: photograph the window and every panel into DIR before closing",
+    )
+    return parser
+
+
+def _refuse_unknown_labels(model: Path, labels) -> str | None:
+    """The sentence to refuse ``--watch`` with, or ``None`` if the model names
+    every label. Checked before the window opens: a refusal inside a timed
+    run would be a message box nobody is there to dismiss."""
+    try:
+        detector_for(model, classes=labels)
+    except DetectionError as error:
+        return f"--watch: {error}"
+    return None
+
+
+def run(argv: list[str] | None = None) -> int:
+    """Start the console. The console-script and packaged entry point.
+
+    See `build_parser` for the flags. Two are for an operator — ``--verbose``,
+    which the ``-dev`` executable forces on because a packaged build has no
+    terminal to read, and ``--database``; the rest exist so a test can drive
+    the packaged binary on the real camera without clicking anything.
+    """
+    global _ACTIVE_WINDOW
+
+    telemetry.silence()
+
+    from PySide6.QtWidgets import QApplication
+    from sentinel import cli, logs
+
+    parser = build_parser()
     arguments, unknown = parser.parse_known_args(sys.argv[1:] if argv is None else argv)
 
     logs.configure(
@@ -2222,17 +2714,40 @@ def run(argv: list[str] | None = None) -> int:
 
     log.info("console starting")
 
+    # Resolved and refused before the window exists, because everything below
+    # that can go wrong would otherwise go wrong inside a modal box on an
+    # unattended machine.
+    model = None
+    if not arguments.no_model:
+        model = Path(arguments.model) if arguments.model else default_model_path()
+    watched = _labels(arguments.watch)
+    if watched is not None and not watched:
+        print("--watch: no class named; leave the flag off to use the machine's list", file=sys.stderr)
+        return 2
+    if watched is not None and model is not None:
+        problem = _refuse_unknown_labels(model, watched)
+        if problem is not None:
+            print(problem, file=sys.stderr)
+            return 2
+    zones = list(arguments.zone or ())
+    if arguments.zone_classes:
+        zones, refusal = cli._apply_zone_classes(zones, arguments.zone_classes)
+        if refusal is not None:
+            print(refusal, file=sys.stderr)
+            return 2
+    settings = (
+        QSettings(str(Path(arguments.settings)), QSettings.Format.IniFormat)
+        if arguments.settings
+        else None
+    )
+
     app = QApplication([sys.argv[0], *unknown] if unknown else sys.argv[:1])
     app.setApplicationName("Sentinel Vision Console")
     app.setOrganizationName("Sentinel Vision")
 
     try:
-        # Resolved here, and logged, because "which detector am I running"
-        # must never be something an operator has to infer.
-        model = None
-        if not arguments.no_model:
-            model = Path(arguments.model) if arguments.model else default_model_path()
-
+        # Logged, because "which detector am I running" must never be
+        # something an operator has to infer.
         if model is None:
             log.info(
                 "no detection model: running on motion detection, which does "
@@ -2241,8 +2756,26 @@ def run(argv: list[str] | None = None) -> int:
         else:
             log.info("detection model: %s", model)
 
-        window = ConsoleWindow(database=arguments.database, model=model)
+        window = ConsoleWindow(
+            database=arguments.database, model=model, settings=settings,
+            watched=watched, confidence=arguments.confidence,
+        )
+        # Installed before the window shows, so the first slot to raise is
+        # already caught. See `_report_uncaught` for why this is not optional
+        # in a build with no terminal.
+        _ACTIVE_WINDOW = weakref.ref(window)
+        sys.excepthook = _report_uncaught
         window.show()
+
+        named = window.seed_site(
+            cameras=arguments.camera or (), pose=arguments.place, zones=zones
+        )
+        if arguments.place is not None and not named:
+            log.warning("--place given but --camera named no camera; nothing was placed")
+        if arguments.duration is not None:
+            window.end_after(arguments.duration, screenshots=arguments.screenshots)
+        elif arguments.screenshots:
+            log.warning("--screenshots without --for: nothing will be photographed")
         if arguments.start:
             # After the event loop is running, not before: starting opens
             # cameras on worker threads whose first frames arrive through

@@ -9,10 +9,14 @@ the weight:
   footprint, in that colour, with a finite age and error on every mapped cell
   and ``inf`` on every empty one — and a bright square crossing a minority of
   those frames leaves no trace.
-- **A second camera extends the grid without disturbing the first.** The
-  accumulator is moved by an index shift, not resampled, and the moved result
-  is held to the unmoved one cell for cell. A wrong offset, or a rebuild that
-  quietly dropped the first camera's minutes, fails here.
+- **A second camera enlarges the union without touching the first.** Each
+  camera samples onto a grid of its own on one shared cell lattice; the build
+  lays each median onto the union by an integer shift, and the laid patch is
+  held to the original cell for cell. A wrong offset, a lattice that is not
+  whole cells, or a rebuild that quietly dropped the first camera's minutes,
+  fails here — and so does what the first shape of this module did: grow the
+  grid on the *second frame of the same camera*, because a footprint edge
+  re-measured in another frame sat half a millimetre past a lattice line.
 - **The files are the asset, or they are refused.** Save and load round-trip
   every array and every pose exactly; a PNG edited afterwards, a JSON with one
   number changed, and the half-written pair a crash leaves are all refused
@@ -37,6 +41,7 @@ import pytest
 from shapely.geometry import Point, Polygon
 
 from sentinel import logs, paths
+import sentinel.basemap as basemap_module
 from sentinel.basemap import (
     DEFAULT_POSE_SIGMA_M,
     FORMAT,
@@ -45,7 +50,7 @@ from sentinel.basemap import (
     BasemapAsset,
     BasemapBuilder,
     BasemapError,
-    _moved,
+    _placed,
     basemap_directory,
     load_basemap,
     save_basemap,
@@ -56,7 +61,7 @@ from sentinel.orthophoto import (
     DEFAULT_CAPACITY,
     MINIMUM_SAMPLES,
     GroundGrid,
-    MedianAccumulator,
+    mosaic,
     sample_frame,
 )
 
@@ -225,24 +230,34 @@ def test_a_bright_square_crossing_in_a_minority_of_frames_leaves_no_trace(refere
 
 
 def test_the_grid_grows_for_a_second_camera_and_the_first_keeps_every_cell(reference_pose):
-    """Extension is an index shift of the ring, and this holds it to that.
+    """The union is an index shift of each camera's own grid, and this holds it to that.
 
     The first camera is built alone, then a camera whose footprint lies
-    outside the grid is fed and the pair is built. Every cell the first asset
+    outside its grid is fed and the pair is built. Every cell the first asset
     mapped must be mapped in the second at the shifted index, with the same
     colour, age and error wherever the first camera still owns it. A rebuild
     that dropped the first camera's samples fails here with no north cells at
-    all; an offset wrong by one cell fails at the footprint's edge.
+    all; an offset wrong by one cell fails at the footprint's edge. And the
+    first camera's ring is the same object on the same grid afterwards —
+    nothing was moved or copied to make room — so the two rings together cost
+    their own cells, not twice the union.
     """
     north, south = facing_pair(reference_pose)
     builder = BasemapBuilder(cell_size_m=1.0)
     feed(builder, "cam-n", north, 5, colour=(0, 0, 255))
     first = builder.build(now=1_100.0)
     small = first.grid
+    ring_n = builder.grid_of("cam-n")
+    assert ring_n is small, "one camera: its own grid is the union"
 
     feed(builder, "cam-s", south, 5, colour=(255, 0, 0))
     second = builder.build(now=1_100.0)
     large = second.grid
+    ring_s = builder.grid_of("cam-s")
+    assert builder.grid_of("cam-n") is ring_n, "the first camera's grid was replaced"
+    assert ring_s is not None and ring_s != large and ring_n != large
+    assert builder.memory_bytes == 113 * (ring_n.cell_count + ring_s.cell_count)
+    assert builder.memory_bytes < 2 * 113 * large.cell_count
 
     dx, dy = _Frame(large.origin).to_xy(small.origin)
     column_offset = dx / large.cell_size_m
@@ -280,41 +295,39 @@ def test_the_grid_grows_for_a_second_camera_and_the_first_keeps_every_cell(refer
     assert second.frames_used == 10
 
 
-def test_a_moved_accumulator_reports_exactly_what_the_unmoved_one_did(reference_pose):
-    """The extension copies the ring through the accumulator's own slots.
+def test_a_patch_laid_on_the_union_grid_is_the_same_patch_at_the_shifted_index(reference_pose):
+    """The build lays each median onto the union through the patch's public fields.
 
-    That coupling is the one place this module knows the accumulator's layout,
-    and this is what keeps it honest: after the move, the median, the count,
-    the error and the newest sample of every cell are identical at the shifted
-    index, and nothing outside the shifted window is ground.
+    After the shift, the colour, the mask, the count, the error and the newest
+    sample of every cell are identical at the shifted index; everything
+    outside the window is what an empty cell is — not ground, zero colour,
+    NaN error and time, zero samples — so the mosaic underneath reads "no
+    ground" there rather than "black ground", and accepts the laid patch as
+    it would the original. A window that does not fit is refused, not
+    clipped.
     """
-    small = GroundGrid.covering(field_of_view(reference_pose), cell_size_m=1.0, margin_m=1.0)
-    accumulator = MedianAccumulator(small, capacity=6)
-    for index in range(4):
-        image = flat((10, 20, 30))
-        if index == 2:
-            image[:, :] = (200, 200, 200)
-        accumulator.update(
-            sample_frame(reference_pose, image, small, camera_id="cam-a",
-                         captured_at=500.0 + index)
-        )
-    before = accumulator.result(camera_id="cam-a", now=600.0)
+    builder = BasemapBuilder(cell_size_m=1.0)
+    feed(builder, "cam-a", reference_pose, 1, colour=(10, 20, 30))
+    small = builder.grid_of("cam-a")
+    assert small is not None
+    before = sample_frame(
+        reference_pose, flat((10, 20, 30)), small, camera_id="cam-a", captured_at=500.0
+    )
 
     large = GroundGrid(
         origin=_Frame(small.origin).to_latlon(-2.0, 3.0),
         cell_size_m=1.0, columns=small.columns + 5, rows=small.rows + 7,
     )
-    moved = _moved(accumulator, large, row_offset=3, column_offset=2)
-    after = moved.result(camera_id="cam-a", now=600.0)
+    after = _placed(before, large, row_offset=3, column_offset=2)
 
     window = (slice(3, 3 + small.rows), slice(2, 2 + small.columns))
     outside = np.ones(large.shape, dtype=bool)
     outside[window] = False
     print(
-        f"{before.covered_cells} cells before the move, {after.covered_cells} after; "
+        f"{before.covered_cells} cells before the shift, {after.covered_cells} after; "
         f"{int(after.valid[outside].sum())} outside the window"
     )
-    assert moved.frames == accumulator.frames == 4
+    assert after.grid == large and after.camera_id == "cam-a"
     assert after.covered_cells == before.covered_cells > 2_000
     assert np.array_equal(after.valid[window], before.valid)
     assert np.array_equal(after.colour[window], before.colour)
@@ -322,6 +335,165 @@ def test_a_moved_accumulator_reports_exactly_what_the_unmoved_one_did(reference_
     assert np.array_equal(after.sigma_m[window], before.sigma_m, equal_nan=True)
     assert np.array_equal(after.updated_at[window], before.updated_at, equal_nan=True)
     assert not after.valid[outside].any()
+    assert not after.colour[outside].any() and not after.samples[outside].any()
+    assert np.all(np.isnan(after.sigma_m[outside])) and np.all(np.isnan(after.updated_at[outside]))
+    assert mosaic([after], {"cam-a": 1.0}).covered_cells == before.covered_cells
+
+    # Already on the grid: handed back as it is, nothing copied.
+    assert _placed(before, small, row_offset=0, column_offset=0) is before
+    with pytest.raises(BasemapError, match="does not fit"):
+        _placed(before, large, row_offset=8, column_offset=2)
+
+
+def test_feeding_a_placed_camera_again_never_touches_the_grid(reference_pose):
+    """A camera's grid is placed once; its second frame costs what its first did.
+
+    The first shape of this module grew the grid on the *second* frame of the
+    same camera — 82×91 to 83×91 at a metre, 327×362 to 328×362 at the CLI's
+    quarter metre — copying the whole ring to do it, because the footprint
+    was measured again in the grid's own frame and found half a millimetre
+    outside. Now the footprint is measured once: the grid is the same object
+    after forty frames as after one, the memory is the same number, and the
+    footprint is computed once per camera and not once per frame.
+    """
+    calls: list[str] = []
+    real = basemap_module.field_of_view
+
+    def counting(pose, *args, **kwargs):
+        calls.append("footprint")
+        return real(pose, *args, **kwargs)
+
+    for cell, frames in ((1.0, 40), (0.25, 3)):
+        calls.clear()
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(basemap_module, "field_of_view", counting)
+            builder = BasemapBuilder(cell_size_m=cell)
+            feed(builder, "cam-a", reference_pose, 1)
+            first = builder.grid
+            after_one = builder.memory_bytes
+            feed(builder, "cam-a", reference_pose, frames - 1, start=1_001.0)
+        print(
+            f"{cell} m: {first.rows}x{first.columns} after one frame, "
+            f"{builder.grid.rows}x{builder.grid.columns} after {frames}; "
+            f"{after_one / 1e6:.2f} MB then {builder.memory_bytes / 1e6:.2f} MB; "
+            f"footprint computed {len(calls)} time(s)"
+        )
+        assert builder.grid is first
+        assert builder.grid_of("cam-a") is first
+        assert builder.memory_bytes == after_one
+        assert builder.frames_fed() == {"cam-a": frames}
+        assert calls == ["footprint"]
+
+
+@pytest.mark.parametrize(
+    "heading, cell",
+    [(180.0, 1.0), (45.0, 1.0), (90.0, 1.0), (135.0, 1.0), (180.0, 0.25)],
+)
+def test_two_cameras_on_one_mast_are_given_one_grid_exactly(heading: float, cell: float):
+    """The same footprint, measured from the lattice origin, lands on the same cells.
+
+    The second camera is measured in the first grid's frame, sixty-odd metres
+    from where the first was measured, and the two frames disagree by the
+    convergence of meridians — half a millimetre over this footprint. With
+    the lattice anchored at a footprint point, or at the corner
+    :meth:`GroundGrid.covering` chooses, a footprint edge plus a whole-cell
+    margin sat *exactly* on a lattice line and that half millimetre decided
+    which side of it the second camera fell: these four headings each got a
+    grid one cell wider or taller. Anchored at the camera, the extremes sit
+    mid-cell and the two grids are equal.
+    """
+    pose = camera(ORIGIN, heading)
+    builder = BasemapBuilder(cell_size_m=cell)
+    feed(builder, "cam-a", pose, 1)
+    feed(builder, "cam-b", pose, 1)
+    first, second = builder.grid_of("cam-a"), builder.grid_of("cam-b")
+    print(f"heading {heading:g} at {cell} m: {first.shape} and {second.shape}")
+    assert second == first
+    assert builder.grid is first, "two equal grids: the union is still the first"
+
+
+def test_a_camera_grid_laid_on_the_union_is_where_its_cells_are_to_a_fraction_of_a_millimetre(
+    reference_pose,
+):
+    """The lattice's one approximation, measured rather than assumed.
+
+    Each camera's grid is a local frame at its own origin and the union is
+    another; the index shift claims that cell ``(r, c)`` of a camera's grid
+    *is* cell ``(r + dr, c + dc)`` of the union. Two such frames disagree by
+    the convergence of meridians, ``D·d·tan(lat)/R`` for origins ``D`` apart
+    east-west and a cell ``d`` away, so the pair here is east-west — a
+    north-south pair measures nothing — and every grid corner is checked
+    against where the union says it is. The offsets must be whole cells to a
+    millionth, and the cell centres agree to under a millimetre.
+    """
+    west = reference_pose
+    east = camera(destination_point(reference_pose.position, 90.0, 60.0), 270.0)
+    builder = BasemapBuilder(cell_size_m=1.0)
+    feed(builder, "cam-w", west, 1)
+    feed(builder, "cam-e", east, 1)
+    union = builder.grid
+    frame = _Frame(union.origin)
+
+    worst = 0.0
+    for camera_id in ("cam-w", "cam-e"):
+        grid = builder.grid_of(camera_id)
+        ox, oy = frame.to_xy(grid.origin)
+        column0, row0 = round(ox / union.cell_size_m), round(-oy / union.cell_size_m)
+        assert abs(ox / union.cell_size_m - column0) < 1e-6
+        assert abs(-oy / union.cell_size_m - row0) < 1e-6
+        assert row0 >= 0 and column0 >= 0
+        assert row0 + grid.rows <= union.rows and column0 + grid.columns <= union.columns
+        for row, column in (
+            (0, 0), (0, grid.columns - 1), (grid.rows - 1, 0),
+            (grid.rows - 1, grid.columns - 1), (grid.rows // 2, grid.columns // 2),
+        ):
+            x, y = frame.to_xy(grid.cell_centre(row, column))
+            expected_x, expected_y = union.cell_xy(row0 + row, column0 + column)
+            worst = max(worst, math.hypot(x - expected_x, y - expected_y))
+    print(
+        f"union {union.rows}x{union.columns}; worst cell-centre disagreement between "
+        f"a camera's frame and the union's: {worst * 1000:.3f} mm"
+    )
+    assert worst < 1e-3
+
+
+def test_a_frame_that_cannot_be_sampled_leaves_nothing_behind(reference_pose):
+    """Refused whole: not counted, no pose recorded, no grid placed for it.
+
+    An image with no pixels is one the sampler refuses. Before this, the
+    frame was counted and the pose recorded *before* sampling, so a refused
+    frame was reported as fed and its pose bound the camera to a placement
+    that never produced a sample.
+    """
+    builder = BasemapBuilder(cell_size_m=1.0)
+    with pytest.raises(BasemapError, match="no pixels"):
+        builder.feed("cam-a", reference_pose, np.zeros((0, 0, 3), np.uint8), 1_000.0)
+    assert builder.frames_fed() == {}
+    assert builder.frames_sampled() == {}
+    assert builder.grid is None and builder.grid_of("cam-a") is None
+    assert builder.memory_bytes == 0
+
+    # The pose was not recorded: the camera may be fed under another one.
+    elsewhere = camera(destination_point(reference_pose.position, 90.0, 5.0), 180.0)
+    feed(builder, "cam-a", elsewhere, 1)
+    assert builder.frames_fed() == {"cam-a": 1}
+    placed = builder.grid
+
+    # And a placed camera's refused frame changes nothing either.
+    with pytest.raises(BasemapError, match="no pixels"):
+        builder.feed("cam-a", elsewhere, np.zeros((0, 0, 3), np.uint8), 1_001.0)
+    assert builder.frames_fed() == {"cam-a": 1}
+    assert builder.frames_sampled() == {"cam-a": 1}
+    assert builder.grid is placed
+
+
+def test_cells_from_refuses_a_camera_the_asset_was_not_built_from(reference_pose):
+    """A mistyped id must not read as "saw no ground"."""
+    asset = one_camera_asset(reference_pose)
+    assert asset.cells_from("cam-a") == asset.covered_cells
+    with pytest.raises(BasemapError, match="not one this basemap was built from") as refusal:
+        asset.cells_from("cam-b")
+    assert "cam-a" in str(refusal.value)
 
 
 def test_a_cell_two_cameras_cover_comes_from_the_one_that_knows_it_better(reference_pose):
@@ -736,8 +908,14 @@ def test_the_files_carry_the_ground_and_its_provenance_and_nothing_else(
     }
     assert document["coverage"]["covered_cells"] == asset.covered_cells
     assert set(document["layers"]) == {"sigma_m", "age_seconds", "source"}
-    text = json_path.read_text(encoding="utf-8")
-    assert "NaN" not in text and "Infinity" not in text
+    # No NaN or Infinity written as a *number*: Python's encoder would, and a
+    # strict reader refuses both. Checked through the parser rather than as a
+    # substring, because the base64 of a layer can spell "NaN" by chance —
+    # and did, the day the grid changed shape by one cell.
+    def refuse(constant: str) -> None:
+        raise AssertionError(f"{constant} was written as a number")
+
+    json.loads(json_path.read_text(encoding="utf-8"), parse_constant=refuse)
 
 
 def test_basemap_directory_is_under_the_data_directory():

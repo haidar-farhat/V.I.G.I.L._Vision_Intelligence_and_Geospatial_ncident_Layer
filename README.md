@@ -326,6 +326,7 @@ there is one set of instructions and no shell-script pair to drift apart.
 | `python tasks.py db` | Report the database's migration state |
 | `python tasks.py db-migrate` | Apply pending migrations |
 | `python tasks.py db-rollback` | Undo the most recent migration |
+| `python tasks.py exetest` | Run the packaged console on this machine's camera for 30 s and keep the pictures, the summary and the log — the shipped binary as the test medium |
 
 ---
 

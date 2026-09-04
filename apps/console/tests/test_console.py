@@ -2455,6 +2455,10 @@ def test_every_path_that_changes_the_site_goes_through_the_lock(qt_app, window):
         # `test_a_camera_cannot_be_dragged_in_monitor` holds it to that.
         "_camera_dragged": "only while map.set_editable(True), which follows the lock",
         "_camera_turned": "only while map.set_editable(True), which follows the lock",
+        # A command-line flag is a deliberate act by whoever launched the
+        # process, not a stray click on a control room screen; every change
+        # it makes goes through the node and is audited like a clicked one.
+        "seed_site": "from run(): --camera, --place and --zone",
     }
     mutators = (
         "self.node.add_camera", "self.node.remove_camera", "self.node.place_camera",
@@ -3536,9 +3540,15 @@ def test_the_console_accepts_the_start_flag(qt_app):
 
     from sentinel_console import app as app_module
 
-    source = __import__("inspect").getsource(app_module.run)
-    assert '"--start"' in source
-    assert "start_on_launch" in source, "the flag is parsed but never acted on"
+    import inspect
+
+    # The flags moved into build_parser() when the console grew a command line
+    # for the packaged binary; run() must still act on this one.
+    assert '"--start"' in inspect.getsource(app_module.build_parser)
+    source = inspect.getsource(app_module.run)
+    assert "arguments.start" in source and "start_on_launch" in source, (
+        "the flag is parsed but never acted on"
+    )
 
 
 # --------------------------------------------------- zone classes, wired
@@ -3578,7 +3588,7 @@ def test_detector_labels_come_from_the_models_class_names(qt_app, window, monkey
         info = Info()
 
     window._model = Path("a-model.onnx")
-    monkeypatch.setattr(app_module, "detector_for", lambda _path: Detector())
+    monkeypatch.setattr(app_module, "detector_for", lambda _path, **_: Detector())
 
     assert window._detector_labels() == ["car", "person", "truck"]
 
@@ -3744,7 +3754,7 @@ def test_with_a_model_the_zone_picker_offers_only_what_is_watched(qt_app, tmp_pa
         assert win._detector_labels() == sorted(WATCHED_LABELS)
         win._set_watched({"person", "dog"})
         assert win._detector_labels() == ["dog", "person"]
-        assert win.zone_properties._vocabulary == ["dog", "person"]
+        assert list(win.zone_properties._vocabulary) == ["dog", "person"]
     finally:
         win.close()
 
@@ -3764,3 +3774,519 @@ def test_the_watched_classes_dialog_refuses_to_watch_nothing(qt_app):
     assert not dialog.buttons.button(QDialogButtonBox.StandardButton.Ok).isEnabled()
     dialog.deleteLater()
 
+
+# ------------------------------------------- a locked control answers a click
+#
+# The operator's report of the lock was "the buttons do nothing". A greyed
+# control that swallows a click is exactly that, whatever its tooltip says.
+
+
+def _answer_the_key_yes(monkeypatch, asked: list):
+    from PySide6.QtWidgets import QMessageBox
+
+    def question(parent, title, text, *args, **kwargs):
+        asked.append(text)
+        return QMessageBox.StandardButton.Yes
+
+    monkeypatch.setattr(QMessageBox, "question", staticmethod(question))
+
+
+def _answer_the_key_no(monkeypatch, asked: list):
+    from PySide6.QtWidgets import QMessageBox
+
+    def question(parent, title, text, *args, **kwargs):
+        asked.append(text)
+        return QMessageBox.StandardButton.No
+
+    monkeypatch.setattr(QMessageBox, "question", staticmethod(question))
+
+
+def _swallow_information_boxes(monkeypatch, shown: list):
+    from PySide6.QtWidgets import QMessageBox
+
+    def information(parent, title, text, *args, **kwargs):
+        shown.append(title)
+        return QMessageBox.StandardButton.Ok
+
+    monkeypatch.setattr(QMessageBox, "information", staticmethod(information))
+
+
+def test_clicking_a_locked_control_offers_the_key_and_then_does_what_was_asked(
+    qt_app, window, monkeypatch
+):
+    from PySide6.QtTest import QTest
+
+    asked, shown = [], []
+    _answer_the_key_yes(monkeypatch, asked)
+    _swallow_information_boxes(monkeypatch, shown)
+    assert not window.remove_button.isEnabled()
+
+    # A real press on the greyed button, delivered the way a mouse would.
+    QTest.mouseClick(window.remove_button, Qt.MouseButton.LeftButton)
+    QApplication.processEvents()
+
+    assert asked, "the click on a locked control was swallowed"
+    assert "locked" in asked[0].lower() and "Remove camera" in asked[0]
+    assert window._configuring, "yes did not unlock the site"
+    assert window.remove_button.isEnabled()
+    # With no camera, Remove says so — which proves the click was carried
+    # out after the unlock rather than merely permitted for next time.
+    assert shown == ["No camera"], shown
+    actions = [row["action"] for row in window.store.audit_trail(limit=5)]
+    assert "console.configure.entered" in actions, "the unlock was not audited"
+
+
+def test_declining_the_key_leaves_the_site_locked_and_says_where_it_is(
+    qt_app, window, monkeypatch
+):
+    from PySide6.QtTest import QTest
+
+    asked, shown = [], []
+    _answer_the_key_no(monkeypatch, asked)
+    _swallow_information_boxes(monkeypatch, shown)
+
+    QTest.mouseClick(window.place_button, Qt.MouseButton.LeftButton)
+    QApplication.processEvents()
+
+    assert asked and "Place" in asked[0]
+    assert not window._configuring
+    assert not window.place_button.isEnabled()
+    assert shown == [], "the refused click was carried out anyway"
+    assert "Configure" in window.status.currentMessage()
+
+
+def test_the_draw_button_offers_the_key_when_the_site_is_locked(
+    qt_app, window, reference_video: Path, monkeypatch
+):
+    from sentinel_console.map_view import MODE_DRAW
+
+    _placed_window(window, reference_video)
+    asked = []
+    _answer_the_key_yes(monkeypatch, asked)
+    assert not window._configuring
+
+    window.mode_buttons[MODE_DRAW].click()
+
+    assert asked and "Draw" in asked[0]
+    assert window._configuring
+    assert window.map.drawing, "unlocked, but the drawing the operator asked for never began"
+    assert window.mode_buttons[MODE_DRAW].isChecked()
+
+
+def test_the_draw_button_declined_still_refuses_and_resets(
+    qt_app, window, reference_video: Path, monkeypatch
+):
+    from sentinel_console.map_view import MODE_DRAW, MODE_SELECT
+
+    _placed_window(window, reference_video)
+    asked = []
+    _answer_the_key_no(monkeypatch, asked)
+
+    window.mode_buttons[MODE_DRAW].click()
+
+    assert asked
+    assert not window._configuring
+    assert not window.map.drawing
+    assert window.mode_buttons[MODE_SELECT].isChecked()
+    assert not window.mode_buttons[MODE_DRAW].isChecked()
+    assert "Configure" in window.status.currentMessage()
+
+
+def test_an_enabled_control_is_not_second_guessed(qt_app, window, monkeypatch):
+    """The filter answers greyed controls only. In Configure a click is a click."""
+    from PySide6.QtTest import QTest
+
+    asked, shown = [], []
+    _answer_the_key_yes(monkeypatch, asked)
+    _swallow_information_boxes(monkeypatch, shown)
+    window.configure_button.setChecked(True)
+
+    QTest.mouseClick(window.remove_button, Qt.MouseButton.LeftButton)
+    QApplication.processEvents()
+
+    assert asked == [], "an unlocked control asked for the key"
+    assert shown == ["No camera"]
+
+
+def test_the_status_bar_always_says_whether_the_site_is_locked(qt_app, window):
+    assert window.lock_label.isVisible() or not window.isVisible()
+    assert "MONITOR" in window.lock_label.text()
+    assert "Configure" in window.lock_label.text()
+    window.configure_button.setChecked(True)
+    assert "CONFIGURE" in window.lock_label.text()
+    window.configure_button.setChecked(False)
+    assert "MONITOR" in window.lock_label.text()
+
+
+def test_escape_does_not_relock_and_the_lock_no_longer_claims_it_does(
+    qt_app, window, reference_video: Path
+):
+    """The tooltip and the manual said Configure "returns to Monitor on
+    Escape". It never did — Escape clears a selection or abandons a drawing —
+    and a lock described wrongly is worse than one described not at all: an
+    operator who trusts the sentence walks away believing the site relocked.
+    """
+    from PySide6.QtTest import QTest
+
+    _placed_window(window, reference_video)
+    window.configure_button.setChecked(True)
+    QTest.keyClick(window, Qt.Key.Key_Escape)
+    QApplication.processEvents()
+
+    assert window._configuring, "Escape relocked; the docs now say it does not"
+    tip = window.configure_button.toolTip()
+    assert "on Escape" not in tip
+    assert "does not relock" in tip
+
+
+def test_a_locked_control_survives_the_freeing_test(qt_app, tmp_path):
+    """Installing the window as an event filter on its own children must not
+    put it in a reference cycle — the cycle is the exit-time heap corruption.
+    """
+    win = ConsoleWindow(":memory:", settings=_isolated_settings(tmp_path))
+    assert win._guarded, "nothing was guarded"
+    win.close()
+    ref = weakref.ref(win)
+    del win
+    assert_freed(ref)
+
+
+# ----------------------------------------------------- an exception in a slot
+
+
+def test_an_exception_raised_in_a_slot_is_logged_named_and_let_go(qt_app, window):
+    """A slot that raises looks, to the operator, like a button that did
+    nothing: PySide prints the traceback to a stderr the packaged console does
+    not have, and keeps it on sys.last_* where it pins the widget.
+    """
+    import logging
+    import sys
+
+    from sentinel_console import app as app_module
+
+    records = []
+
+    class Keep(logging.Handler):
+        def emit(self, record):
+            records.append(self.format(record))
+
+    handler = Keep()
+    handler.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+    logger = logging.getLogger("sentinel")
+    logger.addHandler(handler)
+    try:
+        try:
+            raise RuntimeError("raised inside a slot")
+        except RuntimeError:
+            info = sys.exc_info()
+        # What PyErr_Print does before it calls the hook.
+        sys.last_type, sys.last_value, sys.last_traceback = info
+        app_module._ACTIVE_WINDOW = weakref.ref(window)
+
+        app_module._report_uncaught(*info)
+    finally:
+        logger.removeHandler(handler)
+        app_module._ACTIVE_WINDOW = None
+
+    assert any("CRITICAL" in r and "raised inside a slot" in r for r in records), records
+    assert sys.last_traceback is None and sys.last_value is None
+    assert "RuntimeError" in window.status.currentMessage()
+    assert "log" in window.status.currentMessage()
+
+
+def test_run_installs_the_hook_before_the_window_shows(qt_app):
+    import inspect
+
+    from sentinel_console import app as app_module
+
+    source = inspect.getsource(app_module.run)
+    assert "sys.excepthook = _report_uncaught" in source
+    assert source.index("sys.excepthook = _report_uncaught") < source.index("window.show()")
+
+
+# ----------------------------------------------------------- the floor
+
+
+def test_the_console_requires_half_confidence_by_default_and_remembers_a_change(
+    qt_app, tmp_path
+):
+    from sentinel_console.app import DEFAULT_CONFIDENCE
+
+    assert DEFAULT_CONFIDENCE == 0.5
+    first = ConsoleWindow(":memory:", settings=_isolated_settings(tmp_path))
+    assert first._confidence == DEFAULT_CONFIDENCE
+    assert first._detector_factory.confidence == DEFAULT_CONFIDENCE
+    first._set_confidence(0.6)
+    assert first._detector_factory.confidence == 0.6
+    assert "0.60" in first.status.currentMessage()
+    first.close()
+
+    second = ConsoleWindow(":memory:", settings=_isolated_settings(tmp_path))
+    assert second._confidence == 0.6
+    second.close()
+    del first, second
+    gc.collect()
+
+
+def test_a_nonsense_stored_confidence_falls_back_to_the_default(qt_app, tmp_path):
+    from sentinel_console.app import DEFAULT_CONFIDENCE
+
+    for bad in ("high", "", 3.0, 0.0, -1):
+        settings = _isolated_settings(tmp_path)
+        settings.setValue("detection/confidence", bad)
+        settings.sync()
+        win = ConsoleWindow(":memory:", settings=settings)
+        try:
+            assert win._confidence == DEFAULT_CONFIDENCE, bad
+        finally:
+            win.close()
+        settings.clear()
+        settings.sync()
+
+
+def test_the_floor_is_clamped_to_the_range(qt_app, window):
+    from sentinel_console.app import CONFIDENCE_RANGE
+
+    low, high = CONFIDENCE_RANGE
+    window._set_confidence(0.0)
+    assert window._confidence == low
+    window._set_confidence(1.5)
+    assert window._confidence == high
+
+
+def test_the_factory_hands_the_floor_and_the_watch_list_to_the_detector(monkeypatch):
+    from sentinel.detect import MotionDetector
+    from sentinel_console import app as app_module
+    from sentinel_console.app import _DetectorFactory
+
+    calls = []
+
+    def fake(model, **options):
+        calls.append((model, options))
+        return MotionDetector()
+
+    monkeypatch.setattr(app_module, "detector_for", fake)
+    _DetectorFactory(Path("m.onnx"), frozenset({"person"}), 0.6)()
+    assert calls == [(Path("m.onnx"), {"classes": frozenset({"person"}), "confidence_threshold": 0.6})]
+
+
+def test_a_motion_only_console_still_starts_with_a_floor_set(qt_app, window):
+    # The real factory, no model: motion takes what applies to it and ignores
+    # the rest. A console that could not start on a machine with no model
+    # because of a setting meant for classifiers would be a regression.
+    from sentinel.detect import MotionDetector
+
+    assert window._detector_factory.confidence == 0.5
+    assert isinstance(window._detector_factory(), MotionDetector)
+
+
+def test_the_detector_line_states_the_floor_beside_the_watch_list(qt_app):
+    from sentinel_console.app import _detector_summary
+
+    class Segmenter:
+        classifies = True
+        kind = "onnx-segment"
+        name = "yolov8n-seg instance segmentation"
+        model_sha256 = "f828ccfa4b69abcdef"
+        class_names = {0: "person", 2: "car"}
+
+    class Motion:
+        classifies = False
+        kind = "motion"
+        name = "MOG2"
+        model_sha256 = None
+        class_names = {}
+
+    line = _detector_summary(Segmenter(), 0.5)
+    assert "watching car, person" in line
+    assert "≥ 0.50" in line
+    assert line.index("≥ 0.50") < line.index("f828ccfa4b69")
+    assert "0.50" not in _detector_summary(Motion(), 0.5)
+    assert "≥" not in _detector_summary(Segmenter(), None)
+
+
+def test_the_watched_classes_dialog_carries_the_floor(qt_app):
+    from sentinel_console.watch_dialog import WatchedClassesDialog
+
+    without = WatchedClassesDialog(["person"], {"person"}, defaults={"person"})
+    assert without.confidence() is None and without.confidence_spin is None
+    without.deleteLater()
+
+    dialog = WatchedClassesDialog(["person"], {"person"}, defaults={"person"}, confidence=0.5)
+    assert dialog.confidence() == 0.5
+    dialog.confidence_spin.setValue(0.65)
+    assert dialog.confidence() == 0.65
+    assert dialog.chosen() == frozenset({"person"})
+    dialog.deleteLater()
+
+
+@pytest.mark.skipif(not MODEL_PATH.is_file(), reason="no segmentation model on this machine")
+def test_with_a_model_the_floor_reaches_the_segmenter(qt_app, tmp_path):
+    from sentinel.segment import Segmenter
+
+    win = ConsoleWindow(":memory:", model=MODEL_PATH, settings=_isolated_settings(tmp_path))
+    try:
+        win._set_confidence(0.7)
+        detector = win._detector_factory()
+        assert isinstance(detector, Segmenter)
+        assert detector._confidence == 0.7
+        assert set(detector.info.class_names.values()) == set(win._watched)
+    finally:
+        win.close()
+
+
+# ------------------------------------- the packaged binary as the test medium
+#
+# The rule: the product is tested through the real camera and the shipped
+# binary, never a checkout and never a file. A binary cannot be clicked by a
+# test, so it takes the same flags `sentinel run` does and leaves evidence.
+
+
+def test_the_console_parser_takes_the_flags_a_camera_test_needs(qt_app):
+    from sentinel_console.app import build_parser
+
+    arguments, unknown = build_parser().parse_known_args([
+        "--start", "--for", "5", "--screenshots", "out",
+        "--camera", "device:0", "--camera", "gate.mp4",
+        "--place", "33.8938,35.5018,1.2,180,-15",
+        "--zone", "Room:33.8938,35.5018;33.8939,35.5018;33.8939,35.5019",
+        "--zone-classes", "Room=person",
+        "--watch", "person, car", "--confidence", "0.6", "--settings", "t.ini",
+        "-platform", "offscreen",
+    ])
+    assert arguments.start and arguments.duration == 5.0 and arguments.screenshots == "out"
+    assert arguments.camera == ["device:0", "gate.mp4"]
+    assert arguments.place.mount_height == 1.2 and arguments.place.pitch == -15.0
+    assert [zone.name for zone in arguments.zone] == ["Room"]
+    assert arguments.zone_classes == [("Room", frozenset({"person"}))]
+    assert arguments.watch == "person, car" and arguments.confidence == 0.6
+    assert arguments.settings == "t.ini"
+    # Qt's own arguments pass through, as they always did.
+    assert unknown == ["-platform", "offscreen"]
+
+
+def test_a_confidence_outside_the_range_is_refused_on_the_command_line(qt_app, capsys):
+    from sentinel_console.app import build_parser
+
+    for bad in ("1.5", "0", "high"):
+        with pytest.raises(SystemExit):
+            build_parser().parse_args(["--confidence", bad])
+    assert "--confidence" in capsys.readouterr().err
+
+
+def test_command_line_overrides_apply_to_this_window_and_are_not_remembered(qt_app, tmp_path):
+    settings = _isolated_settings(tmp_path)
+    win = ConsoleWindow(":memory:", settings=settings, watched={"person"}, confidence=0.7)
+    try:
+        assert win._watched == frozenset({"person"})
+        assert win._confidence == 0.7
+        assert win._detector_factory.classes == frozenset({"person"})
+        assert win._detector_factory.confidence == 0.7
+        assert settings.value("detection/watched", None) is None, "--watch was written to the machine"
+        assert settings.value("detection/confidence", None) is None, "--confidence was written to the machine"
+    finally:
+        win.close()
+
+
+def test_the_site_can_be_seeded_from_the_command_line_and_is_audited(
+    qt_app, window, reference_video: Path
+):
+    from sentinel.cli import _pose, _zone
+
+    pose = _pose("33.8938,35.5018,6,180,-22")
+    zone = _zone("Yard:33.89365,35.50170;33.89365,35.50190;33.89345,35.50190;33.89345,35.50170")
+
+    named = window.seed_site(cameras=[reference_video], pose=pose, zones=[zone])
+
+    assert len(named) == 1
+    session = window._sessions[named[0]]
+    assert session.pose == pose
+    assert [zone.id for zone in window._zones] == ["yard"]
+    assert window.start_button.isEnabled()
+    assert not window._configuring, "seeding is not an unlock"
+    actions = [row["action"] for row in window.store.audit_trail(limit=10)]
+    for expected in ("camera.added", "camera.placed", "zone.created"):
+        assert expected in actions, f"{expected} was not audited"
+
+
+def test_seeding_again_keeps_what_is_there_rather_than_duplicating_it(
+    qt_app, window, reference_video: Path
+):
+    from sentinel.cli import _pose, _zone
+
+    pose = _pose("33.8938,35.5018,6,180,-22")
+    zone = _zone("Yard:33.89365,35.50170;33.89365,35.50190;33.89345,35.50190;33.89345,35.50170")
+    first = window.seed_site(cameras=[reference_video], pose=pose, zones=[zone])
+
+    again = window.seed_site(cameras=[reference_video], pose=None, zones=[zone])
+
+    assert again == first
+    assert len(window._sessions) == 1
+    assert len(window._zones) == 1
+    # A restored, unplaced camera named again with a placement is placed.
+    window._sessions[first[0]].record.pose = None
+    window.seed_site(cameras=[reference_video], pose=pose)
+    assert window._sessions[first[0]].pose == pose
+
+
+def test_a_timed_run_photographs_itself_reports_and_closes(
+    qt_app, window, reference_video: Path, tmp_path, capsys
+):
+    _placed_window(window, reference_video)
+    window._start()
+    shots = tmp_path / "shots"
+
+    window.end_after(0.5, screenshots=shots)
+
+    deadline = time.perf_counter() + 20.0
+    while time.perf_counter() < deadline and window.isVisible():
+        qt_app.processEvents(QEventLoop.ProcessEventsFlag.AllEvents, 20)
+    assert not window.isVisible(), "the timed run did not close the window"
+    assert not window._running
+
+    names = sorted(path.name for path in shots.glob("*.png"))
+    for expected in ("console.png", "plan-view.png", "incidents.png", "tracks.png", "zones.png", "camera-cam-07.png"):
+        assert expected in names, names
+    out = capsys.readouterr().out
+    assert "screenshot" in out
+    assert "node local" in out, out
+    assert "cam-07" in out and "frames" in out
+    assert "distinct tracks" in out, "the per-track summary is what a camera test reads"
+
+
+def test_a_timed_run_with_no_pictures_still_reports(qt_app, window, capsys):
+    window.end_after(0.0)
+    deadline = time.perf_counter() + 5.0
+    while time.perf_counter() < deadline and window.isVisible():
+        qt_app.processEvents(QEventLoop.ProcessEventsFlag.AllEvents, 20)
+    assert not window.isVisible()
+    assert "node local" in capsys.readouterr().out
+
+
+def test_an_unknown_watch_label_is_refused_before_any_window_exists(qt_app, monkeypatch):
+    from sentinel.detect import DetectionError
+    from sentinel_console import app as app_module
+
+    def refuse(model, **options):
+        raise DetectionError("asked to watch unicorn, which this model does not name")
+
+    monkeypatch.setattr(app_module, "detector_for", refuse)
+    problem = app_module._refuse_unknown_labels(Path("m.onnx"), frozenset({"unicorn"}))
+    assert problem is not None and "unicorn" in problem
+    assert app_module._labels(None) is None
+    assert app_module._labels("person, car,") == frozenset({"person", "car"})
+
+
+def test_run_seeds_times_and_starts_in_that_order(qt_app):
+    """The flags are wired, and wired in the order that works: seed before
+    the start timer (so a --camera is what --start starts), the excepthook
+    before the window shows."""
+    import inspect
+
+    from sentinel_console import app as app_module
+
+    source = inspect.getsource(app_module.run)
+    for fragment in ("build_parser()", "window.seed_site(", "window.end_after(", "start_on_launch"):
+        assert fragment in source, fragment
+    assert source.index("window.seed_site(") < source.index("start_on_launch")
+    assert source.index("sys.excepthook = _report_uncaught") < source.index("window.show()")

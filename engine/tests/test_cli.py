@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -1072,7 +1073,53 @@ def test_a_basemap_build_from_a_camera_that_sees_no_ground_exits_1(
         "--place", "33.8938,35.5018,6,180,-0.01,62,0.001,90", "--for", "1",
         "--out", str(tmp_path / "bm"),
     ])
+    printed = capsys.readouterr()
 
     assert code == 1
-    assert "no ground" in capsys.readouterr().err
+    assert "no ground" in printed.err
     assert not (tmp_path / "bm").exists()
+    # Frames were read and taken, and none reached a median — and the count
+    # says so. It used to report the frames offered as "fed to the median".
+    read = re.search(r"(\d+) frame\(s\) read in", printed.out)
+    assert read is not None and int(read.group(1)) > 0, printed.out
+    assert "0 fed to the median" in printed.out
+
+
+def test_basemap_build_refuses_a_repeated_id_before_anything_opens(
+    reference_video: Path, tmp_path: Path, monkeypatch, capsys
+):
+    """Two sources under one id would be merged or refused mid-build; refused first."""
+    import cv2
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("a source was opened")
+
+    monkeypatch.setattr(cv2, "VideoCapture", forbidden)
+
+    code = cli.main([
+        "--quiet", "basemap", "build", str(reference_video), str(reference_video),
+        "--id", "gate", "--id", "gate", "--place", "33.8938,35.5018,6,180,-22",
+        "--out", str(tmp_path / "bm"),
+    ])
+
+    assert code == 2
+    assert "gate" in capsys.readouterr().err
+    assert not (tmp_path / "bm").exists()
+
+
+def test_feed_basemap_refuses_a_live_source_without_a_bound_before_opening_it(
+    reference_video: Path, reference_pose, monkeypatch
+):
+    """A contract, not an `assert`: it held under `python -O` as `started + None`."""
+    from sentinel import decode
+    from sentinel.decode import VideoSource
+
+    class Forbidden:
+        def __init__(self, source):
+            raise AssertionError("the stream was opened")
+
+    monkeypatch.setattr(decode, "LiveStream", Forbidden)
+    source = VideoSource(str(reference_video), source_id="gate", live=True)
+
+    with pytest.raises(ValueError, match="--for"):
+        cli._feed_basemap(object(), source, reference_pose, duration=None, per_second=4.0)

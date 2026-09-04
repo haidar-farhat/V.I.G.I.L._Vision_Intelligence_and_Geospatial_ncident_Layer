@@ -41,6 +41,18 @@ silently matching nobody on Monday. A switch in a configuration file would be a
 change nobody audited. In the site row it survives a restart and every flip of
 it is an audit row with a before and an after.
 
+**Declared, or written by the node.** A site row is meant to be an operator's
+declaration — this is where the site is, this is its clock. Until a site editor
+exists, though, the one thing that *must* be written before anybody has
+declared a site is :class:`Identity`: it lives on the site row, and a node with
+plates switched on has to persist that on a row somebody has to write. So the
+node writes one, and :attr:`Site.declared` records that nobody chose what is in
+it. A reader that finds ``declared`` false treats the row as authoritative for
+the switch and for nothing else: its origin is a snapshot of what the node
+could derive when it wrote the row — the first placed camera, or nowhere — and
+the node keeps deriving it afterwards rather than freezing every later camera
+placement onto an origin of (0, 0) that nobody ever meant.
+
 :class:`SiteFrame` is the conversion between latitude/longitude and metres east
 and north of that origin. It is intended to replace both
 ``sentinel.coverage._Frame`` and ``MapView._to_local``, which are today the same
@@ -176,6 +188,17 @@ class Site:
     #: off — for every site that has never been asked, which is every site
     #: written before the switch existed as well as every new one.
     identity: Identity = Identity()
+    #: Whether an operator declared this site, or the node wrote the row on
+    #: its own to hold the identity switch before anybody had declared one.
+    #: True by default and for every row written before the flag existed,
+    #: because a stored origin somebody may have chosen must not be
+    #: second-guessed: overriding a declared origin from the cameras would
+    #: bring back the plan-view jump this record exists to end. False only on
+    #: the row `Node.set_identity` writes when no site exists — and for that
+    #: row the switch is the only field that means anything; the node keeps
+    #: deriving the origin from the first placed camera until an operator
+    #: declares one, rather than freezing the placeholder's (0, 0) forever.
+    declared: bool = True
 
     def __post_init__(self) -> None:
         """Refuse a ring of one or two points at the door.

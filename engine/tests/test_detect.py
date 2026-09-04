@@ -356,3 +356,15 @@ def test_a_motion_detector_ignores_a_watch_list_rather_than_refusing_it():
     assert isinstance(detector_for(None, classes=WATCHED_LABELS), MotionDetector)
     assert "person" in WATCHED_LABELS and "car" in WATCHED_LABELS
     assert "bottle" not in WATCHED_LABELS
+
+
+def test_a_motion_detector_ignores_a_confidence_floor_rather_than_refusing_it():
+    # Its confidence is the fraction of a box that moved, not a probability, so
+    # a floor meant for a classifier is dropped the way the watch list is. The
+    # console sets one for every detector it builds, and a motion-only site
+    # must still start.
+    from sentinel.detect import MotionDetector, detector_for
+
+    detector = detector_for(None, confidence_threshold=0.5, classes={"person"})
+    assert isinstance(detector, MotionDetector)
+    assert detector.info.classifies is False

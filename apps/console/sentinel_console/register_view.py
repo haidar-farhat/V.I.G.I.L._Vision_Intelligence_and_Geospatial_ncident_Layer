@@ -64,7 +64,8 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Protocol
+from inspect import getattr_static
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QBrush
@@ -103,27 +104,41 @@ from .selection import TRACK as TRACK_KIND, Selection
 if TYPE_CHECKING:  # pragma: no cover - typing only; nothing here is imported at runtime
     from sentinel.faces import FaceTemplate, TrackIdentity
     from sentinel.site import Identity, Site
+    from sentinel.store import Store
 
 
+@runtime_checkable
 class IdentityActions(Protocol):
     """What the panel needs from the node, and nothing more.
 
     A protocol rather than `sentinel.node.Node` itself so the panel can be
     tested against the real register with a small stand-in for the node, and
     so the console can hand it a node that has not been built yet without the
-    panel reaching into one. Every method here mirrors the node's identity
-    surface exactly; a method added to one and not the other is a wire that
-    looks connected and is not.
+    panel reaching into one. Every member here is a member of `Node`, under
+    the same name and with the same signature, and `IDENTITY_SURFACE` below
+    names them so `set_actions` can check the object it is handed and refuse
+    one that lacks any — by name, on the status line.
 
-    Reads go through `register` — the store's own `Register`, never a second
-    one over a second connection, for the reasons `Store.register` gives.
-    Writes go through the node, because the node is what writes the audit row
-    beside each of them; a panel that wrote to the register directly would
-    produce enrolments and erasures the audit log never heard about.
+    That check exists because the first version of this protocol required a
+    `register` attribute the node has never had: the node keeps its register
+    at `store.register`. Every stand-in in the tests supplied `register`, all
+    forty tests passed, and wired to the real node the panel would have shown
+    "'Node' object has no attribute 'register'" on every refresh. A wire that
+    looks connected and is not is the defect this repository keeps finding in
+    itself, so the connection is now proved at the moment it is made, and the
+    tests prove it against a real `Node` rather than only against a fake.
+
+    Reads go through `store.register` — the node's own `Store`, whose
+    `register` property is the one `Register` over the store's own
+    connection, never a second one over a second connection, for the reasons
+    `Store.register` gives. Writes go through the node, because the node is
+    what writes the audit row beside each of them; a panel that wrote to the
+    register directly would produce enrolments and erasures the audit log
+    never heard about.
     """
 
     @property
-    def register(self) -> Register: ...
+    def store(self) -> Store: ...
 
     @property
     def identity_status(self) -> str: ...
@@ -154,6 +169,45 @@ class IdentityActions(Protocol):
     def forget_subject(self, subject_id: str) -> Forgotten: ...
 
     def pin_subject(self, subject_id: str, pinned: bool) -> None: ...
+
+
+#: Every member of `IdentityActions`, by name. Spelled out rather than read
+#: off the protocol at import time, so that on an interpreter without
+#: `typing.get_protocol_members` the check in `missing_from` cannot pass
+#: vacuously over an empty list; the tests assert this tuple and the protocol
+#: agree, so a member added to one and not the other fails there.
+IDENTITY_SURFACE: tuple[str, ...] = (
+    "store",
+    "identity_status",
+    "site",
+    "set_identity",
+    "identity_of",
+    "templates_for",
+    "enrol_person",
+    "enrol_vehicle",
+    "forget_subject",
+    "pin_subject",
+)
+
+
+def missing_from(actions: object) -> tuple[str, ...]:
+    """The members of `IDENTITY_SURFACE` this object lacks, by name.
+
+    Looked up statically — `inspect.getattr_static` — so that asking whether
+    a node *has* a `store` never evaluates it. A property that raises because
+    the store behind it has closed is a node of the right shape whose read
+    will fail later, in the guarded place, with the store's own message; a
+    `hasattr` would have turned that into "missing member" here and hidden
+    the reason. A `Register` is only reachable through the store, so a node
+    with no `store` has no register the panel can honestly show.
+    """
+    missing = []
+    for name in IDENTITY_SURFACE:
+        try:
+            getattr_static(actions, name)
+        except AttributeError:
+            missing.append(name)
+    return tuple(missing)
 
 
 #: Columns of the subjects table. Named, because a panel that put the sighting
@@ -531,9 +585,29 @@ class RegisterPanel(QWidget):
         has nothing to read rather than showing an empty list, which is
         indistinguishable from a site on which nobody has ever been enrolled.
         The status line is cleared: it was about another node's register.
+
+        An object lacking part of `IDENTITY_SURFACE` is refused, by name, and
+        the panel stays disconnected. The alternative — accept it and let
+        every refresh report an attribute error — reads as the register being
+        broken when it is the wiring that is, and the person reading the
+        screen is not the person who can fix the wiring.
         """
-        self._actions = actions
         self.status.setText("")
+        missing = () if actions is None else missing_from(actions)
+        if missing:
+            names = ", ".join(repr(name) for name in missing)
+            self._actions = None
+            self.last_failure = TypeError(
+                f"{type(actions).__name__} has no {names}; it is not the node's identity surface"
+            )
+            self.refresh()
+            self.status.setText(
+                f"That node cannot be used: it has no {names}. The panel needs the node's "
+                "identity surface, and stays disconnected rather than show a register it "
+                "cannot read."
+            )
+            return
+        self._actions = actions
         self.refresh()
 
     def set_editable(self, editable: bool) -> None:
@@ -619,7 +693,7 @@ class RegisterPanel(QWidget):
         clock, clock_label = self._clock()
         self.clock_caption.setText(clock_label)
         try:
-            register = self._actions.register
+            register = self._actions.store.register
             subjects = register.subjects(kind=self._kind)
             rows = [
                 (subject, register.identifiers(subject.id), register.history(subject.id))
@@ -634,7 +708,7 @@ class RegisterPanel(QWidget):
                     if subject.id == wanted:
                         self.subjects.setCurrentItem(item)
                         item.setSelected(True)
-            self._fill_history()
+            self._fill_history(clock)
         except Exception as failure:
             self.last_failure = failure
             self._subjects = {}
@@ -732,12 +806,17 @@ class RegisterPanel(QWidget):
             self.status.setText(f"That {_NOUNS[self._kind][0]}'s history could not be shown: {failure}")
         self._update_buttons()
 
-    def _fill_history(self) -> None:
+    def _fill_history(self, clock=None) -> None:
         """Replace the history with the selected subject's, oldest first.
 
         Rebuilt rather than diffed, like every list over the store: a reused
         row keeping a stale confidence would show the certain form of a name
         the register has since hedged.
+
+        ``clock`` is the site's clock when the caller has just read it — a
+        refresh has, for the subject rows — and is read here otherwise. Each
+        read is a site row from the store; a refresh that read it twice was
+        measured doing so, and there is no reason for the second.
         """
         subject = self._selected_subject()
         noun, _ = _NOUNS[self._kind]
@@ -748,8 +827,9 @@ class RegisterPanel(QWidget):
                     f"MOVEMENT HISTORY — select a {noun} to see where they were recognised"
                 )
                 return
-            clock, _label = self._clock()
-            sightings = self._actions.register.history(subject.id)
+            if clock is None:
+                clock, _label = self._clock()
+            sightings = self._actions.store.register.history(subject.id)
             for sighting in sightings:
                 self.history.addTopLevelItem(self._history_row(sighting, clock))
             count = len(sightings)
@@ -1066,7 +1146,7 @@ class RegisterPanel(QWidget):
         number that will actually go.
         """
         assert self._actions is not None
-        register = self._actions.register
+        register = self._actions.store.register
         identifiers = len(register.identifiers(subject.id))
         sightings = len(register.history(subject.id))
         noun, _ = _NOUNS[self._kind]

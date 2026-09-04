@@ -66,7 +66,7 @@ _log = _get_logger(__name__)
 #: Schema version this build expects. A database at a different version is
 #: migrated forward, never opened as-is: opening a schema you do not understand
 #: and hoping the columns line up is how evidence is silently corrupted.
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 
 #: The audit column's zero, for rebuilding a millisecond timestamp exactly.
@@ -544,6 +544,36 @@ MIGRATIONS: tuple[Migration, ...] = (
         ALTER TABLE sites DROP COLUMN identity_plates;
         """,
     ),
+    Migration(
+        version=10,
+        name="site_declared",
+        up="""
+        -- Whether an operator declared this site, or the node wrote the row
+        -- by itself to hold the identity switch before any site editor
+        -- existed. The switch lives on the site row (migration 9), so
+        -- turning plates on for a deployment nobody has declared a site for
+        -- has to write a site row — and that row's origin is whatever the
+        -- node could derive at the time, the first placed camera or (0, 0).
+        -- Without this flag that snapshot became the authoritative origin:
+        -- a camera placed afterwards left the site anchored on nowhere, for
+        -- good, because a stored origin is exactly what the sites table says
+        -- must not move.
+        --
+        -- DEFAULT 1 is the load-bearing part. A row that exists was written
+        -- by something that chose its origin, and the node overriding a
+        -- chosen origin from the cameras would bring back the plan-view jump
+        -- the table exists to end. Only the node's own placeholder says 0,
+        -- and it says so when it is written.
+        ALTER TABLE sites ADD COLUMN declared INTEGER NOT NULL DEFAULT 1
+            CHECK (declared IN (0, 1));
+        """,
+        down="""
+        -- A build without the flag reads every row as declared, which is the
+        -- safe direction: a placeholder read as declared freezes an origin,
+        -- a declared row read as a placeholder moves one. The site survives.
+        ALTER TABLE sites DROP COLUMN declared;
+        """,
+    ),
 )
 
 
@@ -1002,6 +1032,12 @@ class Store:
         read back, and an edit that lost it would turn faces off — or on — as
         a side effect of moving a corner. `Node.set_identity` is the only
         caller that means to change it, and it audits the change.
+
+        ``declared`` is written as given and updated on conflict like every
+        other field, so the node's own placeholder row — written to hold the
+        switch before anybody declared a site — becomes a declared site the
+        moment a site editor saves over it, and stays a placeholder while only
+        the node keeps re-saving it.
         """
         now = _now()
         with self.transaction() as connection:
@@ -1010,8 +1046,8 @@ class Store:
                 INSERT INTO sites (
                     id, name, origin_lat, origin_lon, frame, timezone,
                     boundary_ring, identity_plates, identity_faces,
-                    identity_face_crops, created_at, updated_at
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                    identity_face_crops, declared, created_at, updated_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(id) DO UPDATE SET
                     name = excluded.name,
                     origin_lat = excluded.origin_lat,
@@ -1022,6 +1058,7 @@ class Store:
                     identity_plates = excluded.identity_plates,
                     identity_faces = excluded.identity_faces,
                     identity_face_crops = excluded.identity_face_crops,
+                    declared = excluded.declared,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -1039,6 +1076,7 @@ class Store:
                     1 if site.identity.plates else 0,
                     1 if site.identity.faces else 0,
                     1 if site.identity.face_crops else 0,
+                    1 if site.declared else 0,
                     now, now,
                 ),
             )
@@ -1938,6 +1976,10 @@ def _site_from_row(row: sqlite3.Row) -> Site:
             faces=bool(row["identity_faces"]),
             face_crops=bool(row["identity_face_crops"]),
         ),
+        # Read from the row, never defaulted: a placeholder read as declared
+        # freezes an origin nobody chose, which is the quiet failure the
+        # column was added to end.
+        declared=bool(row["declared"]),
     )
 
 

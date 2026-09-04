@@ -360,6 +360,12 @@ def detector_for(
         # list to whatever detector it has, and a motion-only site is not an
         # error.
         options.pop("classes", None)
+        # Nor is its confidence a probability: it is the fraction of a box
+        # that actually moved (see `MotionDetector.detect`), so a floor meant
+        # for a classifier's score would silently throw away solid, real
+        # movement below it. The console hands one set of options to whatever
+        # detector it has; motion takes the ones that apply to it.
+        options.pop("confidence_threshold", None)
         return MotionDetector(**options)
 
     path = Path(model_path)

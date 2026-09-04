@@ -1,4 +1,4 @@
-"""Which of the model's classes the site watches.
+"""Which of the model's classes the site watches, and how sure the model must be.
 
 A security console that tracks every one of COCO's eighty classes tracks jars,
 phones and cushions with the same green box as a person. This is where an
@@ -6,6 +6,12 @@ operator says what matters on their site. The list is the model's own
 vocabulary — nothing is offered that the detector cannot say — and the two
 buttons are the two honest presets: the security default (people and the
 vehicles they arrive in) and everything.
+
+The confidence floor sits in the same dialog because it answers the same
+complaint from the other side: a class that *is* watched can still be claimed
+on a weak score — a coat on a chair as a person at 0.4 — and the floor is what
+drops that before it becomes a track. The two are one decision about what the
+site is prepared to be told.
 """
 from __future__ import annotations
 
@@ -15,6 +21,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
+    QDoubleSpinBox,
     QHBoxLayout,
     QLabel,
     QListWidget,
@@ -32,10 +39,16 @@ class WatchedClassesDialog(QDialog):
         watched: Iterable[str],
         *,
         defaults: Iterable[str] = (),
+        confidence: float | None = None,
         parent: QWidget | None = None,
     ):
+        """
+        ``confidence`` is the floor a detection must clear to be tracked at
+        all. ``None`` leaves it out of the dialog entirely, for a caller that
+        has no such setting; a number puts a spin box in, seeded with it.
+        """
         super().__init__(parent)
-        self.setWindowTitle("Watched classes")
+        self.setWindowTitle("Watched classes and confidence")
         self.setModal(True)
         self._defaults = frozenset(defaults)
         watched = frozenset(watched)
@@ -72,6 +85,27 @@ class WatchedClassesDialog(QDialog):
         presets.addStretch(1)
         layout.addLayout(presets)
 
+        #: The floor, or ``None`` when the caller has no such setting.
+        self.confidence_spin: QDoubleSpinBox | None = None
+        if confidence is not None:
+            floor = QHBoxLayout()
+            floor.addWidget(QLabel("Minimum confidence"))
+            self.confidence_spin = QDoubleSpinBox()
+            self.confidence_spin.setRange(0.10, 0.95)
+            self.confidence_spin.setSingleStep(0.05)
+            self.confidence_spin.setDecimals(2)
+            self.confidence_spin.setValue(float(confidence))
+            self.confidence_spin.setToolTip(
+                "A detection scoring below this is dropped at the detector, "
+                "before it can become a track. Higher means fewer false objects "
+                "and a later first sighting of a real one. 0.50 is the security "
+                "default; the model's own convention is 0.35. Motion detection "
+                "ignores it — its confidence is how much of a box moved."
+            )
+            floor.addWidget(self.confidence_spin)
+            floor.addStretch(1)
+            layout.addLayout(floor)
+
         self.count_label = QLabel("")
         layout.addWidget(self.count_label)
         self.list.itemChanged.connect(self._recount)
@@ -94,6 +128,12 @@ class WatchedClassesDialog(QDialog):
             for i in range(self.list.count())
             if self.list.item(i).checkState() == Qt.CheckState.Checked
         )
+
+    def confidence(self) -> float | None:
+        """The floor as set, or ``None`` if this dialog was built without one."""
+        if self.confidence_spin is None:
+            return None
+        return round(float(self.confidence_spin.value()), 2)
 
     def _set_all(self, labels: frozenset[str] | None) -> None:
         for i in range(self.list.count()):

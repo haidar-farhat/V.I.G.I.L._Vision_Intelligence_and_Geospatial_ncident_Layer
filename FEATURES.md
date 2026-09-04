@@ -33,20 +33,20 @@ Related: [STATUS.md](STATUS.md) — measurements and honest gaps ·
 
 ## The scoreboard
 
-469 capabilities, each with a state. Many lines cover several related things —
+471 capabilities, each with a state. Many lines cover several related things —
 "heading · pitch · roll" is one row — so this counts *claims*, not code.
 
 | | Count | Share | What it means |
 |---|---:|---:|---|
-| **`TESTED`** | 188 | 40% | A test fails if it stops working |
+| **`TESTED`** | 190 | 40% | A test fails if it stops working |
 | **`IMPL`** | 23 | 5% | Works; a regression would go unnoticed |
 | **`SKEL`** | 32 | 7% | Something is there; it does not do the job |
 | **`PLAN`** | 226 | 48% | Designed, no code |
 
 ```mermaid
 pie showData
-    title Sentinel Vision — 469 capabilities by state
-    "TESTED" : 188
+    title Sentinel Vision — 471 capabilities by state
+    "TESTED" : 190
     "IMPLEMENTED" : 23
     "SKELETON" : 32
     "PLANNED" : 226
@@ -114,10 +114,11 @@ the engine already computes.
 | Dark command-centre interface | `TESTED` | Distinct state colours, asserted distinguishable |
 | Arabic / English / French interface | `PLAN` | No string extraction yet |
 | RTL support | `PLAN` | |
-| Crash recovery | `SKEL` | An unhandled exception is logged with its traceback; nothing restarts |
+| Crash recovery | `SKEL` | An unhandled exception is logged with its traceback — including one raised inside a Qt slot, which Qt prints to a terminal the packaged console does not have and otherwise keeps on `sys.last_*`, pinning the widget it was raised in; the status bar names it. Nothing restarts |
 | Automatic service recovery | `SKEL` | A camera reconnects with backoff — genuinely, since the pipeline began using it; the application does not |
 | Health monitoring | `PLAN` | |
 | Diagnostics centre | `SKEL` | `sentinel where` and the log are the whole of it |
+| The console drivable from the command line — the shipped binary as the test medium | `TESTED` | `--camera`, `--place`, `--zone`, `--zone-classes` seed a site through the node, audited like a click; `--watch` and `--confidence` set what this run tracks without touching the machine's settings; `--settings FILE` keeps a test run out of the registry; `--for SECONDS` closes the console and prints every camera's frames, tracks by class, events and incidents; `--screenshots DIR` photographs the window and every panel first. `python tasks.py exetest` runs `dist/SentinelVision/SentinelVision-dev.exe` that way on `device:0` in an isolated data directory and reads the summary back. The standing rule behind it: test through the camera and the binary, never a prerecorded file |
 | Open the console already running (`--start`) | `TESTED` | Starts every restored camera once the window is up, via a bound method on a zero-delay timer so the event loop exists first. With no cameras it says so in the status bar rather than looking busy. Also what makes driving the packaged binary in a test deterministic — pressing Tab-Tab-Space to reach Start broke the day a pane was added to the left of the toolbar |
 
 ## 🌐 Network & deployment
@@ -242,11 +243,13 @@ two identical webcams are indistinguishable by name.
 | Inference FPS monitoring | `IMPL` | 433 fps / 2.31 ms measured on an idle machine |
 | Model benchmarking | `IMPL` | `engine/tests/bench_scaling.py` |
 | Model A/B testing | `PLAN` | |
-| Detection confidence | `TESTED` | |
+| Detection confidence | `TESTED` | Every detection carries the model's score, and the console sets the floor a classifier must clear: **0.50** by default (0.35 is the exporter's convention), per machine from Detection → Watched classes and confidence…, shown in the status bar as `≥ 0.50` and applied at the next Start. Motion ignores it — its confidence is how much of a box moved. Measured on the laptop camera: the person 0.86; the couch, jar and phone 0.39–0.51 |
+| Watch list — what the site tracks at all | `TESTED` | People and the vehicles they arrive in, by default; every other class the model names is dropped at the detector before it can become a track, a zone event or an incident. Chosen per machine from the model's own vocabulary, remembered across restarts, and the zone class picker offers only what is watched. The operator's word for the eighty-class version was "hallucinations" |
 | Model version tracking | `TESTED` | Recorded on every event |
 | Model integrity verification | `TESTED` | SHA-256 of the weights |
 | Local model installation | `SKEL` | A path under `models/`. No import flow |
 | Offline model management | `PLAN` | **Nothing is ever downloaded** — a missing model is an error that says so |
+| Watched classes: the site says what the detector may report at all | `TESTED` | `Segmenter`/`OnnxDetector(classes=…)` drop every other class before NMS, and the `DetectorInfo` vocabulary shrinks with the filter so a zone's class picker never offers what the detector will drop; a name the model lacks is refused, not ignored. `detect.WATCHED_LABELS` — person, bicycle, car, motorcycle, bus, truck — is the console's default (Detection → Watched classes…, persisted per machine, applied at the next Start; the status caption reads `watching person, car, …`). Found by the operator's screenshot: a jar on a shelf and a phone on the desk were 'bottle' and 'cell phone' tracks at 0.43–0.51, in the same green as the person — 'hallucinations' to the person watching. The model saw a jar; nobody had asked. A motion detector ignores the list (it names nothing). Not yet on the CLI (`--classes`), and per-machine rather than per-site: both recorded in HANDOFF |
 
 ## 👁️ Tracking & scene understanding
 
@@ -629,7 +632,8 @@ event-linked jumps — and the console toggle.
 |---|---|---|
 | Selection bus: one selected thing across map, video wall, track table and incidents | `TESTED` | A console-side `Selection` (camera ／ zone ／ track ／ incident; a track keyed by *(camera_id, track_id)* because ids repeat across cameras) on one `SelectionBus`. `MapView.hit_test` tests smallest-first — a track disc sits inside a zone, so testing the largest thing first would make the small ones unclickable. Clicking a disc outlines the box on the wall and the row in the table; clicking bare ground clears. The bus is silent when nothing changed, so a re-click does not yank a scrolled table |
 | Map modes with a visible mode band; Escape always returns to Select | `TESTED` | Select ／ Draw ／ Measure as mutually exclusive checked buttons, filled in the highlight colour — a checkable button that looks unchecked is a mode indicator that indicates nothing. The mode is derived from the gesture in progress, never stored twice, so a drawing that closes on its own unchecks Draw. The map band says what the next click does; Escape abandons the gesture first and clears the selection second |
-| Monitor and Configure modes with a layout lock | `TESTED` | The console opens in Monitor: select, hover, pan, zoom and measure only. Adding or removing cameras, placing them, and drawing, reshaping or removing zones need Configure, entered from the toolbar and left on Escape or after ten idle minutes — with whatever was half-drawn abandoned. Both edges are audited. Selecting things deliberately does *not* restart the countdown: an operator clicking around is watching, not configuring |
+| Monitor and Configure modes with a layout lock | `TESTED` | The console opens in Monitor: select, hover, pan, zoom and measure only. Adding or removing cameras, placing them, and drawing, reshaping or removing zones need Configure, entered from the toolbar and left by pressing it again or after ten idle minutes — with whatever was half-drawn abandoned. Escape abandons a drawing or clears a selection; it does not relock. Both edges are audited. Selecting things deliberately does *not* restart the countdown: an operator clicking around is watching, not configuring |
+| A locked control answers a click | `TESTED` | The status bar reads MONITOR or CONFIGURE at all times, and clicking a greyed site-changing control — or Draw — says what it does, that the site is locked, and offers to unlock and carry on; yes is audited like any entry to Configure and then does what was asked, no changes nothing. The operator's report of the silent version was "the buttons do nothing" |
 | Camera list panel with per-camera status strip | `TESTED` | `CameraListPanel`, leftmost pane, replacing the combo box as the way a camera is picked; one row per camera with the redacted source, placement, and a status strip from `Node.camera_health()` on the poll timer. "Running and producing nothing" is visibly distinct from running — a camera silent for 30 s reads DARK, not LIVE at 0 fps, which is what a skeptic found it saying first |
 | Undo and redo as compensating, audited edits — never a deletion from history | `PLAN` | A `QUndoStack` whose commands call node inverses: add zone ↔ remove, place camera ↔ restore the previous pose as a new version, change zone ↔ previous version. Each undo is itself an audited node call with `undo_of = <audit id>`, so the log shows both directions and a zone that existed for eleven seconds is recorded as such. Ctrl+Z / Ctrl+Shift+Z; a status toast 'Removed Loading bay — Undo' for 8 s. Policy: nothing undoable asks for confirmation; only removing a running camera and removing a zone with a presence open right now still confirm. |
 | Keyboard shortcuts and a shortcut sheet | `PLAN` | Every action is a `QAction` so its shortcut appears in its tooltip: Z draw zone, C place camera, M measure, Esc cancel or clear selection, Del remove selected (undoable), F fit all / Shift+F fit selected, 1–9 select camera, Ctrl+1–9 toggle layers, A/D/E acknowledge/dismiss/escalate, Space pause, Ctrl+Z / Ctrl+Shift+Z undo/redo, L layers, ? shows the sheet. Digits go to cameras — the thing an operator switches between under pressure — and layers take the modifier. |
@@ -637,6 +641,7 @@ event-linked jumps — and the console toggle.
 | Pause, rewind and scrub the live plan view — analysis, not footage | `PLAN` | A console ring buffer of (time, tracks per camera, recent events) snapshots taken in the poll, about five minutes at 10 Hz; a transport bar under the map with pause, a slider and Live, which flashes after 30 s paused. Paused, the map draws the chosen snapshot, the panes freeze on their last frame under a 'PAUSED — not live' band, and — once versions exist — the zone and pose versions in force at that instant are drawn, labelled 'as of HH:MM:SS (zone-3 v2)'. No recordings, no store change; video replay is the incident-replay row. |
 | Map freshness stamp | `PLAN` | The map shows the age of the last poll that changed it; older than two seconds turns amber with 'no update for N s', distinct from the deliberate Paused band. A frozen map looks exactly like a quiet site, and the node already knows a thread can stick. |
 | Follow the selected track | `PLAN` | A toggle keeps the map centred on the selected track (or the selected incident's latest position) until Esc or a manual pan, and draws that trail brighter; with the view paused it follows the scrubbed position. Watching one person cross a yard means panning by hand today. |
+| Toolbar readable at any display scale, with a reason on every disabled control | `TESTED` | The operator's screenshot read `d camer`, `ve on m`, `onfigur`: one row of twelve buttons, a picker, a spin box, a checkbox and two captions was wider than a laptop screen at its scale and Qt squeezed every button below its text. Two rows now — cameras with the Configure lock at the end, then map and zones — the captions in the status bar, and a test that holds every button at least as wide as its size hint at 1280 px. A greyed control carries its reason in the tooltip (`Locked. Press Configure…`, `Stop the analysis before adding a camera.`, `No incident to export yet.`) and its description after it: a greyed button with no reason was, in the operator's words, a button that does nothing |
 
 ## 🏢 Site management · 🏭 asset protection · 🚪 checkpoints
 

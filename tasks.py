@@ -15,6 +15,8 @@
     python tasks.py check      audit, lint, build and test — what CI runs
     python tasks.py ci         every CI stage this machine can run (--package, --screenshots)
     python tasks.py shots      photograph the real console (--live for this machine's camera)
+    python tasks.py exetest    run the packaged console on this machine's camera and keep
+                               the evidence — the shipped binary as the test medium
 
 Python rather than a Makefile or a shell script, because the product ships on
 Windows, macOS and Linux and the developer commands should not be the one part
@@ -389,6 +391,19 @@ def ci() -> None:
     run([sys.executable, str(ROOT / "tools" / "local_ci.py"), *sys.argv[2:]], ROOT)
 
 
+def exetest() -> None:
+    """Run the packaged console on this machine's camera and keep the evidence.
+
+    The standing rule: the product is tested through the real camera and the
+    binary in `dist/`, never a prerecorded file and never a checkout. Needs
+    the bundle (`package`) and a camera; see `tools/exe_camera_test.py`.
+    """
+    run(
+        [sys.executable, str(ROOT / "tools" / "exe_camera_test.py"), *sys.argv[2:]],
+        ROOT, python_path(),
+    )
+
+
 def shots() -> None:
     """Drive the real console and photograph it. `--live` uses this machine's camera."""
     build()
@@ -402,6 +417,7 @@ TASKS = {
     "build": build,
     "ci": ci,
     "shots": shots,
+    "exetest": exetest,
     "lint": lint,
     "audit": audit,
     "test": test,
@@ -416,7 +432,7 @@ TASKS = {
 
 
 #: Tasks that take arguments of their own, passed through untouched.
-PASSTHROUGH = {"cli", "ci", "shots", "console"}
+PASSTHROUGH = {"cli", "ci", "shots", "console", "exetest"}
 
 
 def main(argv: list[str]) -> int:

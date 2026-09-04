@@ -5,7 +5,7 @@ run a median over many of them, and composite the medians from several cameras.
 Until this module existed nothing called any of it — the sixth instance of the
 repository's recurring defect, correct and tested code that no product path
 reaches. This is the product path: a :class:`BasemapBuilder` that is fed frames
-and owns the grid and the per-camera accumulators, a :class:`BasemapAsset` that
+and owns one grid and one accumulator per camera, a :class:`BasemapAsset` that
 is the finished raster plus everything needed to argue about it later, and a
 pair of files under the data directory that survive the process.
 
@@ -34,15 +34,38 @@ measurement. When a surveyed value exists it replaces this; until then every
 asset is built on the same honest guess for every camera, which ranks them by
 the only evidence that differs between them, the per-cell projection error.
 
-**Memory.** Each camera's accumulator keeps ``capacity`` samples per cell and
-nothing else: ``capacity × (3 + 4) + 8`` bytes per cell, 113 at the default
-depth of fifteen. The reference pose at the CLI's default quarter-metre cell
-is 118,374 cells, so 13.4 MB per camera — measured — and it does not grow with
-the minutes fed. Sampling one frame onto that grid takes 79 ms, which is why
-the command line feeds four frames a second and not every frame the camera
-decodes: the median needs *seconds* of separation between samples to see a
-walker leave a cell, and a hundred frames of the same half-second would fill
-the ring with one moment.
+**One lattice, one grid per camera.** Each camera samples onto a grid of its
+own, sized once from its footprint plus a margin. Every such grid lies on one
+shared cell lattice — anchored where the first camera's grid was placed — so a
+later camera's cells are a whole number of cells from the first camera's, and
+the build lays every median onto the union grid by an integer shift and
+nothing else. No ring is ever moved or copied: a second camera joining the
+build leaves the first camera's samples exactly where they are. An earlier
+shape of this module sized one grid from the first footprint and *extended* it
+when a later footprint fell outside, moving every ring by an index shift — and
+re-measuring the first footprint in the grid's own frame found its edge a
+fraction of a millimetre past where it had been placed, which ``ceil`` made a
+whole row: feeding the same camera a *second frame* grew the grid and copied
+thirteen megabytes for nothing. The two measurements disagreed by the
+convergence of meridians between two local frames, ``D·d·tan(lat)/R`` — 0.6 mm
+for frames 60 m apart over a 100 m footprint at this latitude — which no
+tolerance a millimetre wide would have survived at a larger site. A footprint
+is now measured once, in one frame, and never again.
+
+**Memory.** Each camera's ring keeps ``capacity`` samples per cell of *its own*
+grid and nothing else: ``capacity × (3 + 4) + 8`` bytes per cell, 113 at the
+default depth of fifteen. The reference pose at the CLI's default quarter-metre
+cell is 328×362 = 118,736 cells, so 13.4 MB per camera — measured — and it
+grows neither with the minutes fed nor with the cameras that join later. The
+one approximation in the lattice is that each grid is a local frame at its own
+origin, and two such frames disagree by the convergence of meridians,
+``D·d·tan(lat)/R`` for origins ``D`` apart east-west and a cell ``d`` away:
+0.18 mm measured for a camera 60 m east of the first, a few centimetres across
+a half-kilometre site, and never a resampling. Sampling one frame
+onto that grid takes 79 ms, which is why the command line feeds four frames a
+second and not every frame the camera decodes: the median needs *seconds* of
+separation between samples to see a walker leave a cell, and a hundred frames
+of the same half-second would fill the ring with one moment.
 """
 
 from __future__ import annotations
@@ -70,6 +93,7 @@ from .orthophoto import (
     DEFAULT_CAPACITY,
     MINIMUM_SAMPLES,
     GroundGrid,
+    GroundPatch,
     MedianAccumulator,
     OrthophotoError,
     _frame_for,
@@ -88,9 +112,10 @@ _log = _get_logger(__name__)
 #: moment one exists.
 DEFAULT_POSE_SIGMA_M = 1.0
 
-#: Ground added around every footprint when the grid is sized. One metre covers
-#: the chord bulge of the arc approximation and the half-cell of rounding that
-#: :meth:`GroundGrid.covering` warns can push an extreme point off the raster.
+#: Ground added around every footprint when its grid is placed. One metre
+#: covers the chord bulge of the arc approximation and the rounding that
+#: :meth:`GroundGrid.covering` warns can push an extreme point off the raster;
+#: the placement here rounds *outward* to whole cells on top of it.
 GRID_MARGIN_M = 1.0
 
 #: The two files an asset is kept as. Fixed names, one asset per directory:
@@ -167,9 +192,18 @@ class BasemapAsset:
         return self.covered_cells / self.grid.cell_count
 
     def cells_from(self, camera_id: str) -> int:
-        """How many cells this camera won. Zero for one that saw no ground."""
+        """How many cells this camera won. Zero for one that saw no ground.
+
+        A camera the asset was not built from is refused, not counted as zero:
+        "contributed nothing" is a fact about a camera in :attr:`cameras`, and
+        a mistyped id that read as it would be reported as a camera that saw no
+        ground rather than as a camera nobody asked about.
+        """
         if camera_id not in self.cameras:
-            return 0
+            raise BasemapError(
+                f"camera {camera_id!r} is not one this basemap was built from "
+                f"({', '.join(self.cameras)})"
+            )
         return int(np.count_nonzero(self.source == self.cameras.index(camera_id)))
 
     def describe(self) -> str:
@@ -191,26 +225,38 @@ class BasemapAsset:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class _Placement:
+    """Where one camera's grid sits on the shared lattice.
+
+    ``row`` and ``column`` are the lattice coordinates of the grid's north-west
+    corner — whole cells south and east of the lattice origin, negative for a
+    grid that reaches north or west of it. Integers by construction, which is
+    what lets the build lay this grid onto the union with an index shift and
+    nothing else.
+    """
+
+    grid: GroundGrid
+    row: int
+    column: int
+
+
 class BasemapBuilder:
     """Feeds frames into one median per camera and builds the composite.
 
-    The grid is sized on the first frame, from that camera's footprint plus a
-    margin, because until a camera is fed nothing knows how large the site is.
-    A later camera whose footprint falls outside **extends** the grid by whole
-    cells on whichever sides need it, and every accumulator already holding
-    samples is moved onto the larger grid by an index shift. That is a copy of
-    its ring, not a resample: the old cells keep their exact ground positions
-    (the new origin is a whole number of cells north-west of the old one, so
-    the shift is integer) and their exact sample stacks. The alternative —
-    discarding what was fed and starting over on the larger grid — would throw
-    away a minute of the first camera's footage every time a second camera
-    joined, which is exactly what a console that adds cameras one at a time
-    would do. The extension reaches into the accumulator's ring, which is the
-    one place this module knows its layout, and a test holds the moved result
-    to the unmoved one cell for cell.
+    Each camera gets a grid of its own the first time it is fed, sized from
+    its footprint plus a margin and placed on the lattice the first camera's
+    grid anchored, so that every grid here is a whole number of cells from
+    every other. That footprint is measured once, in one frame, and never
+    again: a camera's pose is fixed for the build (a changed one is refused),
+    so its grid is fixed too, and feeding it a thousandth frame costs the same
+    as feeding it a second. The grid a later camera brings can reach outside
+    the union of the grids before it; the union grows, and no ring moves —
+    the union exists only at :meth:`build`, where each camera's median is laid
+    onto it at its lattice offset and the mosaic is taken there.
 
     A camera pointed at the sky feeds nothing: its footprint is empty, so no
-    grid can be sized from it and no patch sampled. It is still counted — in
+    grid can be placed for it and no patch sampled. It is still counted — in
     :meth:`frames_fed`, in :meth:`blind_cameras`, and in the asset's
     ``cameras`` with zero cells — because "this camera contributed nothing" is
     provenance, not an absence.
@@ -223,7 +269,10 @@ class BasemapBuilder:
         "_cell_size_m",
         "_capacity",
         "_pose_sigma_m",
+        "_lattice",
+        "_placements",
         "_grid",
+        "_grid_at",
         "_accumulators",
         "_poses",
         "_fed",
@@ -257,7 +306,14 @@ class BasemapBuilder:
         self._cell_size_m = float(cell_size_m)
         self._capacity = int(capacity)
         self._pose_sigma_m = float(pose_sigma_m)
+        #: The lattice origin: the first camera's grid origin, once there is one.
+        self._lattice: LatLon | None = None
+        self._placements: dict[str, _Placement] = {}
+        #: The union of every placed grid, and its own lattice coordinates.
+        #: Replaced only when a camera joins outside it, so a caller holding
+        #: the grid holds the current one until then.
         self._grid: GroundGrid | None = None
+        self._grid_at: tuple[int, int] = (0, 0)
         self._accumulators: dict[str, MedianAccumulator] = {}
         self._poses: dict[str, CameraPose] = {}
         self._fed: dict[str, int] = {}
@@ -265,7 +321,11 @@ class BasemapBuilder:
 
     @property
     def grid(self) -> GroundGrid | None:
-        """The raster as currently sized, or ``None`` before any ground was fed."""
+        """The union of every camera's grid, or ``None`` before any ground was fed.
+
+        The same object until a camera joins outside it: feeding a camera that
+        is already placed never changes it, whatever the frame.
+        """
         return self._grid
 
     @property
@@ -285,8 +345,18 @@ class BasemapBuilder:
         """What the accumulators hold, which is what this builder costs."""
         return sum(accumulator.memory_bytes for accumulator in self._accumulators.values())
 
+    def grid_of(self, camera_id: str) -> GroundGrid | None:
+        """The grid this camera's ring is on, or ``None`` when it has no ring.
+
+        ``None`` for a camera never fed and for one that sees no ground —
+        :meth:`blind_cameras` tells the two apart.
+        """
+        placement = self._placements.get(camera_id)
+        return None if placement is None else placement.grid
+
     def frames_fed(self) -> dict[str, int]:
-        """Frames offered per camera — a sky-pointing camera's included."""
+        """Frames taken per camera — a sky-pointing camera's counted, a frame
+        that could not be sampled not."""
         return dict(self._fed)
 
     def frames_sampled(self) -> dict[str, int]:
@@ -315,6 +385,10 @@ class BasemapBuilder:
         already in its ring were placed by the old pose, and a stack mixing two
         placements has no single pose a disputed cell could resolve to. Start a
         new builder for a camera that moved.
+
+        A frame that cannot be sampled is refused whole: it is not counted, its
+        pose is not recorded, and a grid placed for it is dropped. Nothing
+        about a frame that was not fed survives the refusal.
         """
         if not camera_id:
             raise BasemapError("a camera needs an id; every cell of the basemap names its source")
@@ -329,77 +403,101 @@ class BasemapBuilder:
             )
 
         picture = _as_bgr(image)
-        self._fed[camera_id] = self._fed.get(camera_id, 0) + 1
-        self._poses[camera_id] = pose
+        if camera_id in self._blind:
+            # Sees no ground, as established on its first frame. Counted, never
+            # sampled; the footprint is not measured again.
+            self._fed[camera_id] += 1
+            return
 
-        footprint = field_of_view(pose, arc_segments=ARC_SEGMENTS)
-        if len(footprint) < 3:
-            # Sees no ground. Counted, never sampled, never sized for.
-            if camera_id not in self._blind:
+        placement = self._placements.get(camera_id)
+        if placement is None:
+            # The first frame from this camera. Its pose is fixed for the
+            # build, so this is the one time its footprint is measured.
+            footprint = field_of_view(pose, arc_segments=ARC_SEGMENTS)
+            if len(footprint) < 3:
                 _log.warning(
                     "basemap: camera %s sees no ground (the bottom of its frame is "
                     "above the horizon); it contributes nothing", camera_id,
                 )
-            self._blind.add(camera_id)
-            return
-
-        self._cover(footprint)
-        assert self._grid is not None
-        accumulator = self._accumulators.get(camera_id)
-        if accumulator is None:
-            accumulator = MedianAccumulator(self._grid, channels=3, capacity=self._capacity)
-            self._accumulators[camera_id] = accumulator
+                self._blind.add(camera_id)
+                self._poses[camera_id] = pose
+                self._fed[camera_id] = 1
+                return
+            placement = _place(
+                footprint, cell_size_m=self._cell_size_m, lattice=self._lattice,
+                camera=pose.position,
+            )
+            accumulator = MedianAccumulator(placement.grid, channels=3, capacity=self._capacity)
+        else:
+            accumulator = self._accumulators[camera_id]
 
         try:
             patch = sample_frame(
-                pose, picture, self._grid, camera_id=camera_id, captured_at=captured_at
+                pose, picture, placement.grid, camera_id=camera_id, captured_at=captured_at
             )
             accumulator.update(patch)
         except OrthophotoError as error:
             raise BasemapError(f"camera {camera_id!r}: {error}") from error
 
-    def _cover(self, footprint: list[LatLon]) -> None:
-        """Size the grid for this footprint, or grow it by whole cells."""
-        if self._grid is None:
-            self._grid = GroundGrid.covering(
-                footprint, cell_size_m=self._cell_size_m, margin_m=GRID_MARGIN_M
-            )
+        # Only now, with the sample in the ring, does the frame count and the
+        # camera exist here. Counting first meant a frame the sampler refused
+        # was reported as fed, under a pose that was never used.
+        self._fed[camera_id] = self._fed.get(camera_id, 0) + 1
+        self._poses[camera_id] = pose
+        if camera_id not in self._placements:
+            self._join(camera_id, placement, accumulator)
+
+    def _join(self, camera_id: str, placement: _Placement, accumulator: MedianAccumulator) -> None:
+        """Register a placed camera and grow the union to hold it."""
+        self._placements[camera_id] = placement
+        self._accumulators[camera_id] = accumulator
+        grid = placement.grid
+        if self._lattice is None:
+            self._lattice = grid.origin
+            self._grid = grid
+            self._grid_at = (placement.row, placement.column)
             _log.info(
-                "basemap: grid sized %d×%d cells at %g m from the first footprint",
-                self._grid.rows, self._grid.columns, self._cell_size_m,
+                "basemap: grid placed %d×%d cells at %g m for camera %s; the "
+                "lattice is anchored at its origin",
+                grid.rows, grid.columns, self._cell_size_m, camera_id,
             )
             return
 
-        grid = self._grid
-        frame = _frame_for(grid.origin)
-        cell = grid.cell_size_m
-        xs, ys = zip(*(frame.to_xy(point) for point in footprint))
-        # Whole cells to add on each side. The old cells keep their indices
-        # plus (add_north, add_west), which is what makes the move exact.
-        add_west = max(0, math.ceil((GRID_MARGIN_M - min(xs)) / cell))
-        add_east = max(0, math.ceil((max(xs) + GRID_MARGIN_M) / cell) - grid.columns)
-        add_north = max(0, math.ceil((max(ys) + GRID_MARGIN_M) / cell))
-        add_south = max(0, math.ceil((GRID_MARGIN_M - min(ys)) / cell) - grid.rows)
-        if not (add_west or add_east or add_north or add_south):
-            return
-
-        extended = GroundGrid(
-            origin=frame.to_latlon(-add_west * cell, add_north * cell),
-            cell_size_m=cell,
-            columns=grid.columns + add_west + add_east,
-            rows=grid.rows + add_north + add_south,
-        )
-        for camera_id, accumulator in list(self._accumulators.items()):
-            self._accumulators[camera_id] = _moved(
-                accumulator, extended, row_offset=add_north, column_offset=add_west
+        union, at = self._union()
+        if union == self._grid:
+            _log.info(
+                "basemap: camera %s joins with a %d×%d grid at lattice (%d, %d), "
+                "inside the %d×%d union",
+                camera_id, grid.rows, grid.columns, placement.row, placement.column,
+                union.rows, union.columns,
             )
+            return
+        assert self._grid is not None
         _log.info(
-            "basemap: grid extended from %d×%d to %d×%d cells for a footprint "
-            "outside it; %d accumulator(s) moved by (%d, %d) cells",
-            grid.rows, grid.columns, extended.rows, extended.columns,
-            len(self._accumulators), add_north, add_west,
+            "basemap: camera %s joins with a %d×%d grid at lattice (%d, %d); the "
+            "union grows from %d×%d to %d×%d cells, and no ring moves",
+            camera_id, grid.rows, grid.columns, placement.row, placement.column,
+            self._grid.rows, self._grid.columns, union.rows, union.columns,
         )
-        self._grid = extended
+        self._grid = union
+        self._grid_at = at
+
+    def _union(self) -> tuple[GroundGrid, tuple[int, int]]:
+        """The smallest grid on the lattice holding every placed grid, and where it sits."""
+        assert self._lattice is not None and self._placements
+        placements = self._placements.values()
+        row = min(placement.row for placement in placements)
+        column = min(placement.column for placement in placements)
+        rows = max(placement.row + placement.grid.rows for placement in placements) - row
+        columns = max(placement.column + placement.grid.columns for placement in placements) - column
+        cell = self._cell_size_m
+        grid = GroundGrid(
+            origin=_frame_for(self._lattice).to_latlon(column * cell, -row * cell),
+            cell_size_m=cell,
+            columns=columns,
+            rows=rows,
+        )
+        return grid, (row, column)
 
     def build(self, *, now: float | None = None) -> BasemapAsset:
         """The composite of every camera's median, as an asset.
@@ -418,12 +516,19 @@ class BasemapBuilder:
                 f"{', '.join(self.blind_cameras())}. A basemap needs at least one "
                 "camera whose frame reaches the ground."
             )
+        grid = self._grid
+        assert grid is not None
+        union_row, union_column = self._grid_at
 
         moment = time.time() if now is None else float(now)
-        patches = [
-            accumulator.result(camera_id=camera_id, now=moment)
-            for camera_id, accumulator in sorted(self._accumulators.items())
-        ]
+        patches = []
+        for camera_id, accumulator in sorted(self._accumulators.items()):
+            placement = self._placements[camera_id]
+            patches.append(_placed(
+                accumulator.result(camera_id=camera_id, now=moment), grid,
+                row_offset=placement.row - union_row,
+                column_offset=placement.column - union_column,
+            ))
         composite = mosaic(
             patches, {camera_id: self._pose_sigma_m for camera_id in self._accumulators}
         )
@@ -452,7 +557,6 @@ class BasemapBuilder:
         sigma = np.where(valid, composite.sigma_m, np.inf).astype(np.float32)
         built_at_millis = int(round(moment * 1000.0))
         frames_used = sum(accumulator.frames for accumulator in self._accumulators.values())
-        grid = composite.grid
         poses = dict(self._poses)
 
         document = _document(
@@ -471,38 +575,95 @@ class BasemapBuilder:
         return asset
 
 
-def _moved(
-    accumulator: MedianAccumulator,
+def _place(
+    footprint: list[LatLon],
+    *,
+    cell_size_m: float,
+    lattice: LatLon | None,
+    camera: LatLon,
+) -> _Placement:
+    """A grid for this footprint on the lattice, or the grid that anchors one.
+
+    The footprint is measured in one frame — the lattice origin's, or the
+    camera's own position's when there is no lattice yet — and its bounds,
+    widened by :data:`GRID_MARGIN_M`, are rounded *outward* to whole cells.
+    Outward, so the margin is never less than stated; whole cells, so the
+    grid's corner is on the lattice and every other grid placed here is a
+    whole number of cells away from it. Nothing here is measured twice: the
+    frame a footprint is measured in is the frame its grid is placed in, so
+    no rounding can act on the disagreement between two frames.
+
+    The frame for the first camera is deliberately not one of its footprint's
+    own points, and :meth:`GroundGrid.covering` is not used for the same
+    reason. Both put a footprint edge, plus a margin that is a whole number
+    of cells, *exactly* on a lattice line — and a second camera on the same
+    mast, measured from the lattice origin sixty metres away, found that edge
+    half a millimetre to one side of the line (the convergence of meridians
+    between the two frames) and was given a grid one cell wider than the
+    first: four poses in ten, measured. From the camera's position the
+    extremes sit at irrational distances and land mid-cell.
+
+    The first grid placed is at lattice ``(0, 0)`` and its origin becomes the
+    lattice origin, which is what a later placement is measured from.
+    """
+    frame = _frame_for(camera if lattice is None else lattice)
+    xs, ys = zip(*(frame.to_xy(point) for point in footprint))
+    cell = cell_size_m
+    west = math.floor((min(xs) - GRID_MARGIN_M) / cell)
+    east = math.ceil((max(xs) + GRID_MARGIN_M) / cell)
+    north = math.ceil((max(ys) + GRID_MARGIN_M) / cell)
+    south = math.floor((min(ys) - GRID_MARGIN_M) / cell)
+    grid = GroundGrid(
+        origin=frame.to_latlon(west * cell, north * cell),
+        cell_size_m=cell,
+        columns=max(1, east - west),
+        rows=max(1, north - south),
+    )
+    if lattice is None:
+        return _Placement(grid=grid, row=0, column=0)
+    return _Placement(grid=grid, row=-north, column=west)
+
+
+def _placed(
+    patch: GroundPatch,
     grid: GroundGrid,
     *,
     row_offset: int,
     column_offset: int,
-) -> MedianAccumulator:
-    """The same accumulator on a larger grid, its ring copied at an offset.
+) -> GroundPatch:
+    """The same patch on the union grid, its arrays copied in at an offset.
 
-    A pure copy: no sample is resampled, averaged or dropped, and the epoch
-    the sample times are relative to travels with them. Reads the ring through
-    the accumulator's slots because it has no public way to hand its samples
-    over, and the equivalence test in ``test_basemap`` is what keeps this
-    honest when that layout changes.
+    A pure copy through the patch's public fields: no cell is resampled,
+    averaged or dropped, and everything outside the window is what an empty
+    cell is — ``False``, zero colour, NaN error, NaN time, zero samples — so
+    the mosaic reads "no ground" there and not "black ground". The patch's
+    own grid is not consulted for position; the lattice offset is the whole
+    claim, and the equivalence test in ``test_basemap`` holds it cell for cell.
     """
-    moved = MedianAccumulator(
-        grid,
-        channels=accumulator._channels,
-        capacity=accumulator.capacity,
-        dtype=accumulator._dtype,
-        minimum_samples=accumulator._minimum_samples,
-        retain_seconds=accumulator._retain_seconds,
+    if patch.grid == grid:
+        # Already there: the single-camera case, where the union is the grid.
+        return patch
+    rows = slice(row_offset, row_offset + patch.grid.rows)
+    columns = slice(column_offset, column_offset + patch.grid.columns)
+    if row_offset < 0 or column_offset < 0 or rows.stop > grid.rows or columns.stop > grid.columns:
+        raise BasemapError(
+            f"a {patch.grid.rows}×{patch.grid.columns} patch at ({row_offset}, "
+            f"{column_offset}) does not fit a {grid.rows}×{grid.columns} grid"
+        )
+    colour = np.zeros((*grid.shape, patch.channels), dtype=patch.colour.dtype)
+    valid = np.zeros(grid.shape, dtype=bool)
+    sigma = np.full(grid.shape, np.nan, dtype=np.float32)
+    updated = np.full(grid.shape, np.nan)
+    samples = np.zeros(grid.shape, dtype=np.uint32)
+    colour[rows, columns] = patch.colour
+    valid[rows, columns] = patch.valid
+    sigma[rows, columns] = patch.sigma_m
+    updated[rows, columns] = patch.updated_at
+    samples[rows, columns] = patch.samples
+    return GroundPatch(
+        camera_id=patch.camera_id, grid=grid, colour=colour, valid=valid,
+        sigma_m=sigma, updated_at=updated, samples=samples,
     )
-    rows = slice(row_offset, row_offset + accumulator.grid.rows)
-    columns = slice(column_offset, column_offset + accumulator.grid.columns)
-    moved._samples[:, rows, columns, :] = accumulator._samples
-    moved._times[:, rows, columns] = accumulator._times
-    moved._written[rows, columns] = accumulator._written
-    moved._sigma[rows, columns] = accumulator._sigma
-    moved._epoch = accumulator._epoch
-    moved._frames = accumulator._frames
-    return moved
 
 
 def _as_bgr(image: np.ndarray) -> np.ndarray:
