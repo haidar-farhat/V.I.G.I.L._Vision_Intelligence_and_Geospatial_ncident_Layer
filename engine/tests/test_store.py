@@ -1403,3 +1403,116 @@ def test_the_register_is_gone_once_the_store_that_held_it_is_closed(tmp_path: Pa
 
     with pytest.raises(StoreError, match="closed"):
         store.register
+
+
+# ------------------------------------------------------------ the class filter
+#
+# On a real camera a RESTRICTED zone raised "1 couch in Room (HIGH, risk 55)".
+# The filter that stops that lives on the zone, and a zone is only as durable as
+# its row: a filter that did not survive a restart is a filter the operator set
+# once and lost.
+
+
+def make_zone(zone_id: str = "zone-a", **overrides) -> Zone:
+    fields = dict(
+        id=zone_id,
+        name="Restricted Area A",
+        kind=ZoneKind.RESTRICTED,
+        ring=tuple(destination_point(SITE, b, 30.0) for b in (0.0, 90.0, 180.0, 270.0)),
+    )
+    fields.update(overrides)
+    return Zone(**fields)  # type: ignore[arg-type]
+
+
+def test_a_zone_keeps_its_class_filter_across_a_round_trip(store: Store):
+    store.save_zone(make_zone("people", classes=frozenset({"person", "bicycle"})))
+    store.save_zone(make_zone("anything"))
+
+    restored = {zone.id: zone for zone in store.zones()}
+
+    assert restored["people"].classes == frozenset({"person", "bicycle"})
+    assert isinstance(restored["people"].classes, frozenset)
+    assert restored["anything"].classes == frozenset(), "an unfiltered zone came back filtered"
+    assert restored["anything"].watches(None) is True
+
+
+def test_saving_a_zone_again_replaces_its_filter(store: Store):
+    # The console saves on every edit. Clearing the filter is an edit too, and
+    # an upsert that kept the old list would silently keep the old behaviour.
+    store.save_zone(make_zone(classes=frozenset({"person"})))
+    store.save_zone(make_zone())
+
+    assert store.zones()[0].classes == frozenset()
+
+
+def test_the_filter_is_stored_in_one_spelling_whatever_order_it_was_given_in(store: Store):
+    # The audit diff and a plain `SELECT` both compare text. Two saves of the
+    # same set must not differ because a set iterated differently.
+    store.save_zone(make_zone(classes=frozenset({"car", "person", "bicycle"})))
+    first = store._connection.execute("SELECT classes FROM zones").fetchone()["classes"]
+    store.save_zone(make_zone(classes=frozenset({"person", "bicycle", "car"})))
+    second = store._connection.execute("SELECT classes FROM zones").fetchone()["classes"]
+
+    assert first == second == '["bicycle", "car", "person"]'
+
+
+def test_the_class_filter_arrives_and_leaves_without_touching_the_zones(store: Store):
+    """The migration must apply, and undo, on a database that has rows in it.
+
+    Three things are checked on the way down and back that no empty-schema
+    test could show: the zones survive the column being dropped and can still
+    be listed without it; a row written *before* the column existed reads
+    back watching everything, which is what it always did; and a filter is not
+    resurrected by re-applying — it went with the column, and a build that
+    could not read it was never honouring it.
+    """
+    populate(store)
+    store.save_zone(make_zone("people", classes=frozenset({"person"})))
+    before = store.applied_versions()
+    events, incidents = store.event_count(), store.incident_count()
+
+    # Down to and including `zone_classes`, rather than one step, for the
+    # reason the site test gives: this is the newest migration only until the
+    # next one lands.
+    undone = store.rollback()
+    while undone is not None and undone.name != "zone_classes":
+        undone = store.rollback()
+
+    assert undone is not None and undone.name == "zone_classes"
+    assert "classes" not in store.column_names("zones"), "the column survived its own down"
+    listed = {zone.id: zone for zone in store.zones()}
+    assert set(listed) == {"zone-a", "people"}, "rolling back the filter took the zones"
+    assert listed["people"].classes == frozenset(), (
+        "a schema with no column for it cannot hold a filter, and must not invent one"
+    )
+    assert store.event_count() == events and store.incident_count() == incidents
+    assert len(store.cameras()) == 1
+
+    # A row an older build would write: every column it knew, and no filter.
+    with store.transaction() as connection:
+        connection.execute(
+            """
+            INSERT INTO zones (
+                id, name, kind, ring, enter_after_millis, exit_after_millis,
+                accept_uncertain, created_at
+            ) VALUES (?,?,?,?,?,?,?,?)
+            """,
+            (
+                "older", "Drawn last year", "RESTRICTED",
+                "[[33.8941, 35.5018], [33.8938, 35.5021], [33.8935, 35.5018]]",
+                600, 2000, 0, 0,
+            ),
+        )
+
+    store.migrate()
+
+    assert store.applied_versions() == before
+    assert "classes" in store.column_names("zones")
+    listed = {zone.id: zone for zone in store.zones()}
+    assert set(listed) == {"zone-a", "people", "older"}
+    assert listed["older"].classes == frozenset(), "the default did not fill the old row"
+    assert listed["older"].watches(None) is True, "an old zone stopped firing on upgrade"
+    assert listed["people"].classes == frozenset(), "the filter was resurrected from nowhere"
+
+    store.save_zone(make_zone("people", classes=frozenset({"person"})))
+    assert {z.id: z for z in store.zones()}["people"].classes == frozenset({"person"})

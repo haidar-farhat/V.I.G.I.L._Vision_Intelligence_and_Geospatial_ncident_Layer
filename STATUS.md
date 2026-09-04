@@ -25,7 +25,7 @@ implementation was removed in `582d0a8`; its architecture documents were kept
 because the thinking in them carried over, and are being brought up to date.
 Anything below that is not yet re-established after the rewrite says so.
 
-Current suite: **1180 tests** — 60 Rust, 912 engine, 208 console — plus two static
+Current suite: **1262 tests** — 60 Rust, 966 engine, 236 console — plus two static
 checks that run before any of them: an offline audit that fails the build if the
 shipped source names any destination off the site, and a lint that fails it if
 any of the 41 diagrams in this documentation no longer parses. `cargo fmt` and

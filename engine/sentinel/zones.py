@@ -25,6 +25,16 @@ unremarkable at 14:00 and worth waking somebody for at 03:00. A zone carries a
 schedule, and the schedule is evaluated in the site's clock — today the machine's
 own zone, passed in as ``site_tz``; UTC when none is given — because that is
 what "after hours" means to the person being woken.
+
+**What the thing is, is part of the condition.** A restricted area used to fire
+on any class the detector named — on a real camera, "1 couch in Room (HIGH,
+risk 55)" and "A bottle entered Room" — and an operator who has seen a sofa
+raise a HIGH incident stops believing incidents. A zone therefore carries a
+class filter, :attr:`Zone.classes`, and the rules ask :meth:`Zone.watches`
+before acting on a presence. The filter is by the detector's own label string,
+because that is the only vocabulary a site has: the classes are whatever the
+operator's model file names, and nothing here can know them in advance. Empty
+means any, which is what every zone meant before the filter existed.
 """
 
 from __future__ import annotations
@@ -125,7 +135,13 @@ def ring_problem(ring) -> str | None:
     return None
 
 
-def zone_warnings(zone: "Zone", report, others: Sequence["Zone"] = ()) -> tuple[str, ...]:
+def zone_warnings(
+    zone: "Zone",
+    report,
+    others: Sequence["Zone"] = (),
+    *,
+    labels: Iterable[str] | None = None,
+) -> tuple[str, ...]:
     """Everything wrong with this zone that the geometry can prove.
 
     Warnings, never refusals. An operator who draws a zone somewhere no camera
@@ -138,10 +154,37 @@ def zone_warnings(zone: "Zone", report, others: Sequence["Zone"] = ()) -> tuple[
     and ``area_m2``; :class:`sentinel.coverage.ZoneReport` is what the console
     passes. Duck-typed on purpose, so that neither the tests nor a future
     caller has to build a full coverage report to ask this question.
+
+    ``labels`` is the vocabulary of the detector watching this zone — the
+    values of ``DetectorInfo.class_names`` — and it is the same kind of
+    question as coverage: a filter naming a class the detector never emits is
+    a zone that can never fire, and it reads on screen as a zone that filters.
+    An empty vocabulary is a detector that labels nothing, under which any
+    filter at all is dead. ``None`` means the caller does not know what
+    detector will run, and the filter is not judged.
     """
     from shapely.geometry import Polygon
 
     messages: list[str] = []
+
+    if zone.classes and labels is not None:
+        known = frozenset(labels)
+        if not known:
+            messages.append(
+                f"watches only {', '.join(sorted(zone.classes))}, but the detector "
+                "labels nothing — it can never fire"
+            )
+        else:
+            unknown = sorted(zone.classes - known)
+            if len(unknown) == len(zone.classes):
+                messages.append(
+                    f"watches only {', '.join(unknown)}, which the detector never "
+                    "names — it can never fire"
+                )
+            elif unknown:
+                messages.append(
+                    f"watches {', '.join(unknown)}, which the detector never names"
+                )
 
     if report.covered_fraction <= 0.0:
         messages.append("no camera can see this zone — it can never fire")
@@ -241,6 +284,16 @@ class Zone:
     exit_after_millis: int = 2000
     #: Whether an uncertain position may count as being in the zone.
     accept_uncertain: bool = False
+    #: Which detector labels this zone acts on. EMPTY MEANS ANY.
+    #:
+    #: The labels are the detector's own strings — ``"person"`` here is
+    #: whatever the operator's model calls ``"person"``, matched exactly —
+    #: because a model file's names are the only vocabulary a site has, and a
+    #: list fixed in this code would be a guess about weights it has never
+    #: seen. Empty is the default because it is what every zone written before
+    #: this field existed meant, and an outline that went quiet on upgrade
+    #: would read on screen as protection.
+    classes: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
         if len(self.ring) < 3:
@@ -252,9 +305,35 @@ class Zone:
         problem = ring_problem(self.ring)
         if problem is not None:
             raise ValueError(f"Zone {self.id!r}: {problem}")
+        if not isinstance(self.classes, frozenset):
+            # A caller that hands over a list or a set has said what it meant.
+            # Held as a frozenset so the zone stays hashable and so two zones
+            # with the same filter written in a different order compare equal
+            # — the audit diff compares sets whole, and would otherwise report
+            # an edit that changed nothing.
+            object.__setattr__(self, "classes", frozenset(self.classes))
 
     def is_active(self, moment: datetime) -> bool:
         return self.schedule is None or self.schedule.covers(moment)
+
+    def watches(self, label: str | None) -> bool:
+        """Whether a presence the detector calls ``label`` is this zone's business.
+
+        ``label`` is the detector's word for the object, or ``None`` when the
+        detector cannot say — a motion detector finds movement and names
+        nothing. The two answers for ``None`` are the whole point:
+
+        - An **empty** filter watches everything, so it fires for a blob the
+          detector could not name. That is what every zone did before the
+          filter existed and what a motion-only site relies on.
+        - A **non-empty** filter never fires for ``None``. A blob that cannot
+          be named cannot be said to be a person, and a person-only zone that
+          fired on it anyway would be the sofa incident again, this time with
+          the word "person" on it.
+        """
+        if not self.classes:
+            return True
+        return label is not None and label in self.classes
 
     def accepts(self, membership: ZoneMembership) -> bool:
         if membership is ZoneMembership.INSIDE:

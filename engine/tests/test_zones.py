@@ -52,6 +52,7 @@ def make_track(
     first: int = 0,
     last: int = 0,
     speed: float | None = None,
+    class_id: int = 0,
 ) -> Track:
     position = (
         PositionEstimate(point=point, radius_meters=uncertainty, source="GROUND_PROJECTION")
@@ -60,7 +61,7 @@ def make_track(
     )
     return Track(
         id=track_id,
-        class_id=0,
+        class_id=class_id,
         bbox=BoundingBox(0.4, 0.5, 0.1, 0.2),
         confidence=0.9,
         hits=10,
@@ -489,3 +490,123 @@ def test_a_healthy_zone_produces_no_warnings():
     )
 
     assert zone_warnings(yard, FakeReport(), [elsewhere]) == ()
+
+
+# ------------------------------------------------------ what a zone watches
+#
+# The sofa incident. On a real camera a RESTRICTED zone raised "1 couch in Room
+# (HIGH, risk 55)", because it fired on any class the detector named. The
+# filter is by the detector's own label string — the only vocabulary a site
+# has — and empty means any, which is what every zone meant before it existed.
+
+
+def test_a_zone_watches_everything_by_default():
+    # Every zone written before the filter existed has this, and it must keep
+    # meaning "any": an outline that went quiet on upgrade reads as protection.
+    unfiltered = zone()
+
+    assert unfiltered.classes == frozenset()
+    assert unfiltered.watches("person") is True
+    assert unfiltered.watches("couch") is True
+    assert unfiltered.watches("unclassified") is True
+    assert unfiltered.watches(None) is True, "a motion detector must still fire it"
+
+
+def test_a_filtered_zone_watches_only_what_it_names():
+    people = zone(classes=frozenset({"person"}))
+
+    assert people.watches("person") is True
+    assert people.watches("couch") is False
+    assert people.watches("bottle") is False
+    assert people.watches("unclassified") is False
+
+
+def test_a_detector_that_cannot_name_things_fires_an_empty_filter_and_never_a_set_one():
+    """The distinction the whole feature rests on, stated on its own.
+
+    A motion detector labels nothing, which reaches `watches` as ``None``. An
+    empty filter fires on it — that is the motion-only site, and it must keep
+    working. A non-empty filter never does: the detector cannot say what the
+    thing was, so it cannot say it was a person, and a person-only zone that
+    fired anyway would be the sofa incident with the word "person" on it.
+    """
+    assert zone().watches(None) is True
+    assert zone(classes=frozenset({"person"})).watches(None) is False
+    assert zone(classes=frozenset({"person", "car"})).watches(None) is False
+
+
+def test_the_filter_is_the_detectors_exact_label():
+    # "person" is whatever the model calls "person". No case-folding, no
+    # synonyms: a filter that matched more than it says would be a claim the
+    # model never made. `zone_warnings` is where a mismatch gets pointed out.
+    people = zone(classes=frozenset({"person"}))
+
+    assert people.watches("Person") is False
+    assert people.watches("people") is False
+
+
+def test_a_filter_handed_over_as_a_list_is_held_as_a_frozenset():
+    # A console collects checked boxes into whatever it has. The zone must
+    # still hash, and two zones with the same filter in a different order
+    # must compare equal, or the audit diff reports an edit nobody made.
+    a = zone(classes=["person", "car"])  # type: ignore[arg-type]
+    b = zone(classes={"car", "person"})  # type: ignore[arg-type]
+
+    assert isinstance(a.classes, frozenset)
+    assert a == b and hash(a) == hash(b)
+
+
+def test_every_existing_way_of_building_a_zone_still_works():
+    # The field has a default, so nothing that built a zone before needs to
+    # change — and nothing that did gets a filter it did not ask for.
+    plain = Zone(id="z", name="Z", kind=ZoneKind.RESTRICTED, ring=ring_around(SITE, 10.0))
+
+    assert plain.classes == frozenset()
+    assert plain.watches(None) is True
+
+
+# -------------------------------------- a filter the detector cannot satisfy
+
+
+def test_a_filter_under_a_detector_that_labels_nothing_is_named_as_unable_to_fire():
+    # Armed and silent, which is the worst state: it reads on screen as a
+    # zone that filters, and it is a zone that can never fire.
+    people = area_zone("a", "Yard", ZoneKind.RESTRICTED, SITE, classes=frozenset({"person"}))
+
+    (warning,) = zone_warnings(people, FakeReport(), labels=())
+
+    assert warning == "watches only person, but the detector labels nothing — it can never fire"
+
+
+def test_a_filter_naming_a_class_the_detector_never_emits_is_warned():
+    people = area_zone("a", "Yard", ZoneKind.RESTRICTED, SITE, classes=frozenset({"persn"}))
+
+    (warning,) = zone_warnings(people, FakeReport(), labels=("person", "car"))
+
+    assert warning == "watches only persn, which the detector never names — it can never fire"
+
+
+def test_a_filter_partly_outside_the_vocabulary_names_the_part():
+    mixed = area_zone(
+        "a", "Yard", ZoneKind.RESTRICTED, SITE, classes=frozenset({"person", "forklift"})
+    )
+
+    (warning,) = zone_warnings(mixed, FakeReport(), labels=("person", "car"))
+
+    assert warning == "watches forklift, which the detector never names"
+
+
+def test_a_filter_the_detector_can_satisfy_is_not_warned():
+    people = area_zone("a", "Yard", ZoneKind.RESTRICTED, SITE, classes=frozenset({"person"}))
+
+    assert zone_warnings(people, FakeReport(), labels=("person", "car")) == ()
+
+
+def test_the_filter_is_not_judged_when_the_detector_is_unknown():
+    # The default. A caller that does not know what detector will run must
+    # not be told the zone is dead, and an empty filter has nothing to judge.
+    people = area_zone("a", "Yard", ZoneKind.RESTRICTED, SITE, classes=frozenset({"person"}))
+    any_class = area_zone("b", "Yard", ZoneKind.RESTRICTED, SITE)
+
+    assert zone_warnings(people, FakeReport()) == ()
+    assert zone_warnings(any_class, FakeReport(), labels=()) == ()

@@ -779,6 +779,13 @@ def _describe_zone_change(before: Zone, after: Zone) -> str:
         parts.append(f"exit {before.exit_after_millis} -> {after.exit_after_millis} ms")
     if before.accept_uncertain != after.accept_uncertain:
         parts.append(f"accept uncertain {before.accept_uncertain} -> {after.accept_uncertain}")
+    if getattr(before, "classes", frozenset()) != getattr(after, "classes", frozenset()):
+        # A filter edit is the one that decides what a zone will ignore, and it
+        # was being audited in prose as "no change" while the structured
+        # before/after carried it. The prose is what a person reads.
+        was = ", ".join(sorted(before.classes)) or "any"
+        now = ", ".join(sorted(after.classes)) or "any"
+        parts.append(f"watches {was} -> {now}")
     return "; ".join(parts) if parts else "no change"
 
 

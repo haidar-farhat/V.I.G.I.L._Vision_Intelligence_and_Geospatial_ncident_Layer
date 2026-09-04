@@ -41,6 +41,8 @@ from sentinel.events import (
 from sentinel.zones import Presence, PresenceChange, Schedule, Zone, ZoneKind
 from test_zones import make_track, ring_around
 
+import scene
+
 SITE = LatLon(33.8938, 35.5018)
 MOMENT = datetime(2026, 8, 30, 3, 0, tzinfo=timezone.utc)
 
@@ -50,7 +52,8 @@ MODEL = DetectorInfo(
     name="yolo-test",
     model_path="/models/yolo-test.onnx",
     model_sha256="a" * 64,
-    class_names={0: "person"},
+    # COCO's numbering, because that is what the sofa incident was raised in.
+    class_names={0: "person", 39: "bottle", 57: "couch"},
     classifies=True,
 )
 
@@ -471,3 +474,285 @@ def test_the_after_hours_condition_is_written_in_the_site_clock():
         {track.id: track}, at_millis=2000, moment=moment, detector=MOTION, frame_index=60,
     )
     assert any(c.startswith("16:30 UTC+0000") for c in event.triggering_conditions)
+
+
+# ------------------------------------------------------------ the class filter
+#
+# On a real camera a RESTRICTED zone raised "1 couch in Room (HIGH, risk 55)" and
+# "A bottle entered Room", because it fired on any class the segmenter named. A
+# zone now carries a class filter and every rule that acts on a presence asks
+# it. These tests are the couch, the person, and the detector that cannot tell
+# them apart.
+
+PERSON, BOTTLE, COUCH = 0, 39, 57
+
+
+def people_only(**overrides) -> Zone:
+    return restricted(classes=frozenset({"person"}), **overrides)
+
+
+def test_a_couch_entering_a_person_only_zone_raises_nothing():
+    zone = people_only()
+
+    couch = fire_entry([ZoneEntryRule()], zone, make_track(1, SITE, class_id=COUCH), detector=MODEL)
+    bottle = fire_entry([ZoneEntryRule()], zone, make_track(2, SITE, class_id=BOTTLE), detector=MODEL)
+    person = fire_entry([ZoneEntryRule()], zone, make_track(3, SITE, class_id=PERSON), detector=MODEL)
+
+    assert couch == [] and bottle == []
+    assert len(person) == 1
+    assert person[0].summary == "A person entered Restricted Area A"
+    assert person[0].severity is Severity.HIGH
+
+
+def test_an_empty_filter_keeps_firing_for_everything_including_unclassified():
+    # What every zone did before the filter existed, and what a site with no
+    # model relies on. The couch still fires here — that is the operator's
+    # choice to make by setting a filter, not this code's to make for them.
+    zone = restricted()
+
+    couch = fire_entry([ZoneEntryRule()], zone, make_track(1, SITE, class_id=COUCH), detector=MODEL)
+    unnamed = fire_entry(
+        [ZoneEntryRule()], zone, make_track(2, SITE, class_id=UNCLASSIFIED), detector=MODEL
+    )
+    blob = fire_entry([ZoneEntryRule()], zone, make_track(3, SITE, class_id=UNCLASSIFIED), detector=MOTION)
+
+    assert couch[0].summary == "A couch entered Restricted Area A"
+    assert unnamed[0].evidence.class_label == "unclassified"
+    assert blob[0].summary == "An object entered Restricted Area A"
+
+
+def test_a_filtered_zone_never_fires_from_a_motion_detector():
+    """A blob is not a person, however confidently it moved.
+
+    The motion detector labels nothing, so it cannot say the thing in the zone
+    was a person, so a person-only zone must not fire on it — whatever class id
+    happens to be on the track. Checked for every rule that acts on a presence,
+    because one of them firing would be the sofa incident under another name.
+    """
+    night = people_only(schedule=Schedule(time(18, 0), time(6, 0)))
+
+    for class_id in (PERSON, COUCH, UNCLASSIFIED):
+        track = make_track(1, SITE, class_id=class_id)
+        assert fire_entry([ZoneEntryRule()], night, track, detector=MOTION) == []
+        assert fire_entry([AfterHoursRule()], night, track, detector=MOTION) == []
+
+        held = Presence("zone-a", 1, 0, 60_000, confirmed=True, observations=300)
+        loitering = engine(LoiteringRule(dwell_millis=2000)).on_frame(
+            [held], {night.id: night}, {1: track},
+            at_millis=60_000, moment=MOMENT, detector=MOTION, frame_index=900,
+        )
+        assert loitering == []
+
+
+def test_the_context_names_the_class_only_when_the_detector_can():
+    # The one place a rule reads the label. `None` under a motion detector,
+    # not "unclassified": the filter is asked with this value, and the string
+    # is reserved for a classifying detector that looked and could not decide.
+    from sentinel.events import RuleContext
+
+    def context(track: Track, detector: DetectorInfo) -> RuleContext:
+        return RuleContext(
+            node_id="nd_test", camera_id="cam-07", zone=None, track=track, presence=None,
+            at_millis=0, moment=MOMENT, detector=detector, frame_index=0,
+        )
+
+    assert context(make_track(1, SITE, class_id=PERSON), MOTION).class_label is None
+    assert context(make_track(1, SITE, class_id=UNCLASSIFIED), MOTION).class_label is None
+    assert context(make_track(1, SITE, class_id=PERSON), MODEL).class_label == "person"
+    assert context(make_track(1, SITE, class_id=COUCH), MODEL).class_label == "couch"
+    assert context(make_track(1, SITE, class_id=UNCLASSIFIED), MODEL).class_label == "unclassified"
+
+
+def test_loitering_honours_the_filter_without_spending_the_presences_one_firing():
+    # Fires once per presence — and a couch must not use that one up, so a
+    # filter edited while the presence is open still lets the person fire.
+    rule = LoiteringRule(dwell_millis=2000)
+    zone = people_only()
+    active = engine(rule)
+
+    def run(track: Track) -> list[Event]:
+        produced = []
+        for step in range(30):
+            at = step * 200
+            held = Presence("zone-a", track.id, 0, at, confirmed=True, observations=step + 1)
+            produced += active.on_frame(
+                [held], {zone.id: zone}, {track.id: track},
+                at_millis=at, moment=MOMENT, detector=MODEL, frame_index=step,
+            )
+        return produced
+
+    assert run(make_track(1, SITE, class_id=COUCH)) == []
+    assert len(run(make_track(2, SITE, class_id=PERSON))) == 1
+
+
+def test_after_hours_honours_the_filter():
+    night = people_only(schedule=Schedule(time(18, 0), time(6, 0)))
+
+    couch = fire_entry([AfterHoursRule()], night, make_track(1, SITE, class_id=COUCH), detector=MODEL)
+    person = fire_entry([AfterHoursRule()], night, make_track(2, SITE, class_id=PERSON), detector=MODEL)
+
+    assert couch == []
+    assert len(person) == 1 and person[0].type is EventType.AFTER_HOURS_PRESENCE
+
+
+def test_rapid_movement_is_about_the_track_and_ignores_the_filter():
+    # Stated so the omission cannot be read as an oversight: the zone in this
+    # context is incidental, and something moving at 12 m/s is worth a LOW
+    # event whatever the detector calls it.
+    zone = people_only()
+    couch = make_track(1, SITE, uncertainty=1.0, speed=12.0, class_id=COUCH)
+    held = Presence("zone-a", 1, 0, 1000, confirmed=True, observations=5)
+
+    events = engine(RapidMovementRule(speed_mps=6.0)).on_frame(
+        [held], {zone.id: zone}, {1: couch},
+        at_millis=1000, moment=MOMENT, detector=MODEL, frame_index=1,
+    )
+
+    assert len(events) == 1 and events[0].type is EventType.RAPID_MOVEMENT
+
+
+# ----------------------------------------------- the filter on the reference video
+
+
+class OracleLabeller:
+    """The motion detector, with each blob named from the scene's own truth.
+
+    The reference scene has no classes — its walkers are rectangles — so a
+    filter over it has nothing to filter unless something supplies labels. The
+    labels here are taken from ``scene.ground_truth``: the walker whose box is
+    nearest a blob names it. Two walkers are called ``person`` and the third
+    ``couch``, not because it resembles one but because a filter needs
+    something to exclude, and a fixture that labelled everything ``person``
+    would prove the filter equal to no filter and nothing else.
+
+    Everything downstream of `detect()` — tracking, projection, presences, the
+    rules — is the real pipeline, so what this measures is whether the filter
+    removes exactly the events it should from real pipeline output, and not a
+    hand-built presence. Frames are counted rather than passed in because the
+    `Detector` protocol sees only the image; the pipeline calls `detect` once
+    per frame in order, which `test_pipeline.py` asserts.
+    """
+
+    NAMES = {PERSON: "person", COUCH: "couch"}
+    WALKER_CLASS = {"approaching": PERSON, "crossing": PERSON, "loiterer": COUCH}
+
+    def __init__(self, inner):
+        from dataclasses import replace
+
+        self._inner = inner
+        self._frame = 0
+        self._info = replace(
+            inner.info, kind="oracle", name="motion + scene oracle",
+            class_names=dict(self.NAMES), classifies=True,
+        )
+
+    @property
+    def info(self) -> DetectorInfo:
+        return self._info
+
+    def detect(self, image):
+        from dataclasses import replace
+
+        truth = scene.ground_truth(self._frame)
+        self._frame += 1
+
+        labelled = []
+        for detection in self._inner.detect(image):
+            cx = (detection.bbox.x + detection.bbox.w / 2) * scene.WIDTH
+            cy = (detection.bbox.y + detection.bbox.h / 2) * scene.HEIGHT
+            nearest, distance = None, None
+            for name, (x, y, w, h) in truth.items():
+                gap = ((cx - (x + w / 2)) ** 2 + (cy - (y + h / 2)) ** 2) ** 0.5
+                if distance is None or gap < distance:
+                    nearest, distance = name, gap
+            # Within the walker's own size, or the oracle honestly says it
+            # cannot name the blob — a merged pair, a shadow.
+            if nearest is not None and distance <= max(truth[nearest][2], truth[nearest][3]):
+                class_id = self.WALKER_CLASS[nearest]
+            else:
+                class_id = UNCLASSIFIED
+            labelled.append(replace(detection, class_id=class_id))
+        return labelled
+
+
+def reference_zone(pose, classes: frozenset[str] = frozenset()) -> Zone:
+    """The restricted area `test_pipeline.py` lays across the walkers' paths."""
+    centre = destination_point(pose.position, 180.0, 14.0)
+    return Zone(
+        id="zone-a",
+        name="Restricted Area A",
+        kind=ZoneKind.RESTRICTED,
+        ring=tuple(destination_point(centre, b, 9.0) for b in (0.0, 90.0, 180.0, 270.0)),
+        enter_after_millis=600,
+        classes=classes,
+    )
+
+
+def run_reference(video, pose, zone: Zone) -> list[Event]:
+    from sentinel.decode import VideoSource
+    from sentinel.detect import MotionDetector
+    from sentinel.pipeline import Pipeline
+
+    # A fixed clock, so the same footage produces the same ids on any day —
+    # which is what lets the two runs below be compared id for id.
+    epoch = int(datetime(2026, 8, 30, 2, 0, tzinfo=timezone.utc).timestamp() * 1000)
+    with Pipeline(
+        VideoSource(video, source_id="cam-07"),
+        OracleLabeller(MotionDetector()),
+        pose=pose,
+        zones=[zone],
+        rules=[ZoneEntryRule(), LoiteringRule(dwell_millis=4000)],
+        node_id="nd_test",
+        wall_clock_epoch_millis=epoch,
+    ) as pipeline:
+        return [event for result in pipeline.run() for event in result.events]
+
+
+@pytest.fixture(scope="module")
+def filtered_and_not(reference_video, reference_pose):
+    """One pass with no filter and one with ``person`` only, over one video."""
+    return (
+        run_reference(reference_video, reference_pose, reference_zone(reference_pose)),
+        run_reference(
+            reference_video, reference_pose,
+            reference_zone(reference_pose, frozenset({"person"})),
+        ),
+    )
+
+
+def test_a_person_only_zone_on_the_reference_video_raises_no_more_than_an_unfiltered_one(
+    filtered_and_not,
+):
+    """Measured: 9 events unfiltered (7 person, 2 couch) against 7 person-only.
+
+    The floors are below that so a detector or tracker change moves the
+    numbers without failing this — what must hold is the direction, and that
+    the comparison was not vacuous: the unfiltered run has to have raised
+    something the filter could remove.
+    """
+    unfiltered, people = filtered_and_not
+    labels = {event.evidence.class_label for event in unfiltered}
+
+    assert len(unfiltered) >= 4, "the reference walkers never crossed the zone"
+    assert "couch" in labels, "the oracle never labelled a blob couch, so there was nothing to filter"
+    assert len(people) <= len(unfiltered)
+    assert len(people) < len(unfiltered), "the couch's events survived the filter"
+    assert len(people) >= 1, "the filter silenced the people too"
+
+
+def test_a_person_only_zone_never_raises_for_a_non_person_label(filtered_and_not):
+    _, people = filtered_and_not
+
+    assert people, "nothing to check"
+    assert {event.evidence.class_label for event in people} == {"person"}
+    assert all("couch" not in event.summary for event in people)
+
+
+def test_the_filter_removes_exactly_the_non_person_events_and_nothing_else(filtered_and_not):
+    # Ids are deterministic and the presences are unaffected by the filter, so
+    # the person-only run must be the person subset of the unfiltered run —
+    # not fewer events for some other reason, and not different ones.
+    unfiltered, people = filtered_and_not
+
+    expected = {event.id for event in unfiltered if event.evidence.class_label == "person"}
+    assert {event.id for event in people} == expected

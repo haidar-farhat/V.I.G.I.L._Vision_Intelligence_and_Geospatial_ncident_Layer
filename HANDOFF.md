@@ -437,6 +437,29 @@ job does not sweep it; no event is raised from a plate and no reading persists;
 `orthophoto` and `faces` have no caller at all; the audit chain covers only rows
 that carry a hash; the site record has no console screen.
 
+### What the real camera said, answered: zone classes, and fragmentation measured
+
+Driving the packaged console on the laptop camera produced "1 couch in Room
+(HIGH, risk 55)" and, earlier, "A bottle entered Room". Three agents, one
+workflow, every skeptic's mutation check passing:
+
+- **Zone classes.** `Zone.classes` (empty = any), `Zone.watches(label)`,
+  consulted by every presence rule; migration 7; a picker in the properties
+  panel offering only the detector's own vocabulary; `zone_warnings(labels=…)`
+  naming a filter the detector can never satisfy. The rule that matters most:
+  a filtered zone **never fires from a motion detector**, which cannot say
+  what it saw. On the reference scene a person-only zone raises exactly the
+  person subset of the unfiltered zone's events, by deterministic event id.
+- **Fragmentation, finally measured.** `tools/measure_fragmentation.py`:
+  reference scene 4 tracks for 3 walkers (1.33 — identity swaps at the
+  crossing, not temporal splits); laptop camera 7 tracks for one person in
+  15 s with the segmenter. Every earlier figure (3, 10, 4, 11) was incidental.
+- **Post-hoc re-ID** in `sentinel.reid` — masked HSV histogram, EMA per track,
+  `link_fragments` joining only when gap, distance and appearance all agree.
+  It reconciles the count; it cannot un-split a live track. That is the
+  argument for ABI 7 (appearance into the Rust tracker), and the measurement
+  tool is what will show whether it worked. Called by nothing yet.
+
 **Immediate:**
 
 1. **1.3 appearance re-ID.** The tracker fragments (17 tracks over 15 s on one

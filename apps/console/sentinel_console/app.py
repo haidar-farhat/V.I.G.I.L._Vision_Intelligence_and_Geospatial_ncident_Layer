@@ -362,6 +362,11 @@ class ConsoleWindow(QMainWindow):
         self.zone_properties = ZonePropertiesPanel()
         self.zone_properties.changed.connect(self._zone_properties_applied)
         self.zone_properties.set_clock(self.node.site_clock_label)
+        # The class picker offers only the labels this site's detector can
+        # produce. A filter for "person" on a motion-only site would silence
+        # the zone for ever, so with no vocabulary the picker is disabled and
+        # says why (the panel does that; this only hands it the words).
+        self.zone_properties.set_classes(self._detector_labels())
 
         outer.addLayout(self._build_toolbar())
 
@@ -905,6 +910,25 @@ class ConsoleWindow(QMainWindow):
         if self._configuring:
             self._idle_timer.start(CONFIGURE_IDLE_MILLIS)
 
+    def _detector_labels(self) -> list[str]:
+        """The labels the site's detector can actually produce, sorted.
+
+        Read from the model once, here, rather than from a running camera:
+        a zone is configured before anything runs, and an operator drawing a
+        person-only zone on an idle console must see "person" in the list.
+        Empty for motion detection, which labels nothing, and empty — rather
+        than a guessed COCO list — when the model cannot be loaded, because a
+        picker offering words the detector will never say is a filter that
+        silently disarms every zone it is applied to.
+        """
+        if self._model is None:
+            return []
+        try:
+            info = detector_for(self._model).info
+        except DetectionError:
+            return []
+        return sorted(set(info.class_names.values())) if info.classifies else []
+
     def _toggle_detections(self, show: bool) -> None:
         for session in self._sessions.values():
             session.view.set_show_detections(show)
@@ -1418,7 +1442,13 @@ class ConsoleWindow(QMainWindow):
             report = reports.get(zone.id)
             if report is None:
                 continue
-            warnings[zone.id] = zone_warnings(zone, report, [z for z in zones if z.id != zone.id])
+            warnings[zone.id] = zone_warnings(
+                zone, report, [z for z in zones if z.id != zone.id],
+                # The detector's vocabulary, so a person-only zone under a
+                # detector that cannot say "person" is shown as unable to fire
+                # instead of looking armed.
+                labels=self._detector_labels(),
+            )
         return reports, warnings
 
     def _sync_zone_properties(self) -> None:

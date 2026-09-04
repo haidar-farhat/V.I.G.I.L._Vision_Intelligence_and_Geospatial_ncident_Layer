@@ -63,7 +63,7 @@ _log = _get_logger(__name__)
 #: Schema version this build expects. A database at a different version is
 #: migrated forward, never opened as-is: opening a schema you do not understand
 #: and hoping the columns line up is how evidence is silently corrupted.
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 class StoreError(RuntimeError):
@@ -423,6 +423,31 @@ MIGRATIONS: tuple[Migration, ...] = (
         ALTER TABLE audit_logs DROP COLUMN node_id;
         ALTER TABLE audit_logs DROP COLUMN after_json;
         ALTER TABLE audit_logs DROP COLUMN before_json;
+        """,
+    ),
+    Migration(
+        version=7,
+        name="zone_classes",
+        up="""
+        -- Which detector labels a zone acts on: a JSON list of the model's own
+        -- label strings, e.g. '["person"]'. Until now a RESTRICTED zone fired
+        -- on any class the detector named — on a real camera, "1 couch in Room
+        -- (HIGH, risk 55)" — and an operator who has seen a sofa raise a HIGH
+        -- incident stops believing incidents.
+        --
+        -- '[]' means any, and it is the default rather than NULL because it is
+        -- what every zone written before this column meant: an outline drawn
+        -- last year keeps firing for whatever crosses it. A zone that went
+        -- quiet on upgrade would read on screen as protection.
+        --
+        -- The down drops the filters with the column. A build that predates
+        -- the column cannot honour them, and stashing the JSON somewhere it
+        -- cannot read would be a promise nobody keeps; the zones themselves
+        -- survive, as `test_store.py` checks on a populated database.
+        ALTER TABLE zones ADD COLUMN classes TEXT NOT NULL DEFAULT '[]';
+        """,
+        down="""
+        ALTER TABLE zones DROP COLUMN classes;
         """,
     ),
 )
@@ -901,6 +926,12 @@ class Store:
     # ------------------------------------------------------------------- zones
 
     def save_zone(self, zone: Zone) -> None:
+        """Record a zone, its class filter included.
+
+        The filter is written sorted, so the same set produces the same text
+        whichever order the console collected it in — a row that changed
+        because a set was iterated differently is an edit nobody made.
+        """
         schedule = zone.schedule
         with self.transaction() as connection:
             connection.execute(
@@ -909,8 +940,8 @@ class Store:
                     id, name, kind, ring,
                     schedule_start, schedule_end, schedule_days,
                     enter_after_millis, exit_after_millis, accept_uncertain,
-                    created_at
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                    classes, created_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(id) DO UPDATE SET
                     name = excluded.name,
                     kind = excluded.kind,
@@ -920,7 +951,8 @@ class Store:
                     schedule_days = excluded.schedule_days,
                     enter_after_millis = excluded.enter_after_millis,
                     exit_after_millis = excluded.exit_after_millis,
-                    accept_uncertain = excluded.accept_uncertain
+                    accept_uncertain = excluded.accept_uncertain,
+                    classes = excluded.classes
                 """,
                 (
                     zone.id,
@@ -933,6 +965,7 @@ class Store:
                     zone.enter_after_millis,
                     zone.exit_after_millis,
                     int(zone.accept_uncertain),
+                    json.dumps(sorted(zone.classes)),
                     _now(),
                 ),
             )
@@ -1623,6 +1656,16 @@ def _site_from_row(row: sqlite3.Row) -> Site:
 
 
 def _zone_from_row(row: sqlite3.Row) -> Zone:
+    """Rebuild a zone, its class filter included.
+
+    The filter column is read only if the row has one. A store stepped back
+    below `zone_classes` to diagnose something still lists its zones — the
+    rollback tests in `test_store.py` read them on the way down — and a reader
+    that raised on the missing column would turn a rollback into a database
+    that cannot show its own geography. A zone read that way watches
+    everything, which is the truth about that schema: the filter is gone with
+    the column, and it comes back empty when the column does.
+    """
     from datetime import time as clock
 
     schedule = None
@@ -1633,6 +1676,8 @@ def _zone_from_row(row: sqlite3.Row) -> Zone:
             days=frozenset(json.loads(row["schedule_days"] or "[]")),
         )
 
+    classes = row["classes"] if "classes" in row.keys() else None
+
     return Zone(
         id=row["id"],
         name=row["name"],
@@ -1642,6 +1687,7 @@ def _zone_from_row(row: sqlite3.Row) -> Zone:
         enter_after_millis=row["enter_after_millis"],
         exit_after_millis=row["exit_after_millis"],
         accept_uncertain=bool(row["accept_uncertain"]),
+        classes=frozenset(json.loads(classes or "[]")),
     )
 
 

@@ -3529,3 +3529,45 @@ def test_the_console_accepts_the_start_flag(qt_app):
     source = __import__("inspect").getsource(app_module.run)
     assert '"--start"' in source
     assert "start_on_launch" in source, "the flag is parsed but never acted on"
+
+
+# --------------------------------------------------- zone classes, wired
+
+
+def test_a_motion_only_console_offers_no_class_filter(qt_app, window):
+    # The window fixture runs motion detection, which labels nothing. A class
+    # filter here would silence a zone for ever, so the picker must be off
+    # and say why rather than offer an empty list.
+    assert window._detector_labels() == []
+    panel = window.zone_properties
+    # An empty vocabulary, not an unknown one: the detector is known and it
+    # labels nothing, which is the case the picker must refuse rather than
+    # offer an empty list.
+    assert not panel._vocabulary
+    assert not panel.class_picker.isEnabled(), "a motion-only site was offered a class filter"
+
+
+def test_the_class_picker_takes_the_detectors_own_vocabulary(qt_app, window):
+    # Fed the words a real segmenter produces, the picker comes alive with
+    # exactly those, so a person-only zone can be drawn on an idle console.
+    window.zone_properties.set_classes(["person", "car", "truck"])
+
+    panel = window.zone_properties
+    assert panel.class_picker.isEnabled()
+    assert set(panel._vocabulary) == {"person", "car", "truck"}
+
+
+def test_detector_labels_come_from_the_models_class_names(qt_app, window, monkeypatch):
+    from sentinel_console import app as app_module
+
+    class Info:
+        classifies = True
+        class_names = {0: "person", 2: "car", 7: "truck", 99: "car"}
+
+    class Detector:
+        info = Info()
+
+    window._model = Path("a-model.onnx")
+    monkeypatch.setattr(app_module, "detector_for", lambda _path: Detector())
+
+    assert window._detector_labels() == ["car", "person", "truck"]

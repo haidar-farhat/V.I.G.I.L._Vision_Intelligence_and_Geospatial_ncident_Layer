@@ -24,6 +24,14 @@ designed in rather than added later.
 One person loitering for four minutes is one event, not two hundred and forty.
 Rules debounce, presences persist across dropouts, and a rule that fires
 repeatedly for an ongoing condition is a defect rather than a feature.
+
+**A zone's class filter is honoured by every rule that acts on a presence.**
+A restricted area used to fire on whatever the detector named — a couch, a
+bottle — and an operator who sees a sofa raise a HIGH incident stops believing
+incidents. Each such rule asks :meth:`~sentinel.zones.Zone.watches` with
+:attr:`RuleContext.class_label`, the one place the detector's word for a track
+is read, so a rule cannot reach the label by a second route and disagree with
+the first about what a motion detector can say (nothing).
 """
 
 from __future__ import annotations
@@ -239,6 +247,21 @@ class RuleContext:
         """The moment in the site's clock, for text a person reads."""
         return self.moment.astimezone(self.site_tz) if self.site_tz else self.moment
 
+    @property
+    def class_label(self) -> str | None:
+        """What the detector calls this track, or ``None`` when it cannot say.
+
+        ``None`` rather than ``"unclassified"`` under a motion detector, and
+        that difference is load-bearing: a zone filtered to ``person`` is asked
+        with this value, and a detector that classifies nothing must never
+        satisfy it — a blob is not a person, however confidently it moved. The
+        string ``"unclassified"`` is reserved for a classifying detector that
+        looked and could not decide, which a filter may legitimately name.
+        """
+        if self.track is None or not self.detector.classifies:
+            return None
+        return self.detector.label_for(self.track.class_id)
+
 
 class Rule:
     """A condition that turns observations into an assertion.
@@ -262,6 +285,19 @@ class Rule:
         return []
 
     # -------------------------------------------------------------- helpers
+
+    @staticmethod
+    def _watched(context: RuleContext) -> bool:
+        """Whether the zone in this context acts on this track's class at all.
+
+        The check every rule about a presence makes before anything else, so
+        that a filter set on a zone silences all of them together. A rule that
+        skipped it would raise "loitering" for the couch the entry rule had
+        just declined to announce, and the operator would be back to
+        disbelieving the screen. A context with no zone is not filtered: there
+        is no filter to consult.
+        """
+        return context.zone is None or context.zone.watches(context.class_label)
 
     def _build(
         self,
@@ -337,6 +373,10 @@ class ZoneEntryRule(Rule):
         zone = context.zone
         if change.kind != "ENTERED" or zone is None or zone.kind not in self._kinds:
             return []
+        if not self._watched(context):
+            # A couch in a person-only zone. Nothing to say, and saying it
+            # anyway is the incident this filter exists to stop.
+            return []
 
         presence = change.presence
         severity = (
@@ -345,12 +385,8 @@ class ZoneEntryRule(Rule):
 
         # The summary says what the detector can support and no more. Under a
         # motion detector this reads "An object entered", not "A person entered".
-        subject = (
-            context.detector.label_for(context.track.class_id).replace("_", " ")
-            if context.detector.classifies and context.track is not None
-            else "An object"
-        )
-        subject = subject if subject == "An object" else f"A {subject}"
+        label = context.class_label
+        subject = "An object" if label is None else f"A {label.replace('_', ' ')}"
 
         return [
             self._build(
@@ -388,6 +424,10 @@ class LoiteringRule(Rule):
     def on_frame(self, context: RuleContext) -> list[Event]:
         presence, zone, track = context.presence, context.zone, context.track
         if presence is None or zone is None or track is None:
+            return []
+        if not self._watched(context):
+            # Before the dwell test and before `_fired`, so an unwatched class
+            # neither raises nor uses up the one firing this presence gets.
             return []
 
         key = (zone.id, track.id)
@@ -447,6 +487,10 @@ class AfterHoursRule(Rule):
         zone = context.zone
         if change.kind != "ENTERED" or zone is None or zone.schedule is None:
             return []
+        if not self._watched(context):
+            # The hour makes a person worth waking somebody for; it does not
+            # make a couch one.
+            return []
 
         return [
             self._build(
@@ -472,6 +516,12 @@ class RapidMovementRule(Rule):
     pixel is metres. So this rule requires a *confident* position as well as a
     high speed — otherwise it fires on projection error rather than on anything
     that happened, which is the failure mode that makes speed rules distrusted.
+
+    Deliberately not subject to a zone's class filter. This rule is about the
+    track, not about where it is: the zone in its context, when there is one,
+    is incidental, and a thing moving at 12 m/s is worth a LOW event whatever
+    the detector calls it. Asserted in `test_events.py` so the omission cannot
+    be mistaken for an oversight.
     """
 
     id = "rapid-movement"

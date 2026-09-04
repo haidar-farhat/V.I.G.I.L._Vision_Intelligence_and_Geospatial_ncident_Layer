@@ -33,26 +33,26 @@ Related: [STATUS.md](STATUS.md) — measurements and honest gaps ·
 
 ## The scoreboard
 
-463 capabilities, each with a state. Many lines cover several related things —
+465 capabilities, each with a state. Many lines cover several related things —
 "heading · pitch · roll" is one row — so this counts *claims*, not code.
 
 | | Count | Share | What it means |
 |---|---:|---:|---|
-| **`TESTED`** | 181 | 39% | A test fails if it stops working |
+| **`TESTED`** | 184 | 40% | A test fails if it stops working |
 | **`IMPL`** | 23 | 5% | Works; a regression would go unnoticed |
 | **`SKEL`** | 32 | 7% | Something is there; it does not do the job |
-| **`PLAN`** | 227 | 49% | Designed, no code |
+| **`PLAN`** | 226 | 49% | Designed, no code |
 
 ```mermaid
 pie showData
-    title Sentinel Vision — 463 capabilities by state
-    "TESTED" : 181
+    title Sentinel Vision — 465 capabilities by state
+    "TESTED" : 184
     "IMPLEMENTED" : 23
     "SKELETON" : 32
-    "PLANNED" : 227
+    "PLANNED" : 226
 ```
 
-**Read that 39% carefully.** It is not "a third of the product is finished" — it
+**Read that 40% carefully.** It is not "a third of the product is finished" — it
 is that the part which is finished is the analytical core plus, now, the
 recording that makes its evidence real, while most of what is planned is the
 product surface around them. The parts a demonstration shows off are the parts
@@ -266,6 +266,8 @@ two identical webcams are indistinguishable by name.
 | Track timeline | `IMPL` | Inside an incident |
 | Track history search | `PLAN` | |
 | Track position samples persisted at 1 Hz for replay and heatmaps | `PLAN` | Migration: `track_samples (camera_id, track_id, at_millis, lat, lon, uncertainty_m, class_label)` written by the node from `poll()` at most once per second per track — about 100 bytes × tracks × 86,400 per camera per day, stated in the docs as a budget. Retention by age, except that samples inside a preserved incident window are preserved like segments and never deleted, and the evidence package includes them as `tracks.jsonl`. Turns 'trails are context, not a recording' into replayable trails and a heatmap of movement rather than of alerts. |
+| Track fragmentation, measured | `TESTED` | `tools/measure_fragmentation.py` runs the reference scene and reports tracks per true object from the scene's own ground truth, and optionally a live camera. Measured: 4 tracks for 3 walkers (1.33 — identity swaps at the crossing, not temporal splits), and 7 tracks for one person over 15 s on the laptop camera with the segmenter. This is the number appearance re-ID has to beat, and until it existed every figure quoted for it was incidental |
+| Post-hoc fragment linking by appearance, gap and position | `TESTED` | `sentinel.reid` — a masked HSV histogram per observation (mask when the segmenter gives one, box otherwise, provenance kept), an EMA per track, and `link_fragments` joining two tracks on one camera only when the gap, the distance and the appearance all agree — similarity alone never links, because a red coat leaving and a red coat arriving are two people. Reconciles the count after the fact; it cannot un-split a track mid-life, which is the argument for carrying appearance into the Rust tracker (ABI 7). **Called by nothing yet** |
 
 ## 🧑 People: named identity, opt-in
 
@@ -419,7 +421,7 @@ claim on someone than their face.
 | Perimeters · no-entry · parking · loading · critical-asset zones | `PLAN` | |
 | Nested zones | `PLAN` | Overlap and containment are reported by the validation row: two zones that overlap (with area), an exclusion covering any part of a restricted or perimeter zone (which silences it there), and a zone smaller than the local 1σ — each naming both zones and offering to zoom to the overlap. Nesting as a deliberate structure, a room inside a building, is still not modelled. |
 | Zone schedules | `TESTED` | Wrap midnight correctly |
-| Zone-specific object classes | `PLAN` | |
+| Zone-specific object classes | `TESTED` | `Zone.classes` (empty means any) and `Zone.watches(label)`; ZoneEntry, Loitering and AfterHours consult it, RapidMovement is about the track and deliberately does not. A filtered zone never fires from a motion detector — it cannot say what it saw, so it cannot say it was a person — and the console warns when a filter names a class the detector never emits. Migration 7 persists it. Found by the real camera: a sofa and a bottle raised HIGH incidents in a restricted zone; on the reference scene a person-only zone raises exactly the person subset of the unfiltered one. The properties panel offers only the detector's own vocabulary |
 | Zone direction rules | `PLAN` | The one zone item that changes engine semantics: a two-point LINE geometry with a signed side and an arrow, a `geometry_type`/`direction_deg` migration, and the reserved `PERIMETER_BREACH` finally raised. A crossing counts only when consecutive positions are confidently on opposite sides — each further than its σ from the line — with hysteresis, so a jittering estimate straddling the line raises nothing (Shapely `LineString` side test in Python first; Rust `segments_intersect` already exists if it moves to the core as ABI 7). Inbound-only wires ignore outbound crossings. A corridor is a buffered polyline plus the direction rule. `Zone.__post_init__` keeps refusing two points for area zones. |
 | Zone duration rules | `TESTED` | |
 | Zone confidence thresholds | `PLAN` | |
