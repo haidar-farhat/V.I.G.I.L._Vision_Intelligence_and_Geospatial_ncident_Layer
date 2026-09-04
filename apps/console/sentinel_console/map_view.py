@@ -52,6 +52,17 @@ from sentinel.core import (
 )
 
 from . import theme
+from .selection import Selection
+
+
+#: What the next click on the map will do. A click that sometimes pans,
+#: sometimes moves a camera and sometimes drops a zone corner is the single most
+#: dangerous ambiguity in the console: every one of those is destructive in a
+#: different way and none of them is undoable.
+MODE_SELECT = "select"
+MODE_DRAW = "draw"
+MODE_PLACE = "place"
+MODE_MEASURE = "measure"
 
 
 class MapView(QWidget):
@@ -66,6 +77,12 @@ class MapView(QWidget):
     edited = Signal(object, object)
     #: The id of a zone the operator clicked.
     zone_clicked = Signal(str)
+    #: A `Selection` the operator clicked, or ``None`` for empty ground.
+    selected = Signal(object)
+    #: The ground point under the pointer, or ``None`` when it leaves the view.
+    ground_moved = Signal(object)
+    #: The mode changed — including because a gesture finished on its own.
+    mode_changed = Signal(str)
 
     #: How close, in pixels, a click must be to a vertex to grab it, and to an
     #: edge to split it. Generous: a cross-hair on a 4K panel is small.
@@ -101,6 +118,21 @@ class MapView(QWidget):
         #: The last live coverage report and the outline it was computed for.
         self._report_cache: tuple | None = None
         self.show_legend = True
+        #: What is selected across the whole console, and what the pointer is
+        #: over. Hover is a separate, weaker thing: it follows the mouse and is
+        #: forgotten, where a selection persists until something replaces it.
+        self._selection: Selection | None = None
+        self._hover: Selection | None = None
+        #: Measuring is read-only, so it is allowed in Monitor mode. The flag
+        #: is separate from the points because "measuring, nothing placed yet"
+        #: is a real state and an empty list is falsy — inferring the mode from
+        #: the list ended measure mode the instant it began.
+        self._measuring = False
+        self._measure: list = []
+        self._measure_to: QPointF | None = None
+        # Always on, so hovering reports without a button held. It was
+        # previously switched on only while drawing.
+        self.setMouseTracking(True)
         self._tracks: tuple[Track, ...] = ()
         # Trails are keyed by camera and track, because a track id is only
         # unique within one camera. Merging them would draw one path jumping
@@ -118,7 +150,6 @@ class MapView(QWidget):
         #: Live tracks per camera, so one camera's update does not erase another's.
         self._live: dict[str, tuple[Track, ...]] = {}
 
-        self.setMouseTracking(False)
         self.setCursor(Qt.CursorShape.OpenHandCursor)
         self.setToolTip(
             "Wheel to zoom, drag to pan, double-click to fit. "
@@ -169,6 +200,20 @@ class MapView(QWidget):
             event.accept()
             return
 
+        if self.measuring:
+            if left:
+                point = self.point_at(position)
+                if point is not None:
+                    if len(self._measure) >= 2:
+                        self._measure = [point]
+                    else:
+                        self._measure.append(point)
+            elif right:
+                self.cancel_measure()
+            self.update()
+            event.accept()
+            return
+
         if self._draw_points is not None:
             if left:
                 self._draw_points.append(self._from_screen(position))
@@ -212,15 +257,32 @@ class MapView(QWidget):
             return
 
         if left:
-            zone_id = self.zone_at(position)
-            if zone_id is not None:
-                self.select_zone(zone_id)
-                self.zone_clicked.emit(zone_id)
+            hit = self.hit_test(position)
+            # Emitted even when nothing was hit: clicking bare ground is how an
+            # operator says "never mind", and it must clear the selection rather
+            # than leave a stale highlight on four panels.
+            self.selected.emit(hit)
+            if hit is not None and hit.zone_id is not None:
+                self.zone_clicked.emit(hit.zone_id)
             self._drag_from = position.toPoint()
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         position = event.position()
+        self._report_ground(position)
+        if self.measuring:
+            self._measure_to = position
+            self.update()
+            return
+        if self._draw_points is None and self._edit is None and self._drag_from is None:
+            # Hover only while nothing else is going on. A halo that followed
+            # the pointer through a drag would compete with the thing being
+            # dragged for the operator's attention.
+            hover = self.hit_test(position)
+            if hover != self._hover:
+                self._hover = hover
+                self.setToolTip(self._hover_text(hover) or "")
+                self.update()
         if self._draw_points is not None:
             self._hover = position
             self.update()
@@ -250,6 +312,82 @@ class MapView(QWidget):
             self._view_centre[1] + delta.y() / scale,
         )
         self.update()
+
+    def leaveEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        if self._hover is not None:
+            self._hover = None
+            self.update()
+        self.ground_moved.emit(None)
+        super().leaveEvent(event)
+
+    def _report_ground(self, position: QPointF) -> None:
+        """Tell whoever is listening where the pointer is on the ground."""
+        self.ground_moved.emit(self.point_at(position))
+
+    def _hover_text(self, hover: Selection | None) -> str | None:
+        """Everything known about the thing under the pointer.
+
+        Assembled here rather than in a tooltip string built by the caller,
+        because the numbers that matter — the uncertainty and how the position
+        was obtained — live on the objects this view already holds, and a
+        second copy of that formatting would come to disagree with the table.
+        """
+        if hover is None:
+            return None
+
+        if hover.kind == "track":
+            for track in self._live.get(hover.camera_id, ()):
+                if track.id != hover.track_id:
+                    continue
+                lines = [f"#{track.id} on {hover.camera_id}"]
+                if track.position is not None:
+                    metres = haversine_distance(
+                        self._cameras[hover.camera_id].position, track.position.point
+                    ) if hover.camera_id in self._cameras else None
+                    if metres is not None:
+                        bearing = bearing_degrees(
+                            self._cameras[hover.camera_id].position, track.position.point
+                        )
+                        lines.append(f"{metres:.1f} m at {bearing:.0f}° from the camera")
+                    lines.append(f"±{track.position.radius_meters:.1f} m (1σ)")
+                    lines.append(
+                        "projected onto the ground"
+                        if track.position.source == "GROUND_PROJECTION"
+                        else "projection failed — shown at the camera, not located"
+                    )
+                else:
+                    lines.append("not located: the camera is not placed")
+                if track.speed_mps:
+                    lines.append(f"{track.speed_mps:.1f} m/s")
+                if track.heading_degrees is not None:
+                    lines.append(f"heading {track.heading_degrees:.0f}°")
+                return "\n".join(lines)
+            return None
+
+        if hover.kind == "camera":
+            pose = self._cameras.get(hover.camera_id)
+            if pose is None:
+                return None
+            footprint = self._footprints.get(hover.camera_id) or []
+            lines = [hover.camera_id]
+            if footprint:
+                reach = [haversine_distance(pose.position, p) for p in footprint]
+                lines.append(f"sees {min(reach):.0f} m to {max(reach):.0f} m ahead")
+            lines.append(f"{pose.mount_height:.1f} m up, facing {pose.heading:.0f}°")
+            return "\n".join(lines)
+
+        if hover.kind == "zone":
+            zone = next((z for z in self._zones if z.id == hover.zone_id), None)
+            if zone is None:
+                return None
+            kind = getattr(zone.kind, "value", str(zone.kind)).lower()
+            lines = [f"{zone.name} · {kind}", f"{len(zone.ring)} corners"]
+            schedule = getattr(zone, "schedule", None)
+            lines.append(
+                f"active {schedule.describe()}" if schedule is not None else "active at all times"
+            )
+            return "\n".join(lines)
+        return None
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if self._edit is not None:
@@ -284,8 +422,11 @@ class MapView(QWidget):
                 self.cancel_edit()
             elif self._pick_prompt is not None:
                 self.cancel_pick()
+            elif self.measuring:
+                self.cancel_measure()
             else:
                 self.select_zone(None)
+            self.mode_changed.emit(self.mode)
             return
         if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             if self._draw_points is not None:
@@ -301,6 +442,66 @@ class MapView(QWidget):
 
     # ------------------------------------------------------- drawing outlines
 
+    @property
+    def mode(self) -> str:
+        """What the next click will do, derived from what is in progress.
+
+        Derived rather than stored, because the gestures already carry their own
+        state and a second copy would be the thing that disagrees: a mode that
+        said "drawing" after the drawing finished is exactly the ambiguity this
+        is here to remove.
+        """
+        if self._draw_points is not None:
+            return MODE_DRAW
+        if self._pick_prompt is not None:
+            return MODE_PLACE
+        if self._measuring:
+            return MODE_MEASURE
+        return MODE_SELECT
+
+    def begin_measure(self) -> bool:
+        """Measure a distance on the ground. Read-only, so always allowed."""
+        if self._origin is None:
+            return False
+        self.cancel_draw()
+        self.cancel_edit()
+        self._measuring = True
+        self._measure = []
+        self._measure_to = None
+        self.setCursor(Qt.CursorShape.CrossCursor)
+        self.setFocus()
+        self.mode_changed.emit(MODE_MEASURE)
+        self.update()
+        return True
+
+    def cancel_measure(self) -> None:
+        if not self._measuring:
+            return
+        self._measuring = False
+        self._measure = []
+        self._measure_to = None
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self.mode_changed.emit(self.mode)
+        self.update()
+
+    @property
+    def measuring(self) -> bool:
+        return self.mode == MODE_MEASURE
+
+    def measured_metres(self) -> float | None:
+        """The distance between the two placed points, once both are placed."""
+        if len(self._measure) < 2:
+            return None
+        return haversine_distance(self._measure[0], self._measure[1])
+
+    def to_select(self) -> None:
+        """Abandon whatever gesture is running and go back to selecting."""
+        self.cancel_draw()
+        self.cancel_edit()
+        self.cancel_pick()
+        self.cancel_measure()
+        self.mode_changed.emit(MODE_SELECT)
+
     def begin_draw(self, prompt: str = "Draw a zone") -> bool:
         """Start an outline. Each left click places a vertex; double-click or
         Enter closes it; right-click or Backspace removes the last vertex;
@@ -308,10 +509,11 @@ class MapView(QWidget):
         if self._origin is None:
             return False
         self.cancel_edit()
+        self.cancel_measure()
         self._draw_points = []
         self._draw_prompt = prompt
         self._hover = None
-        self.setMouseTracking(True)
+        self.mode_changed.emit(MODE_DRAW)
         self.setCursor(Qt.CursorShape.CrossCursor)
         self.setFocus()
         self.update()
@@ -335,13 +537,16 @@ class MapView(QWidget):
             return False
         ring = [self._from_local(e, n) for e, n in self._draw_points]
         self.cancel_draw()
+        self.mode_changed.emit(self.mode)
         self.drawn.emit(ring)
         return True
 
     def cancel_draw(self) -> None:
         self._draw_points = None
         self._hover = None
-        self.setMouseTracking(False)
+        # Tracking stays on: hover inspection needs it whether or not anything
+        # is being drawn, and switching it off here disabled hover for the rest
+        # of the session after the first zone.
         self.setCursor(Qt.CursorShape.OpenHandCursor)
         self.update()
 
@@ -405,6 +610,60 @@ class MapView(QWidget):
     @property
     def selected_zone(self) -> str | None:
         return self._selected_zone
+
+    def hit_test(self, position: QPointF) -> Selection | None:
+        """What is under this point: a track, a camera, or a zone.
+
+        In that order, and the order is the whole design. A track disc is a few
+        pixels across and sits inside both a footprint and often a zone; a zone
+        is hundreds of pixels across. Testing the largest thing first would make
+        the small ones unclickable, so the test runs smallest-first and the
+        operator can always reach what they can see.
+        """
+        if self._origin is None:
+            return None
+
+        # Tracks, newest camera first, and within a camera the closest to the
+        # pointer rather than the first that happens to be within reach.
+        best: tuple[float, Selection] | None = None
+        for camera_id, tracks in self._live.items():
+            for track in tracks:
+                if track.position is None:
+                    continue
+                point = self._to_screen(*self._to_local(track.position.point))
+                distance = math.hypot(point.x() - position.x(), point.y() - position.y())
+                if distance <= self.HANDLE_PIXELS and (best is None or distance < best[0]):
+                    best = (distance, Selection.track(camera_id, track.id))
+        if best is not None:
+            return best[1]
+
+        for camera_id, pose in self._cameras.items():
+            point = self._to_screen(*self._to_local(pose.position))
+            if math.hypot(point.x() - position.x(), point.y() - position.y()) <= 12.0:
+                return Selection.camera(camera_id)
+
+        zone_id = self.zone_at(position)
+        return None if zone_id is None else Selection.zone(zone_id)
+
+    def set_selection(self, selection: Selection | None) -> None:
+        """Show what is selected. Never emits — this is the way *in*.
+
+        A setter that re-emitted would turn the bus into a loop: the map tells
+        the bus, the bus tells the map, the map tells the bus.
+        """
+        self._selection = selection
+        # The zone highlight predates the bus and is kept working, so a zone
+        # selected either way is drawn the same.
+        self._selected_zone = selection.zone_id if selection is not None else None
+        self.update()
+
+    @property
+    def selection(self) -> Selection | None:
+        return self._selection
+
+    @property
+    def hovered(self) -> Selection | None:
+        return self._hover
 
     def zone_at(self, position: QPointF) -> str | None:
         """The topmost zone under a widget position, or ``None``."""
@@ -736,6 +995,7 @@ class MapView(QWidget):
         self._paint_outline_in_progress(painter)
         self._paint_edit_handles(painter)
         self._paint_scale_bar(painter)
+        self._paint_measure(painter)
         if self.show_legend and self._bands:
             self._paint_legend(painter)
         banner = self._banner()
@@ -766,6 +1026,38 @@ class MapView(QWidget):
             for part in parts
             if not part.is_empty and part.area > 0.05
         ]
+
+    def _paint_measure(self, painter: QPainter) -> None:
+        """The measuring line, its ends, and the distance on it."""
+        if not self._measure:
+            return
+        start = self._to_screen(*self._to_local(self._measure[0]))
+        if len(self._measure) >= 2:
+            end = self._to_screen(*self._to_local(self._measure[1]))
+            metres = self.measured_metres()
+        elif self._measure_to is not None:
+            end = self._measure_to
+            to = self.point_at(end)
+            metres = haversine_distance(self._measure[0], to) if to is not None else None
+        else:
+            end, metres = start, None
+
+        painter.setPen(QPen(theme.SELECTION, 1.6, Qt.PenStyle.DashLine))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawLine(start, end)
+        painter.setBrush(QBrush(theme.SELECTION))
+        painter.setPen(Qt.PenStyle.NoPen)
+        for point in (start, end):
+            painter.drawEllipse(point, 3.0, 3.0)
+
+        if metres is not None:
+            font = QFont(painter.font())
+            font.setPointSize(9)
+            font.setBold(True)
+            painter.setFont(font)
+            painter.setPen(QPen(theme.SELECTION))
+            middle = QPointF((start.x() + end.x()) / 2, (start.y() + end.y()) / 2)
+            painter.drawText(QPointF(middle.x() + 6, middle.y() - 6), f"{metres:.1f} m")
 
     def _paint_legend(self, painter: QPainter) -> None:
         """What the shading means: two lines, bottom-right, clear of the scale bar.
@@ -806,6 +1098,25 @@ class MapView(QWidget):
         )
 
     def _banner(self) -> str | None:
+        if self.measuring:
+            if len(self._measure) >= 2:
+                metres = self.measured_metres() or 0.0
+                bearing = bearing_degrees(self._measure[0], self._measure[1])
+                return (
+                    f"Measured {metres:.1f} m at {bearing:.0f}° — "
+                    "click to start again, Esc to finish"
+                )
+            if self._measure:
+                live = ""
+                if self._measure_to is not None:
+                    to = self.point_at(self._measure_to)
+                    if to is not None:
+                        live = (
+                            f": {haversine_distance(self._measure[0], to):.1f} m at "
+                            f"{bearing_degrees(self._measure[0], to):.0f}°"
+                        )
+                return f"Measure — click the far end{live}, Esc to cancel"
+            return "Measure — click the first point, Esc to cancel"
         if self._pick_prompt is not None:
             return f"{self._pick_prompt} — click the map, right-click to cancel"
         if self._draw_points is not None:
@@ -1012,6 +1323,14 @@ class MapView(QWidget):
 
         for camera_id, pose in self._cameras.items():
             centre = self._to_screen(*self._to_local(pose.position))
+            chosen = self._selection is not None and self._selection.kind == "camera" \
+                and self._selection.camera_id == camera_id
+            hovered = self._hover is not None and self._hover.kind == "camera" \
+                and self._hover.camera_id == camera_id
+            if chosen or hovered:
+                painter.setPen(QPen(theme.SELECTION, 2 if chosen else 1))
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawEllipse(centre, 13, 13)
 
             painter.setPen(QPen(theme.CAMERA, 2))
             painter.setBrush(QBrush(theme.PANEL))
@@ -1047,38 +1366,65 @@ class MapView(QWidget):
         font.setBold(True)
         painter.setFont(font)
 
-        for track in self._tracks:
-            if track.position is None:
-                continue
+        # Per camera, because a track id is only unique within one and the
+        # selection is keyed on both halves. Iterating the flattened tuple meant
+        # searching every camera's list to find out where each track came from.
+        for camera_id, tracks in self._live.items():
+            for track in tracks:
+                if track.position is None:
+                    continue
 
-            point = self._to_screen(*self._to_local(track.position.point))
+                point = self._to_screen(*self._to_local(track.position.point))
 
-            # The uncertainty disc first, so the marker sits on top of it.
-            radius = max(2.0, track.position.radius_meters * scale)
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QBrush(theme.UNCERTAINTY))
-            painter.drawEllipse(point, radius, radius)
+                # The uncertainty disc first, so the marker sits on top of it.
+                radius = max(2.0, track.position.radius_meters * scale)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QBrush(theme.UNCERTAINTY))
+                painter.drawEllipse(point, radius, radius)
 
-            painter.setPen(QPen(theme.TRACK, 2))
-            painter.setBrush(QBrush(theme.TRACK.darker(220)))
-            painter.drawEllipse(point, 4, 4)
+                # How the position was obtained, drawn differently. A fallback is
+                # not a position: the projection failed and all the system can say
+                # is "something, at this camera". Drawn as a filled dot beside a
+                # real one it would be a claim the geometry never made.
+                fallback = track.position.source != "GROUND_PROJECTION"
+                if self._selection is not None and self._selection.is_track(
+                    camera_id, track.id
+                ):
+                    painter.setPen(QPen(theme.SELECTION, 2))
+                    painter.setBrush(Qt.BrushStyle.NoBrush)
+                    painter.drawEllipse(point, 11, 11)
+                elif self._hover is not None and self._hover.is_track(
+                    camera_id, track.id
+                ):
+                    painter.setPen(QPen(theme.SELECTION.lighter(130), 1))
+                    painter.setBrush(Qt.BrushStyle.NoBrush)
+                    painter.drawEllipse(point, 9, 9)
 
-            # Heading, only when there is one. A stationary object gets no arrow,
-            # because an arrow drawn from jitter is an invented direction.
-            if track.heading_degrees is not None and track.speed_mps:
-                angle = math.radians(track.heading_degrees)
-                length = 10 + min(20.0, track.speed_mps * 6)
-                painter.setPen(QPen(theme.TRACK, 2))
-                painter.drawLine(
-                    point,
-                    QPointF(
-                        point.x() + math.sin(angle) * length,
-                        point.y() - math.cos(angle) * length,
-                    ),
-                )
+                if fallback:
+                    painter.setPen(QPen(theme.TRACK, 1.5, Qt.PenStyle.DashLine))
+                    painter.setBrush(Qt.BrushStyle.NoBrush)
+                    painter.drawEllipse(point, 6, 6)
+                else:
+                    painter.setPen(QPen(theme.TRACK, 2))
+                    painter.setBrush(QBrush(theme.TRACK.darker(220)))
+                    painter.drawEllipse(point, 4, 4)
 
-            painter.setPen(QPen(theme.TEXT))
-            painter.drawText(QPointF(point.x() + 7, point.y() - 6), f"#{track.id}")
+                # Heading, only when there is one. A stationary object gets no arrow,
+                # because an arrow drawn from jitter is an invented direction.
+                if track.heading_degrees is not None and track.speed_mps:
+                    angle = math.radians(track.heading_degrees)
+                    length = 10 + min(20.0, track.speed_mps * 6)
+                    painter.setPen(QPen(theme.TRACK, 2))
+                    painter.drawLine(
+                        point,
+                        QPointF(
+                            point.x() + math.sin(angle) * length,
+                            point.y() - math.cos(angle) * length,
+                        ),
+                    )
+
+                painter.setPen(QPen(theme.TEXT))
+                painter.drawText(QPointF(point.x() + 7, point.y() - 6), f"#{track.id}")
 
     def _paint_scale_bar(self, painter: QPainter) -> None:
         step = _nice_step(self._span_meters)

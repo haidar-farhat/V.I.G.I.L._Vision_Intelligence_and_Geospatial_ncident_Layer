@@ -321,6 +321,41 @@ given too little height compresses rather than clips — it is a `QScrollArea`
 now); the zone list's five columns were cut off; and the legend was first
 clipped to "…not de", then measured and 489 px wide on a 600 px view.
 
+### Slice 2 is built: one selection, honest modes, a lock
+
+Console only — no engine change. `selection.py` holds a `Selection` (a track
+keyed by *(camera_id, track_id)*, because ids repeat across cameras) on a
+`SelectionBus`; `MapView.hit_test` tests smallest-first; the map, the wall, the
+track table and the incident list all show the same one thing, and Escape
+clears it. Select ／ Draw ／ Measure are mutually exclusive checked buttons whose
+state is *derived* from the gesture, so a drawing that closes on its own
+unchecks Draw. The console opens in Monitor and everything that changes the
+site needs Configure, which re-arms after ten idle minutes and audits both
+edges. Hovering reports what is actually known; a `CAMERA_FALLBACK` position is
+drawn as a dashed ring and says "not located". The status bar carries the
+ground point under the pointer, named from the camera it is measured from, and
+Ctrl+C copies it.
+
+**What the freeing test caught, twice, while this was being written** — both
+the same defect in different disguises, and both would have shipped silently:
+
+1. `button.clicked.connect(lambda _checked, m=mode: self._choose_mode(m))` — a
+   closure cell holding the window. Replaced with a bound slot that resolves
+   the mode from `self.sender()`.
+2. `_set_configuring(False)` called before `self.status` existed, so
+   `_set_status` raised inside a Qt slot; Qt swallowed the exception and *its
+   traceback* then held the window alive for ever. Construction order fixed.
+
+Exceptions raised in Qt slots are silently retained. That is worth remembering:
+it turns any construction-order slip into a leak with no visible symptom.
+
+**Three more found by its own tests:** an empty `[]` meant "not measuring", so
+measure mode ended the instant it began (an explicit flag now); `_mode_changed`
+called `_refresh_status`, overwriting the very message that said why a mode was
+refused; and a `_touch()` inserted by a sloppy patch landed in
+`_selection_changed`, which would have held the Configure lock open for ever
+just by clicking around — there is now a test for exactly that.
+
 **Immediate:**
 
 1. **1.3 appearance re-ID.** The tracker fragments (17 tracks over 15 s on one

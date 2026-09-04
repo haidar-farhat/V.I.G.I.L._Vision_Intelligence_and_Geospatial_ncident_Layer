@@ -66,6 +66,11 @@ FOOTPRINT_EDGE = QColor(96, 165, 250, 110)
 #: strongly coloured — brightest where its answer can be trusted, fading to the
 #: bare footprint where the error passes five metres.
 SIGMA_BANDS = (22, 36, 52, 70)
+#: The one highlight colour, used for whatever is selected in every panel.
+#: Deliberately not any of the evidence colours: a highlight must never be
+#: mistakable for something the system observed.
+SELECTION = QColor(250, 204, 21)
+
 #: A zone's part that no camera can see, hatched in the fault colour.
 OUTSIDE_HATCH = QColor(248, 113, 113, 60)
 WARNING = STALE
@@ -109,6 +114,23 @@ QPushButton {{
 }}
 QPushButton:hover {{ background: {BORDER.name()}; }}
 QPushButton:disabled {{ color: {TEXT_FAINT.name()}; }}
+/* A checkable button that looks the same checked as unchecked is a mode
+   indicator that indicates nothing — which is the ambiguity the mode buttons
+   exist to remove. Checked is filled in the highlight colour and dark on it,
+   so the current mode is legible across a control room rather than at
+   arm's length. */
+QPushButton:checked {{
+    background: {SELECTION.name()};
+    border: 1px solid {SELECTION.name()};
+    color: {PANEL.name()};
+    font-weight: 600;
+}}
+QPushButton:checked:hover {{ background: {SELECTION.lighter(110).name()}; }}
+QPushButton:checked:disabled {{
+    background: {PANEL_RAISED.name()};
+    border: 1px solid {BORDER.name()};
+    color: {TEXT_FAINT.name()};
+}}
 QTreeWidget, QTableWidget {{
     background: {PANEL.name()};
     border: none;

@@ -1857,3 +1857,517 @@ def test_the_banner_reports_coverage_while_an_outline_is_being_drawn(qt_app, win
 
     report = window.map.live_report()
     assert report is not None and report.area_m2 > 0
+
+
+# ------------------------------------------------- one selection, everywhere
+#
+# Four panels showed the same site and agreed about nothing. An operator who
+# saw something worth attention on the map had to find it again by eye in the
+# table, matching a small green number against a moving object.
+
+
+def _press(view, at):
+    """A real left-click at a widget position."""
+    from PySide6.QtTest import QTest
+
+    QTest.mouseClick(view, Qt.MouseButton.LeftButton, pos=at.toPoint())
+
+
+def _move(view, at):
+    """Move the pointer to a widget position.
+
+    The event is delivered to the widget rather than posted through `QTest`,
+    which routes by *global* position: in a full-suite run another window sits
+    over the same screen coordinates and the move lands there instead. What is
+    under test is what the view does with a move, not Qt's delivery of one.
+    """
+    from PySide6.QtCore import QEvent
+    from PySide6.QtGui import QMouseEvent
+
+    view.mouseMoveEvent(QMouseEvent(
+        QEvent.Type.MouseMove, at, view.mapToGlobal(at),
+        Qt.MouseButton.NoButton, Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier,
+    ))
+    QApplication.processEvents()
+
+
+def _feed_track(window, session, track):
+    """Put one track through a session so the table and pane have it."""
+    import numpy as np
+    from sentinel.node import Update
+    from sentinel.pipeline import FrameResult, PipelineStats
+
+    result = FrameResult(
+        index=10, timestamp_millis=1000, source_id=session.camera_id,
+        detections=(), tracks=(track,), ended=(),
+        image=np.zeros((480, 640, 3), dtype=np.uint8),
+    )
+    update = Update(result=result, analysis_fps=30.0, skipped=0, stats=PipelineStats())
+    session.absorb(update)
+    session.view.show_update(update)
+    window._refresh_tracks()
+    return update
+
+
+def _located_track(track_id: int, point: LatLon, *, radius: float = 1.0,
+                   source: str = "GROUND_PROJECTION", box=None):
+    from sentinel.core import BoundingBox, PositionEstimate, Track
+
+    return Track(
+        id=track_id, class_id=0, bbox=box or BoundingBox(0.4, 0.3, 0.2, 0.4),
+        confidence=0.9, hits=12, first_seen_millis=0, last_seen_millis=1000,
+        position=PositionEstimate(point=point, radius_meters=radius, source=source),
+        speed_mps=1.2, heading_degrees=90.0,
+    )
+
+
+def _map_with_a_track(track_id: int = 3, camera_id: str = "gate", **kwargs):
+    view = MapView()
+    view.resize(600, 600)
+    view.set_cameras({camera_id: SITE_POSE})
+    where = destination_point(SITE_POSE.position, SITE_POSE.heading, 20.0)
+    track = _located_track(track_id, where, **kwargs)
+    view.set_tracks((track,), camera_id)
+    return view, track, where
+
+
+def test_clicking_a_track_on_the_map_selects_it(qt_app):
+    from sentinel_console.selection import Selection
+
+    view, track, where = _map_with_a_track()
+    caught: list = []
+    view.selected.connect(caught.append)
+
+    _press(view, view._to_screen(*view._to_local(where)))
+
+    assert caught == [Selection.track("gate", 3)]
+
+
+def test_a_track_is_keyed_by_camera_as_well_as_id(qt_app):
+    """`#1` on the gate and `#1` on the yard are different people.
+
+    A bus keyed on the number alone would light up the wrong box on the wall
+    the first time two cameras ran at once.
+    """
+    from sentinel_console.selection import Selection
+
+    view = MapView()
+    view.resize(600, 600)
+    view.set_cameras({"gate": SITE_POSE})
+    gate_point = destination_point(SITE_POSE.position, SITE_POSE.heading, 15.0)
+    yard_point = destination_point(SITE_POSE.position, SITE_POSE.heading, 30.0)
+    view.set_tracks((_located_track(1, gate_point),), "gate")
+    view.set_tracks((_located_track(1, yard_point),), "yard")
+
+    caught: list = []
+    view.selected.connect(caught.append)
+    _press(view, view._to_screen(*view._to_local(yard_point)))
+
+    assert caught == [Selection.track("yard", 1)]
+    assert Selection.track("gate", 1) != Selection.track("yard", 1)
+    assert not Selection.track("gate", 1).is_track("yard", 1)
+
+
+def test_clicking_bare_ground_clears_the_selection(qt_app):
+    view, _, _ = _map_with_a_track()
+    caught: list = []
+    view.selected.connect(caught.append)
+
+    # A corner of the widget, far from the camera, its zones and its tracks.
+    _press(view, QPointF(4.0, 4.0))
+
+    assert caught == [None], "clicking nothing left a stale highlight"
+
+
+def test_the_selection_bus_is_silent_when_nothing_changed(qt_app):
+    # Panels repaint on this signal, and a table scrolled away from a row must
+    # not be yanked back by a click that selected what was already selected.
+    from sentinel_console.selection import Selection, SelectionBus
+
+    bus = SelectionBus()
+    seen: list = []
+    bus.changed.connect(seen.append)
+
+    bus.select(Selection.track("gate", 1))
+    bus.select(Selection.track("gate", 1))
+    assert len(seen) == 1
+
+    bus.clear()
+    bus.clear()
+    assert seen == [Selection.track("gate", 1), None]
+    assert bus.current is None
+
+
+def test_a_selection_reaches_the_table_the_wall_and_the_map(qt_app, window, reference_video: Path):
+    from sentinel_console.selection import Selection
+
+    session = _placed_window(window, reference_video)
+    where = destination_point(SITE_POSE.position, SITE_POSE.heading, 18.0)
+    track = _located_track(7, where)
+    _feed_track(window, session, track)
+
+    window.selection.select(Selection.track("cam-07", 7))
+
+    assert window.map.selection == Selection.track("cam-07", 7)
+    assert session.view._selection == Selection.track("cam-07", 7)
+    chosen = window.tracks.currentItem()
+    assert chosen is not None
+    assert chosen.data(0, Qt.ItemDataRole.UserRole) == ("cam-07", 7)
+
+
+def test_escape_clears_the_selection(qt_app, window, reference_video: Path):
+    from PySide6.QtTest import QTest
+
+    from sentinel_console.selection import Selection
+
+    session = _placed_window(window, reference_video)
+    window.selection.select(Selection.camera("cam-07"))
+    assert window.selection.current is not None
+
+    QTest.keyClick(window, Qt.Key.Key_Escape)
+
+    assert window.selection.current is None
+    assert window.map.selection is None
+    assert session.view._selection is None
+
+
+def test_escape_abandons_a_drawing_before_it_clears_a_selection(qt_app, window, reference_video: Path):
+    # Abandoning a half-drawn zone matters more than clearing a highlight, so
+    # the first Escape does that and the second clears.
+    from PySide6.QtTest import QTest
+
+    from sentinel_console.selection import Selection
+
+    _placed_window(window, reference_video)
+    window.selection.select(Selection.camera("cam-07"))
+    window._draw_zone()
+    assert window.map.drawing
+
+    QTest.keyClick(window, Qt.Key.Key_Escape)
+    assert not window.map.drawing
+    assert window.selection.current is not None, "the drawing and the selection both went"
+
+    QTest.keyClick(window, Qt.Key.Key_Escape)
+    assert window.selection.current is None
+
+
+def test_the_video_pane_outlines_the_selected_track(qt_app):
+    import numpy as np
+    from PySide6.QtGui import QImage
+
+    from sentinel.core import BoundingBox
+    from sentinel.node import Update
+    from sentinel.pipeline import FrameResult, PipelineStats
+    from sentinel_console.selection import Selection
+
+    view = VideoView()
+    view.camera_id = "gate"
+    view.resize(640, 480)
+    view.set_detector_info(MotionDetector().info)
+    view.set_show_detections(False)
+
+    track = _located_track(4, SITE_POSE.position, box=BoundingBox(0.3, 0.3, 0.3, 0.4))
+    image = np.zeros((480, 640, 3), dtype=np.uint8)
+    view.show_update(Update(
+        result=FrameResult(index=1, timestamp_millis=1000, source_id="gate",
+                           detections=(), tracks=(track,), ended=(), image=image),
+        analysis_fps=30.0, skipped=0, stats=PipelineStats(),
+    ))
+
+    def highlight_pixels() -> int:
+        # Counted over the whole pane rather than sampled on one row: the
+        # outline is two pixels wide and a single row misses it.
+        rendered = view.grab().toImage().convertToFormat(QImage.Format.Format_RGB888)
+        wanted = theme.SELECTION.name()
+        return sum(
+            rendered.pixelColor(x, y).name() == wanted
+            for y in range(0, rendered.height(), 2)
+            for x in range(0, rendered.width(), 2)
+        )
+
+    before = highlight_pixels()
+    view.set_selection(Selection.track("gate", 4))
+    after = highlight_pixels()
+
+    assert before == 0, "something was already drawn in the highlight colour"
+    assert after > 0, "the selected box is not in the highlight colour"
+
+
+def test_the_video_pane_ignores_a_selection_from_another_camera(qt_app):
+    import numpy as np
+
+    from sentinel.core import BoundingBox
+    from sentinel.node import Update
+    from sentinel.pipeline import FrameResult, PipelineStats
+    from sentinel_console.selection import Selection
+
+    view = VideoView()
+    view.camera_id = "gate"
+    view.resize(640, 480)
+    view.set_detector_info(MotionDetector().info)
+
+    track = _located_track(4, SITE_POSE.position, box=BoundingBox(0.3, 0.3, 0.3, 0.4))
+    image = np.zeros((480, 640, 3), dtype=np.uint8)
+    view.show_update(Update(
+        result=FrameResult(index=1, timestamp_millis=1000, source_id="gate",
+                           detections=(), tracks=(track,), ended=(), image=image),
+        analysis_fps=30.0, skipped=0, stats=PipelineStats(),
+    ))
+
+    assert view.hit_test(QPointF(0.45 * 640, 0.5 * 480)) == Selection.track("gate", 4)
+    # The same id, a different camera: not this pane's track.
+    assert not Selection.track("yard", 4).is_track("gate", 4)
+
+
+def test_hovering_a_track_reports_how_its_position_was_obtained(qt_app):
+    view, _, where = _map_with_a_track(radius=2.5)
+    _move(view, view._to_screen(*view._to_local(where)))
+
+    assert view.hovered is not None and view.hovered.kind == "track"
+    text = view.toolTip()
+    assert "#3 on gate" in text
+    assert "±2.5 m" in text
+    assert "projected onto the ground" in text
+
+
+def test_hovering_a_fallback_position_says_it_is_not_a_location(qt_app):
+    # The projection failed and all the system can say is "something, at this
+    # camera". Reported as a position it would be a claim the geometry never made.
+    view, _, where = _map_with_a_track(source="CAMERA_FALLBACK")
+    _move(view, view._to_screen(*view._to_local(where)))
+
+    assert "not located" in view.toolTip()
+
+
+def test_a_fallback_position_is_drawn_differently_from_a_projected_one(qt_app):
+    from PySide6.QtGui import QImage
+
+    def marker_pixels(source: str) -> int:
+        view, _, where = _map_with_a_track(source=source, radius=0.2)
+        view.show_legend = False
+        view.show()
+        qt_app.processEvents()
+        rendered = view.grab().toImage().convertToFormat(QImage.Format.Format_RGB888)
+        at = view._to_screen(*view._to_local(where))
+        # Count strongly track-coloured pixels in the marker's own few pixels.
+        count = 0
+        for dx in range(-3, 4):
+            for dy in range(-3, 4):
+                colour = rendered.pixelColor(int(at.x()) + dx, int(at.y()) + dy)
+                if abs(colour.green() - theme.TRACK.green()) < 60 and colour.green() > colour.red():
+                    count += 1
+        return count
+
+    filled = marker_pixels("GROUND_PROJECTION")
+    hollow = marker_pixels("CAMERA_FALLBACK")
+    assert filled > hollow, f"filled {filled} vs hollow {hollow}: the two look the same"
+
+
+def test_the_status_bar_reports_the_ground_under_the_pointer(qt_app, window, reference_video: Path):
+    _placed_window(window, reference_video)
+    where = destination_point(SITE_POSE.position, SITE_POSE.heading, 25.0)
+
+    window._ground_moved(where)
+
+    text = window.ground_label.text()
+    assert "from cam-07" in text, text
+    assert "m at" in text and "°" in text
+    assert f"{where.lat:+.6f}" in text
+
+    window._copy_ground()
+    from PySide6.QtGui import QGuiApplication
+    assert QGuiApplication.clipboard().text() == text
+
+    # And nothing to say when the pointer leaves the map.
+    window._ground_moved(None)
+    assert window.ground_label.text() == ""
+
+
+def test_the_ground_readout_names_the_camera_it_is_measured_from(qt_app, window, reference_video: Path):
+    # "37 m at 148°" is useless without knowing what it is 37 m from.
+    _placed_window(window, reference_video)
+    window._ground_moved(destination_point(SITE_POSE.position, SITE_POSE.heading, 10.0))
+
+    assert window.ground_label.text().split(" from ")[1].startswith("cam-07")
+
+
+def test_selecting_an_incident_row_puts_it_on_the_bus(qt_app, window, reference_video: Path):
+    from sentinel_console.selection import Selection
+
+    _placed_window(window, reference_video)
+    incidents = _incident_from_events(3)
+    window.incidents.show_incidents(incidents)
+
+    window.incidents.setCurrentItem(window.incidents.topLevelItem(0))
+
+    assert window.selection.current == Selection.incident(incidents[0].id)
+    assert window.incidents.selected_incident_id() == incidents[0].id
+
+
+# ------------------------------------------- what the next click will do
+#
+# A click that sometimes pans, sometimes moves a camera and sometimes drops a
+# zone corner is the most dangerous ambiguity in the console: each of those is
+# destructive in a different way and none of them is undoable.
+
+
+def test_the_console_opens_locked(qt_app, window):
+    from sentinel_console.map_view import MODE_SELECT
+
+    assert not window._configuring
+    assert not window.configure_button.isChecked()
+    assert window.map.mode == MODE_SELECT
+    assert window.mode_buttons[MODE_SELECT].isChecked()
+
+    for control in window._configure_only():
+        assert not control.isEnabled(), f"{control.text()} is live in Monitor"
+
+
+def test_configure_unlocks_the_site_changing_controls_and_is_audited(qt_app, window):
+    window.configure_button.setChecked(True)
+
+    assert window._configuring
+    for control in window._configure_only():
+        assert control.isEnabled(), f"{control.text()} stayed locked in Configure"
+
+    window.configure_button.setChecked(False)
+    assert not window._configuring
+    for control in window._configure_only():
+        assert not control.isEnabled()
+
+    actions = [row["action"] for row in window.store.audit_trail(limit=20)]
+    assert "console.configure.entered" in actions
+    assert "console.configure.left" in actions
+
+
+def test_drawing_is_refused_in_monitor(qt_app, window, reference_video: Path):
+    from sentinel_console.map_view import MODE_DRAW
+
+    _placed_window(window, reference_video)
+    assert not window._configuring
+
+    window._choose_mode(MODE_DRAW)
+
+    assert not window.map.drawing, "a zone could be drawn with the site locked"
+    assert "Configure" in window.status.currentMessage()
+    assert not window.mode_buttons[MODE_DRAW].isChecked()
+
+
+def test_the_idle_timeout_relocks_and_abandons_what_was_in_progress(qt_app, window, reference_video: Path):
+    # A console left in a control room is left in whatever state the last
+    # person walked away from.
+    _placed_window(window, reference_video)
+    window.configure_button.setChecked(True)
+    window._draw_zone()
+    assert window.map.drawing
+
+    window._relock()
+
+    assert not window._configuring
+    assert not window.map.drawing, "a half-drawn zone survived the relock"
+    assert "relocked" in window.status.currentMessage()
+
+
+def test_working_restarts_the_idle_countdown(qt_app, window, reference_video: Path):
+    _placed_window(window, reference_video)
+    window.configure_button.setChecked(True)
+    window._idle_timer.stop()
+
+    window._draw_zone()
+
+    assert window._idle_timer.isActive(), "the countdown was not restarted by working"
+
+
+def test_selecting_things_does_not_hold_the_lock_open(qt_app, window, reference_video: Path):
+    """Clicking around is watching, not configuring.
+
+    An earlier version restarted the countdown from `_selection_changed`, which
+    runs on every click anywhere — so an operator idly selecting tracks would
+    have held the site unlocked indefinitely.
+    """
+    from sentinel_console.selection import Selection
+
+    _placed_window(window, reference_video)
+    window.configure_button.setChecked(True)
+    window._idle_timer.stop()
+
+    window.selection.select(Selection.camera("cam-07"))
+    window.selection.clear()
+
+    assert not window._idle_timer.isActive(), "selecting restarted the idle countdown"
+
+
+def test_escape_returns_the_map_to_select(qt_app, window, reference_video: Path):
+    from PySide6.QtTest import QTest
+
+    from sentinel_console.map_view import MODE_MEASURE, MODE_SELECT
+
+    _placed_window(window, reference_video)
+    window._choose_mode(MODE_MEASURE)
+    assert window.map.mode == MODE_MEASURE
+    assert window.mode_buttons[MODE_MEASURE].isChecked()
+
+    QTest.keyClick(window.map, Qt.Key.Key_Escape)
+
+    assert window.map.mode == MODE_SELECT
+    assert window.mode_buttons[MODE_SELECT].isChecked()
+    assert not window.mode_buttons[MODE_MEASURE].isChecked()
+
+
+def test_the_mode_buttons_follow_a_gesture_that_ends_on_its_own(qt_app, window, reference_video: Path, monkeypatch):
+    # A drawing closes by itself on a double-click. A Draw button left checked
+    # after that is exactly the ambiguity this was built to remove.
+    from sentinel_console.map_view import MODE_DRAW, MODE_SELECT
+    from sentinel.zones import ZoneKind
+
+    session = _placed_window(window, reference_video)
+    # Closing an outline asks what the zone is, in a modal dialog. Answered
+    # here directly: an unattended dialog hangs the suite forever, which is
+    # also exactly what it would do to an operator.
+    monkeypatch.setattr(
+        ConsoleWindow, "_zone_drawn",
+        lambda self, ring: self._create_zone(tuple(ring), name="Yard", kind=ZoneKind.INTEREST),
+    )
+    window.configure_button.setChecked(True)
+    window._choose_mode(MODE_DRAW)
+    assert window.mode_buttons[MODE_DRAW].isChecked()
+
+    for bearing in (-10.0, 10.0, 0.0):
+        point = destination_point(session.pose.position, session.pose.heading + bearing, 20.0)
+        window.map._draw_points.append(window.map._to_local(point))
+    window.map.finish_draw()
+
+    assert window.map.mode == MODE_SELECT
+    assert window.mode_buttons[MODE_SELECT].isChecked()
+    assert not window.mode_buttons[MODE_DRAW].isChecked()
+
+
+def test_measuring_reports_a_distance_and_changes_nothing(qt_app, window, reference_video: Path):
+    from sentinel_console.map_view import MODE_MEASURE
+
+    session = _placed_window(window, reference_video)
+    before = list(window._zones)
+    window._choose_mode(MODE_MEASURE)
+    assert window.map.measuring
+
+    near = destination_point(session.pose.position, session.pose.heading, 15.0)
+    far = destination_point(session.pose.position, session.pose.heading, 35.0)
+    _press(window.map, window.map._to_screen(*window.map._to_local(near)))
+    _press(window.map, window.map._to_screen(*window.map._to_local(far)))
+
+    metres = window.map.measured_metres()
+    assert metres is not None and 18.0 <= metres <= 22.0, metres
+    assert "Measured" in window.map._banner()
+    assert list(window._zones) == before, "measuring changed the site"
+
+
+def test_measuring_is_allowed_while_the_site_is_locked(qt_app, window, reference_video: Path):
+    # It is read-only, so Monitor must not refuse it.
+    from sentinel_console.map_view import MODE_MEASURE
+
+    _placed_window(window, reference_video)
+    assert not window._configuring
+
+    window._choose_mode(MODE_MEASURE)
+
+    assert window.map.measuring

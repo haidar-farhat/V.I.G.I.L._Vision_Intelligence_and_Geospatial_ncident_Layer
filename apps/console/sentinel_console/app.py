@@ -59,6 +59,7 @@ from PySide6.QtWidgets import (
 from sentinel.core import (
     CameraPose,
     LatLon,
+    bearing_degrees,
     destination_point,
     field_of_view,
     haversine_distance,
@@ -73,7 +74,7 @@ from sentinel.events import (
 )
 from sentinel.evidence import ExportError, export_incident
 from sentinel.coverage import sigma_bands, zone_report
-from sentinel.node import Node, NodeError, Update
+from sentinel.node import ACTOR, Node, NodeError, Update
 from sentinel.paths import default_model_path
 from sentinel.store import default_database_path
 from sentinel import devices, logs, telemetry
@@ -81,11 +82,12 @@ from sentinel.zones import Zone, ZoneKind, zone_warnings
 
 from . import theme
 from .incident_view import IncidentView
-from .map_view import MapView
+from .map_view import MODE_DRAW, MODE_MEASURE, MODE_SELECT, MapView
 from .placement import PlacementDialog
 from .session import CameraSession
 from .add_camera import AddCameraDialog
 from .video_view import VideoView
+from .selection import Selection, SelectionBus
 from .zones_view import ZoneDialog, ZonePropertiesPanel, ZonesView
 
 _log = logs.get(__name__)
@@ -136,6 +138,10 @@ def _detector_summary(info) -> str:
     digest = f" · {info.model_sha256[:12]}" if info.model_sha256 else ""
     return f"{info.name} — {len(info.class_names)} classes{masks}{digest}"
 
+
+#: How long the console stays in Configure with nobody touching it. A lock
+#: that never re-arms is a lock somebody props open on the first day.
+CONFIGURE_IDLE_MILLIS = 10 * 60 * 1000
 
 #: The least height the incident and track panels are ever given. See `_build`.
 LOWER_PANEL_MINIMUM_HEIGHT = 260
@@ -229,6 +235,8 @@ class ConsoleWindow(QMainWindow):
     def _attach(self, record) -> CameraSession:
         """Give a node camera a pane, a row in the picker and a place on the wall."""
         view = VideoView()
+        view.camera_id = record.camera_id
+        view.clicked.connect(self.selection.select)
         view.set_placeholder(f"{record.camera_id} — not started")
         view.set_show_detections(self.show_detections.isChecked())
 
@@ -278,8 +286,26 @@ class ConsoleWindow(QMainWindow):
         self.empty_wall.setObjectName("Caption")
         self.wall_layout.addWidget(self.empty_wall, 0, 0)
 
+        # The site is locked until somebody says otherwise. Set before the
+        # toolbar is built, because the buttons read it as they are created.
+        self._configuring = False
+        self._idle_timer = QTimer(self)
+        self._idle_timer.setSingleShot(True)
+        self._idle_timer.timeout.connect(self._relock)
+
+        # One selected thing, shared by every panel. Built before the views
+        # so each can be wired to it as it is created.
+        self.selection = SelectionBus(self)
+        self.selection.changed.connect(self._selection_changed)
+        #: Guards the round trip: a panel told to show a selection emits its own
+        #: "the user picked a row" signal, which would come straight back here.
+        self._syncing = False
+
         self.map = MapView()
         self.map.picked.connect(self._map_picked)
+        self.map.selected.connect(self.selection.select)
+        self.map.ground_moved.connect(self._ground_moved)
+        self.map.mode_changed.connect(self._mode_changed)
         self.map.drawn.connect(self._zone_drawn)
         self.map.edited.connect(self._zone_outline_edited)
         self.map.zone_clicked.connect(self._zone_clicked_on_map)
@@ -287,7 +313,11 @@ class ConsoleWindow(QMainWindow):
         #: or ("camera", camera_id). Nothing, when nobody is picking.
         self._pick_action: tuple | None = None
         self.tracks = self._build_track_table()
+        self.tracks.itemSelectionChanged.connect(self._track_row_selected)
+        self.tracks.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tracks.customContextMenuRequested.connect(self._track_menu)
         self.incidents = IncidentView()
+        self.incidents.itemSelectionChanged.connect(self._incident_row_selected)
         self.zones_view = ZonesView()
         self.zones_view.itemSelectionChanged.connect(self._zone_selection_changed)
         self.zone_properties = ZonePropertiesPanel()
@@ -335,6 +365,25 @@ class ConsoleWindow(QMainWindow):
         self.setCentralWidget(central)
 
         self.status = self.statusBar()
+        # Permanent, on the right: it answers "where is that?" continuously, and
+        # a message that scrolled it away would make the plan view unreadable
+        # for the one purpose it exists for — sending somebody to a place.
+        self.ground_label = QLabel("")
+        self.ground_label.setObjectName("Caption")
+        self.ground_label.setToolTip(
+            "The ground point under the pointer. Ctrl+C copies it."
+        )
+        self.status.addPermanentWidget(self.ground_label)
+        self._ground_text = ""
+
+        # Locked to start with. After the status bar exists, not before: this
+        # puts the map into Select, which reports its mode, which writes to the
+        # status bar. Called too early it raised inside a Qt slot, and the
+        # swallowed exception's traceback held the whole window alive — the
+        # freeing test caught it, having been written for the same defect in a
+        # different disguise this morning.
+        self._set_configuring(False)
+
         self._set_status("Ready. Add a camera to begin.")
         self._build_menu()
 
@@ -387,6 +436,39 @@ class ConsoleWindow(QMainWindow):
         )
         self.remove_button.clicked.connect(self._remove_camera)
         row.addWidget(self.remove_button)
+
+        row.addSpacing(12)
+
+        # What the next click on the map does, as three buttons that are
+        # visibly one choice. Before this the same click panned, moved a camera
+        # or dropped a zone corner depending on state nothing on screen showed.
+        self.mode_buttons: dict[str, QPushButton] = {}
+        for mode, label, tip in (
+            (MODE_SELECT, "Select", "Click to select, drag to pan, wheel to zoom."),
+            (MODE_DRAW, "Draw", "Click each corner of a zone on the plan view."),
+            (MODE_MEASURE, "Measure",
+             "Click two points to measure the ground between them. Changes nothing."),
+        ):
+            button = QPushButton(label)
+            button.setCheckable(True)
+            button.setToolTip(tip)
+            button.setChecked(mode == MODE_SELECT)
+            button.clicked.connect(self._mode_button_clicked)
+            self.mode_buttons[mode] = button
+            row.addWidget(button)
+
+        self.configure_button = QPushButton("Configure")
+        self.configure_button.setCheckable(True)
+        self.configure_button.setToolTip(
+            "Unlock the controls that change the site: adding and removing "
+            "cameras, placing them, and drawing, reshaping or removing zones. "
+            f"Returns to Monitor on Escape, or after "
+            f"{CONFIGURE_IDLE_MILLIS // 60000} idle minutes."
+        )
+        self.configure_button.toggled.connect(self._set_configuring)
+        row.addWidget(self.configure_button)
+
+        row.addSpacing(12)
 
         self.zone_button = QPushButton("Add zone…")
         self.zone_button.setToolTip(
@@ -628,6 +710,113 @@ class ConsoleWindow(QMainWindow):
                 f"{len(self._sessions)} camera(s). Place them, then press Start."
             )
 
+    # ------------------------------------------------------------- modes
+
+    def _mode_button_clicked(self) -> None:
+        """Turn "a mode button was pressed" into "which mode".
+
+        Resolved from the sender rather than captured in a lambda: a lambda
+        holding the mode would also close over `self`, and a closure cell
+        holding the window is the reference cycle that kept every console alive
+        until interpreter shutdown and corrupted the heap on the way out. The
+        freeing test caught this one the moment it was written.
+        """
+        button = self.sender()
+        for mode, candidate in self.mode_buttons.items():
+            if candidate is button:
+                self._choose_mode(mode)
+                return
+
+    def _choose_mode(self, mode: str) -> None:
+        """Put the map into a mode from the toolbar."""
+        if mode == MODE_DRAW:
+            if not self._configuring:
+                self._set_status("Drawing needs Configure. Press Configure first.")
+                self._mode_changed(self.map.mode)
+                return
+            self._draw_zone()
+        elif mode == MODE_MEASURE:
+            if not self.map.begin_measure():
+                self._set_status(
+                    "Place a camera first: the map cannot measure without an origin."
+                )
+        else:
+            self.map.to_select()
+        self._mode_changed(self.map.mode)
+
+    def _mode_changed(self, mode: str) -> None:
+        """Keep the buttons showing what the map is actually doing.
+
+        Driven from the map rather than from the click, because a mode also
+        ends on its own — a drawing closes, a pick is taken — and a button left
+        checked after that is the ambiguity this was built to remove.
+        """
+        for name, button in self.mode_buttons.items():
+            button.setChecked(name == mode or (mode == "place" and name == MODE_SELECT))
+        # Deliberately does not touch the status bar. It used to call
+        # `_refresh_status`, which overwrote the very message that said why a
+        # mode had been refused — the operator saw the refusal for no frames at
+        # all. The mode is shown by the buttons and by the map's own band.
+
+    # --------------------------------------------------- monitor / configure
+
+    def _configure_only(self) -> list:
+        """The controls that change the site rather than watch it."""
+        return [
+            self.open_button, self.place_button, self.map_place_button,
+            self.remove_button, self.zone_button, self.draw_zone_button,
+            self.reshape_zone_button, self.remove_zone_button,
+            self.zone_properties.apply_button,
+        ]
+
+    def _set_configuring(self, on: bool) -> None:
+        """Unlock or relock the controls that change the site.
+
+        Undo helps the operator who notices a mis-drag. A lock protects against
+        the one who does not — and a console left in a control room is left in
+        whatever state the last person walked away from, which is why this
+        re-arms itself.
+        """
+        was, self._configuring = self._configuring, bool(on)
+        for control in self._configure_only():
+            control.setEnabled(self._configuring)
+        if self.configure_button.isChecked() != self._configuring:
+            self.configure_button.setChecked(self._configuring)
+
+        if self._configuring:
+            self._idle_timer.start(CONFIGURE_IDLE_MILLIS)
+        else:
+            self._idle_timer.stop()
+            # Whatever was half-drawn goes with the mode: a zone corner placed
+            # in Configure must not be completed after it has relocked.
+            self.map.to_select()
+            self._pick_action = None
+
+        if was != self._configuring:
+            self.store.audit(
+                ACTOR,
+                "console.configure.entered" if self._configuring else "console.configure.left",
+                self.node.node_id,
+                "unlocked the controls that change the site"
+                if self._configuring
+                else "relocked",
+            )
+            self._set_status("Configure: the site can be changed." if self._configuring
+                             else "Monitor: the site is locked.")
+
+    def _relock(self) -> None:
+        """The idle timeout fired."""
+        if self._configuring:
+            self._set_configuring(False)
+            self._set_status(
+                f"Monitor: relocked after {CONFIGURE_IDLE_MILLIS // 60000} idle minutes."
+            )
+
+    def _touch(self) -> None:
+        """Any deliberate action restarts the idle countdown."""
+        if self._configuring:
+            self._idle_timer.start(CONFIGURE_IDLE_MILLIS)
+
     def _toggle_detections(self, show: bool) -> None:
         for session in self._sessions.values():
             session.view.set_show_detections(show)
@@ -641,6 +830,7 @@ class ConsoleWindow(QMainWindow):
         their identity — a camera being placed does not make the people it was
         already following into different people.
         """
+        self._touch()
         session = self._selected
         if session is None:
             QMessageBox.information(self, "No camera", "Add a camera first.")
@@ -700,6 +890,7 @@ class ConsoleWindow(QMainWindow):
         and there is no undo — though what the camera saw is kept, and the
         confirmation says so.
         """
+        self._touch()
         session = self._selected
         if session is None:
             QMessageBox.information(self, "No camera", "There is no camera to remove.")
@@ -734,6 +925,7 @@ class ConsoleWindow(QMainWindow):
 
     def _place_camera_on_map(self) -> None:
         """Move the selected camera to a point clicked on the plan view."""
+        self._touch()
         session = self._selected
         if session is None:
             QMessageBox.information(self, "No camera", "Add a camera first.")
@@ -777,6 +969,7 @@ class ConsoleWindow(QMainWindow):
 
     def _add_zone_dialog(self) -> None:
         """Ask what kind of zone, how big, and where, then create it."""
+        self._touch()
         if self._pose is None and not any(s.pose for s in self._sessions.values()):
             QMessageBox.information(
                 self,
@@ -809,6 +1002,7 @@ class ConsoleWindow(QMainWindow):
 
     def _draw_zone(self) -> None:
         """Draw a zone of any shape on the plan view."""
+        self._touch()
         if not self._placed_anywhere():
             QMessageBox.information(
                 self,
@@ -833,6 +1027,7 @@ class ConsoleWindow(QMainWindow):
         self._create_zone(tuple(ring), name=dialog.name() or None, kind=dialog.kind())
 
     def _edit_outline(self) -> None:
+        self._touch()
         zone_id = self.zones_view.selected_zone_id()
         if zone_id is None or not self.map.begin_edit(zone_id):
             QMessageBox.information(self, "No zone selected", "Select a zone to reshape.")
@@ -867,6 +1062,123 @@ class ConsoleWindow(QMainWindow):
         zone_id = self.zones_view.selected_zone_id()
         self.map.select_zone(zone_id)
         self._sync_zone_properties()
+        if not self._syncing and zone_id is not None:
+            self.selection.select(Selection.zone(zone_id))
+
+    # ------------------------------------------------------------- selection
+
+    def _selection_changed(self, selection) -> None:
+        """One selected thing, shown by every panel that can show it.
+
+        Guarded, because each panel answers by emitting its own "the user
+        picked something" signal, and without the guard a click on the map
+        would come back from the table as a second selection.
+        """
+        if self._syncing:
+            return
+        self._syncing = True
+        try:
+            self.map.set_selection(selection)
+            for session in self._sessions.values():
+                session.view.set_selection(selection)
+            self.incidents.set_selection(selection)
+            self._show_selected_track_row(selection)
+            if selection is not None and selection.kind == "zone":
+                self.zones_view.select(selection.zone_id)
+                self.detail_tabs.setCurrentIndex(1)
+            elif selection is not None and selection.kind == "track":
+                self.detail_tabs.setCurrentIndex(0)
+        finally:
+            self._syncing = False
+        self._refresh_status()
+
+    def _show_selected_track_row(self, selection) -> None:
+        if selection is None or selection.kind != "track":
+            self.tracks.clearSelection()
+            return
+        for index in range(self.tracks.topLevelItemCount()):
+            item = self.tracks.topLevelItem(index)
+            if item.data(0, Qt.ItemDataRole.UserRole) == (
+                selection.camera_id, selection.track_id
+            ):
+                self.tracks.setCurrentItem(item)
+                item.setSelected(True)
+                self.tracks.scrollToItem(item)
+                return
+
+    def _track_row_selected(self) -> None:
+        if self._syncing:
+            return
+        item = self.tracks.currentItem()
+        key = item.data(0, Qt.ItemDataRole.UserRole) if item is not None else None
+        if key is not None:
+            self.selection.select(Selection.track(key[0], key[1]))
+
+    def _incident_row_selected(self) -> None:
+        if self._syncing:
+            return
+        incident_id = self.incidents.selected_incident_id()
+        if incident_id is not None:
+            self.selection.select(Selection.incident(incident_id))
+
+    # --------------------------------------------------------- ground readout
+
+    def _ground_moved(self, point) -> None:
+        """Where the pointer is on the ground, continuously.
+
+        Distance and bearing are given from the selected camera when one is
+        selected, otherwise from the first placed camera — an operator reading
+        "37 m at 148°" needs to know what it is 37 m from, so the label always
+        names it.
+        """
+        if point is None:
+            self._ground_text = ""
+            self.ground_label.setText("")
+            return
+
+        reference = None
+        chosen = self.selection.current
+        if chosen is not None and chosen.camera_id in self._sessions:
+            reference = self._sessions[chosen.camera_id]
+        if reference is None or reference.pose is None:
+            reference = next(
+                (s for s in self._sessions.values() if s.pose is not None), None
+            )
+
+        parts = [f"{point.lat:+.6f}, {point.lon:+.6f}"]
+        if reference is not None and reference.pose is not None:
+            metres = haversine_distance(reference.pose.position, point)
+            bearing = bearing_degrees(reference.pose.position, point)
+            parts.insert(0, f"{metres:.1f} m at {bearing:.0f}° from {reference.camera_id}")
+        self._ground_text = "  ·  ".join(parts)
+        self.ground_label.setText(self._ground_text)
+
+    def _copy_ground(self) -> None:
+        """Ctrl+C: put the readout on the clipboard, or say there is nothing."""
+        from PySide6.QtGui import QGuiApplication
+
+        if not self._ground_text:
+            self._set_status("Nothing to copy: move the pointer over the plan view.")
+            return
+        QGuiApplication.clipboard().setText(self._ground_text)
+        self._set_status(f"Copied: {self._ground_text}")
+
+    def _track_menu(self, position) -> None:
+        """Right-click a track row: copy where it is."""
+        from PySide6.QtGui import QGuiApplication
+        from PySide6.QtWidgets import QMenu
+
+        item = self.tracks.itemAt(position)
+        if item is None:
+            return
+        key = item.data(0, Qt.ItemDataRole.UserRole)
+        where = item.text(8) if item.columnCount() > 8 else ""
+        menu = QMenu(self)
+        action = menu.addAction("Copy position")
+        action.setEnabled(bool(where) and where != "not placed")
+        if menu.exec(self.tracks.viewport().mapToGlobal(position)) is action and action.isEnabled():
+            QGuiApplication.clipboard().setText(where)
+            self._set_status(f"Copied #{key[1]} on {key[0]}: {where}")
 
     def _assess_zones(self, placed: dict) -> tuple[dict, dict]:
         """Coverage report and warnings for every zone, by id."""
@@ -918,6 +1230,7 @@ class ConsoleWindow(QMainWindow):
         self._set_status(f"{name} is now {kind.value.lower()}.")
 
     def _remove_zone(self) -> None:
+        self._touch()
         zone_id = self.zones_view.selected_zone_id()
         zone = next((z for z in self._zones if z.id == zone_id), None)
         if zone is None:
@@ -1275,6 +1588,9 @@ class ConsoleWindow(QMainWindow):
                 )
 
     def _track_row(self, camera_id: str, track, update, info) -> QTreeWidgetItem:
+        # The row's key is (camera, id): a track id is only unique within one
+        # camera, and a table holding two cameras' rows would otherwise select
+        # the wrong object as soon as both ran.
         duration = (track.last_seen_millis - track.first_seen_millis) / 1000.0
         gap = update.result.timestamp_millis - track.last_seen_millis
 
@@ -1312,6 +1628,7 @@ class ConsoleWindow(QMainWindow):
             radius,
             origin,
         ])
+        item.setData(0, Qt.ItemDataRole.UserRole, (camera_id, track.id))
         item.setForeground(
             1, theme.TRACK_COASTING if gap > theme.COASTING_AFTER_MILLIS else theme.TRACK
         )
@@ -1361,6 +1678,25 @@ class ConsoleWindow(QMainWindow):
             "downloads.\n\n"
             "See STATUS.md for what is implemented and what is not.",
         )
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        """Escape means "never mind", everywhere.
+
+        The map handles it first when it is mid-gesture — abandoning a drawing
+        matters more than clearing a selection — and this catches the rest.
+        """
+        if event.key() == Qt.Key.Key_Escape:
+            if self.map.drawing or self.map.editing or self.map.picking:
+                self.map.cancel_draw()
+                self.map.cancel_edit()
+                self.map.cancel_pick()
+                self._pick_action = None
+                self._set_status("Cancelled.")
+            else:
+                self.selection.clear()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt naming
         """Shut down in the order that cannot leave something writing.

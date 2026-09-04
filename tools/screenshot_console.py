@@ -190,6 +190,10 @@ def main() -> int:
     )
     window._refresh_placement()
 
+    # An operator unlocks the site before changing it. The console opens in
+    # Monitor, so without this every configure control photographs greyed out.
+    window.configure_button.setChecked(True)
+
     # A zone the camera can actually see, placed the way the console places one
     # — and a second of another kind, at a picked point, because a plan view
     # with one red square says nothing about whether kinds are told apart.
@@ -234,6 +238,16 @@ def main() -> int:
     # coverage line in the band is photographed with the rubber band.
     from PySide6.QtCore import QPoint, Qt
     from PySide6.QtTest import QTest
+
+    # A measurement across the ground, left on screen for the plan-view shot:
+    # it is the one map gesture that changes nothing.
+    if window.map.begin_measure():
+        window.map._measure = [
+            destination_point(session.pose.position, session.pose.heading - 8.0, 18.0),
+            destination_point(session.pose.position, session.pose.heading + 14.0, 46.0),
+        ]
+        shoot(window.map, f"{prefix}10-measure")
+        window.map.cancel_measure()
 
     if window.map.begin_draw("Draw a zone"):
         view = window.map

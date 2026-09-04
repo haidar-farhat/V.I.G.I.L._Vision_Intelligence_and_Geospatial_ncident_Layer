@@ -269,6 +269,41 @@ Every warning is a warning, never a refusal. A zone nothing can see is still
 created, because you may be about to place the camera that fixes it; the status
 bar and the properties panel say what is wrong with it until you do.
 
+### One selected thing, and what the next click will do
+
+Click a track's disc on the plan view and the same object is outlined on its
+camera pane and highlighted in the track table. Click an incident and it is
+selected too. **Escape clears it.** Exactly one thing is selected at a time, in
+one colour, everywhere — a track is identified by *camera and id*, because `#3`
+on the gate and `#3` on the yard are different people.
+
+Hovering tells you what the system actually knows: for a track, the distance and
+bearing from its camera, the 1σ error, and whether the position was projected
+onto the ground or fell back to "something at this camera" — the fallback is
+drawn as a dashed ring rather than a filled dot, because it is not a location.
+
+The status bar shows the ground under the pointer continuously, named from the
+camera it is measured from. **Ctrl+C** copies it; right-clicking a track row
+copies that object's position.
+
+| mode | what a click does |
+|---|---|
+| **Select** (default) | selects what is under the pointer; drag pans, wheel zooms |
+| **Draw** | places zone corners. Needs Configure |
+| **Measure** | two clicks give metres and bearing. Changes nothing, so it works while locked |
+
+### Monitor and Configure
+
+The console opens in **Monitor**: watch, select, hover, pan, zoom, measure.
+Anything that changes the site — adding or removing a camera, placing one,
+drawing, reshaping or removing a zone, editing zone properties — needs
+**Configure**, which you turn on in the toolbar. It turns itself off on Escape
+or after ten idle minutes, abandoning anything half-drawn, and both edges are
+written to the audit log.
+
+Undo helps the operator who notices a mis-drag. A lock protects against the one
+who does not.
+
 ### Reading the plan view
 
 | what you see | what it means |

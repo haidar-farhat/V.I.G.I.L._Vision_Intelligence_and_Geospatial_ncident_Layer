@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 
 import numpy as np
 
-from PySide6.QtCore import QPointF, QRectF, Qt
+from PySide6.QtCore import Signal, QPointF, QRectF, Qt
 from PySide6.QtGui import (
     QBrush,
     QColor,
@@ -35,6 +35,7 @@ from PySide6.QtWidgets import QSizePolicy, QWidget
 from sentinel.detect import DetectorInfo
 
 from . import theme
+from .selection import Selection
 from sentinel.node import Update
 
 
@@ -100,6 +101,10 @@ def _mask_image(mask: "np.ndarray", colour: QColor) -> QImage:
 class VideoView(QWidget):
     """Renders the current frame and its overlay."""
 
+    #: A `Selection` for a box the operator clicked, or ``None`` for the frame
+    #: itself. The pane does not decide what selection means; it reports one.
+    clicked = Signal(object)
+
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self.setMinimumSize(480, 360)
@@ -111,6 +116,9 @@ class VideoView(QWidget):
         self._info: DetectorInfo | None = None
         self._show_detections = True
         self._placeholder = "No source running"
+        #: Which camera this pane is. A track id means nothing without it.
+        self.camera_id: str = ""
+        self._selection: Selection | None = None
 
     # ------------------------------------------------------------------ inputs
 
@@ -125,6 +133,44 @@ class VideoView(QWidget):
         self._pixmap = None
         self._update = None
         self.update()
+
+    def set_selection(self, selection: "Selection | None") -> None:
+        """Highlight the selected track's box, if it is this camera's."""
+        self._selection = selection
+        self.update()
+
+    def hit_test(self, position) -> "Selection | None":
+        """The track whose box is under this point, smallest box first.
+
+        Smallest first because boxes nest: a person standing in front of a car
+        is entirely inside the car's box, and testing largest-first would make
+        the person unclickable.
+        """
+        if self._update is None or not self.camera_id:
+            return None
+        target = self._fit_rect()
+        if target.isEmpty():
+            return None
+
+        best: tuple[float, Selection] | None = None
+        for track in self._update.result.tracks:
+            box = track.bbox
+            rect = QRectF(
+                target.x() + box.x * target.width(),
+                target.y() + box.y * target.height(),
+                box.w * target.width(),
+                box.h * target.height(),
+            )
+            if rect.contains(position):
+                area = rect.width() * rect.height()
+                if best is None or area < best[0]:
+                    best = (area, Selection.track(self.camera_id, track.id))
+        return None if best is None else best[1]
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit(self.hit_test(event.position()))
+        super().mousePressEvent(event)
 
     def set_show_detections(self, show: bool) -> None:
         self._show_detections = show
@@ -238,6 +284,13 @@ class VideoView(QWidget):
             gap = result.timestamp_millis - track.last_seen_millis
             coasting = gap > theme.COASTING_AFTER_MILLIS
             colour = theme.TRACK_COASTING if coasting else theme.TRACK
+            if self._selection is not None and self._selection.is_track(
+                self.camera_id, track.id
+            ):
+                # One highlight colour across every panel, so the thing picked
+                # on the map is the thing outlined here without the operator
+                # matching numbers by eye.
+                colour = theme.SELECTION
 
             pen = QPen(colour, 2.0)
             pen.setStyle(Qt.PenStyle.DashLine if coasting else Qt.PenStyle.SolidLine)
