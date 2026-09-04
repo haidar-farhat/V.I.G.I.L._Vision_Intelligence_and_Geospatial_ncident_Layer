@@ -130,7 +130,7 @@ class GroundGrid:
         if self.columns < 1 or self.rows < 1:
             raise OrthophotoError(
                 "a grid needs at least one cell in each direction; "
-                f"{self.columns}×{self.rows} was given"
+                f"{self.columns} by {self.rows} was given"
             )
 
     @property
@@ -170,7 +170,8 @@ class GroundGrid:
         """
         if not self.contains(row, column):
             raise OrthophotoError(
-                f"cell ({row}, {column}) is outside a {self.rows}×{self.columns} grid"
+                f"cell ({row}, {column}) is outside a "
+                f"{self.rows} by {self.columns} grid"
             )
         x, y = self.cell_xy(row, column)
         return _frame_for(self.origin).to_latlon(x, y)
@@ -247,6 +248,13 @@ class GroundPatch:
     travels with the colour because it is what makes one camera's version of a
     cell better than another's. It grows toward the horizon, so the far half of
     a patch is both blurrier and less certainly *where* it says it is.
+
+    It is finite on every valid cell and NaN on every invalid one, with nothing
+    in between: a cell this patch offers as ground whose error nobody measured
+    is refused where it enters :class:`MedianAccumulator` or :func:`mosaic`,
+    because there is no number to put in its place that is not a lie. Zero would
+    outrank a surveyed camera and NaN reads as "no ground here" to whatever
+    draws the result.
 
     Equality is off: two patches are megabytes of pixels, and a dataclass
     ``__eq__`` over numpy arrays raises rather than answers.
@@ -346,6 +354,29 @@ class Mosaic:
             "not a photograph."
         )
         return "\n".join(lines)
+
+
+def _refuse_unknown_cell_error(patch: GroundPatch) -> None:
+    """Refuse a patch that offers ground whose position error nobody measured.
+
+    ``sigma_m`` is NaN exactly where ``valid`` is false, and both producers here
+    keep that. A NaN on a *valid* cell is a cell whose error is unknown, and no
+    substitute for it is honest: zero — the obvious one — makes an unmeasured
+    cell beat every surveyed camera in :func:`mosaic`, which is the same failure
+    that function already refuses a missing pose error for, and NaN carried
+    through means a renderer that tests for it erases ground a camera really
+    saw. So the patch is refused at the door, naming the camera, rather than
+    averaged over somewhere the operator will read the result as surveyed.
+    """
+    unknown = int(np.count_nonzero(patch.valid & np.isnan(patch.sigma_m)))
+    if unknown:
+        raise OrthophotoError(
+            f"patch {patch.camera_id!r} offers {unknown:,} cell(s) as ground "
+            "whose position error is unknown (sigma_m is NaN where valid is "
+            "true). There is no safe stand-in: zero would let those cells "
+            "outrank a surveyed camera, and NaN reads as 'no ground here' to "
+            "anything that draws the result."
+        )
 
 
 def _as_three_dimensional(image: np.ndarray) -> np.ndarray:
@@ -463,7 +494,7 @@ def sample_frame(
     image: np.ndarray,
     grid: GroundGrid,
     *,
-    camera_id: str = "camera",
+    camera_id: str,
     captured_at: float | None = None,
     lattice: int = DEFAULT_LATTICE,
     angular_uncertainty_deg: float = 1.5,
@@ -485,6 +516,11 @@ def sample_frame(
     module's docstring: exact at the lattice nodes, piecewise-linear between,
     and biased inward at the footprint edge so no cell is claimed that the pose
     does not reach.
+
+    ``camera_id`` is required and has no default. Every cell of the mosaic this
+    feeds names the camera it came from, and a default would name two different
+    masts the same thing — which is the one question a disputed cell has to be
+    able to answer.
     """
     picture = _as_three_dimensional(np.asarray(image))
     height, width = picture.shape[:2]
@@ -700,6 +736,10 @@ class MedianAccumulator:
                 f"the accumulator holds {self._channels}-channel colour; "
                 f"this patch has {patch.channels}"
             )
+        # Caught here rather than at the mosaic, where the camera named in the
+        # refusal would be this accumulator's own id and not the frame that
+        # arrived without an error to its name.
+        _refuse_unknown_cell_error(patch)
 
         rows, columns = np.nonzero(patch.valid)
         self._frames += 1
@@ -724,7 +764,7 @@ class MedianAccumulator:
             self._sigma[rows, columns], patch.sigma_m[rows, columns]
         )
 
-    def result(self, *, now: float | None = None, camera_id: str = "median") -> GroundPatch:
+    def result(self, *, camera_id: str, now: float | None = None) -> GroundPatch:
         """The median patch: the empty site, as far as the samples can show it.
 
         Cells with fewer than ``minimum_samples`` surviving observations come
@@ -735,6 +775,12 @@ class MedianAccumulator:
 
         ``updated_at`` is the newest sample behind each cell, so a renderer can
         fade stale ground without being told which frames went in.
+
+        ``camera_id`` is required and deliberately has no default. It used to
+        default to ``"median"``, which named every accumulator's result the same
+        thing — so the ordinary pipeline, one accumulator per camera, produced a
+        set of patches that :func:`mosaic` could not tell apart and a ``source``
+        index that resolved back to nobody.
         """
         filled = np.arange(self._capacity, dtype=np.uint32)[:, None, None] < np.minimum(
             self._written, self._capacity
@@ -791,9 +837,16 @@ def mosaic(
     contributions, one from where the ray lands and one from how well the mast
     is surveyed.
 
-    ``sigma_by_camera`` is required, and a camera missing from it is an error
-    rather than a zero. Defaulting an unsurveyed camera to a perfect pose would
-    let it win every cell it touches, which is precisely backwards.
+    Both halves of that rank must be evidence, so both are refused when they
+    are not. A camera missing from ``sigma_by_camera`` is an error rather than a
+    zero — defaulting an unsurveyed camera to a perfect pose would let it win
+    every cell it touches, which is precisely backwards — and so is a patch that
+    offers a cell as ground without an error for it, for exactly the same
+    reason one cell lower down.
+
+    Two patches claiming the same ``camera_id`` are refused too. A cell's
+    ``source`` has to resolve to one camera and one pose to be worth keeping,
+    and a repeated id makes it resolve to whichever patch sorted first.
 
     Cells no patch covers stay empty. Nothing is interpolated across them, ever.
     """
@@ -802,6 +855,7 @@ def mosaic(
 
     grid = patches[0].grid
     channels = patches[0].channels
+    claimed: set[str] = set()
     for patch in patches:
         if patch.grid != grid:
             raise OrthophotoError(
@@ -820,6 +874,18 @@ def mosaic(
                 "unknown cannot be ranked against one whose is, and assuming "
                 "zero would make it win every cell it can see."
             )
+        if patch.camera_id in claimed:
+            raise OrthophotoError(
+                f"two patches both claim to come from camera "
+                f"{patch.camera_id!r}. A cell's source must resolve to one "
+                "camera and one pose: with a repeated id the winner is "
+                "whichever patch sorted first, `cells_from` under-reports by "
+                "however many patches share the name, and an operator "
+                "disputing what is drawn under a fence line gets an index "
+                "that names nobody in particular."
+            )
+        claimed.add(patch.camera_id)
+        _refuse_unknown_cell_error(patch)
 
     ordered = sorted(patches, key=lambda patch: patch.camera_id)
     cameras = tuple(patch.camera_id for patch in ordered)
@@ -836,11 +902,13 @@ def mosaic(
                 f"the pose error for camera {patch.camera_id!r} is {pose_sigma}; "
                 "it must be a non-negative number of metres"
             )
-        # NaN sigma on a valid cell would compare false against everything and
-        # silently lose every contest, so a patch built without projection
-        # uncertainty falls back to the pose error alone.
-        cell_sigma = np.where(np.isnan(patch.sigma_m), 0.0, patch.sigma_m)
-        effective = np.hypot(cell_sigma, pose_sigma)
+        # Every valid cell carries its own measured error — a patch that did
+        # not was refused above — so what ranks the cameras here is evidence the
+        # whole way down: where the ray landed, and how well the mast it came
+        # from is surveyed, in quadrature. Substituting zero for an unmeasured
+        # cell was the bug this replaced: it handed the least-known camera the
+        # smallest number and printed its guess as a surveyed one.
+        effective = np.hypot(patch.sigma_m.astype(np.float64), pose_sigma)
         # Strictly better, over patches in camera-id order: a tie goes to the
         # first camera by name, so the same inputs always give the same mosaic.
         wins = patch.valid & (effective < best)

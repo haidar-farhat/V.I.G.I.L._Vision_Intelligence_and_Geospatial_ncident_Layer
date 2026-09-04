@@ -495,6 +495,11 @@ class PlateAccumulator:
     was dropped — the same guess this class exists to refuse. The count of
     reads set aside is reported so a track whose reads never settled on a length
     is visibly that, rather than quietly a short reading.
+
+    **A read folded for another country is refused outright.** A reading carries
+    a country, and a country stamped on characters that were folded to somebody
+    else's format — or to no format at all — is a claim the evidence does not
+    support. See :meth:`add` for the register key that mismatch splits in two.
     """
 
     __slots__ = ("_country", "_min_agreement", "_min_confidence", "_reads")
@@ -525,7 +530,31 @@ class PlateAccumulator:
         return len(self._reads)
 
     def add(self, read: PlateRead) -> None:
-        """Take one frame's read. Empty reads are dropped, not counted as votes."""
+        """Take one frame's read. Empty reads are dropped, not counted as votes.
+
+        A read normalised for a different country is refused. This accumulator's
+        country and the reader's are configured in two different places, so
+        nothing but this check stands between a mismatch and a :class:`Reading`
+        that says ``UK`` over characters no UK format ever folded: ``AB12 CD0``
+        keys as ``AB12CD0`` under :data:`GENERIC` and as ``AB12CDO`` under
+        ``UK``, so one vehicle reaches the register twice, under two keys, both
+        stamped ``UK``. That is the claim-without-evidence failure this whole
+        module is written against, and it is silent — both readings look right.
+
+        Refusing rather than quietly re-folding is deliberate. Re-folding would
+        have to start from ``raw_text`` and would repair, invisibly and on every
+        read of every track, a misconfiguration that is worth one loud error at
+        the moment the two settings first disagree.
+        """
+        if read.country.upper() != self._country:
+            raise ValueError(
+                f"a read normalised for {read.country.upper()!r} cannot be counted "
+                f"by a {self._country!r} accumulator: {read.raw_text!r} keys as "
+                f"{read.text!r} under the first and "
+                f"{normalise(read.raw_text, self._country)!r} under the second, so "
+                "counting it here would file one vehicle under two keys. Read the "
+                "plate with the country this accumulator was built for."
+            )
         if not read.text:
             return
         self._reads.append(read)

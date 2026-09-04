@@ -493,6 +493,46 @@ def test_an_incident_that_was_already_running_when_the_window_opened_is_found(
     assert incidents_across.items[0].closed_at_millis > 160_000
 
 
+def test_an_incident_is_matched_by_evidence_the_window_does_not_contain(store: Store):
+    """The price of matching incidents by overlap, recorded rather than left
+    to be discovered by whoever reads the filter bar and believes it.
+
+    The window here contains the incident's *rapid movement* event and not its
+    after-hours one, yet a filter for after-hours returns the incident. That is
+    the documented behaviour: for an incident the window is asked of its span and
+    the type is asked of its events, with no time bound on the second, so a type
+    filter names evidence anywhere in the incident. The alternative — pushing the
+    window into the EXISTS as well — would drop every incident that was already
+    running when the window opened, which is the case the test above exists for.
+
+    The same query against the events is measured beside it, because the contrast
+    is the whole of the point: the console panel that shows nothing here shows
+    one incident there, and neither is wrong.
+    """
+    window = Window(BASE + 170_000, BASE + 190_000)
+    query = Query(window=window, types=EventType.AFTER_HOURS_PRESENCE)
+
+    found = search_incidents(store, query)
+    inside = search_events(store, query)
+    matching = [
+        event
+        for event in found.items[0].events
+        if event.type is EventType.AFTER_HOURS_PRESENCE
+    ]
+    at_millis = int(matching[0].occurred_at.timestamp() * 1000)
+    print(
+        f"{found.total} incident(s), {inside.total} event(s) inside; "
+        f"its after-hours evidence lands {window.start_millis - at_millis} ms "
+        "before the window opened"
+    )
+
+    assert found.total == 1
+    assert inside.total == 0, "no after-hours event was supposed to be inside"
+    assert len(matching) == 1, "the fixture wanted exactly one piece of evidence"
+    assert at_millis < window.start_millis
+    assert not window.contains(at_millis)
+
+
 def test_incidents_come_back_newest_first_with_a_total_beside_them(store: Store):
     page = search_incidents(store, Query(limit=1))
     everything = search_incidents(store)

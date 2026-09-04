@@ -241,6 +241,11 @@ def similarity(left: FaceTemplate, right: FaceTemplate) -> float:
     with itself a few ulps above 1.0, and a score printed as 1.0000000000000002
     beside a name reads as a bug in the thing an operator is being asked to
     trust.
+
+    This is the two-template helper, for a caller holding exactly two. Nothing
+    that compares a track against a register is built out of it: see
+    :class:`_Register` for why a per-pair loop over this function is the wrong
+    shape by two orders of magnitude.
     """
     value = float(np.dot(left.as_array(), right.as_array()))
     return float(np.clip(value, -1.0, 1.0))
@@ -382,6 +387,80 @@ NO_IDENTITY = TrackIdentity(
 )
 
 
+@dataclass(frozen=True, slots=True, eq=False)
+class _Register:
+    """The whole register as one matrix, because a comparison is not a loop.
+
+    Every comparison this module makes is the same arithmetic — a unit vector
+    against every enrolled unit vector — and that is one matrix multiply, not a
+    Python loop calling :func:`similarity` per pair. The difference is not
+    academic: a thirty-frame track against fifty people of five templates each
+    is 7,500 dot products, which measured 92 ms as a loop and a fraction of a
+    millisecond as one ``A @ B.T`` on this machine. A camera worker identifying
+    tracks on a cadence pays that per track, and it grows with the register the
+    operator is being encouraged to build — so the loop punished a site for
+    enrolling people.
+
+    ``starts`` is where each person's block of templates begins, which is what
+    lets ``np.maximum.reduceat`` collapse the full score matrix to a best score
+    per person per frame in one pass. People with no templates are dropped when
+    this is built rather than skipped in a branch further down: an empty person
+    cannot contribute a score, and leaving them out is what keeps ``starts`` an
+    honest index into ``vectors``.
+
+    Deliberately built per call and never cached. A module-level cache of
+    registers would be a second copy of the site's biometrics, outliving the
+    ``forget_person`` that was supposed to delete them and held somewhere no
+    audit row describes. Restacking costs microseconds; a hidden register costs
+    the argument for the whole feature.
+    """
+
+    people: tuple[EnrolledPerson, ...]
+    #: ``(M, TEMPLATE_DIMENSIONS)``, every enrolled template, people in order.
+    vectors: np.ndarray
+    #: ``(P,)``, the row where each person's templates start.
+    starts: np.ndarray
+
+    @property
+    def compared(self) -> int:
+        """How many templates a comparison against this actually looks at."""
+        return int(self.vectors.shape[0])
+
+    def scores_for(self, templates: Sequence[FaceTemplate]) -> np.ndarray:
+        """``(frames, people)`` — each frame's best score against each person.
+
+        The clamp is :func:`similarity`'s, for :func:`similarity`'s reason: a
+        template against itself lands a few ulps above 1.0, and a score above
+        one printed beside a name reads as a broken instrument.
+        """
+        faces = np.asarray(
+            [template.vector for template in templates], dtype=np.float64
+        )
+        every = np.clip(faces @ self.vectors.T, -1.0, 1.0)
+        return np.maximum.reduceat(every, self.starts, axis=1)
+
+
+def _register_of(enrolled: Sequence[EnrolledPerson]) -> "_Register | None":
+    """Stack a register once, or ``None`` when there is nobody to compare against.
+
+    ``None`` rather than an empty matrix, because "nobody is enrolled" is a
+    different answer from "everybody scored badly" and the callers must not be
+    able to blur the two — that distinction is what :data:`NO_MATCH` carries.
+    """
+    people = tuple(person for person in enrolled if person.templates)
+    if not people:
+        return None
+    counts = [len(person.templates) for person in people]
+    return _Register(
+        people=people,
+        vectors=np.asarray(
+            [template.vector for person in people for template in person.templates],
+            dtype=np.float64,
+        ),
+        starts=np.cumsum([0] + counts[:-1], dtype=np.intp),
+    )
+
+
 def match(template: FaceTemplate, enrolled: Sequence[EnrolledPerson]) -> Match:
     """Compare one face against the register and say which of three things it is.
 
@@ -394,20 +473,18 @@ def match(template: FaceTemplate, enrolled: Sequence[EnrolledPerson]) -> Match:
     An empty register returns :data:`NO_MATCH`, whose score is ``None``. It has
     not decided this is a stranger; it has not looked at anybody.
     """
-    best_score: float | None = None
-    best_person: EnrolledPerson | None = None
-    compared = 0
-
-    for person in enrolled:
-        for enrolled_template in person.templates:
-            compared += 1
-            score = similarity(template, enrolled_template)
-            if best_score is None or score > best_score:
-                best_score = score
-                best_person = person
-
-    if best_score is None or best_person is None:
+    register = _register_of(enrolled)
+    if register is None:
         return NO_MATCH
+
+    # One row — this face against every enrolled template, collapsed to the best
+    # per person. ``argmax`` takes the first of any tie, which is the same
+    # arbitrary order the loop it replaced resolved ties in.
+    per_person = register.scores_for((template,))[0]
+    winner = int(np.argmax(per_person))
+    best_score = float(per_person[winner])
+    best_person = register.people[winner]
+    compared = register.compared
 
     verdict = verdict_for(best_score)
     if verdict is Verdict.NONE:
@@ -447,29 +524,20 @@ def identify_track(
     """
     if not templates or not enrolled:
         return NO_IDENTITY
-
-    best_person: EnrolledPerson | None = None
-    best_median = -2.0
-    best_frame = -2.0
-
-    for person in enrolled:
-        if not person.templates:
-            continue
-        per_frame = [
-            max(
-                similarity(template, enrolled_template)
-                for enrolled_template in person.templates
-            )
-            for template in templates
-        ]
-        median = float(np.median(per_frame))
-        if median > best_median:
-            best_median = median
-            best_frame = float(max(per_frame))
-            best_person = person
-
-    if best_person is None:
+    register = _register_of(enrolled)
+    if register is None:
         return NO_IDENTITY
+
+    # ``(frames, people)``: one matmul, then a median down the frame axis. The
+    # median is taken over a column rather than over a Python list built per
+    # person, so a longer track and a larger register cost arithmetic and not
+    # interpreter time.
+    per_person = register.scores_for(templates)
+    medians = np.median(per_person, axis=0)
+    winner = int(np.argmax(medians))
+    best_median = float(medians[winner])
+    best_frame = float(per_person[:, winner].max())
+    best_person = register.people[winner]
 
     verdict = verdict_for(best_median)
     if verdict is Verdict.MATCH and len(templates) < FRAMES_FOR_A_MATCH:
@@ -877,19 +945,49 @@ class FaceEngine:
         which turns "look inside this person" into "run a face detector over
         everything" — the exact behaviour this module promises never to do,
         arrived at silently.
+
+        **The size is what decides that, not the corner.** Checking only ``x``
+        and ``y`` left the whole failure open behind a legal-looking origin:
+        ``BoundingBox(0.0, 0.0, 200.0, 150.0)`` starts at the top-left of any
+        image, and clamping its width handed the detector every pixel of every
+        frame. So ``w`` and ``h`` carry the same bound as ``x`` and ``y``, and
+        they are the half that closes the hole — a box whose *extent* is a
+        fraction of the frame can only ever crop a fraction of it.
+
+        **A box running off an edge is a different thing, and is allowed.** The
+        tracker's own ``clamp_box`` pins a coasting box to ``x ∈ [-w, 1]`` and
+        deliberately leaves ``w`` alone, so a person walking out of the left or
+        right of frame is *supposed* to arrive here with ``x < 0`` or
+        ``x + w > 1``. Trimming that to the visible part is a crop of that
+        person and of nobody else; refusing it would raise on the most ordinary
+        event a camera sees. Rejecting the size while clamping the position is
+        the distinction: one describes a person, the other stopped describing
+        one at all.
         """
-        for value, label in ((person_box.x, "x"), (person_box.y, "y")):
-            if not -_BOX_TOLERANCE <= value <= 1.0 + _BOX_TOLERANCE:
-                raise FaceError(
-                    f"person box {label}={value} is not in normalised 0..1 "
-                    "coordinates; a pixel box here would silently become the "
-                    "whole frame"
-                )
         if person_box.w <= 0 or person_box.h <= 0:
             raise FaceError(
                 f"person box has no area ({person_box.w} x {person_box.h}); "
                 "there is nothing inside it to look at"
             )
+        for value, label in ((person_box.w, "w"), (person_box.h, "h")):
+            if value > 1.0 + _BOX_TOLERANCE:
+                raise FaceError(
+                    f"person box {label}={value} is not in normalised 0..1 "
+                    "coordinates; a pixel box here would silently become the "
+                    "whole frame"
+                )
+        for value, extent, label in (
+            (person_box.x, person_box.w, "x"),
+            (person_box.y, person_box.h, "y"),
+        ):
+            # A box may begin off the top or left edge by at most its own size,
+            # which is exactly the range the tracker clamps a coasting box into.
+            if not -extent - _BOX_TOLERANCE <= value <= 1.0 + _BOX_TOLERANCE:
+                raise FaceError(
+                    f"person box {label}={value} is not in normalised 0..1 "
+                    "coordinates; a pixel box here would silently become the "
+                    "whole frame"
+                )
 
         height, width = frame.shape[:2]
         left = max(0, int(round(person_box.x * width)))

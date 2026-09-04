@@ -23,8 +23,12 @@ source, so the two can never disagree:
   difference between an audit trail that can answer "which corner, and by how
   much" and one that can only say that somebody touched it.
 - :func:`describe` — the prose line, rebuilt from those changes in the voice
-  `_describe_zone_change` already uses, so adopting this does not change how the
-  existing log reads.
+  `_describe_zone_change` already uses. It reproduces that function's output
+  exactly for flat fields, for a schedule appearing or vanishing, and for a ring
+  that gained or lost corners; it differs in three cases, named and measured in
+  :func:`describe`'s own docstring, two of which read *worse* than the line they
+  would replace. Adopting it is therefore a visible change to an existing log
+  line and a decision for whoever wires it in, not a drop-in.
 - :class:`AuditRecord` — actor, action, subject, node, both states as canonical
   JSON, the changes, and :meth:`AuditRecord.chain`, a SHA-256 over this record's
   canonical bytes and the previous record's hash.
@@ -453,10 +457,35 @@ def describe(changes: Sequence[FieldChange]) -> str:
     record and the prose cannot drift apart — there is one comparison, and the
     string is a rendering of it — while the existing log keeps its voice.
 
-    One place this says *more* than the old line: a ring whose corners moved
-    without changing in number is named corner by corner, because the changes
-    carry that and "moved" threw it away. When corners were added or removed the
-    old wording is reproduced exactly, counts and all.
+    It is character-identical to `_describe_zone_change` for every flat field,
+    for a schedule appearing or vanishing, for a ring that gained or lost
+    corners, and for no change at all. **Three cases differ, and only the first
+    is an improvement.** They are stated here rather than discovered later,
+    because two of them would quietly make the log read worse:
+
+    1. A ring whose corners moved without changing in number is named corner by
+       corner — ``outline corner 2 moved`` where the old line said ``outline 4
+       -> 4 points, moved``. More information, not different information: the
+       changes carry which corner and "moved" threw it away.
+    2. A schedule edited in place reports the field inside it: ``schedule start
+       18:00:00 -> 19:00:00`` where the old line said ``schedule 18:00–06:00 on
+       Mon, Tue -> 19:00–06:00 on Mon, Tue``.
+    3. A change to a schedule's days reports the set: ``schedule days [1,2] ->
+       [1,2,3]`` where the old line said ``schedule 18:00–06:00 on Mon, Tue ->
+       18:00–06:00 on Mon, Tue, Wed``.
+
+    Cases 2 and 3 **lose** `Schedule.describe`'s wording — the operator-readable
+    form is replaced by a raw ``time.isoformat()`` and by a canonical JSON array
+    inside a prose line — and that is a degradation, not a trade. The cause is
+    structural rather than an oversight: :func:`diff` recurses into the schedule,
+    so a change at ``schedule.start`` carries one ``time`` and not the enclosing
+    :class:`~sentinel.zones.Schedule`, and the whole schedule cannot be rendered
+    from what the change holds. Fixing it means either passing the two subjects
+    in alongside the changes, or stopping the diff at the schedule and losing the
+    ``schedule.start`` / ``schedule.days`` paths that make it queryable. Both are
+    real designs and both change something already reviewed, so the choice is
+    named here and left to whoever adopts this rather than made silently. The
+    divergence is pinned by tests so it cannot widen unnoticed.
 
     Empty changes give ``"no change"``, which is what the existing function
     returns and what a caller comparing two identical zones should see.
@@ -668,6 +697,13 @@ class AuditRecord:
         ``before_json`` and ``after_json`` go in as the strings they are, escaped
         rather than embedded: a record whose bytes could be read two ways is a
         record whose hash could be met two ways.
+
+        Because it is a decision, it is pinned: one test asserts the exact key
+        set and another varies each of the eight in turn and requires the hash to
+        move. Without those, a later edit could *narrow* what the chain protects
+        — drop ``at``, drop ``before`` — and nothing would fail, which is a chain
+        that still verifies while no longer covering the two things an audit log
+        exists to fix: when it happened and what it was before.
         """
         return canonical_bytes(
             {

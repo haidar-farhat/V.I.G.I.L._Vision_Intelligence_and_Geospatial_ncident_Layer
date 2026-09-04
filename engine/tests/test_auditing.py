@@ -12,12 +12,20 @@ believing:
   changes when nothing did is a tamper alarm that gets switched off.
 - **A change is named where it happened.** ``ring[2].lat``, not "the outline
   changed". Which corner and how far is the question an auditor asks.
-- **The prose does not change voice.** The line this rebuilds is compared
-  character for character against `node._describe_zone_change`, which is what
-  operators have been reading.
-- **The chain detects alteration.** Editing one earlier record must break every
-  hash after it — and the test says *which* record, because "the log was
-  altered" is not actionable.
+- **The prose does not change voice, and where it does, the suite says so.**
+  Flat fields, a schedule appearing, an added or removed corner and "no change"
+  are compared character for character against `node._describe_zone_change`,
+  which is what operators have been reading. Three cases diverge, and each has a
+  test that spells out both strings rather than quietly skipping the comparison:
+  a same-length moved ring (which says more), and a schedule edited in place or
+  by its days (which say *less*, losing `Schedule.describe`'s wording). Recorded
+  here so that adopting `describe` is a decision made with the diff in hand.
+- **The chain detects alteration, over every field it claims to cover.** Editing
+  one earlier record must break every hash after it — and the test says *which*
+  record, because "the log was altered" is not actionable. Every one of the
+  eight hashed fields is varied in turn, because a test suite that still passes
+  when `at` or `before` is dropped from the digest is a suite that would let the
+  chain silently stop protecting them.
 
 No model, no database and no network is needed for any of it: everything below
 is built from `Zone`, `Schedule` and `LatLon`, which are values.
@@ -26,9 +34,11 @@ is built from `Zone`, `Schedule` and `LatLon`, which are values.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import subprocess
 import sys
+from dataclasses import replace
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 
@@ -397,12 +407,16 @@ def test_a_corner_added_to_the_outline_keeps_the_old_wording():
 
 
 def test_a_corner_that_only_moved_is_named_rather_than_counted():
-    # The one place this deliberately says more than the old line, which threw
-    # away which corner moved and printed "4 -> 4 points, moved".
-    line = describe(diff(zone(), zone(ring=moved_corner(2, north=0.0001))))
-    print(line)
+    # The third divergence, and the only one that says *more* than the old line:
+    # that threw away which corner moved and printed "4 -> 4 points, moved".
+    before = zone()
+    after = zone(ring=moved_corner(2, north=0.0001))
+    old, new = existing_line(before, after), describe(diff(before, after))
+    print("old:", old)
+    print("new:", new)
 
-    assert line == "outline corner 2 moved"
+    assert old == "outline 4 -> 4 points, moved"
+    assert new == "outline corner 2 moved"
 
 
 def test_several_moved_corners_are_all_named():
@@ -425,14 +439,57 @@ def test_clauses_are_joined_the_way_the_existing_line_joins_them():
     assert line.count(";") == 1
 
 
-def test_a_field_edited_inside_a_schedule_still_names_the_schedule():
-    before = zone(schedule=Schedule(time(18, 0), time(6, 0)))
-    after = zone(schedule=Schedule(time(19, 0), time(6, 0)))
-    line = describe(diff(before, after))
-    print(line)
+def scheduled(start: time, days=frozenset({1, 2})) -> Zone:
+    return zone(schedule=Schedule(start, time(6, 0), days))
 
-    assert line.startswith("schedule start ")
-    assert "18:00:00 -> 19:00:00" in line
+
+def test_a_schedule_edited_in_place_names_the_field_and_loses_the_old_wording():
+    """The first of the two divergences that read *worse* than the old line.
+
+    `diff` recurses into the schedule, so the change carries one `time` and not
+    the `Schedule` around it, and `describe` cannot rebuild what it never got.
+    Both strings are spelled out here rather than the comparison being skipped:
+    a divergence recorded only in prose is a divergence that widens unnoticed.
+    """
+    before, after = scheduled(time(18, 0)), scheduled(time(19, 0))
+    old, new = existing_line(before, after), describe(diff(before, after))
+    print("old:", old)
+    print("new:", new)
+
+    assert old == "schedule 18:00–06:00 on Mon, Tue -> 19:00–06:00 on Mon, Tue"
+    assert new == "schedule start 18:00:00 -> 19:00:00"
+    assert new != old, "the divergence has been closed; update the docstrings"
+
+
+def test_a_schedule_whose_days_changed_loses_the_old_wording_too():
+    """The second. `Schedule.describe` writes "on Mon, Tue"; this writes [1,2]."""
+    before = scheduled(time(18, 0))
+    after = scheduled(time(18, 0), frozenset({1, 2, 3}))
+    old, new = existing_line(before, after), describe(diff(before, after))
+    print("old:", old)
+    print("new:", new)
+
+    assert old == (
+        "schedule 18:00–06:00 on Mon, Tue -> 18:00–06:00 on Mon, Tue, Wed"
+    )
+    assert new == "schedule days [1,2] -> [1,2,3]"
+    assert new != old, "the divergence has been closed; update the docstrings"
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "describe() cannot rebuild a whole Schedule from a change at "
+        "schedule.start. Closing this needs either the two subjects passed in "
+        "alongside the changes or a diff that stops at the schedule; both are "
+        "named in describe()'s docstring. Strict, so whoever closes it is told "
+        "to update the three docstrings that record the divergence."
+    ),
+)
+def test_a_schedule_edited_in_place_would_ideally_read_like_the_existing_line():
+    before, after = scheduled(time(18, 0)), scheduled(time(19, 0))
+
+    assert describe(diff(before, after)) == existing_line(before, after)
 
 
 # ------------------------------------------------------------------ the record
@@ -484,6 +541,60 @@ def test_two_records_differing_only_in_actor_hash_differently():
     theirs = record(actor="someone else", before=zone(), after=zone(name="North yard"))
 
     assert mine.chain(None) != theirs.chain(None)
+
+
+def test_the_hashed_dict_names_exactly_the_fields_the_chain_protects():
+    """What goes into the digest is a decision, so it is written down as one.
+
+    `canonical_bytes` builds its dict by hand rather than from the dataclass's
+    fields, precisely so a field added for the console cannot change every hash
+    in an existing log. The reverse needs pinning too: without this, a later edit
+    could *narrow* the digest — drop `at`, drop `before` — and the log would go
+    on verifying while no longer covering when the edit happened or what it
+    undid. Change this list only on purpose; every stored hash moves with it.
+    """
+    hashed = json.loads(record(before=zone(), after=zone(name="North yard")).canonical_bytes())
+    print(sorted(hashed))
+
+    assert sorted(hashed) == [
+        "action", "actor", "after", "at", "before", "changes", "node_id", "subject",
+    ]
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("actor", "someone else"),
+        ("action", "zone.removed"),
+        ("subject", "z2"),
+        ("subject", None),
+        ("node_id", "gate-01"),
+        ("at", WHEN + timedelta(seconds=1)),
+        ("before_json", canonical(zone(name="Something else"))),
+        ("before_json", None),
+        ("after_json", canonical(zone(name="Something else"))),
+        ("after_json", None),
+        ("changes", (FieldChange("name", "Yard", "Somewhere else"),)),
+        ("changes", ()),
+    ],
+)
+def test_altering_any_recorded_field_moves_the_hash(field, value):
+    """Every field the digest claims to cover, varied one at a time.
+
+    The chain's whole promise is that altering a record breaks it. Testing that
+    through `actor` alone proves only that `actor` is in there — and the two
+    things an audit log exists to pin down are the moment it happened and the
+    state before it, neither of which was covered. Each case below differs from
+    the base record in exactly one field, so a digest that stopped hashing that
+    field fails here rather than passing quietly.
+    """
+    base = record(before=zone(), after=zone(name="North yard"))
+    varied = replace(base, **{field: value})
+    print(field, "->", varied.chain(None))
+    print(field, "was", base.chain(None))
+
+    assert getattr(base, field) != value, "the case does not vary anything"
+    assert varied.chain(None) != base.chain(None)
 
 
 def test_an_added_corner_and_a_nulled_one_do_not_hash_alike():

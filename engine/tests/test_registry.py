@@ -706,3 +706,143 @@ def test_pinning_a_subject_who_is_not_there_is_refused(register: Register):
     # protected while the next sweep deletes it.
     with pytest.raises(RegistryError, match="no subject"):
         register.set_pinned("person-nobody", True, actor="operator:nadia")
+
+
+# ------------------------------------------- the evidence behind a stored claim
+#
+# `identifier_id` is the column an operator follows to ask "why does it think
+# this is her?". Everything below is about that pointer being answerable: it may
+# name an enrolment of this subject, or nothing, and there is no third state.
+
+
+def test_a_sighting_records_the_enrolment_behind_the_match(
+    register: Register, encoder: PretendEncoder
+):
+    enrolment = enrol_person(register, encoder)
+
+    sighting = register.record_sighting(
+        subject_id="person-ali",
+        camera_id="cam-01",
+        track_id=11,
+        first_seen_millis=NOW,
+        last_seen_millis=NOW + 4_000,
+        confidence=Confidence.MATCH,
+        score=0.94,
+        identifier_id=enrolment.identifier.id,
+    )
+
+    print("cited enrolment:", sighting.identifier_id)
+    assert sighting.identifier_id == enrolment.identifier.id
+    # The pointer must survive the round trip, or the console reads it back as
+    # a claim with nothing behind it.
+    assert register.history("person-ali")[0].identifier_id == enrolment.identifier.id
+
+
+def test_a_sighting_cannot_cite_another_subjects_enrolment_as_its_evidence(
+    register: Register, encoder: PretendEncoder
+):
+    enrol_person(register, encoder)
+    rana = enrol_person(
+        register,
+        encoder,
+        subject_id="person-rana",
+        display_name="Rana",
+        identifier=encoder.template("rana"),
+    )
+
+    # Ali's name, shown because Rana's template matched. The score is perfectly
+    # well formed; the reason behind the name is somebody else's.
+    with pytest.raises(RegistryError, match="belongs to subject"):
+        register.record_sighting(
+            subject_id="person-ali",
+            camera_id="cam-01",
+            track_id=11,
+            first_seen_millis=NOW,
+            last_seen_millis=NOW + 4_000,
+            confidence=Confidence.MATCH,
+            score=0.94,
+            identifier_id=rana.identifier.id,
+        )
+
+    # Refused, not stored-and-flagged: a rejected write leaves no row.
+    assert register.history("person-ali") == ()
+
+
+def test_a_sighting_cannot_cite_an_enrolment_that_never_existed(
+    register: Register, connection: sqlite3.Connection, encoder: PretendEncoder
+):
+    enrol_person(register, encoder)
+
+    # The declared foreign key does not catch this on its own: the connection
+    # belongs to the caller and its PRAGMA foreign_keys may be off, which is the
+    # state this fixture is in.
+    (foreign_keys,) = connection.execute("PRAGMA foreign_keys").fetchone()
+    print("PRAGMA foreign_keys =", foreign_keys)
+
+    with pytest.raises(RegistryError, match="no enrolment"):
+        register.record_sighting(
+            subject_id="person-ali",
+            camera_id="cam-01",
+            track_id=11,
+            first_seen_millis=NOW,
+            last_seen_millis=NOW + 4_000,
+            confidence=Confidence.POSSIBLE,
+            score=0.61,
+            identifier_id="id_totally_made_up",
+        )
+
+    assert register.history("person-ali") == ()
+
+
+@pytest.mark.parametrize("foreign_keys", [0, 1])
+def test_a_swept_enrolment_leaves_no_sighting_still_citing_it(
+    encoder: PretendEncoder, foreign_keys: int
+):
+    # Run both ways round on purpose. The register's own docstring says it does
+    # not control this pragma, so behaviour that forks on it is behaviour the
+    # module cannot promise. With the pragma off, ON DELETE SET NULL never
+    # fires and a bare DELETE would leave the sighting citing a row that is
+    # gone — an API returning a provenance claim the database cannot support.
+    connection = sqlite3.connect(":memory:")
+    connection.execute(f"PRAGMA foreign_keys = {foreign_keys}")
+    register = Register(connection)
+    enrolment = enrol_person(register, encoder)
+    register.record_sighting(
+        subject_id="person-ali",
+        camera_id="cam-01",
+        track_id=11,
+        first_seen_millis=NOW,
+        last_seen_millis=NOW + 4_000,
+        confidence=Confidence.MATCH,
+        score=0.94,
+        identifier_id=enrolment.identifier.id,
+    )
+
+    policy = RetentionPolicy(face_template_days=30.0)
+    sweep = register.sweep_expired(NOW + 40 * DAY, policy)
+    assert [row.id for row in sweep.deleted] == [enrolment.identifier.id]
+
+    (sighting,) = register.history("person-ali")
+    print(
+        f"foreign_keys={foreign_keys}: after the sweep "
+        f"identifier_id={sighting.identifier_id!r}, score={sighting.score}"
+    )
+    assert sighting.identifier_id is None, (
+        "the sighting still points at a swept enrolment"
+    )
+    # What the sweep took is the pointer, and only the pointer. The encounter
+    # itself happened and the score behind it was measured; deleting those
+    # would be rewriting history rather than expiring a biometric.
+    assert sighting.score == 0.94
+    assert sighting.confidence is Confidence.MATCH
+    assert sighting.duration_millis == 4_000
+
+    # And nothing is left in the raw table either, whichever way the pragma is
+    # set — the count is the same measurement the module's own docstring makes.
+    dangling = connection.execute(
+        "SELECT COUNT(*) FROM register_sightings s "
+        "WHERE s.identifier_id IS NOT NULL AND NOT EXISTS ("
+        "  SELECT 1 FROM register_identifiers i WHERE i.id = s.identifier_id)"
+    ).fetchone()[0]
+    print("dangling evidence pointers:", dangling)
+    assert dangling == 0

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import inspect
 import math
+import time
 
 import numpy as np
 import pytest
@@ -474,6 +475,79 @@ def test_a_pixel_box_is_refused_rather_than_clamped_to_the_frame():
     assert models.images == [], "it looked at something before refusing"
 
 
+def test_a_pixel_box_whose_corner_looks_legal_is_still_refused():
+    # The box above is caught by its origin. This one is not: it starts at the
+    # top-left of any image, so only its *size* says it is pixels — and its size
+    # is what decides how much of the frame the detector is shown. Clamping it
+    # handed over the whole frame, which is the one thing this module promises
+    # never to do.
+    models = StandInModels((face_box(), unit(1.0)))
+    engine = FaceEngine(enabled=True, backend=models)
+    frame = frame_with_bright_box(PERSON)
+    print("frame:", frame.shape, "box:", BoundingBox(0.0, 0.0, 200.0, 150.0))
+
+    with pytest.raises(FaceError) as raised:
+        engine.templates_in(frame, BoundingBox(0.0, 0.0, 200.0, 150.0))
+
+    print("error:", raised.value)
+    assert "normalised" in str(raised.value)
+    assert models.images == [], "the detector was shown the frame before refusing"
+
+
+def test_a_pixel_box_from_a_normalised_corner_is_refused_by_its_size():
+    # A real pixel box from a real call site: the corner is a fraction, the
+    # width and height are the frame's own dimensions. Clamped, this was every
+    # pixel from the person's corner to the bottom-right of the image.
+    models = StandInModels((face_box(), unit(1.0)))
+    engine = FaceEngine(enabled=True, backend=models)
+
+    with pytest.raises(FaceError) as raised:
+        engine.templates_in(
+            frame_with_bright_box(PERSON), BoundingBox(0.25, 0.25, 400.0, 300.0)
+        )
+
+    print("error:", raised.value)
+    assert "normalised" in str(raised.value)
+    assert models.images == []
+
+
+def test_a_person_walking_out_of_frame_is_cropped_to_what_is_still_visible():
+    # Not the same failure, and it must not be refused: the tracker's own
+    # clamp_box pins a coasting box to x in [-w, 1] and leaves w alone, so every
+    # person who leaves the frame arrives here running off an edge. Trimming
+    # that to the visible part is a crop of them; raising would take the camera
+    # down on the most ordinary event it sees.
+    leaving = BoundingBox(0.8, 0.4, 0.4, 0.5)
+    models = StandInModels((face_box(), unit(1.0)))
+    engine = FaceEngine(enabled=True, backend=models)
+    frame = frame_with_bright_box(leaving)
+
+    templates = engine.templates_in(frame, leaving)
+
+    crop = models.images[0]
+    print("frame:", frame.shape, "-> crop:", crop.shape)
+    assert len(templates) == 1
+    # Half the person's width is off the right edge, so half the box comes back.
+    assert crop.shape[0] == 150 and crop.shape[1] == 80
+    assert crop.min() == 255, "a pixel from outside the person reached the detector"
+
+
+def test_a_person_entering_from_the_left_edge_is_not_refused():
+    # The mirror image: clamp_box allows x as low as -w, so a box beginning off
+    # the left edge is a box the core is documented to produce.
+    entering = BoundingBox(-0.15, 0.4, 0.4, 0.5)
+    models = StandInModels((face_box(), unit(1.0)))
+    engine = FaceEngine(enabled=True, backend=models)
+
+    templates = engine.templates_in(frame_with_bright_box(PERSON), entering)
+
+    crop = models.images[0]
+    print("crop:", crop.shape, "of frame (300, 400, 3)")
+    assert len(templates) == 1
+    assert crop.shape[1] == 100, "the visible quarter of the person"
+    assert crop.shape[:2] != (300, 400), "it became the whole frame"
+
+
 def test_a_box_with_no_area_is_refused():
     engine = FaceEngine(enabled=True, backend=StandInModels())
 
@@ -622,6 +696,100 @@ def test_the_engine_aggregates_the_frames_of_a_track_it_was_given():
     assert len(models.images) == FRAMES_FOR_A_MATCH
 
 
+def test_a_track_is_scored_by_the_same_numbers_a_pair_at_a_time_would_give():
+    # The aggregate is one matrix multiply rather than a loop over similarity().
+    # This is the check that the faster spelling is the same arithmetic: the
+    # median of each person's best-per-frame, worked out here the slow, obvious
+    # way and compared against what the module says.
+    rng = np.random.default_rng(3)
+    track = [
+        FaceTemplate(
+            vector=tuple(rng.normal(size=TEMPLATE_DIMENSIONS)),
+            quality=0.9,
+            model="stand-in embedder",
+            source="camera-1/track-7",
+            created_unix_millis=0,
+        )
+        for _ in range(7)
+    ]
+    register = [
+        EnrolledPerson(
+            f"p{index}",
+            f"person {index}",
+            tuple(
+                FaceTemplate(
+                    vector=tuple(rng.normal(size=TEMPLATE_DIMENSIONS)),
+                    quality=0.9,
+                    model="stand-in embedder",
+                    source="enrolment",
+                    created_unix_millis=0,
+                )
+                for _ in range(3)
+            ),
+        )
+        for index in range(6)
+    ]
+
+    by_hand = {
+        person.person_id: float(
+            np.median(
+                [
+                    max(similarity(face, enrolled) for enrolled in person.templates)
+                    for face in track
+                ]
+            )
+        )
+        for person in register
+    }
+    expected_id = max(by_hand, key=lambda key: by_hand[key])
+
+    identity = identify_track(track, register)
+
+    print("pair at a time:", expected_id, by_hand[expected_id])
+    print("module:", identity.score, "best frame:", identity.best_frame_score)
+    assert identity.score is not None
+    assert abs(identity.score - by_hand[expected_id]) <= 1e-12
+    assert identity.frames == len(track)
+
+
+def test_a_register_worth_building_is_compared_in_one_pass():
+    # A register is the thing an operator is encouraged to grow, so the cost of
+    # identifying a track must not grow a Python-level step per enrolled
+    # template. Thirty frames against fifty people of five templates each is
+    # 7,500 comparisons: as a per-pair loop that measured 92 ms on this machine,
+    # which is the dominant cost of the feature on a worker that identifies
+    # tracks on a cadence. The ceiling below is far above what one pass costs
+    # and far below what a loop costs, so it survives a slow machine and still
+    # fails a return to the loop.
+    rng = np.random.default_rng(5)
+
+    def made(source: str) -> FaceTemplate:
+        return FaceTemplate(
+            vector=tuple(rng.normal(size=TEMPLATE_DIMENSIONS)),
+            quality=0.9,
+            model="stand-in embedder",
+            source=source,
+            created_unix_millis=0,
+        )
+
+    track = [made("camera-1/track-7") for _ in range(30)]
+    register = [
+        EnrolledPerson(f"p{index}", f"person {index}", tuple(made("enrolment") for _ in range(5)))
+        for index in range(50)
+    ]
+    pairs = len(track) * sum(len(person.templates) for person in register)
+
+    best = float("inf")
+    for _ in range(5):
+        started = time.perf_counter()
+        identify_track(track, register)
+        best = min(best, time.perf_counter() - started)
+
+    print(f"{pairs} comparisons in {best * 1000:.2f} ms")
+    assert pairs == 7500
+    assert best < 0.040, "this is the shape of a per-pair Python loop again"
+
+
 # ----------------------------------------------------- the name and the score
 
 
@@ -693,15 +861,20 @@ def test_nothing_here_can_build_a_person_out_of_a_sighting():
     # module returns an EnrolledPerson — enrolment lives where the audit row is.
     import sentinel.faces as faces
 
-    returns_a_person = [
-        name
-        for name, member in vars(faces).items()
-        if callable(member)
-        and getattr(inspect.signature(member).return_annotation, "__name__", "")
-        == "EnrolledPerson"
-    ]
-    print("functions returning an EnrolledPerson:", returns_a_person)
+    scanned: list[str] = []
+    returns_a_person: list[str] = []
+    members = list(vars(faces).items()) + list(vars(faces.FaceEngine).items())
+    for name, member in members:
+        if not inspect.isfunction(member) or member.__module__ != faces.__name__:
+            continue
+        scanned.append(name)
+        # Annotations are strings here — `from __future__ import annotations` is
+        # on — so this compares the spelling, which is what is written down.
+        if "EnrolledPerson" in str(inspect.signature(member).return_annotation):
+            returns_a_person.append(name)
+    print("scanned:", len(scanned), "returning an EnrolledPerson:", returns_a_person)
 
+    assert len(scanned) > 5, "the walk found almost nothing, so it proved nothing"
     assert returns_a_person == []
 
 

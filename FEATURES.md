@@ -33,26 +33,26 @@ Related: [STATUS.md](STATUS.md) — measurements and honest gaps ·
 
 ## The scoreboard
 
-456 capabilities, each with a state. Many lines cover several related things —
+462 capabilities, each with a state. Many lines cover several related things —
 "heading · pitch · roll" is one row — so this counts *claims*, not code.
 
 | | Count | Share | What it means |
 |---|---:|---:|---|
-| **`TESTED`** | 169 | 37% | A test fails if it stops working |
+| **`TESTED`** | 175 | 38% | A test fails if it stops working |
 | **`IMPL`** | 23 | 5% | Works; a regression would go unnoticed |
 | **`SKEL`** | 32 | 7% | Something is there; it does not do the job |
-| **`PLAN`** | 232 | 51% | Designed, no code |
+| **`PLAN`** | 232 | 50% | Designed, no code |
 
 ```mermaid
 pie showData
-    title Sentinel Vision — 456 capabilities by state
-    "TESTED" : 169
+    title Sentinel Vision — 462 capabilities by state
+    "TESTED" : 175
     "IMPLEMENTED" : 23
     "SKELETON" : 32
     "PLANNED" : 232
 ```
 
-**Read that 37% carefully.** It is not "a third of the product is finished" — it
+**Read that 38% carefully.** It is not "a third of the product is finished" — it
 is that the part which is finished is the analytical core plus, now, the
 recording that makes its evidence real, while most of what is planned is the
 product surface around them. The parts a demonstration shows off are the parts
@@ -299,6 +299,8 @@ nothing, and only while the feature is on.
 | Face crops stored only when the operator opts in separately | `PLAN` | The template is the default and the crop is not kept. A crop is a photograph of somebody's face and needs its own justification, its own retention and its own audit row |
 | Nothing biometric leaves the machine | `PLAN` | Covered by the existing offline guarantee — no network at runtime — and by extending the evidence exporter's credential scanner to refuse any package carrying templates unless the operator explicitly included them |
 | An unmatched face is never enrolled, counted or stored | `PLAN` | A stranger walking past produces a track like any other and nothing else. There is no "unknown persons" gallery, because that is an identity database built by accident |
+| Face matching engine: templates, thresholds and the three-way verdict | `TESTED` | `sentinel.faces` — YuNet and SFace behind a seam; disabled by default and inert while disabled, enforced in the engine; `match` returns MATCH above 0.5, POSSIBLE between 0.363 and 0.5, and NONE below, with POSSIBLE a distinct value a caller cannot mistake for a match. **Called by nothing yet** |
+| Register for people and vehicles: enrol, forget, retain, sight | `TESTED` | `sentinel.registry` — one module for both features so the safeguards cannot drift apart. Enrolment demands an actor and a lawful basis; `forget` deletes every identifier and reports what it removed; `sweep_expired` honours pinning; sightings are the movement history both panels will show. **Called by nothing yet** — no migration wires it into the store |
 
 ## 🚗 Vehicles and number plates
 
@@ -320,6 +322,7 @@ claim on someone than their face.
 | Movement history for a vehicle | `PLAN` | Every track its plate was read on, across cameras and time, drawn on the plan view — the same panel as a person's history |
 | Vehicles menu: register, name, watchlist, forget | `PLAN` | |
 | Off by default, audited, retained and deletable | `PLAN` | The same machinery as people: a per-site switch enforced in the pipeline, an audit row for every change, a retention sweep, and a delete that really deletes |
+| Plate reading engine: detection, CTC decoding, per-country normalisation | `TESTED` | `sentinel.plates` — models injected behind a seam so the logic is testable with no weights present; `normalise` folds separators and confusables only where the country's format makes it unambiguous and refuses otherwise; `PlateAccumulator` resolves a character only once enough reads agree. 41 tests. **Called by nothing yet** — the pipeline does not construct a reader |
 
 ## 🔗 Multi-camera intelligence
 
@@ -380,6 +383,7 @@ claim on someone than their face.
 | The generated map is drawn under the plan view | `PLAN` | As a basemap layer beneath zones, footprints and tracks: the real ground under the virtual map, with no tile server, no download and no external imagery. The layer panel toggles it like any other |
 | Per-cell freshness and coverage, drawn honestly | `PLAN` | A cell last updated an hour ago is drawn faded and the layer reports its age; cells no camera covers are left empty rather than interpolated, because inventing ground nobody has seen is the one thing a map under a security overlay must not do |
 | The generated basemap is a site asset with a fingerprint | `PLAN` | Stored against the site record with the SHA-256 of its bytes, the poses it was built from and when, so an incident judged 'inside the fence' against it can be re-checked later — the same treatment as an imported plan or tile package |
+| Orthophoto engine: ground sampling, temporal median and mosaic | `TESTED` | `sentinel.orthophoto` — a metric ground grid sharing coverage's tangent plane, numpy sampling of a frame into a top-down patch, a per-cell running median that erases anything that moves, and a mosaic preferring the camera with the smallest position error per cell. Uncovered cells stay empty. **Called by nothing yet** — nothing accumulates frames into it |
 
 ## 📐 Spatial & camera geometry
 
@@ -566,6 +570,7 @@ event-linked jumps — and the console toggle.
 | Event-to-video jump | `PLAN` | Needs recording |
 | Event-to-map jump | `PLAN` | |
 | Camera-to-camera transition visualisation | `PLAN` | |
+| Query layer over events and incidents | `TESTED` | `sentinel.search` — a combinable `Query` (cameras, window, types, severities, zones, free text, limit) with bound parameters only, returning real objects newest-first with a total count so a caller can say 'showing 50 of 1,284' rather than truncating silently. **Called by nothing yet** — this is the layer the missing investigation panel will sit on |
 
 ## 📦 Evidence & chain of custody
 
@@ -733,6 +738,7 @@ both are `TESTED`.
 | Structured before/after audit records for every map, zone and camera edit | `PLAN` | The audit row grows `before_json`, `after_json`, `node_id`, `session_id`, `request_id` and `undo_of`; the prose `detail` stays for humans (`_describe_zone_change` already writes it). Every edit — zone create/change/remove, camera add/place/move/remove, plan or basemap import, calibration accept, mode changes — writes the canonical JSON of both states. A read-only Audit tab shows a field-by-field diff filterable by subject and time, with moved ring corners highlighted. 'restricted → exclusion' as a string is readable but not queryable and omits the schedule and ring that changed with it. |
 | Hash-chained audit log with `sentinel audit verify` | `PLAN` | Each row stores `prev_hash` and `row_hash = SHA-256(prev_hash ‖ canonical row)`; `verify` walks the chain and names the first broken row; the chain head goes into every evidence and site export so a package pins the log state at export time. Append-only is enforced by the absence of a method today, and the file is writable by any SQLite editor; a chain makes edits detectable by anyone with the file. |
 | Clock provenance on every audited action and geometry version | `PLAN` | Each audit and version row stores wall-clock UTC, the process monotonic offset and the store's per-camera clock skew at that moment (`clock_skew` exists); a system-time change larger than a threshold between two rows is itself audited as `clock.jumped`. Order of edits versus events is what a review turns on. |
+| Canonical JSON, field-level diffs and a tamper-evident chain | `TESTED` | `sentinel.auditing` — deterministic serialisation so equal objects hash equally, a `diff` that names the moved ring corner rather than saying 'the ring changed', prose matching the existing audit voice, and a SHA-256 chain over records. Detects alteration; does not prevent it and is not a signature. **Called by nothing yet** — no migration, and node.py still writes prose |
 
 ## 💾 Storage
 

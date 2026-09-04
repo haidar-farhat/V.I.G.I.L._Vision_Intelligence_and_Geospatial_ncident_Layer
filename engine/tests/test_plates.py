@@ -198,7 +198,7 @@ def test_a_disagreeing_character_stays_unresolved_while_its_neighbours_resolve()
 def test_a_reading_never_completes_an_unresolved_character():
     # `B?7 4?21` must never be presented, matched or exported as `BX7 4921`, so
     # the completed string does not exist as a value while a `?` remains.
-    accumulator = PlateAccumulator(min_agreement=3)
+    accumulator = PlateAccumulator(country="DE", min_agreement=3)
     for frame, text in enumerate(("B17421", "B17421", "B27421", "B37421")):
         accumulator.add(make_read(text, frame=frame, country="DE"))
 
@@ -256,6 +256,41 @@ def test_a_character_read_with_low_confidence_does_not_vote():
     assert reading.display == "AB12CDE"
     assert reading.agreement[0] == 3, "the 0.2 character voted"
     assert reading.agreement[1] == 4
+
+
+def test_a_read_normalised_for_another_country_is_not_counted_as_this_one():
+    # The two settings live in two places — the reader's country and the
+    # accumulator's — and a mismatch is silent, because both keys look like
+    # plates. Measured below: the same eight characters key two different ways.
+    generic = make_read("AB12 CD0", country=GENERIC)
+    british = make_read("AB12 CD0", country="UK")
+    print("GENERIC keys as", generic.text, "/ UK keys as", british.text)
+    assert generic.text != british.text
+
+    accumulator = PlateAccumulator(country="UK")
+    with pytest.raises(ValueError, match="two keys"):
+        accumulator.add(generic)
+
+    # Refused outright, so nothing partial is left behind either: no vote was
+    # cast, and the reading claims nothing rather than claiming it in UK's name.
+    assert len(accumulator) == 0
+    assert accumulator.resolve().text is None
+    assert accumulator.resolve().total_reads == 0
+
+
+def test_a_reading_only_claims_the_country_its_characters_were_folded_to():
+    # The positive half of the same rule: fed reads of its own country, the
+    # accumulator's country label is backed by the fold that produced the key.
+    accumulator = PlateAccumulator(country="uk", min_agreement=2)
+    for frame in range(2):
+        accumulator.add(make_read("AB12 CD0", frame=frame, country="uk"))
+
+    reading = accumulator.resolve()
+    print(reading.describe(), "country", reading.country)
+
+    assert accumulator.country == "UK"
+    assert reading.country == "UK"
+    assert reading.text == normalise("AB12 CD0", "UK") == "AB12CDO"
 
 
 def test_reads_of_a_different_length_are_set_aside_rather_than_aligned():

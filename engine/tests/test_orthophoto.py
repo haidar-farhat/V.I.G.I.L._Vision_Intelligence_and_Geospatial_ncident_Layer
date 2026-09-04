@@ -80,7 +80,7 @@ def grid(reference_pose: CameraPose) -> GroundGrid:
     there is nowhere for "this cell must stay empty" to be asserted.
     """
     return GroundGrid.covering(
-        field_of_view(reference_pose), cell_size_m=1.0, margin_m=20.0
+        field_of_view(reference_pose), cell_size_m=1.0, margin_m=30.0
     )
 
 
@@ -160,7 +160,7 @@ def test_a_grid_built_to_cover_a_footprint_contains_every_point_of_it(reference_
     footprint = field_of_view(reference_pose)
     covering = GroundGrid.covering(footprint, cell_size_m=1.0, margin_m=1.0)
     missed = [point for point in footprint if covering.cell_of(point) is None]
-    print(f"{covering.rows}×{covering.columns} cells, {len(missed)} footprint point(s) off it")
+    print(f"{covering.rows}x{covering.columns} cells, {len(missed)} footprint point(s) off it")
     assert missed == []
 
 
@@ -329,7 +329,7 @@ def test_uncertainty_travels_with_every_sampled_cell(reference_pose, grid):
     near = patch.valid & (distance < 15.0)
     far = patch.valid & (distance > 60.0)
     print(
-        f"1σ near (<15 m): {patch.sigma_m[near].mean():.2f} m, "
+        f"1-sigma near (<15 m): {patch.sigma_m[near].mean():.2f} m, "
         f"far (>60 m): {patch.sigma_m[far].mean():.2f} m"
     )
     assert near.any() and far.any()
@@ -339,7 +339,7 @@ def test_uncertainty_travels_with_every_sampled_cell(reference_pose, grid):
 def test_a_camera_pointed_at_the_sky_produces_an_entirely_empty_patch(grid):
     """Not an exception and not a guess: it sees no ground, so it maps none."""
     patch = sample_frame(
-        camera(ORIGIN, 180.0, pitch=10.0), flat((200, 0, 0)), grid, camera_id="sky"
+        camera(ORIGIN, 180.0, pitch=30.0), flat((200, 0, 0)), grid, camera_id="sky"
     )
     assert patch.covered_cells == 0
     assert patch.covered_fraction == 0.0
@@ -394,7 +394,7 @@ def test_the_median_removes_an_object_that_appears_in_a_minority_of_frames(
                          captured_at=1_000.0 + index)
         )
 
-    result = accumulator.result(now=1_100.0)
+    result = accumulator.result(camera_id="cam-a", now=1_100.0)
     colours = np.unique(result.colour[result.valid].reshape(-1, 3), axis=0)
     print(
         f"{accumulator.frames} frames, {result.covered_cells} cells; "
@@ -424,7 +424,7 @@ def test_the_median_keeps_something_that_was_there_for_most_of_the_window(
                          captured_at=2_000.0 + index)
         )
 
-    result = accumulator.result(now=2_100.0)
+    result = accumulator.result(camera_id="cam-a", now=2_100.0)
     colours = np.unique(result.colour[result.valid].reshape(-1, 3), axis=0)
     print(f"colours surviving a six-of-nine majority: {colours.tolist()}")
     assert colours.tolist() == [[200, 210, 220]]
@@ -438,7 +438,7 @@ def test_a_cell_seen_too_few_times_is_left_empty(reference_pose, grid):
             sample_frame(reference_pose, flat((7, 7, 7)), grid, camera_id="cam-a",
                          captured_at=float(index))
         )
-    thin = accumulator.result(now=100.0)
+    thin = accumulator.result(camera_id="cam-a", now=100.0)
     print(f"after {accumulator.frames} frames: {thin.covered_cells} cells reported")
     assert thin.covered_cells == 0
 
@@ -446,7 +446,7 @@ def test_a_cell_seen_too_few_times_is_left_empty(reference_pose, grid):
         sample_frame(reference_pose, flat((7, 7, 7)), grid, camera_id="cam-a",
                      captured_at=99.0)
     )
-    enough = accumulator.result(now=100.0)
+    enough = accumulator.result(camera_id="cam-a", now=100.0)
     print(f"after {accumulator.frames} frames: {enough.covered_cells} cells reported")
     assert enough.covered_cells > 2_000
 
@@ -470,7 +470,7 @@ def test_the_accumulator_memory_is_bounded_by_the_ring_not_the_frame_count(
     after_sixty = accumulator.memory_bytes
 
     print(
-        f"{accumulator.bytes_per_cell} bytes per cell × {grid.cell_count:,} cells = "
+        f"{accumulator.bytes_per_cell} bytes per cell x {grid.cell_count:,} cells = "
         f"{accumulator.memory_bytes / 1e6:.2f} MB after 1 frame and after "
         f"{accumulator.frames} frames"
     )
@@ -479,7 +479,7 @@ def test_the_accumulator_memory_is_bounded_by_the_ring_not_the_frame_count(
     assert accumulator.bytes_per_cell < 200
     # A cell only ever holds its last `capacity` samples, so the count reported
     # beside the colour saturates there rather than growing with the footage.
-    result = accumulator.result(now=100.0)
+    result = accumulator.result(camera_id="cam-a", now=100.0)
     assert result.samples.max() == DEFAULT_CAPACITY
 
 
@@ -492,8 +492,8 @@ def test_retention_drops_samples_older_than_the_window(reference_pose, grid):
                          captured_at=1_000.0 + index)
         )
 
-    fresh = accumulator.result(now=1_010.0)
-    stale = accumulator.result(now=1_200.0)
+    fresh = accumulator.result(camera_id="cam-a", now=1_010.0)
+    stale = accumulator.result(camera_id="cam-a", now=1_200.0)
     print(
         f"{fresh.covered_cells} cells within the window, "
         f"{stale.covered_cells} once every sample is older than it"
@@ -509,12 +509,73 @@ def test_the_median_reports_the_newest_sample_behind_each_cell(reference_pose, g
             sample_frame(reference_pose, flat((60, 60, 60)), grid, camera_id="cam-a",
                          captured_at=500.0 + index * 10.0)
         )
-    result = accumulator.result(now=600.0)
+    result = accumulator.result(camera_id="cam-a", now=600.0)
     newest = np.nanmax(result.updated_at)
     print(f"newest contributing sample at t={newest:.1f}, oldest at t=500.0")
     assert newest == pytest.approx(540.0, abs=0.01)
     assert np.all(result.age_seconds(now=600.0)[result.valid]
                   == pytest.approx(60.0, abs=0.01))
+
+
+def test_the_median_reports_the_worst_position_error_behind_a_cell_not_the_last_one():
+    """The number that ranks cameras in the mosaic must be the worst frame's.
+
+    A camera on a mast that moves — wind, a knock, a re-aim — projects the same
+    cell with a different error in different frames. Reporting the last one, or
+    the best one, would let a single lucky frame present a stack of uncertain
+    samples as a surveyed cell and take the overlap off a camera that really
+    does know where that ground is. So the accumulator keeps the maximum, and
+    this asserts it in both orders, because "the last one" and "the worst one"
+    agree in exactly one of them.
+    """
+    small = GroundGrid(origin=ORIGIN, cell_size_m=1.0, columns=6, rows=4)
+    seen = np.zeros(small.shape, dtype=bool)
+    seen[1:3, 1:5] = True
+
+    def measured(sigma: float, when: float) -> GroundPatch:
+        return synthetic_patch(small, "cam-a", colour=(20, 30, 40), valid=seen,
+                               sigma_m=sigma, when=when)
+
+    for first, second in ((0.5, 4.0), (4.0, 0.5)):
+        accumulator = MedianAccumulator(small, capacity=4, minimum_samples=1)
+        accumulator.update(measured(first, 10.0))
+        accumulator.update(measured(second, 20.0))
+        result = accumulator.result(camera_id="cam-a", now=30.0)
+
+        reported = result.sigma_m[seen]
+        print(
+            f"{first} m then {second} m: the median reports "
+            f"{reported.min():.2f}-{reported.max():.2f} m on "
+            f"{int(seen.sum())} cell(s)"
+        )
+        assert np.all(result.valid == seen)
+        assert np.all(reported == np.float32(4.0))
+        assert np.all(np.isfinite(result.sigma_m[result.valid]))
+        assert np.all(np.isnan(result.sigma_m[~result.valid]))
+
+
+def test_a_frame_with_no_error_to_its_name_never_reaches_the_median():
+    """An unmeasured error is refused at the door, not carried into the map.
+
+    ``sigma_m`` NaN on a cell the patch calls ground is a cell whose position
+    nobody measured. Folded in, it would leave the median's own error NaN on a
+    cell it reports as valid — which the mosaic would have to guess at and a
+    renderer would read as "no ground here".
+    """
+    small = GroundGrid(origin=ORIGIN, cell_size_m=1.0, columns=6, rows=4)
+    seen = np.ones(small.shape, dtype=bool)
+    unmeasured = GroundPatch(
+        camera_id="cam-unmeasured", grid=small,
+        colour=np.zeros((*small.shape, 3), dtype=np.uint8), valid=seen,
+        sigma_m=np.full(small.shape, np.nan, dtype=np.float32),
+        updated_at=np.full(small.shape, 10.0), samples=seen.astype(np.uint32),
+    )
+    accumulator = MedianAccumulator(small, capacity=4, minimum_samples=1)
+    with pytest.raises(OrthophotoError, match="position error is unknown") as refusal:
+        accumulator.update(unmeasured)
+    print(f"refused: {refusal.value}")
+    assert "cam-unmeasured" in str(refusal.value)
+    assert accumulator.result(camera_id="cam-a", now=20.0).covered_cells == 0
 
 
 def test_a_patch_from_another_grid_is_refused(reference_pose, grid):
@@ -628,6 +689,78 @@ def test_cells_no_camera_covers_stay_empty(grid):
     assert "never interpolated" in result.describe()
 
 
+def test_a_cell_whose_error_is_unknown_never_outranks_one_that_is_measured():
+    """Zero is not a stand-in for "nobody measured it", and it used to be one.
+
+    A camera whose per-cell error is NaN on ground it claims once had that NaN
+    replaced with 0.0 — which made it the most certain camera on the site and
+    handed it every cell it could see, reported to an operator as a surveyed
+    number. That is the same failure the mosaic already refuses a missing pose
+    error for, one cell lower down, so it is refused the same way: named, and
+    before anything is composited.
+    """
+    small = GroundGrid(origin=ORIGIN, cell_size_m=1.0, columns=4, rows=4)
+    everywhere = np.ones(small.shape, dtype=bool)
+    surveyed = synthetic_patch(small, "a-surveyed", colour=(0, 255, 0),
+                               valid=everywhere, sigma_m=0.2, when=100.0)
+    unknown = GroundPatch(
+        camera_id="b-unknown", grid=small,
+        colour=np.full((*small.shape, 3), 255, dtype=np.uint8), valid=everywhere,
+        sigma_m=np.full(small.shape, np.nan, dtype=np.float32),
+        updated_at=np.full(small.shape, 200.0),
+        samples=everywhere.astype(np.uint32),
+    )
+
+    with pytest.raises(OrthophotoError, match="position error is unknown") as refusal:
+        mosaic([surveyed, unknown], {"a-surveyed": 0.2, "b-unknown": 0.1})
+    print(f"refused: {refusal.value}")
+    assert "b-unknown" in str(refusal.value)
+
+    # And once b's error is actually measured — at 3 m, worse than a's 0.2 m
+    # even though its mast is the better-surveyed of the two — the surveyed
+    # camera keeps the cell and the reported error is its own.
+    measured = synthetic_patch(small, "b-unknown", colour=(255, 255, 255),
+                               valid=everywhere, sigma_m=3.0, when=200.0)
+    result = mosaic([surveyed, measured], {"a-surveyed": 0.2, "b-unknown": 0.1})
+    print(
+        f"a-surveyed won {result.cells_from('a-surveyed')} of "
+        f"{small.cell_count} cells, reporting {result.sigma_m[0, 0]:.4f} m"
+    )
+    assert result.cells_from("a-surveyed") == small.cell_count
+    assert result.sigma_m[0, 0] == pytest.approx(math.hypot(0.2, 0.2), rel=1e-5)
+    assert np.all(result.colour[result.valid] == (0, 255, 0))
+
+
+def test_two_patches_claiming_the_same_camera_are_refused():
+    """``source`` is a promise that a cell resolves to one camera and one pose.
+
+    It is the ordinary case rather than an exotic one: the documented pipeline
+    is an accumulator per camera, and two of them handed the same id produce a
+    mosaic whose rows are indistinguishable, whose ``cells_from`` under-reports
+    by half, and whose ``source`` index answers a dispute with nothing.
+    """
+    small = GroundGrid(origin=ORIGIN, cell_size_m=1.0, columns=4, rows=4)
+    everywhere = np.ones(small.shape, dtype=bool)
+    north = synthetic_patch(small, "median", colour=(0, 0, 255),
+                            valid=everywhere, sigma_m=0.2, when=100.0)
+    south = synthetic_patch(small, "median", colour=(255, 0, 0),
+                            valid=everywhere, sigma_m=0.2, when=200.0)
+
+    with pytest.raises(OrthophotoError, match="both claim to come from camera") as refusal:
+        mosaic([north, south], {"median": 0.2})
+    print(f"refused: {refusal.value}")
+    assert "'median'" in str(refusal.value)
+
+    # Named apart, the same two patches compose and every cell resolves.
+    renamed = synthetic_patch(small, "cam-south", colour=(255, 0, 0),
+                              valid=everywhere, sigma_m=0.2, when=200.0)
+    result = mosaic([north, renamed], {"median": 0.2, "cam-south": 0.2})
+    total = sum(result.cells_from(camera_id) for camera_id in result.cameras)
+    print(f"{result.cameras} account for {total} of {result.covered_cells} mapped cells")
+    assert len(set(result.cameras)) == len(result.cameras)
+    assert total == result.covered_cells
+
+
 def test_a_camera_with_no_stated_pose_error_is_refused(grid):
     """Defaulting it to zero would let an unsurveyed mast win every cell."""
     everywhere = np.ones(grid.shape, dtype=bool)
@@ -683,7 +816,7 @@ def test_two_real_cameras_facing_each_other_compose_into_one_basemap(reference_p
 
     both = patches[0].valid & patches[1].valid
     print(
-        f"{shared.rows}×{shared.columns} raster: "
+        f"{shared.rows}x{shared.columns} raster: "
         f"north {patches[0].covered_cells}, south {patches[1].covered_cells}, "
         f"{int(both.sum())} seen by both, {result.covered_cells} mapped, "
         f"{shared.cell_count - result.covered_cells} left empty"

@@ -186,7 +186,7 @@ def _members(values: object, enum_type: type, what: str) -> tuple:
         except ValueError:
             known = ", ".join(member.value for member in enum_type)
             raise SearchError(
-                f"{value!r} is not a {enum_type.__name__}. Known values: {known}"
+                f"{enum_type.__name__} has no value {value!r}. Known values: {known}"
             ) from None
     return tuple(members)
 
@@ -205,6 +205,21 @@ class Query:
     not against the zone names an incident carries in its own row. A zone can be
     renamed, and a search matching the stored name would stop finding the
     incidents it found yesterday. The id does not move.
+
+    ``window`` and the event-level filters are asked of *different things* when
+    the subject is an incident, and that is deliberate. `search_incidents` asks
+    the window of the incident's whole span, because an investigator scrubbing
+    into the middle of something wants the whole of it; the camera, zone and type
+    filters are then asked of that incident's events with no time bound at all.
+    So a filter bar reading "03:00 to 03:05; after-hours" can return an incident
+    that was still running at 03:00 whose after-hours event happened at 02:58:
+    for an incident, a type or camera names evidence *anywhere in* it, not
+    evidence inside the window. Pushing the window into that clause as well would
+    undo the overlap it was written for — the incident found because it began
+    before the window opened would then be dropped for having nothing inside it,
+    hiding exactly the thing being scrubbed to. `search_events` has no such
+    subtlety: there the filters are all asked of the one row, and the same query
+    returns only what happened inside the window.
     """
 
     #: Camera ids. Empty means every camera.
@@ -450,6 +465,20 @@ def _incident_filters(query: Query) -> tuple[list[str], list[object]]:
     that "cam-07 and LOITERING" means *one event that is both* rather than an
     incident that happens to contain a cam-07 event and, separately, somebody
     loitering in front of a different camera.
+
+    That EXISTS carries no time bound — ``with_time=False`` — even when the query
+    has a window, and the omission is the point rather than an oversight. The
+    window has already been asked, just above, of the incident's own span, and
+    asking it a second time of the events would quietly undo it: an incident
+    matched *because* it was already running when the window opened would then be
+    dropped for containing no event inside that window, which is to say the
+    filter would hide precisely what the overlap test exists to find. The price
+    is worth saying out loud, because it surprises people — a matched incident's
+    cam-07 or LOITERING evidence may lie outside the stated span, since the
+    filters name evidence anywhere in the incident. It is stated on `Query` too,
+    where a caller reads it, and
+    `test_an_incident_is_matched_by_evidence_the_window_does_not_contain` is what
+    holds it in place.
     """
     clauses: list[str] = []
     params: list[object] = []

@@ -335,7 +335,12 @@ class Sighting:
     #: where there is no score and pretending otherwise would be a fabrication.
     score: float | None
     #: The identifier that matched, where one did, so an operator asking "why
-    #: does it think this is her?" can be shown the enrolment it came from.
+    #: does it think this is her?" can be shown the enrolment it came from. It
+    #: always names an enrolment of *this* subject or nothing at all: it is
+    #: checked on the way in, and nulled on the way out when the retention sweep
+    #: or a forget removes the enrolment behind it. A pointer to a row that is
+    #: gone would answer that question with silence while the row still looked
+    #: like it had an answer.
     identifier_id: str | None
 
     @property
@@ -825,8 +830,8 @@ class Register:
             )
             # The natural key of a face enrolment: this subject, this vector.
             already = (
-                "SELECT id FROM register_identifiers WHERE subject_id = ? "
-                "AND kind = ? AND template = ?",
+                "SELECT id, subject_id FROM register_identifiers "
+                "WHERE subject_id = ? AND kind = ? AND template = ?",
                 (subject_id, kind.value, identifier.vector),
             )
         else:
@@ -843,7 +848,7 @@ class Register:
             # does not include the subject: enrolling a registration that
             # belongs to somebody else must be refused, not silently added.
             already = (
-                "SELECT id FROM register_identifiers WHERE plate = ?",
+                "SELECT id, subject_id FROM register_identifiers WHERE plate = ?",
                 (normalised,),
             )
 
@@ -863,6 +868,17 @@ class Register:
                 )
 
             existing = connection.execute(*already).fetchone()
+            if existing is not None and existing[1] != subject_id:
+                # The identifier is already somebody else's. Refused rather
+                # than moved: re-pointing a plate at a second subject would
+                # rewrite the first subject's provenance under this actor's
+                # name, and a watchlist hit would then name the wrong owner.
+                # Whose it really is, is the operator's decision to make.
+                raise RegistryError(
+                    f"that plate is already enrolled to another subject "
+                    f"({existing[1]!r}); moving it is a decision for the "
+                    "operator, not a side effect of enrolling"
+                )
             stored_id = existing[0] if existing is not None else new_identifier_id()
             try:
                 connection.execute(
@@ -1040,6 +1056,16 @@ class Register:
         operator naming somebody produces no score and any number attached to it
         would be invented.
 
+        ``identifier_id`` is checked against this subject rather than trusted.
+        It is the column an operator follows to ask "why does it think this is
+        her?", so one naming an enrolment that does not exist, or one belonging
+        to somebody else, is a name shown with the wrong reason behind it — the
+        precise failure the score/confidence pairing above is guarded against,
+        and it must not be reachable through the one column that identifies the
+        evidence. The foreign key alone does not do this: the connection is the
+        caller's and ``PRAGMA foreign_keys`` may be off, and no foreign key can
+        express "and it must be *this* subject's" in any case.
+
         One row per track, and re-recording the same track widens the window and
         replaces the claim. Aggregation across the frames of a track belongs to
         the matcher: a decision made on one frame is a guess, and this method
@@ -1068,6 +1094,24 @@ class Register:
             )
 
         with self._unit() as connection:
+            if identifier_id is not None:
+                cited = connection.execute(
+                    "SELECT subject_id FROM register_identifiers WHERE id = ?",
+                    (identifier_id,),
+                ).fetchone()
+                if cited is None:
+                    raise RegistryError(
+                        f"no enrolment {identifier_id!r} to cite as the evidence "
+                        "for this sighting: a claim whose evidence cannot be "
+                        "looked up is a name shown with no reason behind it"
+                    )
+                if cited[0] != subject_id:
+                    raise RegistryError(
+                        f"enrolment {identifier_id!r} belongs to subject "
+                        f"{cited[0]!r}, not to {subject_id!r}: a sighting whose "
+                        "evidence points at somebody else's template is a name "
+                        "shown with the wrong reason behind it"
+                    )
             connection.execute(
                 "INSERT INTO register_sightings "
                 f"({_SIGHTING_COLUMNS}) VALUES (?,?,?,?,?,?,?,?) "
@@ -1202,6 +1246,17 @@ class Register:
         name because the template expired would silently discard the notes and
         the history along with it — that is :meth:`forget`'s job, and it is
         somebody's decision, not a timer's.
+
+        A swept sighting keeps its window, its score and its confidence and
+        loses only its pointer to the enrolment, because the enrolment is gone.
+        The unlinking is written out explicitly rather than left to
+        ``ON DELETE SET NULL``, for the reason this class's docstring already
+        gives: the connection is the caller's and ``PRAGMA foreign_keys`` may be
+        off, in which case the cascade never fires and the sighting is left
+        citing an identifier row that no longer exists. An operator following
+        that pointer to ask "why does it think this is her?" would get nothing
+        back, and the API would still be returning a provenance claim the
+        database can no longer support.
         """
         policy = RetentionPolicy() if policy is None else policy
         rows = self._connection.execute(
@@ -1226,6 +1281,14 @@ class Register:
 
         if expired:
             with self._unit() as connection:
+                # Unlink before deleting, in one savepoint with the delete, so
+                # no window exists in which a sighting cites a row that is
+                # already gone.
+                connection.executemany(
+                    "UPDATE register_sightings SET identifier_id = NULL "
+                    "WHERE identifier_id = ?",
+                    [(identifier.id,) for identifier in expired],
+                )
                 connection.executemany(
                     "DELETE FROM register_identifiers WHERE id = ?",
                     [(identifier.id,) for identifier in expired],
