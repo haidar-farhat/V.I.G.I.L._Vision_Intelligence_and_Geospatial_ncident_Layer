@@ -908,3 +908,290 @@ def test_a_stored_site_hands_out_the_frame_everything_should_share(store: Store)
     assert east == pytest.approx(100.0, abs=0.01)
     assert abs(north) < 0.01
     assert SiteFrame.of(restored).origin == frame.origin
+
+
+# ------------------------------------------------------------------ the register
+
+
+def register_schema(connection) -> dict[str, str]:
+    """Every register object's definition, with comments and spacing removed.
+
+    Compared as text rather than as a list of table names, because the parts
+    that carry the weight are the CHECK constraints. A migrated database that
+    accepted a MATCH sighting with no score while a fresh one refused it would
+    hold — on upgraded deployments only — exactly the claim-without-evidence the
+    register exists to make unrepresentable, and a comparison of table names
+    would call the two databases identical.
+    """
+    rows = connection.execute(
+        "SELECT name, sql FROM sqlite_master WHERE name LIKE 'register%' "
+        "ORDER BY name"
+    ).fetchall()
+    return {row[0]: flattened(row[1]) for row in rows}
+
+
+def flattened(sql: str) -> str:
+    """One line, no comments: the schema as SQLite will enforce it."""
+    kept = [line for line in sql.splitlines() if not line.strip().startswith("--")]
+    return " ".join(" ".join(kept).split())
+
+
+def test_a_fresh_database_and_an_upgraded_one_hold_the_same_register(tmp_path: Path):
+    """The migration must build what `registry.create_schema` builds, exactly.
+
+    Two ways into one schema is two schemas eventually, and the half that drifts
+    is the half holding face templates. Checked against a database that predates
+    the register — rolled back below it and brought forward again — because that
+    is the deployment the difference would appear on, and never on the developer
+    machine where every database is fresh.
+    """
+    import sqlite3
+
+    from sentinel.registry import create_schema
+
+    with Store(tmp_path / "old.db") as upgraded:
+        populate(upgraded)
+        while any(name.startswith("register_") for name in upgraded.table_names()):
+            assert upgraded.rollback() is not None, "the register was never undone"
+        assert "register_subjects" not in upgraded.table_names()
+
+        upgraded.migrate()
+        migrated = register_schema(upgraded._connection)
+
+    bare = sqlite3.connect(":memory:")
+    try:
+        create_schema(bare)
+        fresh = register_schema(bare)
+    finally:
+        bare.close()
+
+    print(sorted(migrated))
+    assert "register_subjects" in migrated, "the migration created no register"
+    assert migrated == fresh, "an upgraded database is not the schema a new one gets"
+
+
+def test_the_register_arrives_and_leaves_without_touching_the_evidence(store: Store):
+    """The migration must apply, and undo, on a database that has rows in it.
+
+    An air-gapped deployment steps back a version to diagnose something and
+    steps forward again afterwards. If either direction took the cameras, zones,
+    incidents or the audit log with it, the diagnosis would cost the evidence.
+    """
+    from sentinel.registry import Plate
+
+    populate(store)
+    store.register.enrol(
+        subject_id="veh-1",
+        display_name="Contractor van",
+        identifier=Plate("B 7421"),
+        actor="operator:alice",
+        basis="site access list",
+    )
+    before = store.applied_versions()
+    events, incidents = store.event_count(), store.incident_count()
+
+    undone = store.rollback()
+    while undone is not None and undone.name != "register":
+        undone = store.rollback()
+
+    assert undone is not None and undone.name == "register"
+    assert [n for n in store.table_names() if n.startswith("register_")] == [], (
+        "a register table survived its own down"
+    )
+    assert store.event_count() == events, "rolling back the register took the events"
+    assert store.incident_count() == incidents
+    assert len(store.cameras()) == 1
+    assert len(store.zones()) == 1
+    assert len(store.audit_trail()) == 1
+
+    store.migrate()
+
+    assert store.applied_versions() == before
+    assert store.register.subjects() == (), (
+        "an enrolment came back from a table that had been dropped"
+    )
+    store.register.enrol(
+        subject_id="veh-1",
+        display_name="Contractor van",
+        identifier=Plate("B 7421"),
+        actor="operator:alice",
+        basis="site access list",
+    )
+    assert store.register.find_plate("B-7421") is not None
+
+
+def test_an_enrolment_made_through_the_store_survives_a_reopen(tmp_path: Path):
+    """The register is reachable from the store, and what it writes is durable.
+
+    Reachability is the point. Until this property existed the register was a
+    tested module with no way to an operator, because building one needs a
+    connection and the only honest connection is the store's own.
+    """
+    from sentinel.registry import Plate
+
+    database = tmp_path / "n.db"
+    with Store(database) as store:
+        enrolment = store.register.enrol(
+            subject_id="veh-1",
+            display_name="Contractor van",
+            identifier=Plate("b 7421", frames_agreeing=6),
+            actor="operator:alice",
+            basis="site access list",
+        )
+        assert enrolment.created_subject
+        # The audit row gets ids, kinds and counts. The plate and the name stay
+        # in the register, where forgetting can reach them.
+        store.audit(
+            "operator:alice", enrolment.action, enrolment.subject.id, enrolment.detail()
+        )
+        assert "7421" not in (store.audit_trail()[0]["detail"] or "")
+
+    with Store(database) as again:
+        subject = again.register.find_plate("B-7421")
+
+        assert subject is not None, "the enrolment did not survive the reopen"
+        assert subject.display_name == "Contractor van"
+        identifiers = again.register.identifiers("veh-1")
+        assert [identifier.plate for identifier in identifiers] == ["B7421"]
+        assert identifiers[0].raw_text == "b 7421", "the characters read were lost"
+        assert identifiers[0].basis == "site access list"
+        assert identifiers[0].enrolled_by == "operator:alice"
+
+
+def test_the_register_writes_inside_the_stores_own_unit_of_work(store: Store):
+    """One connection, so an enrolment and the row proving it land together.
+
+    A `Register` built by a caller on a second connection to the same file would
+    commit on its own: the enrolment would survive a failure that rolled back
+    everything written beside it, and the database would hold a template with no
+    audit row saying who put it there.
+    """
+    from sentinel.registry import Plate
+
+    assert store.register is store.register, "each call built another register"
+
+    with pytest.raises(RuntimeError, match="the paperwork failed"):
+        with store.transaction():
+            store.register.enrol(
+                subject_id="veh-1",
+                display_name="Contractor van",
+                identifier=Plate("B 7421"),
+                actor="operator:alice",
+                basis="site access list",
+            )
+            raise RuntimeError("the paperwork failed")
+
+    assert store.register.subjects() == (), (
+        "the enrolment committed on its own connection, outside the failed unit "
+        "of work"
+    )
+
+
+# -------------------------------------------------------- structured audit rows
+
+
+def zone_pair() -> tuple[Zone, Zone]:
+    """One zone before and after an edit that changes exactly one field."""
+    ring = tuple(destination_point(SITE, bearing, 30.0) for bearing in (0.0, 90.0, 180.0))
+    before = Zone(id="zone-a", name="Yard", kind=ZoneKind.RESTRICTED, ring=ring)
+    return before, Zone(id="zone-a", name="Yard", kind=ZoneKind.EXCLUSION, ring=ring)
+
+
+def make_record(**overrides):
+    from sentinel.auditing import AuditRecord
+
+    before, after = zone_pair()
+    fields = dict(
+        actor="operator:alice",
+        action="zone.changed",
+        subject="zone-a",
+        node_id="gatehouse",
+        at=datetime(2026, 3, 1, 9, 30, tzinfo=timezone.utc),
+        before=before,
+        after=after,
+    )
+    fields.update(overrides)
+    return AuditRecord.of(**fields)
+
+
+def test_a_structured_audit_row_keeps_the_prose_and_the_states_behind_it(store: Store):
+    # The sentence is what an operator reads; the states are what makes the row
+    # answerable to a question nobody asked at the time.
+    import json
+
+    record = make_record()
+
+    head = store.audit_record(record)
+
+    row = store.audit_trail()[0]
+    print(row["detail"])
+    assert row["detail"] == "kind RESTRICTED -> EXCLUSION"
+    assert row["actor"] == "operator:alice" and row["node_id"] == "gatehouse"
+    assert row["at"] == int(record.at.timestamp() * 1000), "the row moved in time"
+    before = json.loads(row["before_json"])
+    after = json.loads(row["after_json"])
+    assert {key for key in before if before[key] != after[key]} == {"kind"}
+    assert row["chain_hash"] == head
+
+
+def test_the_chain_folds_each_record_into_the_next(store: Store):
+    """Editing one row must break every hash after it, and say which row.
+
+    A chain that only covered the newest row would detect nothing: altering an
+    audit log means altering something old.
+    """
+    from sentinel.auditing import verify_chain
+
+    first = make_record(subject="zone-a")
+    second = make_record(subject="zone-b")
+    hashes = [store.audit_record(first), store.audit_record(second)]
+
+    assert hashes[0] != hashes[1]
+    assert store.audit_chain_head() == hashes[1]
+    assert verify_chain([first, second], hashes) is None
+
+    tampered = make_record(subject="zone-a", actor="operator:mallory")
+    assert verify_chain([tampered, second], hashes) == 0, (
+        "an edited record verified, so the chain protects nothing"
+    )
+
+
+def test_a_prose_only_row_leaves_the_chain_where_it_was(store: Store):
+    # `audit` has no before-state to record and writes no hash, and the chain is
+    # honest about covering only the rows that carry one. Claiming the whole log
+    # is chained when half of it is not is the failure this pins.
+    head = store.audit_record(make_record())
+
+    store.audit("node", "node.started", "gatehouse")
+
+    assert store.audit_chain_head() == head, "a row with no hash broke the chain"
+    assert store.audit_trail()[0]["chain_hash"] is None
+
+
+def test_an_audit_row_written_before_the_columns_existed_still_reads(store: Store):
+    """Nullable is load-bearing here, not lenient.
+
+    The audit log is append-only, so there is no pass that could go back and
+    fill a before-state in for an edit made last year. A NOT NULL column would
+    either fail the migration or force this code to invent one.
+    """
+    undone = store.rollback()
+    while undone is not None and undone.name != "audit_records":
+        undone = store.rollback()
+    assert undone is not None and undone.name == "audit_records"
+    assert "before_json" not in store.column_names("audit_logs")
+
+    store.audit("operator:alice", "camera.placed", "cam-07", "6 m mast, bearing 145")
+    store.migrate()
+
+    row = store.audit_trail()[0]
+    assert row["actor"] == "operator:alice"
+    assert row["detail"] == "6 m mast, bearing 145", "the old row lost its line"
+    assert row["before_json"] is None and row["after_json"] is None
+    assert row["node_id"] is None and row["chain_hash"] is None
+    assert store.audit_chain_head() is None
+
+    # And a structured row written after it starts the chain rather than failing
+    # on a predecessor that has no hash.
+    head = store.audit_record(make_record())
+    assert head and store.audit_chain_head() == head

@@ -283,7 +283,7 @@ class InvestigationPanel(QWidget):
         self.severity.currentIndexChanged.connect(self._filters_changed)
         self.limit.valueChanged.connect(self._filters_changed)
 
-        self.search()
+        # WIRING REMOVED
 
     # ---------------------------------------------------------------- the node
 
