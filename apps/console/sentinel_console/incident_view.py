@@ -153,12 +153,17 @@ class IncidentView(QTreeWidget):
                 _detail(f"{factor.points:+.0f}", f"{factor.name} — {factor.because}")
             )
 
-        # Cross-camera associations, with the reasoning. An operator must be able
-        # to see why two cameras were treated as one object, and disagree.
+        # Associations, with the reasoning. An operator must be able to see why
+        # two tracks were treated as one object, and disagree. Labelled by what
+        # was joined: two cameras' tracks (a hand-off) or two fragments of one
+        # camera's track (the tracker lost and re-found the same object). They
+        # are different claims and were both called "linked" until same-camera
+        # links existed.
         for association in incident.associations:
+            same_camera = association.a[0] == association.b[0]
             item.addChild(
                 _detail(
-                    "linked",
+                    "same camera" if same_camera else "cross camera",
                     f"{association.a[0]}#{association.a[1]} = "
                     f"{association.b[0]}#{association.b[1]} "
                     f"({association.score:.2f}): {association.reasons[0]}",
@@ -167,8 +172,13 @@ class IncidentView(QTreeWidget):
 
         item.addChild(_heading("timeline", f"{len(incident.events)} events"))
         for entry in incident.timeline():
+            # Relative to when the incident opened, which is what "t+" claims.
+            # `at_millis` is a wall clock: near zero for a file, a Unix epoch
+            # for a live camera, and this read "t+1788513275.8s" on the laptop
+            # webcam — the defect fixed in the evidence report this morning,
+            # still here.
             child = _detail(
-                f"t+{entry.at_millis / 1000:.1f}s",
+                f"t+{(entry.at_millis - incident.opened_at_millis) / 1000:.1f}s",
                 f"{entry.camera_id}  {entry.summary}",
             )
             child.setForeground(

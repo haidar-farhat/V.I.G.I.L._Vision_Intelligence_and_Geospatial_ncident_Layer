@@ -529,3 +529,328 @@ def test_an_unbounded_live_source_says_so_before_it_starts(
     printed = capsys.readouterr().err
     assert "unbounded" in printed
     assert "--for" in printed and "--frames" in printed
+
+
+# --------------------------------------------------- which zones a run watches
+
+
+YARD = "Yard:33.8940,35.5016;33.8940,35.5020;33.8936,35.5020;33.8936,35.5016"
+DOCK = "Dock:33.8950,35.5016;33.8950,35.5020;33.8946,35.5020;33.8946,35.5016"
+
+
+class CapturingPipeline:
+    """Stands in for `Pipeline` and keeps what the CLI built it with.
+
+    The question these tests ask is "which zones, with which filters, reached
+    the pipeline" — a question about the wiring, which a real decode of the
+    reference scene would answer slowly and by inference from event counts.
+    """
+
+    built: list[dict] = []
+
+    def __init__(self, source, detector, **kwargs):
+        from sentinel.pipeline import PipelineStats
+
+        CapturingPipeline.built.append(dict(kwargs, source_id=source.source_id))
+        self.stats = PipelineStats()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
+    def run(self):
+        return iter(())
+
+
+@pytest.fixture
+def capturing_pipeline(monkeypatch):
+    CapturingPipeline.built = []
+    monkeypatch.setattr(cli, "Pipeline", CapturingPipeline)
+    return CapturingPipeline.built
+
+
+def test_a_class_filter_is_parsed_into_a_zone_name_and_its_labels():
+    name, classes = cli._zone_classes("Loading Yard = person, car ")
+
+    assert name == "Loading Yard"
+    assert classes == frozenset({"person", "car"})
+
+
+@pytest.mark.parametrize("text", ["Yard", "=person", "Yard=", "Yard=,"])
+def test_a_class_filter_without_a_zone_or_without_labels_is_refused(text: str):
+    # `Yard=` is a filter somebody forgot to finish far more often than a
+    # decision to watch everything, and leaving the option off already means
+    # that.
+    with pytest.raises(argparse.ArgumentTypeError):
+        cli._zone_classes(text)
+
+
+def test_zone_classes_reach_the_zone_the_run_watches_and_are_stored_with_it(
+    reference_video: Path, database: Path, capturing_pipeline
+):
+    code = cli.main([
+        "--database", str(database), "--quiet",
+        "run", str(reference_video),
+        "--zone", YARD, "--zone", DOCK,
+        "--zone-classes", "Yard=person", "--zone-classes", "yard=car",
+    ])
+
+    assert code == 0
+    zones = {zone.name: zone for zone in capturing_pipeline[0]["zones"]}
+    # Two filters naming the same zone — by name and by its slug — combine,
+    # rather than the second silently dropping the class the first typed.
+    assert zones["Yard"].classes == frozenset({"person", "car"})
+    assert zones["Dock"].classes == frozenset(), "an unfiltered zone watches anything"
+
+    # The filter is written back with the zone, so this is the way a filter
+    # gets set without opening the console.
+    with Store(database) as store:
+        stored = {zone.name: zone for zone in store.zones()}
+    assert stored["Yard"].classes == frozenset({"person", "car"})
+
+
+def test_zone_classes_naming_a_zone_no_zone_declared_is_refused(
+    reference_video: Path, database: Path, capturing_pipeline, capsys
+):
+    # Refused even though the database holds a zone of that name: a run that
+    # rewrote a stored zone's filter would change what the console watches
+    # from then on, with no audit row naming who did it.
+    with Store(database) as store:
+        store.save_zone(cli._zone(DOCK))
+
+    code = cli.main([
+        "--database", str(database), "--quiet",
+        "run", str(reference_video),
+        "--zone", YARD, "--zone-classes", "Dock=person",
+    ])
+
+    assert code == 2
+    printed = capsys.readouterr().err
+    assert "Dock" in printed and "--zone" in printed
+    assert capturing_pipeline == [], "nothing was opened"
+    with Store(database) as store:
+        assert store.zones()[0].classes == frozenset(), "the stored zone was not touched"
+
+
+def test_zone_classes_reach_the_node_too(database: Path, monkeypatch, tmp_path: Path):
+    built: list[dict] = []
+
+    class CapturingNode:
+        def __init__(self, database, **kwargs):
+            built.append(kwargs)
+            self.store = Store(database)
+            self.cameras = ()
+            self.zones = tuple(kwargs["zones"])
+            self.rules = ()
+
+        def add_camera(self, source, *, camera_id=None, pose=None):
+            pass
+
+        def run_forever(self, *, until=None):
+            pass
+
+        def summary(self):
+            return ""
+
+        def close(self):
+            self.store.close()
+
+    monkeypatch.setattr(cli, "Node", CapturingNode)
+    video = tmp_path / "gate.mp4"
+    video.write_bytes(b"")
+
+    code = cli.main([
+        "--database", str(database), "--quiet",
+        "node", str(video), "--for", "1",
+        "--zone", YARD, "--zone-classes", "Yard=person",
+    ])
+
+    assert code == 0
+    assert [zone.classes for zone in built[0]["zones"]] == [frozenset({"person"})]
+
+    refused = cli.main([
+        "--database", str(database), "--quiet",
+        "node", str(video), "--for", "1", "--zone-classes", "Yard=person",
+    ])
+    assert refused == 2
+    assert len(built) == 1, "a refused command builds no node"
+
+
+def test_a_run_with_no_zone_restores_the_stored_zones_and_says_what_they_watch(
+    reference_video: Path, database: Path, capturing_pipeline, capsys
+):
+    # The gap the real camera found: a database whose one zone watched
+    # `person`, a run that built its zones from --zone alone, and a report of
+    # "No events" from a run that was watching nothing.
+    from dataclasses import replace
+
+    with Store(database) as store:
+        store.save_zone(replace(cli._zone(YARD), classes=frozenset({"person"})))
+        store.save_zone(cli._zone(DOCK))
+
+    code = cli.main([
+        "--database", str(database), "--quiet", "run", str(reference_video),
+    ])
+
+    assert code == 0
+    watched = {zone.name: zone.classes for zone in capturing_pipeline[0]["zones"]}
+    assert watched == {"Yard": frozenset({"person"}), "Dock": frozenset()}
+
+    printed = capsys.readouterr()
+    assert "2 restored from the database" in printed.out
+    assert "Yard" in printed.out and "watches person" in printed.out
+    assert "Dock" in printed.out and "every class" in printed.out
+    # And the reason this run can raise nothing in Yard, said before it starts.
+    assert "Yard" in printed.err and "--model" in printed.err
+
+
+def test_a_run_given_zones_uses_only_those_and_says_which_stored_ones_it_left(
+    reference_video: Path, database: Path, capturing_pipeline, capsys
+):
+    with Store(database) as store:
+        store.save_zone(cli._zone(DOCK))
+
+    code = cli.main([
+        "--database", str(database), "--quiet",
+        "run", str(reference_video), "--zone", YARD,
+    ])
+
+    assert code == 0
+    assert [zone.name for zone in capturing_pipeline[0]["zones"]] == ["Yard"]
+
+    printed = capsys.readouterr().out
+    assert "1 from --zone" in printed
+    assert "not used this run: 1 stored zone(s)" in printed and "Dock" in printed
+    with Store(database) as store:
+        assert sorted(zone.name for zone in store.zones()) == ["Dock", "Yard"], (
+            "explicit wins for the run; the stored zone is not deleted"
+        )
+
+
+def test_a_run_on_a_database_with_no_zones_says_so(
+    reference_video: Path, database: Path, capturing_pipeline, capsys
+):
+    assert cli.main([
+        "--database", str(database), "--quiet", "run", str(reference_video),
+    ]) == 0
+
+    assert capturing_pipeline[0]["zones"] == []
+    assert "zones       none" in capsys.readouterr().out
+
+
+# ------------------------------------------------ retention reaches the register
+
+
+DAY = 86_400_000
+
+
+def enrol_two_vans(database: Path, *, days_ago: float) -> tuple[str, str]:
+    """A van enrolled `days_ago`, and a pinned one enrolled the same day.
+
+    Returns the two identifier ids. Plates rather than faces because a plate
+    needs no encoder; the sweep prices the kinds differently but selects them
+    the same way.
+    """
+    import time
+
+    from sentinel.registry import Plate
+
+    then = int(time.time() * 1000) - int(days_ago * DAY)
+    with Store(database) as store:
+        gone = store.register.enrol(
+            subject_id="veh-old", display_name="Old van",
+            identifier=Plate("B 7421"), actor="operator:nadia",
+            basis="site access list", now_millis=then,
+        )
+        kept = store.register.enrol(
+            subject_id="veh-pinned", display_name="Pinned van",
+            identifier=Plate("C 1122"), actor="operator:nadia",
+            basis="site access list", now_millis=then,
+        )
+        store.register.set_pinned("veh-pinned", True, actor="operator:nadia")
+    return gone.identifier.id, kept.identifier.id
+
+
+def test_retention_reports_the_register_sweep_without_apply_and_touches_nothing(
+    database: Path, capsys
+):
+    enrol_two_vans(database, days_ago=400)
+
+    code = cli.main([
+        "--database", str(database), "--quiet",
+        "retention", "--min-free-gib", "0",
+    ])
+
+    assert code == 0
+    printed = capsys.readouterr().out
+    assert "2 identifier(s) examined" in printed
+    assert "would delete    1 identifier(s)" in printed
+    assert "kept        1 identifier(s) past retention" in printed
+    assert "Add --apply" in printed
+
+    with Store(database) as store:
+        assert len(store.register.identifiers("veh-old")) == 1, "a report deleted"
+        assert all(
+            row["action"] != "register.sweep" for row in store.audit_trail()
+        ), "a report audited a sweep that did not happen"
+
+
+def test_retention_sweeps_an_expired_identifier_keeps_a_pinned_one_and_audits_it(
+    database: Path, capsys
+):
+    gone, kept = enrol_two_vans(database, days_ago=400)
+
+    code = cli.main([
+        "--database", str(database), "--quiet",
+        "retention", "--apply", "--min-free-gib", "0",
+    ])
+
+    assert code == 0
+    printed = capsys.readouterr().out
+    assert "deleted    1 identifier(s)" in printed
+    assert "kept        1 identifier(s) past retention" in printed
+
+    with Store(database) as store:
+        assert store.register.identifiers("veh-old") == ()
+        assert [row.id for row in store.register.identifiers("veh-pinned")] == [kept]
+        assert store.register.subject("veh-old") is not None, (
+            "the name survives; forgetting it is a person's decision"
+        )
+        sweeps = [row for row in store.audit_trail() if row["action"] == "register.sweep"]
+
+    assert len(sweeps) == 1
+    detail = json.loads(sweeps[0]["detail"])
+    assert detail["deleted_ids"] == [gone]
+    assert detail["kept_pinned_ids"] == [kept]
+    assert "7421" not in sweeps[0]["detail"], "ids and counts, never a plate"
+
+
+def test_the_report_promises_exactly_what_apply_then_does(database: Path, capsys):
+    # The dry run reads the register with its own selection, because the sweep
+    # has none. The two must agree, or the report understates the sweep.
+    enrol_two_vans(database, days_ago=400)
+    arguments = ["--database", str(database), "--quiet", "retention", "--min-free-gib", "0"]
+
+    cli.main([*arguments, "--plate-days", "500"])
+    inside = capsys.readouterr().out
+    cli.main([*arguments, "--plate-days", "500", "--apply"])
+    applied_inside = capsys.readouterr().out
+
+    assert "would delete    0 identifier(s)" in inside
+    assert "deleted    0 identifier(s)" in applied_inside
+
+    cli.main(arguments)
+    report = capsys.readouterr().out
+    cli.main([*arguments, "--apply"])
+    applied = capsys.readouterr().out
+
+    assert "would delete    1 identifier(s)" in report
+    assert "deleted    1 identifier(s)" in applied
+
+
+def test_a_negative_identifier_retention_is_refused(database: Path):
+    assert cli.main([
+        "--database", str(database), "--quiet", "retention", "--face-days", "-1",
+    ]) == 2

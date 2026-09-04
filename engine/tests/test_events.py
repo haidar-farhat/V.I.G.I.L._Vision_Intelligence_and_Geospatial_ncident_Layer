@@ -756,3 +756,42 @@ def test_the_filter_removes_exactly_the_non_person_events_and_nothing_else(filte
 
     expected = {event.id for event in unfiltered if event.evidence.class_label == "person"}
     assert {event.id for event in people} == expected
+
+
+def test_every_rule_names_the_class_the_same_way():
+    """"A person entered" beside "An object remained" reads as doubt.
+
+    Seen on the laptop camera with a person-only zone: the entry events said
+    "A person" and the loitering event for the same person said "An object",
+    because two rules carried a fixed subject. All three now share one
+    phrasing, and under a motion detector all three still say "An object".
+    """
+    from sentinel.events import AfterHoursRule, LoiteringRule, RuleContext, _subject
+    from sentinel.zones import Schedule
+    from datetime import time as clock
+
+    person = make_track(1, SITE, class_id=0)
+    yard = restricted()
+
+    def context(detector, track):
+        return RuleContext(
+            node_id="nd", camera_id="cam-07", zone=yard, track=track,
+            presence=presence(track.id), at_millis=2000,
+            moment=datetime(2026, 8, 30, 3, 0, tzinfo=timezone.utc),
+            detector=detector, frame_index=60,
+        )
+
+    assert _subject(context(MODEL, person)) == "A person"
+    assert _subject(context(MOTION, person)) == "An object"
+
+    # And the two rules that used to say "An object" regardless now agree
+    # with the entry rule when the detector can name the class.
+    night = restricted(schedule=Schedule(clock(18, 0), clock(6, 0)))
+    (after_hours,) = AfterHoursRule().on_presence_change(
+        PresenceChange("ENTERED", presence(person.id), 2000),
+        RuleContext(node_id="nd", camera_id="cam-07", zone=night, track=person,
+                    presence=presence(person.id), at_millis=2000,
+                    moment=datetime(2026, 8, 30, 3, 0, tzinfo=timezone.utc),
+                    detector=MODEL, frame_index=60),
+    )
+    assert after_hours.summary.startswith("A person was in")

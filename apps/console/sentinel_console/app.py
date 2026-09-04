@@ -90,6 +90,7 @@ from .session import CameraSession
 from .add_camera import AddCameraDialog
 from .video_view import VideoView
 from .selection import CAMERA as CAMERA_KIND, Selection, SelectionBus
+from .audit_view import AuditPanel
 from .investigation import InvestigationPanel
 from .zones_view import ZoneDialog, ZonePropertiesPanel, ZonesView
 
@@ -400,6 +401,12 @@ class ConsoleWindow(QMainWindow):
         self.investigation = InvestigationPanel(self.node.store)
         self.investigation.selected.connect(self.selection.select)
         self.detail_tabs.addTab(self.investigation, "Investigation")
+        # The audit log, readable at last. It is what makes an incident
+        # defensible, and until this tab nothing in any interface showed a row
+        # of it — the chain of before/after states was written for nobody.
+        self.audit = AuditPanel()
+        self.audit.set_store(self.node.store)
+        self.detail_tabs.addTab(self.audit, "Audit")
         lower.addWidget(_panel("TRACKED OBJECTS · ZONES", self.detail_tabs))
         lower.setStretchFactor(0, 3)
         lower.setStretchFactor(1, 2)

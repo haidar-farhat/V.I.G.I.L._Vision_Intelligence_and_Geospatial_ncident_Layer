@@ -20,6 +20,8 @@ properties that make it a *node*:
 
 from __future__ import annotations
 
+import contextlib
+import logging
 import subprocess
 import sys
 import threading
@@ -1364,3 +1366,400 @@ def test_the_state_word_is_what_an_interface_actually_prints():
     # And the comparison every caller was told it could make still holds.
     assert CameraState.LIVE == "LIVE"
     assert CameraState.LIVE.value == "LIVE"
+
+
+# ---------------------------------------------------------------- plate reads
+
+
+class _PlateRunner:
+    """Stands in for a camera whose pipeline has a plate reader.
+
+    A real one needs a plate model this suite does not ship, and the property
+    under test is not reading — `test_plates.py` and `test_pipeline.py` own
+    that — but what the node does with a reading once the pipeline has
+    published it. Hands out the updates it was given, one per poll, in order;
+    everything else is what a live runner would report.
+    """
+
+    def __init__(self, updates):
+        self._updates = list(updates)
+        self.is_running = True
+        self.fault = None
+        self.stats = None
+        self.skipped = 0
+        self.analysis_fps = 30.0
+        self.dropped_frames = 0
+        self.reconnects = 0
+
+    def take_latest(self):
+        return self._updates.pop(0) if self._updates else None
+
+    def take_segments(self):
+        return []
+
+    def take_events(self):
+        return []
+
+    def ask_to_stop(self):
+        self.is_running = False
+
+    def stop(self, timeout=None):
+        self.is_running = False
+        return True
+
+    @property
+    def seconds_since_frame(self):
+        return 0.0
+
+    @property
+    def seconds_since_started(self):
+        return 1.0
+
+
+def _reading(
+    track: int = 3,
+    *,
+    display: str,
+    text: str | None = None,
+    confident: bool = False,
+    agreement: int = 0,
+    reads: int = 3,
+):
+    from sentinel.pipeline import TrackPlate
+
+    return TrackPlate(
+        track_id=track, country="LB", display=display, text=text,
+        is_confident=confident, agreement=agreement, reads=reads,
+    )
+
+
+def _frame(index: int, *, plates, first_seen: int, last_seen: int):
+    """One published frame carrying a vehicle track and its readings."""
+    from sentinel.core import BoundingBox, Track
+    from sentinel.node import Update
+    from sentinel.pipeline import FrameResult, PipelineStats
+
+    tracks = tuple(
+        Track(
+            id=plate.track_id, class_id=2, bbox=BoundingBox(0.4, 0.5, 0.2, 0.2),
+            confidence=0.9, hits=index, first_seen_millis=first_seen,
+            last_seen_millis=last_seen, position=None, speed_mps=None,
+            heading_degrees=None,
+        )
+        for plate in plates
+    )
+    result = FrameResult(
+        index=index, timestamp_millis=last_seen, source_id="gate",
+        detections=(), tracks=tracks, ended=(), events=(), plates=tuple(plates),
+    )
+    return Update(result=result, analysis_fps=30.0, skipped=0, stats=PipelineStats())
+
+
+def _enrol_van(node: Node):
+    from sentinel.registry import Plate
+
+    return node.store.register.enrol(
+        subject_id="veh-1", display_name="Contractor van",
+        identifier=Plate("B 7421", frames_agreeing=6),
+        actor="operator:alice", basis="site access list",
+    )
+
+
+def _sightings_of_anyone(node: Node):
+    register = node.store.register
+    return [
+        sighting
+        for subject in register.subjects()
+        for sighting in register.history(subject.id)
+    ]
+
+
+def _sighting_audits(node: Node):
+    return [
+        row for row in node.store.audit_trail(limit=500)
+        if row["action"] == "vehicle.sighted"
+    ]
+
+
+@contextlib.contextmanager
+def _listening_to_the_node(level: int = logging.WARNING):
+    """Everything `node.py` logs, at or above ``level``.
+
+    `caplog` cannot be used: `logs.configure` sets ``propagate=False`` on the
+    `sentinel` tree, deliberately, so the handler has to go on the logger that
+    actually emits.
+    """
+    said: list[logging.LogRecord] = []
+
+    class Collect(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            said.append(record)
+
+    logger = logging.getLogger("sentinel.node")
+    handler = Collect()
+    handler.setLevel(level)
+    was = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(min(was, level) if was else level)
+    try:
+        yield said
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(was)
+
+
+def test_a_plate_reading_is_persisted_once_however_many_frames_carry_it(
+    tmp_path: Path, reference_video: Path
+):
+    """Until this was wired, `FrameResult.plates` reached the screen and nothing else.
+
+    Three polls, three frames of the same van, one row — holding the last
+    tally and the whole window. A row per frame would make one van three.
+    """
+    frames = [
+        _frame(10, plates=[_reading(display="B74?1", reads=3)], first_seen=1_000, last_seen=1_400),
+        _frame(14, plates=[_reading(display="B7421", text="B7421", agreement=3, reads=5)], first_seen=1_000, last_seen=1_560),
+        _frame(22, plates=[_reading(display="B7421", text="B7421", agreement=3, reads=6)], first_seen=1_000, last_seen=1_880),
+    ]
+    with Node(tmp_path / "n.db") as node:
+        node.add_camera(reference_video, camera_id="gate")
+        node.camera("gate").runner = _PlateRunner(frames)
+
+        polled = sum(len(node.poll()) for _ in range(3))
+        rows = node.store.plate_reads()
+
+    assert polled == 3, "the fake fed fewer frames than the test believes"
+    assert len(rows) == 1
+    assert (rows[0].camera_id, rows[0].track_id) == ("gate", 3)
+    assert (rows[0].first_frame, rows[0].last_frame) == (10, 22)
+    assert (rows[0].agreement, rows[0].reads) == (3, 6)
+    assert rows[0].seen_at_millis == 1_880
+
+
+def test_an_unconfident_reading_is_kept_but_never_becomes_a_sighting(
+    tmp_path: Path, reference_video: Path
+):
+    """A half-read plate must not become a sighting of somebody's car.
+
+    Two readings of an enrolled plate that fall short in the two ways a
+    reading can: one character unread, and every character read but the
+    weakest under the bar. Both are recorded — an operator may look — and
+    neither reaches the register.
+    """
+    frames = [
+        _frame(10, plates=[_reading(1, display="B74?1", reads=3)], first_seen=1_000, last_seen=1_400),
+        _frame(11, plates=[_reading(2, display="B7421", text="B7421", agreement=3, reads=3)], first_seen=1_000, last_seen=1_440),
+    ]
+    with Node(tmp_path / "n.db") as node:
+        _enrol_van(node)
+        node.add_camera(reference_video, camera_id="gate")
+        node.camera("gate").runner = _PlateRunner(frames)
+
+        node.poll()
+        node.poll()
+
+        readings = node.store.plate_reads()
+        history = node.store.register.history("veh-1")
+        audits = _sighting_audits(node)
+
+    assert {r.track_id for r in readings} == {1, 2}, "an unconfident reading was not kept"
+    assert all(r.is_confident is False for r in readings)
+    assert history == (), "a reading under the bar was matched against the register"
+    assert audits == []
+
+
+def test_a_confident_reading_of_an_enrolled_plate_records_a_sighting_that_advances(
+    tmp_path: Path, reference_video: Path
+):
+    """This is the movement history the Vehicles panel will show.
+
+    Two polls of one track: the sighting is one row, its first observation
+    stays where the track began and its last advances with the track. The
+    claim carries its evidence — a MATCH with the share of reads that agreed
+    on the weakest character — and cites the enrolment it matched.
+    """
+    from sentinel.registry import Confidence
+
+    confident = _reading(display="B7421", text="B7421", confident=True, agreement=4, reads=6)
+    frames = [
+        _frame(30, plates=[confident], first_seen=1_000, last_seen=2_000),
+        _frame(80, plates=[confident], first_seen=1_000, last_seen=4_000),
+    ]
+    with Node(tmp_path / "n.db") as node:
+        enrolment = _enrol_van(node)
+        node.add_camera(reference_video, camera_id="gate")
+        node.camera("gate").runner = _PlateRunner(frames)
+
+        node.poll()
+        after_one = node.store.register.history("veh-1")
+        node.poll()
+        after_two = node.store.register.history("veh-1")
+        readings = node.store.plate_reads()
+
+    assert len(after_one) == 1 and len(after_two) == 1, "one track became two sightings"
+    assert (after_one[0].first_seen_millis, after_one[0].last_seen_millis) == (1_000, 2_000)
+    assert (after_two[0].first_seen_millis, after_two[0].last_seen_millis) == (1_000, 4_000)
+    sighting = after_two[0]
+    assert (sighting.camera_id, sighting.track_id) == ("gate", 3)
+    assert sighting.confidence is Confidence.MATCH
+    assert sighting.score == pytest.approx(4 / 6)
+    assert sighting.identifier_id == enrolment.identifier.id, "the sighting does not say why"
+    assert len(readings) == 1 and readings[0].is_confident is True
+
+
+def test_the_first_sighting_is_audited_once_by_id_and_never_by_plate(
+    tmp_path: Path, reference_video: Path
+):
+    # The audit log is read by more people than the register is. It gets the
+    # subject id and the camera; the plate and the name stay where a forget
+    # can reach them.
+    confident = _reading(display="B7421", text="B7421", confident=True, agreement=4, reads=6)
+    frames = [
+        _frame(30, plates=[confident], first_seen=1_000, last_seen=2_000),
+        _frame(80, plates=[confident], first_seen=1_000, last_seen=4_000),
+    ]
+    with Node(tmp_path / "n.db") as node:
+        _enrol_van(node)
+        node.add_camera(reference_video, camera_id="gate")
+        node.camera("gate").runner = _PlateRunner(frames)
+
+        node.poll()
+        node.poll()
+        audits = _sighting_audits(node)
+
+    assert len(audits) == 1, "one encounter was audited once per poll"
+    row = audits[0]
+    assert row["subject"] == "veh-1"
+    assert row["actor"] == ACTOR
+    assert "gate" in row["detail"] and "track 3" in row["detail"]
+    for column in ("subject", "detail"):
+        assert "7421" not in (row[column] or ""), f"the plate reached the audit log in {column}"
+        assert "Contractor" not in (row[column] or ""), f"the name reached the audit log in {column}"
+
+
+def test_a_confident_reading_of_a_stranger_stays_a_reading(
+    tmp_path: Path, reference_video: Path
+):
+    # Nothing is ever enrolled by being observed. A plate nobody named is
+    # stored as a reading, and the register is not touched.
+    confident = _reading(display="C9988", text="C9988", confident=True, agreement=5, reads=7)
+    with Node(tmp_path / "n.db") as node:
+        _enrol_van(node)
+        node.add_camera(reference_video, camera_id="gate")
+        node.camera("gate").runner = _PlateRunner(
+            [_frame(30, plates=[confident], first_seen=1_000, last_seen=2_000)]
+        )
+
+        node.poll()
+
+        readings = node.store.plate_reads()
+        sightings = _sightings_of_anyone(node)
+        subjects = node.store.register.subjects()
+        audits = _sighting_audits(node)
+
+    assert [r.text for r in readings] == ["C9988"] and readings[0].is_confident is True
+    assert sightings == []
+    assert [s.id for s in subjects] == ["veh-1"], "observation enrolled somebody"
+    assert audits == []
+
+
+def test_a_read_the_register_cannot_spell_does_not_stop_the_poll(
+    tmp_path: Path, reference_video: Path
+):
+    """The pipeline keeps any alphanumeric; the register keeps A–Z and 0–9.
+
+    Greek capitals are both alphanumeric and outside the plate alphabet, so a
+    confident read of them normalises to nothing and the register refuses it.
+    That is a read of something that is not a registration, not a fault: the
+    reading is kept, no sighting is made, and the next poll still runs.
+    """
+    odd = _reading(display="\u0391\u0392\u0393", text="\u0391\u0392\u0393", confident=True, agreement=4, reads=4)
+    frames = [
+        _frame(30, plates=[odd], first_seen=1_000, last_seen=2_000),
+        _frame(31, plates=[odd], first_seen=1_000, last_seen=2_040),
+    ]
+    with Node(tmp_path / "n.db") as node:
+        _enrol_van(node)
+        node.add_camera(reference_video, camera_id="gate")
+        node.camera("gate").runner = _PlateRunner(frames)
+
+        with _listening_to_the_node() as said:
+            polled = len(node.poll()) + len(node.poll())
+
+        readings = node.store.plate_reads()
+        sightings = _sightings_of_anyone(node)
+
+    assert polled == 2, "the refusal stopped the poll"
+    assert len(readings) == 1 and readings[0].last_frame == 31
+    assert sightings == []
+    # Logged once, not once per poll \u2014 and without the read. The register's
+    # own refusal quotes it, and the node log travels in support bundles.
+    refusals = [r.getMessage() for r in said if "track 3" in r.getMessage()]
+    assert len(refusals) == 1, "the refusal was logged once per poll, or not at all"
+    assert "\u0391\u0392\u0393" not in refusals[0], "the plate reached the node log"
+
+
+def test_a_refusal_dies_with_the_runner_that_earned_it(
+    tmp_path: Path, reference_video: Path
+):
+    """A camera restarted in the same process starts its track ids again.
+
+    Found by a skeptic: the refusal was remembered per (camera, track) and
+    never let go, so a Greek read on track 3 in one run silenced the enrolled
+    van's confident read on track 3 in the next. No sighting, no audit row,
+    and no line in any log saying why.
+    """
+    odd = _reading(display="\u0391\u0392\u0393", text="\u0391\u0392\u0393", confident=True, agreement=4, reads=4)
+    van = _reading(display="B7421", text="B7421", confident=True, agreement=4, reads=6)
+    with Node(tmp_path / "n.db") as node:
+        _enrol_van(node)
+        node.add_camera(reference_video, camera_id="gate")
+        gate = node.camera("gate")
+
+        gate.runner = _PlateRunner([_frame(30, plates=[odd], first_seen=1_000, last_seen=2_000)])
+        node.poll()
+        gate.runner = _PlateRunner([_frame(3, plates=[van], first_seen=5_000, last_seen=5_200)])
+        node.poll()
+
+        history = node.store.register.history("veh-1")
+        audits = _sighting_audits(node)
+
+    assert len(history) == 1, "the new run's track 3 inherited the old run's refusal"
+    assert (history[0].camera_id, history[0].track_id) == ("gate", 3)
+    assert (history[0].first_seen_millis, history[0].last_seen_millis) == (5_000, 5_200)
+    assert len(audits) == 1 and audits[0]["subject"] == "veh-1"
+
+
+def test_a_second_run_of_the_same_track_id_is_a_second_encounter(
+    tmp_path: Path, reference_video: Path
+):
+    """The mirror of the refusal: an audit in one run must not silence the next.
+
+    The van on track 3, the runner rebuilt, the van on the new run's track 3:
+    two encounters, two audit lines. The limit written down was that a
+    restarted node audits a still-live encounter *once more*; keyed without
+    the run it audited it never again.
+    """
+    van = _reading(display="B7421", text="B7421", confident=True, agreement=4, reads=6)
+    with Node(tmp_path / "n.db") as node:
+        _enrol_van(node)
+        node.add_camera(reference_video, camera_id="gate")
+        gate = node.camera("gate")
+
+        gate.runner = _PlateRunner([_frame(30, plates=[van], first_seen=1_000, last_seen=2_000)])
+        node.poll()
+        first_run = len(_sighting_audits(node))
+        gate.runner = _PlateRunner([
+            _frame(3, plates=[van], first_seen=5_000, last_seen=5_200),
+            _frame(4, plates=[van], first_seen=5_000, last_seen=5_240),
+        ])
+        node.poll()
+        node.poll()
+
+        audits = _sighting_audits(node)
+        runs = gate.run
+
+    assert runs == 2, "the record did not count its runners"
+    assert first_run == 1
+    assert len(audits) == 2, "the second run's encounter was taken for the first's"
+    assert all(row["subject"] == "veh-1" for row in audits)

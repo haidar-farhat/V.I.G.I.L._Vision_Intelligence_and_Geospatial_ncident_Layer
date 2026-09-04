@@ -58,7 +58,8 @@ from .evidence import (
 from .events import Event, Rule, default_rules
 from .incidents import Correlator, Incident
 from .logs import get as _get_logger
-from .pipeline import FrameResult, Pipeline, PipelineStats
+from .pipeline import FrameResult, Pipeline, PipelineStats, TrackPlate
+from .registry import Confidence, RegistryError, Subject
 from .store import Store, default_database_path
 from .zones import Zone
 
@@ -277,6 +278,14 @@ class CameraRecord:
     #: it is never logged, displayed or stored — `display_source` is.
     source: str
     pose: CameraPose | None = None
+    #: How many runners this record has been given. Track ids and frame
+    #: indices start again with each one, so anything the node keeps keyed on
+    #: a track id — a refusal, an encounter already audited — is keyed on this
+    #: as well. Without it a camera restarted in the same process handed its
+    #: new track 3 whatever the old track 3 had earned: a known van read
+    #: confidently on a track id that once carried a refused read was never
+    #: sighted, and nothing said so.
+    run: int = field(default=0, init=False)
     runner: "CameraRunner | None" = None
     #: Events this camera has raised, kept so correlation can run across the
     #: whole node rather than within one camera.
@@ -284,6 +293,19 @@ class CameraRecord:
     #: Set when this camera's own run ends or fails, so an interface can show
     #: *which* camera is in trouble rather than only that something is.
     fault: str | None = None
+
+    def __setattr__(self, name: str, value: object) -> None:
+        # Counted on assignment rather than in `Node.start`, so that a runner
+        # swapped in by any other route — a test's stand-in included — is a
+        # new run too. Clearing the runner, or setting the same one again, is
+        # not a run.
+        if (
+            name == "runner"
+            and value is not None
+            and value is not self.__dict__.get("runner")
+        ):
+            object.__setattr__(self, "run", self.__dict__.get("run", 0) + 1)
+        object.__setattr__(self, name, value)
 
     @property
     def display_source(self) -> str:
@@ -863,6 +885,24 @@ class Node:
         self._restored_cameras = 0
         self._incidents: tuple[Incident, ...] = ()
         self._persisted: set[str] = set()
+        # Encounters already written to the audit log, keyed the way the
+        # register keys a sighting — one row per (subject, camera, track) —
+        # plus the camera's run, because track ids start again with every
+        # runner. Without the set the audit log would gain a line per poll
+        # for a van parked in shot, and a log that says the same thing five
+        # times a second is a log nobody reads; without the run a camera
+        # restarted in the same process would take the new run's track 3 for
+        # the old one's and never audit it. In memory only, so a restarted
+        # node — same process or not — audits a still-live encounter once
+        # more; that is one extra line, and the alternative is a query per
+        # poll per vehicle.
+        self._sighted: set[tuple[str, str, int, int]] = set()
+        # Tracks whose confident text the register refused to spell, so the
+        # refusal is logged once and not looked up again every poll. Keyed on
+        # the run as well: a refusal has to die with the runner that earned
+        # it, or the next run's track 3 — a different vehicle — inherits it,
+        # and a known van's sighting is lost without a line in any log.
+        self._plate_refused: set[tuple[str, int, int]] = set()
         self._last_correlated = 0.0
         self._running = False
         self._stop = threading.Event()
@@ -1369,6 +1409,9 @@ class Node:
             update = record.runner.take_latest()
             if update is not None:
                 updates.append(update)
+                if update.result.plates:
+                    # On this thread, for the same reason as the segments.
+                    self._note_plates(record, update.result)
 
             for segment in record.runner.take_segments():
                 # On this thread, which is the only one allowed to write.
@@ -1396,6 +1439,130 @@ class Node:
             self.correlate()
 
         return tuple(updates)
+
+    def _note_plates(self, record: CameraRecord, result: FrameResult) -> None:
+        """Keep what the plate reader concluded, and match what it is sure of.
+
+        Until this existed a reading reached the screen and nothing else:
+        `FrameResult.plates` was drawn beside the box and dropped with the
+        frame, so a reader that worked all night left no record that it had.
+        Each reading is upserted on (camera, track) — one row per vehicle,
+        refreshed as agreement grows, never one per frame — and the whole
+        frame's readings land in one unit of work, so a poll that fails
+        halfway leaves the table as it was rather than with half a frame.
+
+        Only a reading that is *confident* and fully resolved is looked up in
+        the register. ``display`` carries ``?`` where a character is unread and
+        ``text`` is ``None`` until every character resolved, and neither is
+        ever handed to the register: completing a half-read plate against a
+        list of known plates is how somebody's car is sighted at a gate it
+        never came through. The pipeline draws that line; this method keeps it.
+        """
+        with self.store.transaction():
+            for plate in result.plates:
+                self.store.save_plate_read(
+                    record.camera_id, plate,
+                    frame_index=result.index,
+                    seen_at_millis=result.timestamp_millis,
+                )
+                if plate.is_confident and plate.text and plate.reads > 0:
+                    self._note_sighting(record, plate, plate.text, result)
+
+    def _note_sighting(
+        self, record: CameraRecord, plate: TrackPlate, text: str, result: FrameResult
+    ) -> None:
+        """Record a known vehicle's track as a sighting of its subject.
+
+        A ``MATCH``, because the register compares the whole normalised string
+        for equality and the reading cleared the pipeline's bar for acting on
+        it. The score is the share of this track's reads that agreed on the
+        weakest character — the evidence the reading actually rests on, and a
+        number an operator can argue with, unlike a similarity nobody
+        measured. The enrolment matched is cited, so "why does it think this
+        is that van" has an answer in the row.
+
+        The window is the track's own first and last observation, on the
+        pipeline's clock, so a sighting lines up with the track's events. It
+        widens on every poll: `Register.record_sighting` folds the window and
+        keeps one row per track, which is what makes calling this per poll
+        safe.
+
+        A reading the register cannot spell — characters outside the plate
+        alphabet, which the pipeline's own normalisation keeps — is logged
+        once and never becomes a sighting. It is not a fault: it is a read of
+        something that is not a registration, and the poll goes on. The
+        refusal is remembered per run, not per camera: a runner rebuilt in
+        the same process starts its track ids again, and a refusal that
+        outlived its runner once cost a known van its sighting — the new
+        run's track 3 inherited the old run's silence.
+
+        The first sighting of an encounter is audited by subject id and camera,
+        never by plate or name. The audit log is read by more people than the
+        register is, and a registration in it is a registration the register
+        can no longer take back. The node log gets no plate either: the
+        register's refusal quotes the read, and a log travels in every
+        support bundle, so the reason is given here in the node's own words.
+        """
+        camera_id = record.camera_id
+        key = (camera_id, record.run, plate.track_id)
+        if key in self._plate_refused:
+            return
+        try:
+            subject = self.store.register.find_plate(text)
+        except RegistryError:
+            self._plate_refused.add(key)
+            _log.warning(
+                "node %s: camera %s track %d: the register cannot spell this "
+                "read — no character in it survives the plate alphabet — so "
+                "it is recorded as a reading and nothing more",
+                self._node_id, camera_id, plate.track_id,
+            )
+            return
+        if subject is None:
+            return
+
+        track = next((t for t in result.tracks if t.id == plate.track_id), None)
+        first_seen = track.first_seen_millis if track else result.timestamp_millis
+        last_seen = track.last_seen_millis if track else result.timestamp_millis
+        self.store.register.record_sighting(
+            subject_id=subject.id,
+            camera_id=camera_id,
+            track_id=plate.track_id,
+            first_seen_millis=min(first_seen, last_seen),
+            last_seen_millis=max(first_seen, last_seen),
+            confidence=Confidence.MATCH,
+            score=min(1.0, plate.agreement / plate.reads),
+            identifier_id=self._enrolment_matching(subject, text),
+        )
+
+        encounter = (subject.id, camera_id, record.run, plate.track_id)
+        if encounter not in self._sighted:
+            self._sighted.add(encounter)
+            self.store.audit(
+                self._actor, "vehicle.sighted", subject.id,
+                f"camera {camera_id}, track {plate.track_id}",
+            )
+            _log.info(
+                "node %s: subject %s sighted on camera %s track %d "
+                "(agreement %d/%d)",
+                self._node_id, subject.id, camera_id, plate.track_id,
+                plate.agreement, plate.reads,
+            )
+
+    def _enrolment_matching(self, subject: Subject, text: str) -> str | None:
+        """The id of the plate enrolment this read matched, to cite as evidence.
+
+        Looked up rather than assumed. `Register.find_plate` returns the
+        subject and not the row, and a sighting citing nothing would answer
+        "why this van" with silence while a subject with two plates enrolled
+        would leave the question genuinely open.
+        """
+        register = self.store.register
+        normalised = register.plate_format.normalise(text)
+        for identifier in register.identifiers(subject.id):
+            if identifier.plate == normalised:
+                return identifier.id
+        return None
 
     def correlate(self) -> tuple[Incident, ...]:
         """Group every camera's events into incidents, across the whole node.

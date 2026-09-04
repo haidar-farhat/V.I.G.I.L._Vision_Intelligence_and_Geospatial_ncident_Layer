@@ -33,20 +33,20 @@ Related: [STATUS.md](STATUS.md) — measurements and honest gaps ·
 
 ## The scoreboard
 
-465 capabilities, each with a state. Many lines cover several related things —
+468 capabilities, each with a state. Many lines cover several related things —
 "heading · pitch · roll" is one row — so this counts *claims*, not code.
 
 | | Count | Share | What it means |
 |---|---:|---:|---|
-| **`TESTED`** | 184 | 40% | A test fails if it stops working |
+| **`TESTED`** | 187 | 40% | A test fails if it stops working |
 | **`IMPL`** | 23 | 5% | Works; a regression would go unnoticed |
 | **`SKEL`** | 32 | 7% | Something is there; it does not do the job |
-| **`PLAN`** | 226 | 49% | Designed, no code |
+| **`PLAN`** | 226 | 48% | Designed, no code |
 
 ```mermaid
 pie showData
-    title Sentinel Vision — 465 capabilities by state
-    "TESTED" : 184
+    title Sentinel Vision — 468 capabilities by state
+    "TESTED" : 187
     "IMPLEMENTED" : 23
     "SKELETON" : 32
     "PLANNED" : 226
@@ -267,7 +267,7 @@ two identical webcams are indistinguishable by name.
 | Track history search | `PLAN` | |
 | Track position samples persisted at 1 Hz for replay and heatmaps | `PLAN` | Migration: `track_samples (camera_id, track_id, at_millis, lat, lon, uncertainty_m, class_label)` written by the node from `poll()` at most once per second per track — about 100 bytes × tracks × 86,400 per camera per day, stated in the docs as a budget. Retention by age, except that samples inside a preserved incident window are preserved like segments and never deleted, and the evidence package includes them as `tracks.jsonl`. Turns 'trails are context, not a recording' into replayable trails and a heatmap of movement rather than of alerts. |
 | Track fragmentation, measured | `TESTED` | `tools/measure_fragmentation.py` runs the reference scene and reports tracks per true object from the scene's own ground truth, and optionally a live camera. Measured: 4 tracks for 3 walkers (1.33 — identity swaps at the crossing, not temporal splits), and 7 tracks for one person over 15 s on the laptop camera with the segmenter. This is the number appearance re-ID has to beat, and until it existed every figure quoted for it was incidental |
-| Post-hoc fragment linking by appearance, gap and position | `TESTED` | `sentinel.reid` — a masked HSV histogram per observation (mask when the segmenter gives one, box otherwise, provenance kept), an EMA per track, and `link_fragments` joining two tracks on one camera only when the gap, the distance and the appearance all agree — similarity alone never links, because a red coat leaving and a red coat arriving are two people. Reconciles the count after the fact; it cannot un-split a track mid-life, which is the argument for carrying appearance into the Rust tracker (ABI 7). **Called by nothing yet** |
+| Post-hoc fragment linking by appearance, gap and position | `TESTED` | `sentinel.reid` — masked HSV descriptor, EMA per track, `link_fragments` joining only when gap, distance and appearance agree. **Now used**: `Correlator.correlate` joins consecutive same-camera fragments into one object (stricter — shorter gap, closer position — when no appearance travels on the evidence, so time and place alone never merge two people passing one spot), records each join as an Association with its reasons, and counts distinct objects from the merged groups. One person split into three fragments is one object and one 'group' risk factor. It reconciles the count after the fact; carrying appearance into the Rust tracker (ABI 7) is what would stop the splits |
 
 ## 🧑 People: named identity, opt-in
 
@@ -326,6 +326,8 @@ claim on someone than their face.
 | Vehicles menu: register, name, watchlist, forget | `PLAN` | |
 | Off by default, audited, retained and deletable | `PLAN` | The same machinery as people: a per-site switch enforced in the pipeline, an audit row for every change, a retention sweep, and a delete that really deletes |
 | Plate reading engine: detection, CTC decoding, per-country normalisation | `TESTED` | `sentinel.plates` behind a seam so it is testable with no weights. Now wired: a `Pipeline` given a `PlateReader` reads only inside vehicle tracks, keeps one bounded accumulator per track and drops it when the track ends, publishes `FrameResult.plates`, and the track table shows the reading as its display form — `B7?4921 (2)` for a thin read with unresolved characters, plainly once confident. No event, no persistence and no register lookup yet; those are the watchlist rows |
+| Plate readings persisted, and known plates become sightings | `TESTED` | Migration 8 `plate_reads`: one row per (camera, track), upserted as agreement grows rather than one per frame. A confident, fully resolved reading whose text the register knows becomes a sighting of that vehicle — first and last seen advancing — and the first sighting is audited by subject id, never by plate text. An unconfident reading is stored as a reading and never becomes a sighting: a half-read plate must not become a record of somebody's car |
+| Register retention swept with the video | `TESTED` | `sentinel retention` sweeps the register after the video sweep (`--face-days` 30, `--plate-days` 365), previews without `--apply`, reports what it deleted and what an operator's pin kept, and audits the sweep with counts and ids only. A deployment where video expires and biometric templates do not is the wrong way round |
 
 ## 🔗 Multi-camera intelligence
 
@@ -438,6 +440,7 @@ claim on someone than their face.
 | Weakening a zone asks for confirmation and records it | `PLAN` | Changing kind from RESTRICTED or PERIMETER to EXCLUSION or INTEREST, lengthening the entry delay, or removing a schedule shows the effect ('this zone will stop raising events') and the audit row carries `confirmed_weakening = true`. The edit most worth auditing is the one that makes the system quieter; it should be possible, visible afterwards, and impossible by accident. Nothing else in the panel confirms — undo covers it. |
 | Live adjudicability while an outline is drawn | `TESTED` | The map band's second line reads "covered 100% · confident 0% · 7 m² · seen by gate" from the third corner onward, so the number arrives before the zone is committed rather than after |
 | The part of a zone no camera can see is hatched | `TESTED` | On the selected zone, the area outside every footprint is drawn with a diagonal hatch — a zone half outside the coverage is half a zone, and an operator should see which half |
+| Class filter and stored zones from the command line | `TESTED` | `sentinel run` / `node` take `--zone-classes NAME=person,car`; naming a zone no `--zone` declared is refused rather than rewriting a stored one. `run` with no `--zone` now restores the store's zones, filters included — it used to run with none and report 'No events' as if nothing had happened — and every run prints which zones it watches and what each watches, with a warning when a filtered zone runs under a motion detector that names nothing |
 
 ## 🧠 Behavioural intelligence
 
@@ -738,7 +741,7 @@ both are `TESTED`.
 | Node pairing · permission · retention changes · PTZ activity | `PLAN` | |
 | Immutable operator notes | `PLAN` | |
 | AI generation history · model/prompt provenance | `PLAN` | |
-| Structured before/after audit records for every map, zone and camera edit | `TESTED` | Migration 6: `audit_logs` gains `before_json`, `after_json`, `node_id`, `chain_hash`, all nullable so every old row still reads. `Node.replace_zone`, `place_camera` and `remove_camera` write both states as canonical JSON through `auditing.diff`, with the prose line character-identical to before, chained by SHA-256 through `Store.audit_record`. Still prose-only: node.started, camera.added, zone.created, zone.removed — the chain does not cover those rows, and says so |
+| Structured before/after audit records for every map, zone and camera edit | `TESTED` | Migration 6 columns; `Node.replace_zone`, `place_camera` and `remove_camera` write both states through `auditing.diff`, prose unchanged, chained by SHA-256. **Readable at last**: the Audit tab lists rows newest first with action and subject filters and 'showing N of M', expands a structured row to its field-by-field diff, says plainly when a prose-only row carries no states, and *Verify chain* reconstructs the chain with `auditing.verify_chain` and names the row where it breaks — stating that prose-only rows carry no hash and are not protected |
 | Hash-chained audit log with `sentinel audit verify` | `PLAN` | Each row stores `prev_hash` and `row_hash = SHA-256(prev_hash ‖ canonical row)`; `verify` walks the chain and names the first broken row; the chain head goes into every evidence and site export so a package pins the log state at export time. Append-only is enforced by the absence of a method today, and the file is writable by any SQLite editor; a chain makes edits detectable by anyone with the file. |
 | Clock provenance on every audited action and geometry version | `PLAN` | Each audit and version row stores wall-clock UTC, the process monotonic offset and the store's per-camera clock skew at that moment (`clock_skew` exists); a system-time change larger than a threshold between two rows is itself audited as `clock.jumped`. Order of edits versus events is what a review turns on. |
 | Canonical JSON, field-level diffs and a tamper-evident chain | `TESTED` | `sentinel.auditing` — deterministic serialisation so equal objects hash equally, a `diff` that names the moved ring corner rather than saying 'the ring changed', prose matching the existing audit voice, and a SHA-256 chain over records. Detects alteration; does not prevent it and is not a signature. **Called by nothing yet** — no migration, and node.py still writes prose |

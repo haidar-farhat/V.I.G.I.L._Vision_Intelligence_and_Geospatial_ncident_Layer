@@ -460,6 +460,47 @@ workflow, every skeptic's mutation check passing:
   argument for ABI 7 (appearance into the Rust tracker), and the measurement
   tool is what will show whether it worked. Called by nothing yet.
 
+**Verified in the packaged binary on the laptop camera (exetest4):** unfiltered,
+the Room zone raised events for *a bottle, a couch and a person*; with
+`classes = ["person"]` stored and the console restoring it (`--start`), the
+incident is "1 person in Room" and nothing else fires. Two CLI gaps found on
+the way: `sentinel run` builds its zones only from `--zone` and does not
+restore stored ones (the console and `sentinel node` do), and there is no
+`--zone-classes` option, so a filter can only be set from the console today.
+
+### The recorded gaps, closed (4 builders, every mutation check passing)
+
+- **CLI:** `--zone-classes`; `run` restores stored zones when given none (it
+  used to watch nothing and say "No events"); every run prints what it
+  watches; `retention` sweeps the register with `--face-days` / `--plate-days`.
+- **Re-ID is used:** the correlator joins same-camera fragments into one object
+  with reasons on the Association; one person in three fragments is one
+  object. Same-camera links are labelled as such in the console, the report
+  and the JSON (a new `same_camera_associations` key; the old key keeps its
+  meaning).
+- **Audit tab:** rows, filters, the field-by-field diff, and *Verify chain*.
+  Two skeptic findings worth remembering: the `detail` column is outside the
+  hash, and `Node._audit` was writing microsecond timestamps that broke the
+  first record's hash every time — both fixed.
+- **Plates persist** (migration 8) and a confident, resolved reading of an
+  enrolled plate becomes a register sighting; unconfident readings never do.
+- **The console's incident timeline** had the same epoch-as-offset defect the
+  evidence report had this morning (`t+1788513275.8s`); fixed, with a test.
+
+**Found by the photograph, not by any test or skeptic:** the Audit tab's first
+picture read "the chain breaks at chained record 1 of 1" on a fresh database.
+`Store.audit_record` hashed the record with its microsecond timestamp and
+stored milliseconds, so no row could ever re-hash to its own chain hash. The
+skeptic had reported this fixed; it was not. Fixed by truncating *before*
+hashing — what is hashed is what is written — with a store test using a
+microsecond stamp. The lesson generalises: a "verify" feature must be
+photographed verifying real rows, not only its own fixtures.
+
+**Still unwired, honestly:** nothing enrols into the register from the console
+(no People/Vehicles panel yet); `orthophoto` and `faces` have no caller; the
+site record has no console screen; the audit chain still covers only rows that
+carry a hash.
+
 **Immediate:**
 
 1. **1.3 appearance re-ID.** The tracker fragments (17 tracks over 15 s on one

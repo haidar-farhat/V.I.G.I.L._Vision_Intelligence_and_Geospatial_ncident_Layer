@@ -237,6 +237,12 @@ def main() -> int:
     window.detail_tabs.setCurrentIndex(2)
     window.investigation.search()
     shoot(window.detail_tabs, f"{prefix}11-investigation")
+    # The audit tab, after everything above was audited: placement, zones,
+    # the Configure unlock. Verified, so the chain line is in the photograph.
+    window.detail_tabs.setCurrentIndex(3)
+    window.audit.refresh()
+    window.audit.verify()
+    shoot(window.detail_tabs, f"{prefix}12-audit")
     window.detail_tabs.setCurrentIndex(0)
 
     # Mid-drawing: three corners placed and the pointer moving, so the

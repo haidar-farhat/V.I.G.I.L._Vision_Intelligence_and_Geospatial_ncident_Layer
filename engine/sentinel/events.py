@@ -356,6 +356,20 @@ class Rule:
         )
 
 
+def _subject(context: "RuleContext") -> str:
+    """"A person" when the detector said so, "An object" when it could not.
+
+    One phrasing for every rule. The entry rule named the class and the
+    loitering and after-hours rules said "An object" whatever the detector knew,
+    so a person-only zone produced "A person entered" beside "An object
+    remained" for the same person — and a reader takes the second to mean the
+    system was not sure. The label is the detector's, never a guess: under a
+    motion detector every rule says "An object".
+    """
+    label = context.class_label
+    return "An object" if label is None else f"A {label.replace('_', ' ')}"
+
+
 class ZoneEntryRule(Rule):
     """Something entered a zone that should not have anything in it."""
 
@@ -454,7 +468,7 @@ class LoiteringRule(Rule):
             self._build(
                 context,
                 summary=(
-                    f"An object remained in {zone.name} for "
+                    f"{_subject(context)} remained in {zone.name} for "
                     f"{presence.duration_millis / 1000:.0f} seconds"
                 ),
                 conditions=conditions,
@@ -495,7 +509,7 @@ class AfterHoursRule(Rule):
         return [
             self._build(
                 context,
-                summary=f"An object was in {zone.name} outside permitted hours",
+                summary=f"{_subject(context)} was in {zone.name} outside permitted hours",
                 conditions=[
                     # The site's clock, with its offset, because the schedule
                     # was written in it and the reader will check it against a

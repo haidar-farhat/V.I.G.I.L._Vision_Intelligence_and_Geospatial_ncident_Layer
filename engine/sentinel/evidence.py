@@ -171,6 +171,18 @@ def _event_dict(event: Event) -> dict:
     }
 
 
+def _association_dict(link) -> dict:
+    return {
+        "a": f"{link.a[0]}#{link.a[1]}",
+        "b": f"{link.b[0]}#{link.b[1]}",
+        "score": link.score,
+        "separation_meters": link.separation_meters,
+        "allowance_meters": link.allowance_meters,
+        "time_gap_millis": link.time_gap_millis,
+        "reasons": list(link.reasons),
+    }
+
+
 def _incident_dict(incident: Incident) -> dict:
     return {
         "id": incident.id,
@@ -200,17 +212,17 @@ def _incident_dict(incident: Incident) -> dict:
                 for f in incident.risk.factors
             ],
         },
+        # Two lists, because they are two claims. A cross-camera link says a
+        # hand-off happened; a same-camera link says the tracker lost and
+        # re-found one object. The old key keeps its old meaning so a package
+        # written before same-camera links existed reads the same.
         "cross_camera_associations": [
-            {
-                "a": f"{link.a[0]}#{link.a[1]}",
-                "b": f"{link.b[0]}#{link.b[1]}",
-                "score": link.score,
-                "separation_meters": link.separation_meters,
-                "allowance_meters": link.allowance_meters,
-                "time_gap_millis": link.time_gap_millis,
-                "reasons": list(link.reasons),
-            }
-            for link in incident.associations
+            _association_dict(link)
+            for link in incident.associations if link.a[0] != link.b[0]
+        ],
+        "same_camera_associations": [
+            _association_dict(link)
+            for link in incident.associations if link.a[0] == link.b[0]
         ],
         "timeline": [
             {
@@ -254,9 +266,14 @@ def _readable_report(incident: Incident, exported_by: str, at: datetime) -> str:
     for factor in incident.risk.factors:
         lines.append(f"  {factor.points:+6.0f}  {factor.name}: {factor.because}")
 
-    if incident.associations:
-        lines += ["", "CROSS-CAMERA ASSOCIATIONS", "-" * 70]
-        for link in incident.associations:
+    across = [link for link in incident.associations if link.a[0] != link.b[0]]
+    within = [link for link in incident.associations if link.a[0] == link.b[0]]
+    for heading, links in (("CROSS-CAMERA ASSOCIATIONS", across),
+                           ("SAME-CAMERA ASSOCIATIONS (one object the tracker lost and re-found)", within)):
+        if not links:
+            continue
+        lines += ["", heading, "-" * 70]
+        for link in links:
             lines.append(
                 f"  {link.a[0]}#{link.a[1]} = {link.b[0]}#{link.b[1]}  "
                 f"(score {link.score:.2f})"

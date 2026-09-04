@@ -41,10 +41,10 @@ import json
 import sqlite3
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from dataclasses import dataclass, replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterable, Iterator, Sequence
+from typing import TYPE_CHECKING, Iterable, Iterator, Sequence
 
 from .auditing import AuditRecord
 from .core import LatLon
@@ -58,12 +58,19 @@ from .zones import Schedule, Zone, ZoneKind
 from . import paths
 from .logs import get as _get_logger
 
+if TYPE_CHECKING:
+    from .pipeline import TrackPlate
+
 _log = _get_logger(__name__)
 
 #: Schema version this build expects. A database at a different version is
 #: migrated forward, never opened as-is: opening a schema you do not understand
 #: and hoping the columns line up is how evidence is silently corrupted.
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
+
+
+#: The audit column's zero, for rebuilding a millisecond timestamp exactly.
+_AUDIT_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
 class StoreError(RuntimeError):
@@ -450,7 +457,86 @@ MIGRATIONS: tuple[Migration, ...] = (
         ALTER TABLE zones DROP COLUMN classes;
         """,
     ),
+    Migration(
+        version=8,
+        name="plate_reads",
+        up="""
+        -- What each vehicle track's plate was read as. Until now a reading
+        -- reached the screen and nothing else: `FrameResult.plates` was drawn
+        -- beside the box and dropped with the frame, so the first question an
+        -- operator asks of a plate reader — "which plates did you see last
+        -- night" — had no answer at all, however well the reader worked.
+        --
+        -- One row per (camera, track), and that key is the whole design. A
+        -- reading is published on every frame of the track and refined as
+        -- reads accumulate; a row per frame would store one guess forty times
+        -- and let the forty count as forty vehicles. The row holds the latest
+        -- conclusion and the window of frames it was seen over.
+        --
+        -- `text` is NULL until every character resolved, exactly as the
+        -- pipeline publishes it, and `is_confident` is the only column a rule,
+        -- a register or an export may act on: `display` carries `?` where a
+        -- character is unread and exists for a person to look at. The CHECK
+        -- keeps a confident row from arriving without its text, which is the
+        -- one shape nothing downstream could interpret.
+        --
+        -- `seen_at_millis` is the pipeline's clock — the one events carry in
+        -- `occurred_at_millis` — so a reading lines up with the events of the
+        -- track it was read on. It is not the wall clock for a file source.
+        CREATE TABLE plate_reads (
+            camera_id       TEXT NOT NULL,
+            track_id        INTEGER NOT NULL,
+            first_frame     INTEGER NOT NULL,
+            last_frame      INTEGER NOT NULL,
+            country         TEXT NOT NULL,
+            display         TEXT NOT NULL,
+            text            TEXT,
+            is_confident    INTEGER NOT NULL CHECK (is_confident IN (0, 1)),
+            agreement       INTEGER NOT NULL,
+            reads           INTEGER NOT NULL,
+            seen_at_millis  INTEGER NOT NULL,
+            CHECK (is_confident = 0 OR text IS NOT NULL),
+            PRIMARY KEY (camera_id, track_id)
+        );
+        CREATE INDEX plate_reads_by_time ON plate_reads (seen_at_millis);
+        """,
+        down="""
+        DROP INDEX IF EXISTS plate_reads_by_time;
+        DROP TABLE IF EXISTS plate_reads;
+        """,
+    ),
 )
+
+
+@dataclass(frozen=True, slots=True)
+class PlateRead:
+    """What one vehicle track's plate was last read as, and over which frames.
+
+    The store's own shape rather than the pipeline's `TrackPlate`, because a
+    row outlives the run that wrote it and carries two things the live reading
+    does not: which camera it came from, and the window it was seen over. The
+    live fields keep their names and their meaning — `display` is for a person
+    and carries ``?``; `text` is ``None`` until every character resolved;
+    `is_confident` is the only field anything may act on.
+    """
+
+    camera_id: str
+    track_id: int
+    #: The first and last frame this node saw the reading on. The node takes
+    #: the newest frame per poll and skips the rest, so the first frame here
+    #: is the first one *collected*, not the first one the reader took.
+    first_frame: int
+    last_frame: int
+    country: str
+    display: str
+    text: str | None
+    is_confident: bool
+    #: Reads behind the least-agreed character, and reads that voted in total.
+    agreement: int
+    reads: int
+    #: The pipeline's clock for the last frame — media time for a file, the
+    #: wall clock for a live camera — the same clock the track's events carry.
+    seen_at_millis: int
 
 
 # ------------------------------------------------------------------- the store
@@ -1431,6 +1517,118 @@ class Store:
             "SELECT COUNT(*) AS n FROM recordings"
         ).fetchone()["n"]
 
+    # ------------------------------------------------------------------ plates
+
+    def save_plate_read(
+        self,
+        camera_id: str,
+        plate: "TrackPlate",
+        *,
+        frame_index: int,
+        seen_at_millis: int,
+    ) -> None:
+        """Record what a track's plate reads as, once per track, not per frame.
+
+        Keyed on (camera, track) and upserted, so the fortieth frame of a
+        parked van refreshes one row rather than adding a fortieth. The latest
+        reading replaces the stored one wholesale — agreement, resolved text
+        and confidence included — because the accumulator behind it re-tallies
+        every read and a later tally is the better one, whichever direction it
+        moved. Only the window is folded: the first frame is kept and the last
+        advances.
+
+        A frame index that goes *backwards* starts the window again. Track ids
+        and frame indices both restart with the run, so a restarted node reads
+        "track 3" on a camera that had a track 3 yesterday; keeping yesterday's
+        first frame would report a new vehicle as having been in shot since a
+        run that ended. This catches a restart whose new index is still below
+        the old last frame, which is the common case; a short old run followed
+        by a long new one is not detected, and the row then reads as one
+        window. Named here rather than solved: solving it needs a run id the
+        schema does not carry.
+
+        A confident reading with no text is refused before it reaches the
+        table. The pipeline never publishes one, and a row in that shape would
+        be a plate everything may act on that nobody can read.
+        """
+        if plate.is_confident and plate.text is None:
+            raise StoreError(
+                f"camera {camera_id!r} track {plate.track_id}: a confident "
+                "reading with no text is a contradiction, and a contradiction "
+                "is not evidence"
+            )
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO plate_reads (
+                    camera_id, track_id, first_frame, last_frame, country,
+                    display, text, is_confident, agreement, reads, seen_at_millis
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(camera_id, track_id) DO UPDATE SET
+                    first_frame = CASE
+                        WHEN excluded.last_frame < plate_reads.last_frame
+                        THEN excluded.first_frame
+                        ELSE MIN(plate_reads.first_frame, excluded.first_frame)
+                    END,
+                    last_frame = excluded.last_frame,
+                    country = excluded.country,
+                    display = excluded.display,
+                    text = excluded.text,
+                    is_confident = excluded.is_confident,
+                    agreement = excluded.agreement,
+                    reads = excluded.reads,
+                    seen_at_millis = excluded.seen_at_millis
+                """,
+                (
+                    camera_id,
+                    plate.track_id,
+                    frame_index,
+                    frame_index,
+                    plate.country,
+                    plate.display,
+                    plate.text,
+                    int(plate.is_confident),
+                    plate.agreement,
+                    plate.reads,
+                    seen_at_millis,
+                ),
+            )
+
+    def plate_reads(
+        self,
+        *,
+        camera_id: str | None = None,
+        since_millis: int | None = None,
+        limit: int = 200,
+    ) -> list[PlateRead]:
+        """Readings, newest last-seen first, optionally for one camera.
+
+        Newest first because the question this answers is "what has been read
+        lately", and a panel that shows the oldest 200 of a week's readings
+        shows nothing that happened tonight. ``since_millis`` is compared
+        against the same clock the rows carry — the pipeline's — and ordered
+        on it too, so a query across cameras is not interleaved by two clocks.
+        """
+        clauses, params = [], []
+        if camera_id is not None:
+            clauses.append("camera_id = ?")
+            params.append(camera_id)
+        if since_millis is not None:
+            clauses.append("seen_at_millis >= ?")
+            params.append(since_millis)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._connection.execute(
+            f"SELECT * FROM plate_reads {where} "
+            "ORDER BY seen_at_millis DESC, camera_id, track_id LIMIT ?",
+            (*params, limit),
+        ).fetchall()
+        return [_plate_read_from_row(row) for row in rows]
+
+    def plate_read_count(self) -> int:
+        return self._connection.execute(
+            "SELECT COUNT(*) AS n FROM plate_reads"
+        ).fetchone()["n"]
+
     # ------------------------------------------------------------------- audit
 
     def audit(
@@ -1490,6 +1688,14 @@ class Store:
         turns that into a wait, which is what the timeout is for.
         """
         with self.transaction(immediate=True) as connection:
+            # Hash exactly what will be written. The column holds milliseconds;
+            # a record stamped with microseconds hashed one moment and stored
+            # another, so the very first chained row in a fresh database failed
+            # its own verification — the Audit tab's first photograph showed
+            # "the chain breaks at chained record 1 of 1". Truncate first, then
+            # hash, so what is read back re-hashes to what was written.
+            millis = int(record.at.timestamp() * 1000)
+            record = replace(record, at=_AUDIT_EPOCH + timedelta(milliseconds=millis))
             previous = self.audit_chain_head()
             chain_hash = record.chain(previous)
             connection.execute(
@@ -1590,6 +1796,22 @@ def _segment_from_row(row: sqlite3.Row) -> "Segment":
         complete=bool(row["complete"]),
     )
 
+
+
+def _plate_read_from_row(row: sqlite3.Row) -> PlateRead:
+    return PlateRead(
+        camera_id=row["camera_id"],
+        track_id=row["track_id"],
+        first_frame=row["first_frame"],
+        last_frame=row["last_frame"],
+        country=row["country"],
+        display=row["display"],
+        text=row["text"],
+        is_confident=bool(row["is_confident"]),
+        agreement=row["agreement"],
+        reads=row["reads"],
+        seen_at_millis=row["seen_at_millis"],
+    )
 
 
 def _event_from_row(row: sqlite3.Row) -> Event:

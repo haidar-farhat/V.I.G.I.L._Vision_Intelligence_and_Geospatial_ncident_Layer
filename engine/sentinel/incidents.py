@@ -28,6 +28,20 @@ three people into six.
 against a fixed threshold makes the answer depend on how far each camera was from
 the subject, which is not a property of the subject at all.
 
+**A fragmented track is still one object.** The laptop camera gave one person
+seven track ids in fifteen seconds (measured, `tools/measure_fragmentation.py`).
+Counted as seven objects that one person becomes "7 objects in Room", a "group"
+risk factor worth 20 points, and a HIGH incident about nobody. So the same
+union-find that joins tracks across cameras also joins consecutive fragments on
+one camera — using the time and place gates :mod:`sentinel.reid` exposes, with
+appearance when the evidence carries it and a stricter gate when it does not —
+and each join is an :class:`Association` with its reasons, so the count that
+reaches the operator can be argued with link by link. What the evidence can
+prove is narrower than what the tracker knew: a fragment's end is known only
+as of its last event, so two tracks the *evidence* shows overlapping stay two,
+and a track that lived on unseen can still be joined to a newcomer. Each such
+link says so.
+
 **Risk is explained, never asserted.** The score comes with the contributions
 that produced it. A number an operator cannot interrogate is a number they will
 eventually learn to ignore.
@@ -38,11 +52,17 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Iterable, Sequence
+from typing import TYPE_CHECKING, Iterable, Sequence
 
-from .core import LatLon, haversine_distance
+from .core import BoundingBox, LatLon, PositionEstimate, haversine_distance
 from .events import Event, Severity, severity_rank
 from .zones import ZoneKind
+
+if TYPE_CHECKING:  # pragma: no cover
+    # ``reid`` imports this module for its union-find; the runtime import goes
+    # the other way inside :func:`link_same_camera_fragments` so neither module
+    # sees the other half-initialised.
+    from .reid import TrackAppearance
 
 #: How far apart in time two events may be and still belong to one incident.
 #: Long enough to hold a walk across a site, short enough that two unrelated
@@ -137,11 +157,51 @@ class Association:
     time_gap_millis: int
     reasons: tuple[str, ...]
 
+    @property
+    def same_camera(self) -> bool:
+        """Whether this joins two fragments of one track rather than two cameras.
+
+        Derived from the keys rather than stored, so a link read back from the
+        store — which persists only the fields above — is classified the same
+        way as one just made. For a same-camera link ``a`` is the earlier
+        fragment and ``b`` the one that continues it.
+        """
+        return self.a[0] == self.b[0]
+
+    def describe(self) -> str:
+        """``#7 = #3 on webcam (gap 0.4 s, 0.6 m apart)`` — what an operator reads."""
+        gap = f"{self.time_gap_millis / 1000:.1f} s"
+        if self.same_camera:
+            return (
+                f"#{self.b[1]} = #{self.a[1]} on {self.a[0]} "
+                f"(gap {gap}, {self.separation_meters:.1f} m apart)"
+            )
+        return (
+            f"{self.a[0]}#{self.a[1]} = {self.b[0]}#{self.b[1]} "
+            f"({self.separation_meters:.1f} m apart, {gap} apart)"
+        )
+
 
 def _position_of(event: Event) -> LatLon | None:
     if event.evidence.latitude is None or event.evidence.longitude is None:
         return None
     return LatLon(event.evidence.latitude, event.evidence.longitude)
+
+
+def _time_and_place_score(proximity: float, recency: float) -> float:
+    """Order candidates that only time and place can speak for.
+
+    Read by the cross-camera gate and by the blind fragment gate, so a link of
+    either kind sorts the same way and the split lives in one place. Place
+    outweighs time because the allowance is a bound on the *pair* — built from
+    the two positions' own uncertainties — while the window or hold is a bound
+    on the site: a gap short by that standard is short for everyone who was
+    there, and says less about who this was. The 65/35 is a judgement, stated
+    here so it can be argued with; :mod:`sentinel.reid` gives appearance half
+    its score and splits the rest evenly, because there a look has already
+    done the separating that place has to do alone here.
+    """
+    return round(0.65 * proximity + 0.35 * recency, 4)
 
 
 def associate(
@@ -200,7 +260,7 @@ def associate(
 
             proximity = 1.0 - separation / allowance
             recency = 1.0 - gap / window_millis
-            score = round(0.65 * proximity + 0.35 * recency, 4)
+            score = _time_and_place_score(proximity, recency)
 
             associations.append(
                 Association(
@@ -219,6 +279,304 @@ def associate(
             )
 
     return associations
+
+
+# ------------------------------------------------------ same-camera fragments
+
+#: Without appearance, the longest a fragment may be missing and still be
+#: rejoined: the tracker's own hold. Inside the hold a detection that came back
+#: and was *not* matched is a box that jumped — the person turned, or half of
+#: them went behind a chair — and place can vouch for that. Beyond it the object
+#: was genuinely gone, and "the same one came back" is a claim only a look could
+#: support; :mod:`sentinel.reid` allows 5 s when it has one, this allows less
+#: than half of that without.
+BLIND_FRAGMENT_MAX_GAP_MILLIS = 2000
+
+#: Without appearance, the fraction of reid's spatial allowance a fragment must
+#: fall within. Halved rather than merely trimmed, because the allowance reid
+#: builds is sized for a pair whose colours already agree; on time and place
+#: alone the same gate would join two people who walked through one doorway a
+#: second apart. Halving does not make that impossible — nothing without a look
+#: can — it makes the second person have to appear within a metre or two of
+#: where the first was last placed, and the link's reasons say that is all it
+#: rests on.
+BLIND_FRAGMENT_ALLOWANCE_FRACTION = 0.5
+
+#: Evidence carries a place, not a box. A fragment built from events has no
+#: image position for reid's frame fallback, and this stands in so the gate has
+#: a field to read; the fallback's result is refused below, never measured.
+_NO_BOX = BoundingBox(0.0, 0.0, 0.0, 0.0)
+
+
+@dataclass(frozen=True, slots=True)
+class _Fragment:
+    """One track as its events describe it, in the shape reid's gates read."""
+
+    track: "TrackAppearance"
+    #: ``None`` when the detector could not say what it saw.
+    class_label: str | None
+
+
+def _ground_position(event: Event) -> PositionEstimate | None:
+    """The event's position, only when it measures the *object*.
+
+    A ``CAMERA_FALLBACK`` position is the camera's own location, which every
+    track on that camera shares. A place gate fed two of them finds zero metres
+    between anything and everything, and time alone would then merge whoever
+    walked past next. So it is dropped here, and a fragment without a ground
+    position is never linked — an unplaced camera keeps its inflated count
+    rather than being given a flattering one.
+    """
+    evidence = event.evidence
+    if (
+        evidence.latitude is None
+        or evidence.longitude is None
+        or evidence.position_source != "GROUND_PROJECTION"
+    ):
+        return None
+    return PositionEstimate(
+        point=LatLon(evidence.latitude, evidence.longitude),
+        radius_meters=evidence.position_uncertainty_meters or 0.0,
+        source=evidence.position_source,
+    )
+
+
+def _carried_appearance(event: Event) -> tuple[object | None, int]:
+    """A descriptor on the evidence, if the evidence carries one.
+
+    :class:`~sentinel.events.Evidence` has no such field today. This reads
+    ``appearance`` by name — a :class:`~sentinel.reid.Appearance`-shaped
+    object with a ``histogram``, or the array itself — so the seen path is
+    live the day the evidence grows one, and returns ``(None, 0)`` until then.
+    """
+    carried = getattr(event.evidence, "appearance", None)
+    if carried is None:
+        return None, 0
+    histogram = getattr(carried, "histogram", carried)
+    return histogram, int(getattr(carried, "samples", 1))
+
+
+def _fragments_of(events: Sequence[Event]) -> dict[tuple[str, int], _Fragment]:
+    """Fold every event about a track into one fragment.
+
+    A track's start is known to every event about it. Its end is known only as
+    of the *last* event about it — the track may have lived on without raising
+    anything more — so the end folded here is a lower bound on the true end and
+    the gap measured downstream an upper bound on the true gap. That cuts both
+    ways. Against the hold it errs towards refusing, which is the side to err
+    on. Against the overlap check it errs towards *joining*: a track that was
+    still there when the next one began shows a positive gap, not a negative
+    one, and nothing here can tell the two apart. That is the limit
+    :func:`link_same_camera_fragments` states and every blind link repeats.
+    """
+    import numpy as np
+
+    from .reid import TrackAppearance
+
+    by_track: dict[tuple[str, int], list[Event]] = {}
+    for event in events:
+        key = (event.evidence.camera_id, event.evidence.track_id)
+        by_track.setdefault(key, []).append(event)
+
+    fragments: dict[tuple[str, int], _Fragment] = {}
+    for key, concerning in by_track.items():
+        concerning.sort(key=lambda e: (e.occurred_at_millis, e.id))
+        first, last = concerning[0], concerning[-1]
+        first_seen = min(e.evidence.first_seen_millis for e in concerning)
+        last_seen = max(e.evidence.last_seen_millis for e in concerning)
+
+        # The newest descriptor is the running one: the most frames behind it.
+        histogram, samples = None, 0
+        for event in reversed(concerning):
+            histogram, samples = _carried_appearance(event)
+            if histogram is not None:
+                break
+
+        track = TrackAppearance(
+            camera_id=key[0],
+            track_id=key[1],
+            first_seen_millis=first_seen,
+            last_seen_millis=last_seen,
+            last_confirmed_millis=last_seen,
+            first_box=_NO_BOX,
+            last_box=_NO_BOX,
+            first_position=_ground_position(first),
+            last_position=_ground_position(last),
+            histogram=None if histogram is None else np.asarray(histogram, dtype=np.float32),
+            samples=samples if histogram is not None else 0,
+        )
+        label = last.evidence.class_label if last.evidence.detector_classifies else None
+        fragments[key] = _Fragment(track=track, class_label=label)
+    return fragments
+
+
+def _class_reason(earlier: _Fragment, later: _Fragment) -> str:
+    if earlier.class_label is not None and later.class_label is not None:
+        return f"both classified {earlier.class_label}"
+    if earlier.class_label is None and later.class_label is None:
+        return "the detector does not classify, so class could not separate them"
+    label = earlier.class_label if earlier.class_label is not None else later.class_label
+    return f"one fragment classified {label}, the other unclassified: class could not separate them"
+
+
+def _estimated_end_reason(a: "TrackAppearance", b: "TrackAppearance", defence: str) -> str:
+    """Say that the earlier end is an estimate, and what stood in for it.
+
+    Without this line a link reads as though the two tracks were known to be
+    consecutive. They were not: ``a``'s end is as of its last event, and an
+    operator weighing "1 object" against a possible second person needs to see
+    that the only evidence of order is a last event and the place gate.
+    """
+    return (
+        f"#{a.track_id}'s end is as of its last event, t+{a.last_confirmed_millis / 1000:.1f} s, "
+        f"not the tracker's; had it lived on unseen it overlapped #{b.track_id} and "
+        f"only {defence} stood between them"
+    )
+
+
+def _consider_fragment(earlier: _Fragment, later: _Fragment) -> Association | None:
+    """Decide whether ``later`` continues ``earlier`` on one camera.
+
+    The time condition keeps apart two tracks the evidence shows overlapping:
+    one first seen before the other's last event, or on that very frame —
+    they shared it. It cannot see past the last event, so a track that lived
+    on unseen is not protected by it (see :func:`link_same_camera_fragments`).
+    Place and, when carried, appearance are then reid's gates unchanged; blind,
+    the gap is the tracker's hold and the allowance is halved (see the
+    constants), because time and place alone must not merge two people passing
+    one spot, and the link's reasons state what it rests on — including that
+    the earlier end is an estimate.
+    """
+    from . import reid
+
+    a, b = earlier.track, later.track
+    gap = b.first_seen_millis - a.last_confirmed_millis
+    if gap <= 0:
+        return None
+    if (
+        earlier.class_label is not None
+        and later.class_label is not None
+        and earlier.class_label != later.class_label
+    ):
+        # A person's fragment cannot continue a bottle's.
+        return None
+
+    if a.has_appearance and b.has_appearance:
+        link = reid._consider(a, b, reid.DEFAULT_MAX_GAP_MILLIS, reid.DEFAULT_MIN_SIMILARITY)
+        if link is None or link.separation_unit != "m":
+            # "frame" here means an end with no ground position: the stand-in
+            # box measured nothing, and nothing is not evidence of place.
+            return None
+        return Association(
+            a=a.key,
+            b=b.key,
+            score=link.score,
+            separation_meters=round(link.separation, 2),
+            allowance_meters=round(link.allowance, 2),
+            time_gap_millis=gap,
+            reasons=link.reasons + (
+                _estimated_end_reason(a, b, "place and appearance"),
+                _class_reason(earlier, later),
+            ),
+        )
+
+    if gap > BLIND_FRAGMENT_MAX_GAP_MILLIS:
+        return None
+    separation, allowance, unit = reid._spatial_gate(a, b, gap / 1000.0)
+    if unit != "m":
+        return None
+    allowance *= BLIND_FRAGMENT_ALLOWANCE_FRACTION
+    if separation > allowance:
+        return None
+
+    if a.has_appearance != b.has_appearance:
+        # One side had a look and the other did not. Saying "no appearance was
+        # carried" here would name a failure that did not happen; the failure
+        # is that a comparison needs two.
+        lacking = b if a.has_appearance else a
+        why_blind = (
+            f"because #{lacking.track_id} carried no appearance, so nothing "
+            "could say whether they look alike"
+        )
+    else:
+        why_blind = "because no appearance was carried to say they look alike"
+
+    proximity = 1.0 - separation / allowance if allowance > 0 else 1.0
+    recency = 1.0 - gap / BLIND_FRAGMENT_MAX_GAP_MILLIS
+    score = _time_and_place_score(proximity, recency)
+    return Association(
+        a=a.key,
+        b=b.key,
+        score=score,
+        separation_meters=round(separation, 2),
+        allowance_meters=round(allowance, 2),
+        time_gap_millis=gap,
+        reasons=(
+            f"#{b.track_id} began {gap / 1000:.1f} s after #{a.track_id} was last "
+            f"seen, within the tracker's {BLIND_FRAGMENT_MAX_GAP_MILLIS / 1000:.0f} s hold",
+            f"{separation:.2f} m apart, within {allowance:.2f} m — half of what the "
+            f"gap and the two position uncertainties would allow, {why_blind}",
+            _estimated_end_reason(a, b, "place"),
+            _class_reason(earlier, later),
+        ),
+    )
+
+
+def link_same_camera_fragments(events: Sequence[Event]) -> list[Association]:
+    """Decide which tracks on one camera are fragments of one object.
+
+    The counterpart of :func:`associate`, which refuses same-camera pairs
+    because identity within a camera is the tracker's job. It is — and the
+    tracker gave one person seven ids in fifteen seconds. Second-guessing it on
+    the evidence it did not have (a longer memory, and appearance when carried)
+    is what this does; second-guessing it on the evidence it *did* have is what
+    the time condition forbids: two tracks whose *evidence* shows them
+    overlapping never merge.
+
+    That is weaker than "two tracks the tracker held at once", and the gap
+    between the two is this function's honest limit. A fragment's end is known
+    only as of its last event — an entry event is raised on first sight, so a
+    track with one event has an end equal to its own start — and a track that
+    lived on silently after it has an end that is too early. A newcomer within
+    the hold can therefore be joined to a track that was in fact still there,
+    and the place gate is the only thing between them; every such link says so
+    in its reasons. Until the pipeline gives the correlator the tracker's live
+    track ends, the count can flicker on a live window: "1 object" while the
+    first track's evidence ends early, "2 objects" once a later event about it
+    arrives.
+
+    Each fragment continues at most one other and is continued by at most one.
+    When two tracks appear after one vanishes, only the better-supported one
+    can be its continuation, and the other is somebody else.
+    """
+    fragments = _fragments_of(events)
+    by_camera: dict[str, list[_Fragment]] = {}
+    for key, fragment in fragments.items():
+        by_camera.setdefault(key[0], []).append(fragment)
+
+    accepted: list[Association] = []
+    for on_camera in by_camera.values():
+        candidates: list[Association] = []
+        for earlier in on_camera:
+            for later in on_camera:
+                if later is earlier:
+                    continue
+                link = _consider_fragment(earlier, later)
+                if link is not None:
+                    candidates.append(link)
+
+        candidates.sort(key=lambda link: (-link.score, link.time_gap_millis, link.b[1]))
+        continued: set[tuple[str, int]] = set()
+        continues: set[tuple[str, int]] = set()
+        for link in candidates:
+            if link.a in continued or link.b in continues:
+                continue
+            continued.add(link.a)
+            continues.add(link.b)
+            accepted.append(link)
+
+    accepted.sort(key=lambda link: (link.a[0], fragments[link.b].track.first_seen_millis, link.b[1]))
+    return accepted
 
 
 # ---------------------------------------------------------------- risk scoring
@@ -414,6 +772,12 @@ class Incident:
             f"  events     {len(self.events)}",
         ]
         lines.append("  " + self.risk.describe().replace("\n", "\n  "))
+        if self.associations:
+            # The object count above is only as good as these; an operator
+            # who cannot see them cannot tell "1 object" from a lucky merge.
+            lines.append("  links")
+            for link in self.associations:
+                lines.append(f"    {link.describe()}")
         lines.append("  timeline")
         for entry in self.timeline():
             lines.append(
@@ -437,7 +801,12 @@ def incident_id(opening_event: Event) -> str:
 class CorrelationStats:
     events_in: int = 0
     incidents_out: int = 0
+    #: Cross-camera joins.
     associations: int = 0
+    #: Same-camera fragment joins, counted apart because they measure a
+    #: different thing: how badly the tracker fragmented, not how many cameras
+    #: agreed.
+    fragment_links: int = 0
 
     @property
     def reduction(self) -> float:
@@ -479,6 +848,13 @@ class Correlator:
             ordered, window_millis=self._window, radius_meters=self._radius
         )
         self.stats.associations += len(links)
+
+        # Same-camera fragments join the same identity as cross-camera pairs,
+        # so the distinct-object count — and the "group" factor built on it —
+        # is of objects, not of the ids a flickering detector handed out.
+        fragments = link_same_camera_fragments(ordered)
+        self.stats.fragment_links += len(fragments)
+        links = links + fragments
 
         identity = ObjectIdentity()
         for event in ordered:

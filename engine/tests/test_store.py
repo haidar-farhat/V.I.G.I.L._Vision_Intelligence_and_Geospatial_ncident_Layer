@@ -1516,3 +1516,198 @@ def test_the_class_filter_arrives_and_leaves_without_touching_the_zones(store: S
 
     store.save_zone(make_zone("people", classes=frozenset({"person"})))
     assert {z.id: z for z in store.zones()}["people"].classes == frozenset({"person"})
+
+
+# ---------------------------------------------------------------- plate reads
+
+
+def make_reading(
+    track: int = 3,
+    *,
+    display: str = "B74?1",
+    text: str | None = None,
+    confident: bool = False,
+    agreement: int = 0,
+    reads: int = 3,
+):
+    """A reading as the pipeline publishes one, with the pipeline's own type.
+
+    Built through `TrackPlate` rather than a stand-in so that a field the
+    pipeline renames is a failure here and not a row written with a column
+    quietly holding the wrong thing.
+    """
+    from sentinel.pipeline import TrackPlate
+
+    return TrackPlate(
+        track_id=track, country="LB", display=display, text=text,
+        is_confident=confident, agreement=agreement, reads=reads,
+    )
+
+
+def test_a_reading_is_stored_once_and_refreshed_as_agreement_grows(store: Store):
+    """Three frames of one van are one row holding the latest tally.
+
+    A reading is published on every frame of a track and refined as reads
+    accumulate. A row per frame would store one guess three times and let the
+    three count as three vehicles; a row that kept the first tally would show
+    the half-read plate after the reader had finished reading it.
+    """
+    frames = (
+        (10, make_reading(display="B74?1", reads=3)),
+        (14, make_reading(display="B7421", text="B7421", agreement=3, reads=5)),
+        (22, make_reading(display="B7421", text="B7421", confident=True, agreement=4, reads=6)),
+    )
+    for index, reading in frames:
+        store.save_plate_read("gate", reading, frame_index=index, seen_at_millis=1000 + index * 40)
+
+    rows = store.plate_reads()
+
+    assert store.plate_read_count() == 1, "one track became more than one row"
+    assert len(rows) == 1
+    row = rows[0]
+    assert (row.camera_id, row.track_id) == ("gate", 3)
+    assert (row.first_frame, row.last_frame) == (10, 22), "the window did not fold"
+    assert row.text == "B7421" and row.is_confident is True
+    assert (row.agreement, row.reads) == (4, 6), "the row holds an earlier tally"
+    assert row.seen_at_millis == 1000 + 22 * 40
+    assert row.country == "LB"
+
+
+def test_a_later_tally_replaces_an_earlier_one_whichever_way_it_moved(store: Store):
+    # The accumulator re-tallies every read; a disagreeing frame can lower the
+    # agreement behind a character. The row must say what the reader says now,
+    # not the highest number it ever said.
+    store.save_plate_read("gate", make_reading(text="B7421", display="B7421", agreement=3, reads=3), frame_index=5, seen_at_millis=5)
+    store.save_plate_read("gate", make_reading(text=None, display="B742?", agreement=0, reads=4), frame_index=6, seen_at_millis=6)
+
+    row = store.plate_reads()[0]
+
+    assert row.text is None and row.display == "B742?"
+    assert (row.agreement, row.reads) == (0, 4)
+    assert (row.first_frame, row.last_frame) == (5, 6)
+
+
+def test_a_frame_index_that_went_backwards_starts_the_window_again(store: Store):
+    """A restarted run reuses track ids and frame indices from zero.
+
+    Folding the new run's window into the old one would report today's
+    vehicle as having been in shot since a run that ended yesterday.
+
+    The restart lands *inside* the old window, at 500 between 400 and 900.
+    A skeptic showed that restarting below the old first frame proves
+    nothing: plain ``MIN(400, 30)`` gives 30 whether or not a restart is
+    noticed. With 500, a fold that noticed nothing would read (400, 500).
+    """
+    store.save_plate_read("gate", make_reading(), frame_index=400, seen_at_millis=400)
+    store.save_plate_read("gate", make_reading(), frame_index=900, seen_at_millis=900)
+    store.save_plate_read("gate", make_reading(display="C99?8"), frame_index=500, seen_at_millis=500)
+
+    row = store.plate_reads()[0]
+
+    assert (row.first_frame, row.last_frame) == (500, 500), "yesterday's window survived the restart"
+    assert row.display == "C99?8"
+    assert store.plate_read_count() == 1
+
+
+def test_a_confident_reading_without_its_text_is_refused_at_both_layers(store: Store):
+    # The pipeline never publishes one, and a row in that shape would be a
+    # plate everything may act on that nobody can read. Refused in Python so
+    # the message names the track, and in the schema so no other writer can.
+    import sqlite3
+
+    with pytest.raises(StoreError, match="track 3"):
+        store.save_plate_read("gate", make_reading(text=None, confident=True, agreement=4, reads=4), frame_index=1, seen_at_millis=1)
+    assert store.plate_read_count() == 0
+
+    with pytest.raises(sqlite3.IntegrityError):
+        with store.transaction() as connection:
+            connection.execute(
+                "INSERT INTO plate_reads (camera_id, track_id, first_frame, last_frame, "
+                "country, display, text, is_confident, agreement, reads, seen_at_millis) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                ("gate", 9, 1, 1, "LB", "B7421", None, 1, 4, 4, 1),
+            )
+    assert store.plate_read_count() == 0
+
+
+def test_readings_are_listed_newest_first_and_filtered_on_the_same_clock(store: Store):
+    # Newest first, because the question is "what was read lately"; and the
+    # `since` filter and the ordering read the same column, so a query across
+    # two cameras is not interleaved by two clocks.
+    store.save_plate_read("gate", make_reading(1), frame_index=1, seen_at_millis=1_000)
+    store.save_plate_read("yard", make_reading(1), frame_index=1, seen_at_millis=3_000)
+    store.save_plate_read("gate", make_reading(2), frame_index=9, seen_at_millis=2_000)
+
+    everything = store.plate_reads()
+    assert [(r.camera_id, r.track_id) for r in everything] == [("yard", 1), ("gate", 2), ("gate", 1)]
+
+    assert [r.track_id for r in store.plate_reads(camera_id="gate")] == [2, 1]
+    assert [(r.camera_id, r.track_id) for r in store.plate_reads(since_millis=2_000)] == [("yard", 1), ("gate", 2)]
+    assert [r.camera_id for r in store.plate_reads(limit=1)] == ["yard"]
+    assert store.plate_reads(camera_id="gate", since_millis=1_500) == [everything[1]]
+
+
+def test_plate_readings_arrive_and_leave_without_touching_the_evidence(store: Store):
+    """The migration must apply, and undo, on a database that has rows in it.
+
+    An air-gapped deployment steps back a version to diagnose something and
+    forward again afterwards. The readings go with the table on the way down
+    — a build that predates them cannot hold them — and the cameras, zones,
+    events, incidents and audit rows must not go with it.
+    """
+    populate(store)
+    store.save_plate_read("cam-07", make_reading(text="B7421", display="B7421", confident=True, agreement=4, reads=5), frame_index=12, seen_at_millis=1_000)
+    before = store.applied_versions()
+    events, incidents = store.event_count(), store.incident_count()
+
+    # Down to and including `plate_reads`, rather than one step, for the
+    # reason the site test gives: this is the newest migration only until the
+    # next one lands.
+    undone = store.rollback()
+    while undone is not None and undone.name != "plate_reads":
+        undone = store.rollback()
+
+    assert undone is not None and undone.name == "plate_reads"
+    assert "plate_reads" not in store.table_names(), "the table survived its own down"
+    assert store.event_count() == events, "rolling back the readings took the events"
+    assert store.incident_count() == incidents
+    assert len(store.cameras()) == 1
+    assert len(store.zones()) == 1
+    assert len(store.audit_trail()) == 1
+
+    store.migrate()
+
+    assert store.applied_versions() == before
+    assert "plate_reads" in store.table_names()
+    assert store.plate_read_count() == 0, "a reading was resurrected by re-applying"
+    store.save_plate_read("cam-07", make_reading(), frame_index=1, seen_at_millis=1)
+    assert store.plate_read_count() == 1
+
+
+def test_a_record_stamped_to_the_microsecond_still_verifies_from_its_row(tmp_path: Path):
+    """What is hashed must be what is written.
+
+    The column holds milliseconds. A record stamped with microseconds was
+    hashed with them and stored without them, so the first chained row in a
+    fresh database failed its own verification — the Audit tab's first
+    photograph read "the chain breaks at chained record 1 of 1".
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from sentinel.auditing import AuditRecord, verify_chain
+
+    with Store(tmp_path / "s.db") as store:
+        at = datetime(2026, 9, 4, 15, 43, 36, 93873, tzinfo=timezone.utc)   # microseconds on purpose
+        written = store.audit_record(AuditRecord(
+            actor="console", action="camera.placed", subject="cam", node_id="local", at=at,
+            before_json='{"heading": 90.0}', after_json='{"heading": 180.0}',
+        ))
+        row = store.audit_trail(limit=1)[0]
+        assert row["chain_hash"] == written
+
+        rebuilt = AuditRecord(
+            actor=row["actor"], action=row["action"], subject=row["subject"], node_id=row["node_id"],
+            at=datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(milliseconds=int(row["at"])),
+            before_json=row["before_json"], after_json=row["after_json"],
+        )
+        assert verify_chain([rebuilt], [row["chain_hash"]]) is None, "the row does not re-hash to its own chain hash"

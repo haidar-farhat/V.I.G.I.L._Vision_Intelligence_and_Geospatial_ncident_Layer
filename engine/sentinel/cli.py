@@ -24,10 +24,13 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 
 from . import devices, logs, paths, telemetry
 from .recording import RetentionPolicy, apply_retention
+from .registry import Identifier, Register
+from .registry import RetentionPolicy as IdentifierRetentionPolicy
 from .core import CameraPose, LatLon
 from .decode import VideoSource
 from .detect import MotionDetector
@@ -118,12 +121,127 @@ def _zone(text: str) -> Zone:
         )
 
     return Zone(
-        id=name.strip().lower().replace(" ", "-"),
+        id=_zone_id(name),
         name=name.strip(),
         kind=ZoneKind.RESTRICTED,
         ring=tuple(points),
         enter_after_millis=600,
     )
+
+
+def _zone_id(name: str) -> str:
+    """The id a `--zone` name becomes, in one place.
+
+    `--zone-classes` finds its zone by the same rule, so ``Loading Yard`` and
+    ``loading-yard`` name the same polygon on both options. Two spellings of
+    the slug would let a filter typed for a zone silently attach to nothing.
+    """
+    return name.strip().lower().replace(" ", "-")
+
+
+def _zone_classes(text: str) -> tuple[str, frozenset[str]]:
+    """``NAME=label,label`` — which detector labels one `--zone` acts on.
+
+    The labels are the model's own strings, matched exactly, because a model
+    file's names are the only vocabulary a site has. An empty list is refused
+    rather than read as "everything": leaving the option off already means
+    that, and ``Yard=`` is far more often a filter somebody forgot to finish
+    than a decision to watch every class.
+    """
+    name, sep, labels = text.partition("=")
+    if not sep or not name.strip():
+        raise argparse.ArgumentTypeError(
+            "--zone-classes takes NAME=label,label — the NAME of a --zone in the "
+            "same command, then the detector's own labels"
+        )
+    classes = frozenset(label.strip() for label in labels.split(",") if label.strip())
+    if not classes:
+        raise argparse.ArgumentTypeError(
+            f"--zone-classes {name.strip()}: no labels. Leave the option off to "
+            "watch every class the detector reports."
+        )
+    return name.strip(), classes
+
+
+def _apply_zone_classes(
+    zones: list[Zone], filters: list[tuple[str, frozenset[str]]]
+) -> tuple[list[Zone], str | None]:
+    """Attach each `--zone-classes` filter to the `--zone` it names.
+
+    Returns the zones with their filters, or the sentence to refuse with. The
+    filter attaches only to a zone declared by ``--zone`` *in this command*,
+    never to one the database already holds: a run that quietly rewrote a
+    stored zone's filter would change what the console watches from then on,
+    with no console open and no audit row naming the operator who did it.
+
+    Two filters naming the same zone are combined, because ``Yard=person``
+    followed by ``Yard=car`` reads as both; a later one replacing an earlier
+    one would drop a class the operator typed.
+    """
+    by_id = {zone.id: zone for zone in zones}
+    for name, classes in filters:
+        zone = by_id.get(_zone_id(name))
+        if zone is None:
+            declared = ", ".join(zone.name for zone in zones) or "none"
+            return zones, (
+                f"--zone-classes names {name!r}, but no --zone in this command "
+                f"declares it (declared: {declared}). The filter applies only to "
+                "a zone given by --zone in the same command; a zone stored in the "
+                "database keeps the filter set in the console."
+            )
+        by_id[zone.id] = replace(zone, classes=zone.classes | classes)
+    return [by_id[zone.id] for zone in zones], None
+
+
+def _watches(zone: Zone) -> str:
+    """What one zone acts on, in the words the summary line uses."""
+    if zone.classes:
+        return "watches " + ", ".join(sorted(zone.classes))
+    return "watches every class the detector reports"
+
+
+def _describe_zones(
+    zones: list[Zone], *, explicit: bool, unused_stored: list[Zone], model_given: bool
+) -> None:
+    """Say which zones this invocation runs with, and what each one watches.
+
+    Printed before the first frame, because the end-of-run summary can only
+    count events, and "No events" from a run whose zones all filtered for a
+    label the detector never produces reads as an empty scene. It read that
+    way once on a real camera: a database whose one zone watched ``person``,
+    a ``run`` that ignored stored zones entirely, and a report that said
+    nothing crossed a rule when nothing was being watched at all.
+    """
+    if not zones:
+        print(
+            "zones       none — the database holds none and no --zone was given, "
+            "so no zone rule runs this time"
+        )
+        return
+
+    origin = "from --zone" if explicit else "restored from the database"
+    print(f"zones       {len(zones)} {origin}")
+    for zone in zones:
+        print(f"  {zone.name:<20} {_watches(zone)}")
+
+    if explicit and unused_stored:
+        # Explicit wins, and the operator sees what that cost.
+        names = ", ".join(zone.name for zone in unused_stored)
+        print(
+            f"  not used this run: {len(unused_stored)} stored zone(s) --zone did "
+            f"not name ({names})"
+        )
+
+    if not model_given and any(zone.classes for zone in zones):
+        # The rule that matters most: a filtered zone never fires from a motion
+        # detector, which cannot say what it saw. A run that watched nothing
+        # for that reason would otherwise report "No events" as an empty scene.
+        filtered = ", ".join(zone.name for zone in zones if zone.classes)
+        print(
+            f"  WARNING: {filtered} filter by class, but without --model the "
+            "motion detector names nothing, so these zones cannot fire this run.",
+            file=sys.stderr,
+        )
 
 
 def _ring(text: str) -> list[LatLon]:
@@ -172,8 +290,12 @@ _rules = default_rules
 
 
 def _run(args: argparse.Namespace) -> int:
-    zones = list(args.zone or [])
-    rules = _rules(zones)
+    explicit, refusal = _apply_zone_classes(
+        list(args.zone or []), list(args.zone_classes or [])
+    )
+    if refusal is not None:
+        print(f"error: {refusal}", file=sys.stderr)
+        return 2
 
     # Every argument is checked before any source is constructed. An earlier
     # version validated `--id` *after* the loop that indexed it, so the wrong
@@ -239,6 +361,24 @@ def _run(args: argparse.Namespace) -> int:
     recording_failed = False
 
     try:
+        # Explicit wins; otherwise the database's own zones, the way `Node`
+        # and the console already behave. Until this matched, a run with no
+        # --zone on a database whose zones carried filters watched nothing and
+        # reported "No events" as though the scene were empty.
+        stored = store.zones()
+        if explicit:
+            zones = explicit
+            named = {zone.id for zone in explicit}
+            unused = [zone for zone in stored if zone.id not in named]
+        else:
+            zones, unused = stored, []
+        rules = _rules(zones)
+        print()
+        _describe_zones(
+            zones, explicit=bool(explicit), unused_stored=unused,
+            model_given=args.model is not None,
+        )
+
         for index, source in enumerate(sources):
             pose = None
             if args.place:
@@ -337,7 +477,9 @@ def _run(args: argparse.Namespace) -> int:
                         )
                         recording_failed = True
 
-        for zone in zones:
+        # Only what --zone declared is written back. The restored zones came
+        # from this table and rewriting them would say an edit happened.
+        for zone in explicit:
             store.save_zone(zone)
 
         if not all_events:
@@ -641,7 +783,12 @@ def _node(args: argparse.Namespace) -> int:
     of them on a cadence, and is what a machine with no display in a cupboard
     actually does.
     """
-    zones = list(args.zone or [])
+    zones, refusal = _apply_zone_classes(
+        list(args.zone or []), list(args.zone_classes or [])
+    )
+    if refusal is not None:
+        print(f"error: {refusal}", file=sys.stderr)
+        return 2
 
     if args.place and len(args.place) not in (1, len(args.source)):
         print(
@@ -686,6 +833,16 @@ def _node(args: argparse.Namespace) -> int:
         deadline = time.monotonic() + args.for_seconds if args.for_seconds else None
         print(f"node {args.node}: {len(node.cameras)} camera(s), "
               f"{len(node.zones)} zone(s), {len(node.rules)} rule(s)")
+        # `Node` restored the stored zones itself when --zone was absent; what
+        # it is actually watching is `node.zones`, whichever way it got them.
+        # The explicit ones are already saved, so the stored zones it did not
+        # name are the ones left over in the table.
+        named = {zone.id for zone in zones}
+        _describe_zones(
+            list(node.zones), explicit=bool(zones),
+            unused_stored=[z for z in node.store.zones() if z.id not in named],
+            model_given=args.model is not None,
+        )
         if deadline is None:
             # On Windows an external SIGINT does not reach a Python process at
             # all — measured — so a scheduled job or a container needs --for.
@@ -703,17 +860,54 @@ def _node(args: argparse.Namespace) -> int:
         node.close()
 
 
+def _register_expiry(
+    register: Register, now_millis: int, policy: IdentifierRetentionPolicy
+) -> tuple[list[Identifier], list[Identifier]]:
+    """What a register sweep would delete and what a pin would save — read only.
+
+    The sweep has no dry run of its own, and the first thing anybody should do
+    with a retention policy is find out what it would have eaten; a report that
+    could only say "add --apply to find out" would be no report. The selection
+    is the sweep's — retention by kind from the same policy, age from the same
+    enrolment time, the subject's pin the only exemption — and
+    `test_cli` holds the two to the same answer, so this cannot drift into
+    promising a smaller sweep than the one --apply then performs.
+    """
+    expired: list[Identifier] = []
+    pinned: list[Identifier] = []
+    for subject in register.subjects():
+        for identifier in register.identifiers(subject.id):
+            retention = policy.retention_millis(identifier.kind)
+            if retention is None or identifier.age_millis(now_millis) < retention:
+                continue
+            (pinned if subject.pinned else expired).append(identifier)
+    return expired, pinned
+
+
 def _retention(args: argparse.Namespace) -> int:
-    """Report or apply the recording retention policy.
+    """Report or apply the retention policy: recorded video, then the register.
 
     Reports by default. The first thing anybody should do with a retention
     policy is find out what it would have eaten, and a command whose default
     deletes video is a command that deletes video by accident.
+
+    The register is swept by the same command, after the video, because the
+    two are one decision: a deployment where the footage expires on schedule
+    and the biometric templates it was taken from do not is the wrong way
+    round, and it stayed that way here for as long as the sweep was a tested
+    method nothing called.
     """
     policy = RetentionPolicy(
         max_age_days=args.keep_days if args.keep_days > 0 else None,
         max_bytes=int(args.max_gib * 1024**3) if args.max_gib else None,
         min_free_bytes=int(args.min_free_gib * 1024**3) if args.min_free_gib else None,
+    )
+    if args.face_days < 0 or args.plate_days < 0:
+        print("error: --face-days and --plate-days are durations; neither can be "
+              "negative", file=sys.stderr)
+        return 2
+    identifiers = IdentifierRetentionPolicy(
+        face_template_days=args.face_days, plate_days=args.plate_days
     )
 
     store = Store(args.database or default_database_path())
@@ -737,11 +931,41 @@ def _retention(args: argparse.Namespace) -> int:
             print(f"missing     {result.already_missing} indexed file(s) were already gone")
         if result.failed:
             print(f"failed      {len(result.failed)} file(s) could not be deleted")
+
+        # The register, whatever the video sweep managed. A full disk is a
+        # reason to stop deleting video, not a reason to keep a face template
+        # past the day it was promised to go.
+        now_millis = int(time.time() * 1000)
+        register = store.register
+        if args.apply:
+            sweep = register.sweep_expired(now_millis, identifiers)
+            # Audited even when it deleted nothing: the row is the evidence
+            # that the sweep ran, which is what a data-protection audit asks
+            # for first. Ids and counts only, never a name or a plate.
+            store.audit(ACTOR, sweep.action, None, sweep.detail())
+            expired, pinned = list(sweep.deleted), list(sweep.kept_pinned)
+            examined = sweep.examined
+        else:
+            expired, pinned = _register_expiry(register, now_millis, identifiers)
+            examined = sum(
+                len(register.identifiers(subject.id)) for subject in register.subjects()
+            )
+
+        print()
+        print(f"register    {identifiers.describe()} — {examined} identifier(s) examined")
+        print(f"{verb}    {len(expired)} identifier(s) past retention")
+        if pinned:
+            # Reported, never passed over: an identifier past its retention
+            # that is still here is exactly what an audit asks about, and the
+            # answer is "an operator pinned that subject".
+            print(f"kept        {len(pinned)} identifier(s) past retention, because "
+                  "an operator pinned the subject")
+
         if result.shortfall:
             print()
             print(f"  {result.shortfall}")
             return 1
-        if not args.apply and result.deleted:
+        if not args.apply and (result.deleted or expired):
             print()
             print("  Nothing was deleted. Add --apply to do it.")
         return 0
@@ -824,6 +1048,8 @@ def build_parser() -> argparse.ArgumentParser:
             "      --place 33.8942,35.5018,6,0,-22 \\\n"
             "      --zone 'Yard:33.8940,35.5016;33.8940,35.5020;"
             "33.8936,35.5020;33.8936,35.5016'\n"
+            "  sentinel run gate.mp4 --model gate.onnx --zone 'Yard:...' "
+            "--zone-classes Yard=person,car\n"
             "  sentinel node gate.mp4 north.mp4 --record --for 3600\n"
             "  sentinel devices --probe\n"
             "  sentinel run device:0 --place 33.8938,35.5018,3,90,-15\n"
@@ -869,7 +1095,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument(
         "--zone", action="append", type=_zone, default=None,
-        help="name:lat,lon;lat,lon;lat,lon — a restricted polygon",
+        help=(
+            "name:lat,lon;lat,lon;lat,lon — a restricted polygon. Without any, "
+            "the zones the database already holds are used, filters included."
+        ),
+    )
+    run.add_argument(
+        "--zone-classes", action="append", type=_zone_classes, default=None,
+        metavar="NAME=label,label",
+        help=(
+            "which detector labels a --zone in this command acts on, e.g. "
+            "Yard=person,car. Repeatable. Without it a zone fires for anything. "
+            "A filtered zone needs --model: the motion detector names nothing."
+        ),
     )
     run.add_argument(
         "--for", dest="duration", type=float, default=None, metavar="SECONDS",
@@ -977,7 +1215,10 @@ def build_parser() -> argparse.ArgumentParser:
     node.add_argument("--place", action="append", type=_pose, default=None,
                       help="lat,lon,height,heading,pitch[,hfov,vfov,range]")
     node.add_argument("--zone", action="append", type=_zone, default=None,
-                      help="name:lat,lon;lat,lon;lat,lon")
+                      help="name:lat,lon;lat,lon;lat,lon (default: the stored zones)")
+    node.add_argument("--zone-classes", action="append", type=_zone_classes,
+                      default=None, metavar="NAME=label,label",
+                      help="which detector labels a --zone in this command acts on")
     node.add_argument("--record", metavar="DIR", nargs="?", const="", default=None,
                       help="record video to DIR, or to the data directory")
     node.add_argument("--segment-seconds", type=float, default=60.0)
@@ -993,7 +1234,21 @@ def build_parser() -> argparse.ArgumentParser:
     node.set_defaults(handler=_node)
 
     retention = commands.add_parser(
-        "retention", help="delete recorded video the policy no longer covers"
+        "retention",
+        help="delete recorded video and enrolled identifiers the policy no longer covers",
+    )
+    retention.add_argument(
+        "--face-days", type=float, default=30.0, metavar="DAYS",
+        help=(
+            "delete face templates enrolled longer ago than this (default 30). "
+            "A pinned subject is the only exemption. There is no value meaning "
+            "forever: keeping a biometric indefinitely is a decision that needs "
+            "a name and an audit row, not a flag."
+        ),
+    )
+    retention.add_argument(
+        "--plate-days", type=float, default=365.0, metavar="DAYS",
+        help="delete plates enrolled longer ago than this (default 365)",
     )
     retention.add_argument(
         "--keep-days", type=float, default=14.0, metavar="DAYS",

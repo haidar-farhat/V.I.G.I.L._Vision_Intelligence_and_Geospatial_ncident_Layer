@@ -3571,3 +3571,34 @@ def test_detector_labels_come_from_the_models_class_names(qt_app, window, monkey
     monkeypatch.setattr(app_module, "detector_for", lambda _path: Detector())
 
     assert window._detector_labels() == ["car", "person", "truck"]
+
+
+def test_the_incident_views_timeline_is_relative_to_the_incident_not_the_epoch(qt_app):
+    """The evidence report had this fixed this morning; the console did not.
+
+    Built from events stamped with a real wall clock, the children must read
+    "t+0.0s", "t+0.5s" — not fifty-six years.
+    """
+    from sentinel_console.incident_view import IncidentView
+
+    view = IncidentView()
+    incidents = _incident_from_events(3)          # events at index * 500 ms
+    view.show_incidents(incidents)
+    row = view.topLevelItem(0)
+    stamps = [row.child(i).text(1) for i in range(row.childCount()) if row.child(i).text(1).startswith("t+")]
+    assert stamps, [row.child(i).text(1) for i in range(row.childCount())]
+    offsets = [float(s[2:-1]) for s in stamps]
+    assert offsets[0] == 0.0
+    assert max(offsets) < 3600, offsets
+
+
+def test_the_audit_tab_is_in_the_window_and_reads_the_nodes_store(qt_app, window, reference_video: Path):
+    labels = [window.detail_tabs.tabText(i) for i in range(window.detail_tabs.count())]
+    assert "Audit" in labels
+
+    # Something audited through the node must be visible in the tab: the
+    # panel reads the same store the node writes, not a copy.
+    _placed_window(window, reference_video)
+    window._add_zone(radius=5.0)
+    window.audit.refresh()
+    assert window.audit.listed_row_ids(), "the audit tab shows nothing after an audited action"

@@ -408,3 +408,39 @@ def test_the_timeline_is_relative_to_the_incident_not_the_epoch(tmp_path: Path):
     assert max(offsets) < 3600, f"the timeline is an epoch, not an offset: {offsets}"
     # The absolute time stays beside it: a package read a year later needs both.
     assert "UTC" in timeline[0]
+
+
+def test_a_same_camera_link_is_not_reported_as_a_hand_off(tmp_path: Path):
+    """"#7 = #3 on webcam" under CROSS-CAMERA ASSOCIATIONS claims a second camera.
+
+    Same-camera fragment links are a different statement — the tracker lost
+    and re-found one object — and the package keeps the two apart, in the JSON
+    (the old key keeps its old meaning) and in the report.
+    """
+    from dataclasses import replace
+
+    from sentinel.incidents import Association
+
+    incident = incident_with()
+    within = Association(
+        a=("cam-07", 7), b=("cam-07", 3), score=0.8, separation_meters=0.6,
+        allowance_meters=2.0, time_gap_millis=400,
+        reasons=("gap 0.4 s", "0.6 m apart", "appearance 0.91"),
+    )
+    across = Association(
+        a=("cam-07", 1), b=("cam-08", 4), score=0.7, separation_meters=1.1,
+        allowance_meters=2.5, time_gap_millis=900, reasons=("hand-off",),
+    )
+    incident = replace(incident, associations=(within, across))
+
+    export = export_incident(incident, tmp_path / "exports", exported_by=EXPORTED_BY, at=MOMENT)
+    package = json.loads((export.directory / "incident.json").read_text(encoding="utf-8"))
+    assert [a["a"] for a in package["cross_camera_associations"]] == ["cam-07#1"]
+    assert [a["a"] for a in package["same_camera_associations"]] == ["cam-07#7"]
+
+    report = (export.directory / "report.txt").read_text(encoding="utf-8")
+    assert "SAME-CAMERA ASSOCIATIONS" in report
+    cross = report.index("CROSS-CAMERA ASSOCIATIONS")
+    same = report.index("SAME-CAMERA ASSOCIATIONS")
+    assert report.index("cam-07#7 = cam-07#3") > same
+    assert cross < report.index("cam-07#1 = cam-08#4") < same or report.index("cam-07#1 = cam-08#4") > cross
