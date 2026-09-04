@@ -775,6 +775,144 @@ def test_a_zone_outline_change_is_audited_as_such(tmp_path: Path, yard: Zone):
         assert "name" not in detail, "an unchanged field was reported as changed"
 
 
+# ---------------------------------------------------- structured audit records
+
+
+def audit_row(store: Store, action: str):
+    """The most recent row for one action, or a failure that names what was there.
+
+    A bare ``next(...)`` raises `StopIteration` with nothing in it, and the
+    question when this fails is always "then what did get written".
+    """
+    for row in store.audit_trail(limit=100):
+        if row["action"] == action:
+            return row
+    written = [row["action"] for row in store.audit_trail(limit=100)]
+    raise AssertionError(f"no {action!r} row was written; the log holds {written}")
+
+
+def test_a_zone_change_stores_both_states_and_still_reads_as_it_did(
+    tmp_path: Path, yard: Zone
+):
+    """The prose is unchanged for a person; the states are there for everything else.
+
+    A rename that reached the log as "name 'Yard' -> 'Loading bay'" could be
+    read and nothing else: not filtered, not replayed, not checked. Now the two
+    zones are stored beside the sentence, and the sentence is rendered from the
+    same comparison — so the row cannot say the kind changed while the record
+    says it did not.
+
+    Both halves are asserted, because either alone passes while the wiring is
+    only half there: the prose alone passes with `store.audit`, and the JSON
+    alone passes with a line nobody can read.
+    """
+    import json
+
+    from sentinel.node import _describe_zone_change
+
+    renamed = Zone(
+        id=yard.id, name="Loading bay", kind=yard.kind, ring=yard.ring,
+        schedule=yard.schedule, enter_after_millis=yard.enter_after_millis,
+        exit_after_millis=yard.exit_after_millis,
+        accept_uncertain=yard.accept_uncertain,
+    )
+
+    with Node(tmp_path / "n.db", zones=[yard], node_id="gatehouse") as node:
+        node.replace_zone(renamed)
+
+    with Store(tmp_path / "n.db") as store:
+        row = audit_row(store, "zone.changed")
+        print(row["detail"])
+        print(row["before_json"])
+
+        assert row["detail"] == _describe_zone_change(yard, renamed), (
+            "the line operators have been reading changed voice"
+        )
+        assert row["before_json"] is not None, "the row kept only the sentence"
+        before = json.loads(row["before_json"])
+        after = json.loads(row["after_json"])
+        differing = {key for key in before if before[key] != after[key]}
+
+        assert differing == {"name"}, "the states differ somewhere nothing changed"
+        assert before["name"] == "Yard" and after["name"] == "Loading bay"
+        assert row["node_id"] == "gatehouse", "the row cannot say which node wrote it"
+        assert row["chain_hash"], "the row is not in the chain"
+
+
+def test_a_camera_placement_records_where_it_was_as_well_as_where_it_is(
+    tmp_path: Path, reference_video: Path, site: CameraPose
+):
+    """A camera nudged three degrees is a track that lands outside the zone.
+
+    The log could always say where a camera ended up and never where it had
+    been, so a placement that quietly moved a boundary out of view left nothing
+    to compare against. The prose stays the coordinate line a person reads —
+    a diff of two poses would put JSON there instead, which is worse for the
+    reader — and the two poses go beside it.
+    """
+    import json
+
+    nudged = CameraPose(
+        position=site.position, mount_height=site.mount_height,
+        heading=site.heading + 3.0, pitch=site.pitch,
+        horizontal_fov=site.horizontal_fov, vertical_fov=site.vertical_fov,
+        range_meters=site.range_meters,
+    )
+
+    with Node(tmp_path / "n.db") as node:
+        node.add_camera(reference_video, camera_id="gate")
+        node.place_camera("gate", site)
+        node.place_camera("gate", nudged)
+
+    with Store(tmp_path / "n.db") as store:
+        row = audit_row(store, "camera.placed")
+        print(row["detail"])
+
+        assert row["detail"].startswith(f"{site.position.lat:.6f},"), (
+            "the placement line stopped being a coordinate"
+        )
+        assert "hdg=183.0" in row["detail"]
+        before = json.loads(row["before_json"])
+        after = json.loads(row["after_json"])
+        differing = {key for key in before if before[key] != after[key]}
+
+        assert differing == {"heading"}, "a pose changed where nothing was moved"
+        assert before["heading"] == site.heading
+        assert after["heading"] == nudged.heading
+
+
+def test_a_removed_camera_leaves_the_placement_it_took_with_it(
+    tmp_path: Path, reference_video: Path, site: CameraPose
+):
+    """The row is the last surviving record of where the evidence came from.
+
+    Its events keep the camera id and nothing else; once the camera row is
+    deleted, where it was pointing exists only here. The source recorded is the
+    redacted one, because this row outlives the camera and a password in it is a
+    password in an append-only log.
+    """
+    import json
+
+    with Node(tmp_path / "n.db") as node:
+        node.add_camera(reference_video, camera_id="gate", pose=site)
+        record = node.camera("gate")
+        display = record.display_source
+        node.remove_camera("gate")
+
+    with Store(tmp_path / "n.db") as store:
+        row = audit_row(store, "camera.removed")
+        print(row["before_json"])
+
+        assert row["detail"] == display, "the removal line changed voice"
+        assert row["after_json"] is None, "a deletion was given an after state"
+        before = json.loads(row["before_json"])
+
+        assert before["source"] == display
+        assert before["pose"]["heading"] == site.heading, (
+            "where it was pointing went with it"
+        )
+
+
 def test_a_node_names_the_clock_its_schedules_are_read_against(tmp_path: Path):
     from datetime import timedelta, timezone
 

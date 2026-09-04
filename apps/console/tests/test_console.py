@@ -2438,6 +2438,13 @@ def test_every_path_that_changes_the_site_goes_through_the_lock(qt_app, window):
         "_zone_outline_edited": "only after Reshape",
         "_zone_properties_applied": "only from the Apply button",
         "_add_zone": "from _add_zone_dialog and the screenshot tool",
+        # The map emits these only while it is editable, and it is editable
+        # only while the console is configuring — `_set_configuring` is the
+        # single caller of `map.set_editable`. That is the lock, worn by a
+        # widget instead of by a button, and
+        # `test_a_camera_cannot_be_dragged_in_monitor` holds it to that.
+        "_camera_dragged": "only while map.set_editable(True), which follows the lock",
+        "_camera_turned": "only while map.set_editable(True), which follows the lock",
     }
     mutators = (
         "self.node.add_camera", "self.node.remove_camera", "self.node.place_camera",
@@ -3159,3 +3166,247 @@ def test_the_legend_explains_the_two_far_edges(qt_app):
     assert not legend.intersects(view.scale_bar_rect())
     assert legend.top() >= 0 and legend.bottom() <= view.height()
     assert legend.width() <= view.width() * 0.45, f"the legend is {legend.width():.0f} px wide"
+
+
+# ------------------------------------- the camera list, its strip, and the map
+#
+# Three finished things used to be wired to nothing: a camera list panel nobody
+# put in the window, a `Node.camera_health()` nobody called on the poll timer,
+# and a plan view that could drag a camera only for a caller that set
+# `set_editable` itself. What follows is what an operator can now actually
+# reach, and each of these fails if the connection is taken out of `app.py`.
+
+
+def _click_camera_row(panel, camera_id: str) -> None:
+    """Click the row for a camera, the way an operator picks one.
+
+    A real click on the viewport rather than a call to `setCurrentItem`: the
+    whole point of the panel is the path from a mouse to the selection bus, and
+    a test that sets the current item skips exactly the wiring under test.
+    """
+    from PySide6.QtTest import QTest
+
+    tree = panel.tree
+    for index in range(tree.topLevelItemCount()):
+        item = tree.topLevelItem(index)
+        if item.data(0, Qt.ItemDataRole.UserRole) == camera_id:
+            rect = tree.visualItemRect(item)
+            assert not rect.isEmpty(), f"{camera_id}'s row has no rectangle to click"
+            QTest.mouseClick(
+                tree.viewport(), Qt.MouseButton.LeftButton, pos=rect.center()
+            )
+            QApplication.processEvents()
+            return
+    raise AssertionError(f"there is no row for {camera_id} to click")
+
+
+def _row_status(panel, camera_id: str) -> str:
+    from sentinel_console.camera_list import STATUS_COLUMN
+
+    tree = panel.tree
+    for index in range(tree.topLevelItemCount()):
+        item = tree.topLevelItem(index)
+        if item.data(0, Qt.ItemDataRole.UserRole) == camera_id:
+            return item.text(STATUS_COLUMN)
+    raise AssertionError(f"there is no row for {camera_id}")
+
+
+def _listed_cameras(window) -> list:
+    tree = window.camera_list.tree
+    return [
+        tree.topLevelItem(index).data(0, Qt.ItemDataRole.UserRole)
+        for index in range(tree.topLevelItemCount())
+    ]
+
+
+def test_the_camera_list_is_in_the_window_and_names_every_camera(
+    qt_app, window, reference_video: Path
+):
+    """A combo box shows one camera and hides the rest.
+
+    Eight cameras looked identical whether all eight were delivering frames or
+    seven had been dark since midnight, because seven of them were not on the
+    screen at all. Every camera has a row now, and the row says what that
+    camera is doing.
+    """
+    window.add_camera(reference_video, "cam-07")
+    window.add_camera(reference_video, "cam-08")
+    QApplication.processEvents()
+
+    assert window.camera_list.isVisibleTo(window), "the list is not in the window"
+    assert _listed_cameras(window) == ["cam-07", "cam-08"]
+    # "not started" is a state, and it is the true one: nothing has run.
+    for camera_id in ("cam-07", "cam-08"):
+        status = _row_status(window.camera_list, camera_id)
+        assert "not started" in status, f"{camera_id} shows {status!r}, which is not a state"
+    assert "2 cameras" in window.camera_list.summary.text()
+
+
+def test_the_camera_status_strip_follows_the_poll_timer(
+    qt_app, window, reference_video: Path
+):
+    """The strip is refreshed by the same call that moves the engine forward.
+
+    "Is this camera delivering frames" is only true of the instant it was
+    asked. A strip refreshed when a camera is added and never again is the
+    green dot on a wedged decoder that this exists to remove, so what is
+    asserted is that running the console forward changes it.
+    """
+    session = window.add_camera(reference_video, "cam-07")
+    QApplication.processEvents()
+    assert "not started" in _row_status(window.camera_list, "cam-07")
+
+    window._start()
+    pump(qt_app, window, 2.0)
+
+    after = _row_status(window.camera_list, "cam-07")
+    assert "not started" not in after, "the strip never noticed the camera start"
+    assert session.record.runner is not None
+    window._stop()
+
+
+def test_picking_a_row_in_the_camera_list_selects_that_camera_everywhere(
+    qt_app, window, reference_video: Path
+):
+    """One selected camera, whichever panel the operator used to say so."""
+    from sentinel_console.selection import Selection
+
+    window.add_camera(reference_video, "cam-07")
+    window.add_camera(reference_video, "cam-08")
+    QApplication.processEvents()
+    # The newest camera is the selected one, so cam-07 is a real change.
+    assert window.camera_picker.currentData() == "cam-08"
+
+    _click_camera_row(window.camera_list, "cam-07")
+
+    assert window.selection.current == Selection.camera("cam-07"), "the bus was not told"
+    assert window.camera_picker.currentData() == "cam-07", (
+        "the list and the toolbar disagree about which camera the buttons act on"
+    )
+    assert window._selected.camera_id == "cam-07"
+
+
+def test_choosing_a_camera_in_the_picker_lights_its_row_in_the_list(
+    qt_app, window, reference_video: Path
+):
+    """And back the other way, because two views of one choice must not drift."""
+    from sentinel_console.selection import Selection
+
+    window.add_camera(reference_video, "cam-07")
+    window.add_camera(reference_video, "cam-08")
+    QApplication.processEvents()
+
+    window.camera_picker.setCurrentIndex(window.camera_picker.findData("cam-07"))
+    QApplication.processEvents()
+
+    assert window.camera_list.selected_camera_id() == "cam-07", "the row did not light"
+    assert window.selection.current == Selection.camera("cam-07")
+
+
+def test_a_camera_delivering_nothing_is_dark_on_the_map_as_well_as_in_the_list(
+    qt_app, window, reference_video: Path
+):
+    """A camera that stopped keeps its pose, and used to keep its wedge with it.
+
+    The plan view drew the yard as covered by a camera that had not produced a
+    frame since it failed. `camera_health()` already decided this; the map is
+    now told, from the same read that fills the list, so the two cannot
+    disagree about the same camera.
+    """
+    session = _placed_window(window, reference_video)
+    assert window.map.dark_cameras == frozenset(), "dark before anything went wrong"
+
+    # What the node's own poll writes when a camera's run ends badly.
+    session.record.fault = "the decoder stopped returning frames"
+    window._refresh_cameras()
+
+    assert window.node.camera_health()["cam-07"].is_dark
+    assert window.map.dark_cameras == frozenset({"cam-07"}), (
+        "the map still paints ground nobody is watching as covered"
+    )
+    assert "failed" in _row_status(window.camera_list, "cam-07")
+    assert "1 failed" in window.camera_list.summary.text()
+
+
+def test_the_plan_view_can_be_edited_only_while_the_console_is_configuring(
+    qt_app, window, reference_video: Path
+):
+    """The drag lock is the site lock, not a second quieter one."""
+    _placed_window(window, reference_video)
+    assert not window._configuring
+    assert not window.map.editable, "a locked console offered a drag"
+
+    window.configure_button.setChecked(True)
+    assert window.map.editable
+
+    window.configure_button.setChecked(False)
+    assert not window.map.editable, "Monitor left the masts draggable"
+
+
+def _drag_camera(view, camera_id: str, dx: float, dy: float) -> QPointF:
+    """Pick a mast up, move it, and let it go. Real events, on the real view."""
+    centre = view._to_screen(*view._to_local(view._cameras[camera_id].position))
+    target = QPointF(centre.x() + dx, centre.y() + dy)
+    _hold(view, centre)
+    _move(view, target)
+    _let_go(view, target)
+    QApplication.processEvents()
+    return target
+
+
+def test_a_camera_cannot_be_dragged_while_the_console_is_monitoring(
+    qt_app, window, reference_video: Path
+):
+    """Where a camera is said to be is the input to every position it reports.
+
+    A sleeve across a touchscreen in Monitor must not be able to change it, and
+    "must not" here means the node never hears about it — not that the map
+    quietly draws the camera somewhere else.
+    """
+    session = _placed_window(window, reference_video)
+    before = session.pose
+    assert window.map.size().width() > 200, "the plan view is too small to drag on"
+
+    _drag_camera(window.map, "cam-07", 60, 40)
+
+    assert session.pose == before, "a locked console moved a camera"
+    assert window.store.camera_pose("cam-07") == before, "and wrote it down"
+    assert window.map._cameras["cam-07"] == before, "the map shows a move that never happened"
+
+
+def test_dragging_a_camera_in_configure_places_it_and_keeps_its_height_and_heading(
+    qt_app, window, reference_video: Path
+):
+    """The drag is a placement, made through the node like every other one.
+
+    A drag across the ground says where the mast is. It says nothing about how
+    high it stands or which way it faces, and a placement that reset either
+    would silently re-aim a camera the operator only meant to shift — every
+    position that camera has ever reported is measured from those three facts
+    together.
+    """
+    from sentinel.core import haversine_distance
+
+    session = _placed_window(window, reference_video)
+    window.configure_button.setChecked(True)
+    before = session.pose
+
+    _drag_camera(window.map, "cam-07", 60, 40)
+
+    after = session.pose
+    metres = haversine_distance(before.position, after.position)
+    # Measured for this drag on the console's own plan view at 1280x800: 17.0 m.
+    # Floored well under it, because the width the splitter gives the map is a
+    # layout decision and not the thing under test.
+    print(f"dragged {metres:.1f} m")
+    assert metres > 5.0, f"{metres:.2f} m is not a drag, so nothing is proven"
+    assert after.heading == before.heading, "the drag re-aimed the camera"
+    assert after.mount_height == before.mount_height, "the drag changed the mast height"
+    assert after.pitch == before.pitch
+    assert after.horizontal_fov == before.horizontal_fov
+
+    # Through the node, so it survives a restart and leaves an audit line.
+    stored = window.store.camera_pose("cam-07")
+    assert stored is not None and stored.position == after.position, (
+        "the console moved the camera on screen and never persisted it"
+    )

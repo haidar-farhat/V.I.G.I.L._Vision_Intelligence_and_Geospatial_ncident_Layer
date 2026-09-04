@@ -18,6 +18,10 @@ than any one of them:
   new intruder every frame.
 - **Place** asks *where on the ground is this*. Projected through the camera
   pose, with an uncertainty that is part of the answer rather than a footnote.
+- **Read**, where the operator has supplied plate models, asks *which vehicle is
+  this*. It runs inside vehicle track boxes only — never over the frame, which
+  would read the street outside the site boundary — and it answers with the
+  characters several frames of one track agreed on and a ``?`` for the rest.
 - **Zones and rules** ask *does any of this mean anything*. This is where
   observation becomes assertion, and it is the first stage whose output is
   intended to interrupt a person — so it is the first that has to justify
@@ -44,6 +48,13 @@ from .decode import Frame, LiveStream, VideoSource
 from .detect import Detector, DetectorInfo
 from .events import Event, EventEngine, Rule, utc_from_millis
 from .incidents import Correlator, Incident
+from .plates import (
+    MIN_AGREEMENT,
+    MIN_CHARACTER_CONFIDENCE,
+    PlateAccumulator,
+    PlateReader,
+    Reading,
+)
 from .zones import Zone, ZoneEvaluator
 
 from .logs import get as _get_logger
@@ -58,6 +69,66 @@ _log = _get_logger(__name__)
 #: objects and none of that detail is read once the track has ended. The count
 #: of distinct objects is NOT derived from those, so trimming cannot change it.
 _MAX_TRACKED_DETAIL = 4096
+
+#: Detector labels whose boxes a plate may be read inside. A reader pointed at
+#: anything else is a reader pointed at whatever text is in shot — a sign, a
+#: hoarding, a delivery driver's shirt — and every string lifted from those
+#: arrives looking exactly like a plate. `plates.py` calls reading from a
+#: vehicle box rather than from a frame its central promise; this set is where
+#: the pipeline, which is the only stage holding the whole image, keeps it.
+#:
+#: Matched by label rather than by class id because the ids are the model's, and
+#: a site that changes model must not silently start reading plates off people.
+VEHICLE_LABELS = frozenset({"car", "truck", "bus", "motorcycle"})
+
+
+@dataclass(frozen=True, slots=True)
+class TrackPlate:
+    """What one vehicle track's plate has been read as, so far.
+
+    Three separate facts rather than one string, because keeping them apart is
+    what stops a half-read plate reaching a watchlist. :attr:`display` is for an
+    operator and carries ``?`` wherever a character has not resolved.
+    :attr:`text` is ``None`` until every character has, so there is no completed
+    string for a rule or an export to match by accident. :attr:`is_confident`
+    says whether the *weakest* character has enough agreement behind it to act
+    on, which is a higher bar than being resolved.
+
+    The counts travel with them for the same reason `plates.py` keeps them: a
+    plate shown without its evidence is a conclusion presented as a fact, and a
+    reading from four reads is a different thing from one from forty.
+    """
+
+    track_id: int
+    country: str
+    #: What an operator is shown. Contains ``?`` where nothing resolved.
+    display: str
+    #: The plate, or ``None`` while any character is unresolved.
+    text: str | None
+    #: Whether this may be matched against a register or a watchlist.
+    is_confident: bool
+    #: Reads behind the least-agreed character; ``0`` if any is unresolved.
+    agreement: int
+    #: Reads that voted, out of everything this track offered.
+    reads: int
+
+    @classmethod
+    def of(cls, track_id: int, reading: Reading) -> "TrackPlate":
+        """Flatten a :class:`~sentinel.plates.Reading` for one track.
+
+        Flattened rather than passed whole so that nothing downstream can reach
+        past ``text`` for the characters behind it and reassemble the completed
+        string the reading refuses to produce.
+        """
+        return cls(
+            track_id=track_id,
+            country=reading.country,
+            display=reading.display,
+            text=reading.text,
+            is_confident=reading.is_confident,
+            agreement=reading.weakest_agreement,
+            reads=reading.contributing_reads,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,6 +151,10 @@ class FrameResult:
     ended: tuple[int, ...]
     #: Events raised on this frame. Usually empty — that is the point.
     events: tuple[Event, ...] = ()
+    #: One entry per vehicle track something has been read on, so a caller can
+    #: show the plate beside the box it came from. Always empty unless the
+    #: pipeline was given a plate reader.
+    plates: tuple[TrackPlate, ...] = ()
     #: The frame these conclusions were drawn from, when the caller asked for
     #: it. Opt-in because a full-resolution image per result is tens of
     #: megabytes over a short clip, and most callers want the conclusions only.
@@ -115,6 +190,10 @@ class PipelineStats:
     #: Events raised. The number that matters most, and the one that should stay
     #: small: this system is measured by how little it says.
     events: int = 0
+    #: Plate reads accumulated, across every vehicle track. Counted because a
+    #: reader that is running and finding nothing looks exactly like a reader
+    #: that is switched off, and the two want different remedies.
+    plate_reads: int = 0
 
     @property
     def distinct_objects(self) -> int:
@@ -137,6 +216,8 @@ class PipelineStats:
             f"zone presences        {self.presences_started}",
             f"events                {self.events}",
         ]
+        if self.plate_reads:
+            lines.append(f"plate reads           {self.plate_reads}")
         for track_id in sorted(self.track_ids):
             seen = self.observations.get(track_id, 0)
             lines.append(
@@ -160,7 +241,8 @@ class Pipeline:
                  "_correlator", "_recent_events", "_event_retention",
                  "_resolved_epoch", "_epoch_basis",
                  "_record_to", "_segment_seconds", "_on_segment", "_recorder",
-                 "_stopping", "_stream")
+                 "_stopping", "_stream",
+                 "_plate_reader", "_plate_settings", "_plates", "_vehicle_class_ids")
 
     def __init__(
         self,
@@ -182,6 +264,9 @@ class Pipeline:
         segment_seconds: float = 60.0,
         on_segment=None,
         site_tz=None,
+        plate_reader: PlateReader | None = None,
+        plate_min_agreement: int = MIN_AGREEMENT,
+        plate_min_character_confidence: float = MIN_CHARACTER_CONFIDENCE,
     ):
         """
         ``max_gap_millis`` is how long a track survives without a detection. It
@@ -190,6 +275,14 @@ class Pipeline:
         people who passed the same spot a second apart become one. The default
         of two seconds assumes a detector that misses intermittently, which the
         motion detector demonstrably does.
+
+        ``plate_reader`` is off unless the operator has supplied one, and with
+        none supplied nothing about a run changes and nothing is paid for the
+        ability: no crop is taken, no accumulator is made, no inference is run.
+        The two thresholds beside it are the bars a character has to clear to
+        vote and to resolve; they default to the ones `plates.py` argues for,
+        and lowering them lowers the standard of every plate this camera
+        reports.
         """
         self._source = source
         self._detector = detector
@@ -218,6 +311,36 @@ class Pipeline:
         self._segment_seconds = segment_seconds
         self._on_segment = on_segment
         self._recorder: Recorder | None = None
+
+        # Plate reading is opt-in for the same reason recording is: it costs a
+        # crop and two model calls per vehicle per frame, and a camera watching
+        # a footpath has no use for either. With no reader the whole stage is
+        # skipped rather than run over nothing.
+        self._plate_reader = plate_reader
+        self._plate_settings = (plate_min_agreement, plate_min_character_confidence)
+        #: One accumulator per live vehicle track, dropped as the track ends.
+        self._plates: dict[int, PlateAccumulator] = {}
+        self._vehicle_class_ids: frozenset[int] = frozenset()
+        if plate_reader is not None:
+            info = detector.info
+            self._vehicle_class_ids = frozenset(
+                class_id
+                for class_id, label in info.class_names.items()
+                if label.strip().lower() in VEHICLE_LABELS
+            )
+            if not self._vehicle_class_ids:
+                # Silence here would look identical to a car park where no
+                # vehicle ever came: models loaded, reader running, not one
+                # plate ever read, and nothing said why. A detector that cannot
+                # name a vehicle cannot hand this reader a vehicle box.
+                _log.warning(
+                    "%s: a plate reader was supplied, but the detector (%s) "
+                    "labels no vehicle class of %s — no plate will be read. "
+                    "Plates are read inside vehicle boxes only.",
+                    source.source_id,
+                    detector.info.name,
+                    ", ".join(sorted(VEHICLE_LABELS)),
+                )
 
         self._zones = {zone.id: zone for zone in zones}
         # The clock zone schedules are written in. `None` keeps UTC, which is
@@ -275,6 +398,10 @@ class Pipeline:
         if self._tracker is not None:
             self._tracker.close()
             self._tracker = None
+        # Each accumulator holds the reads of one vehicle, crops included.
+        # Keeping them past the run would hold the plates of every vehicle in
+        # the last camera this object watched.
+        self._plates.clear()
         self._source.close()
 
     @property
@@ -313,12 +440,18 @@ class Pipeline:
             self._recorder.start()
 
         _log.info(
-            "%s: analysis started (detector %s, %s, %d zone(s), %d rule(s))",
+            "%s: analysis started (detector %s, %s, %d zone(s), %d rule(s)%s)",
             self._source.source_id,
             self._detector.info.name,
             "placed" if self._pose else "not placed",
             len(self._zones),
             len(self._engine.rules) if self._engine else 0,
+            # Named in the same line as the detector because a plate is
+            # personal data almost everywhere, and a run that reads them should
+            # be visibly a run that reads them.
+            f", plates in {self._plate_reader.country}"
+            if self._plate_reader is not None
+            else "",
         )
 
         try:
@@ -422,6 +555,7 @@ class Pipeline:
         ended = self._tracker.ended()
 
         self._record(frame, detections, tracks)
+        plates = self._read_plates(frame, tracks, ended)
         events = self._evaluate(frame, tracks)
 
         return FrameResult(
@@ -432,8 +566,72 @@ class Pipeline:
             tracks=tuple(tracks),
             ended=tuple(ended),
             events=tuple(events),
+            plates=plates,
             image=frame.image if self._keep_images else None,
         )
+
+    def _read_plates(
+        self, frame: Frame, tracks: Sequence[Track], ended: Sequence[int]
+    ) -> tuple[TrackPlate, ...]:
+        """Read the plate inside each vehicle track, and forget the ones that left.
+
+        Three things this does not do, each of which is a way a plate reader
+        manufactures a wrong answer:
+
+        **It never sees the frame as a frame.** The reader is handed one track's
+        box at a time, so what it reads is a vehicle this camera is tracking and
+        not the traffic on the road behind the fence. The reader crops for
+        itself, but only this stage knows which boxes are vehicles, so this is
+        where the promise is kept or broken.
+
+        **It reads only inside a vehicle.** A track's class must be one of
+        :data:`VEHICLE_LABELS` as the detector's own labels name it. Anything
+        else — a person, a bag, a blob a motion detector cannot classify at
+        all — is never cropped, so there is no text lifted off a shirt or a sign
+        for the accumulator to vote on.
+
+        **It forgets a vehicle when the vehicle goes.** One accumulator per live
+        track is bounded by what is on screen; one per vehicle ever seen is the
+        same unbounded growth the per-track statistics were trimmed to stop,
+        and each of these holds a track's reads and a crop with them.
+
+        Returns nothing at all, having done nothing at all, when no reader was
+        supplied.
+        """
+        if self._plate_reader is None:
+            return ()
+
+        for track_id in ended:
+            self._plates.pop(track_id, None)
+
+        min_agreement, min_confidence = self._plate_settings
+        plates: list[TrackPlate] = []
+        for track in tracks:
+            if track.class_id not in self._vehicle_class_ids:
+                continue
+            accumulator = self._plates.get(track.id)
+            if accumulator is None:
+                accumulator = PlateAccumulator(
+                    country=self._plate_reader.country,
+                    min_agreement=min_agreement,
+                    min_character_confidence=min_confidence,
+                )
+                self._plates[track.id] = accumulator
+
+            reads = self._plate_reader.read(
+                frame.image, track.bbox, frame_index=frame.index
+            )
+            accumulator.add_all(reads)
+            self.stats.plate_reads += len(reads)
+
+            if not len(accumulator):
+                # Nothing has been read on this vehicle yet, which is the normal
+                # state of a car that is still too far away. An empty reading
+                # published beside it every frame would read as "no plate"
+                # rather than "not yet", and those are different claims.
+                continue
+            plates.append(TrackPlate.of(track.id, accumulator.resolve()))
+        return tuple(plates)
 
     def _wall_clock_epoch(self) -> int:
         """When media time zero happened, in real-world milliseconds.

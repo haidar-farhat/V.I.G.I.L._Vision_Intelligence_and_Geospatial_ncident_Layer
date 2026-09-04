@@ -46,9 +46,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Iterator, Sequence
 
+from .auditing import AuditRecord
 from .core import LatLon
 from .events import Event, Evidence, EventType, Severity, utc_from_millis
 from .incidents import Association, Incident, Risk, RiskFactor
+from .registry import DEFAULT_PLATE_FORMAT, PlateFormat, Register
+from .registry import SCHEMA as _REGISTER_SCHEMA
 from .site import DEFAULT_SITE_ID, FrameKind, Site
 from .zones import Schedule, Zone, ZoneKind
 
@@ -60,7 +63,7 @@ _log = _get_logger(__name__)
 #: Schema version this build expects. A database at a different version is
 #: migrated forward, never opened as-is: opening a schema you do not understand
 #: and hoping the columns line up is how evidence is silently corrupted.
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 6
 
 
 class StoreError(RuntimeError):
@@ -93,6 +96,25 @@ class Migration:
     #: Every migration carries a way back. An upgrade that cannot be undone on a
     #: machine with no Internet and no spare hardware is a gamble, not an upgrade.
     down: str
+
+
+def _register_schema_sql() -> str:
+    """The register's tables, taken from the module that owns them.
+
+    Spelled here as a reference rather than as a copy of the DDL. Two spellings
+    of one schema drift — and the half that drifts would be the one holding
+    face templates, which is the half nobody may get wrong. A copied
+    ``CREATE TABLE`` missing the ``CHECK`` that keeps a ``MATCH`` sighting from
+    losing its score would make a migrated database accept a claim about a
+    person that a fresh one refuses, and only the deployments that have been
+    upgraded would hold it.
+
+    Every statement in `registry.SCHEMA` is ``IF NOT EXISTS``, so applying this
+    to a database a `Register` has already touched is a no-op rather than a
+    conflict.
+    """
+    separator = ";\n\n"
+    return separator.join(statement.strip() for statement in _REGISTER_SCHEMA) + ";"
 
 
 MIGRATIONS: tuple[Migration, ...] = (
@@ -342,6 +364,67 @@ MIGRATIONS: tuple[Migration, ...] = (
         DROP TABLE sites;
         """,
     ),
+    Migration(
+        version=5,
+        name="register",
+        # The register: the people and vehicles somebody deliberately named, and
+        # the machinery for taking a name away again.
+        #
+        # In the ladder as well as in `registry.create_schema` because the two
+        # must produce the same database. A `Register` handed a bare connection
+        # creates its own tables, which is right for a migration tool and wrong
+        # as the only path: a deployment where the register exists because
+        # something happened to open it has a schema whose presence depends on
+        # what ran, and a fresh install would then differ from an upgraded one.
+        # The statements are read from `registry.SCHEMA` rather than copied, for
+        # the reason `_register_schema_sql` gives.
+        up=_register_schema_sql(),
+        down="""
+        -- Children first: a subject whose identifiers outlive it is an
+        -- enrolment nobody can find to delete, which is the one failure this
+        -- half of the schema exists to make impossible.
+        DROP INDEX IF EXISTS register_sightings_by_subject_time;
+        DROP TABLE IF EXISTS register_sightings;
+        DROP INDEX IF EXISTS register_identifiers_by_age;
+        DROP INDEX IF EXISTS register_identifiers_by_subject;
+        DROP INDEX IF EXISTS register_template_unique;
+        DROP INDEX IF EXISTS register_plate_unique;
+        DROP TABLE IF EXISTS register_identifiers;
+        DROP TABLE IF EXISTS register_subjects;
+        """,
+    ),
+    Migration(
+        version=6,
+        name="audit_records",
+        up="""
+        -- The structured half of an audit row. Until now an edit reached this
+        -- table as one prose string — "kind RESTRICTED -> EXCLUSION" — which is
+        -- readable and nothing else: it cannot be filtered, replayed or
+        -- checked, and it keeps only the fields somebody wrote a branch for.
+        --
+        -- Every column is nullable, and that is load-bearing rather than
+        -- lenient. Every row already written has none of them, and an audit log
+        -- is append-only: there is no pass that can go back and fill these in,
+        -- so a NOT NULL here would either fail the migration or force this code
+        -- to invent a before-state for an edit made last year.
+        ALTER TABLE audit_logs ADD COLUMN before_json TEXT;
+        ALTER TABLE audit_logs ADD COLUMN after_json TEXT;
+        -- Which node wrote the row. Two nodes' logs merged without it are one
+        -- log in which nobody can say where an entry came from.
+        ALTER TABLE audit_logs ADD COLUMN node_id TEXT;
+        -- SHA-256 over this record and the hash before it. It detects
+        -- alteration; it does not prevent it, and it is not a signature —
+        -- anybody able to rewrite a row can recompute every hash after it. What
+        -- it buys is that an alteration has to be complete to go unnoticed.
+        ALTER TABLE audit_logs ADD COLUMN chain_hash TEXT;
+        """,
+        down="""
+        ALTER TABLE audit_logs DROP COLUMN chain_hash;
+        ALTER TABLE audit_logs DROP COLUMN node_id;
+        ALTER TABLE audit_logs DROP COLUMN after_json;
+        ALTER TABLE audit_logs DROP COLUMN before_json;
+        """,
+    ),
 )
 
 
@@ -379,17 +462,30 @@ class Store:
     transaction — a subtle way to commit half of somebody else's write.
     """
 
-    __slots__ = ("_connection", "_path")
+    __slots__ = ("_connection", "_path", "_plate_format", "_register")
 
-    def __init__(self, path: str | Path = ":memory:", *, auto_migrate: bool = True):
+    def __init__(
+        self,
+        path: str | Path = ":memory:",
+        *,
+        auto_migrate: bool = True,
+        plate_format: PlateFormat = DEFAULT_PLATE_FORMAT,
+    ):
         """
         ``auto_migrate`` is on for application use: an operator starting the
         console should not have to run a command first. It is off for
         maintenance, because a rollback that the next open silently re-applies
         is not a rollback — somebody stepping back a version to diagnose a
         problem would find the step undone underneath them.
+
+        ``plate_format`` is how this site's country writes a registration down,
+        and it is set here because :attr:`register` is the only way to reach the
+        register: a caller that could not name the format would have to build
+        its own `Register`, which is the thing this store exists to stop.
         """
         self._path = str(path)
+        self._plate_format = plate_format
+        self._register: Register | None = None
         if self._path != ":memory:":
             Path(self._path).parent.mkdir(parents=True, exist_ok=True)
 
@@ -409,6 +505,30 @@ class Store:
     @property
     def path(self) -> str:
         return self._path
+
+    @property
+    def register(self) -> Register:
+        """Who is enrolled, over this store's own connection.
+
+        A property rather than something a caller constructs, because a
+        `Register` needs a connection and the obvious way to get one is to open
+        a second connection to the same file. That fails three ways at once, all
+        of them quietly: the second connection creates the register's tables
+        outside the migration ladder, so a database's schema comes to depend on
+        which process opened it first; it cannot see anything written inside a
+        transaction this store has open, so an enrolment and the audit row
+        proving it was made can disagree about whether it happened; and two
+        writers on one SQLite file take turns, so an enrolment during a
+        correlation pass waits for a lock or fails on one.
+
+        Built once and kept, since constructing one runs its DDL, and reusing
+        the object is what makes "the register" a single thing on this node.
+        """
+        if self._register is None:
+            self._register = Register(
+                self._connection, plate_format=self._plate_format
+            )
+        return self._register
 
     def close(self) -> None:
         self._connection.close()
@@ -1200,6 +1320,12 @@ class Store:
 
         No code path in this module updates or deletes an audit row, and there is
         deliberately no method to. An audit log that can be edited is not one.
+
+        The prose-only path, and it stays. Most actions have no before-state to
+        record — a node starting, analysis stopping — and forcing every caller
+        through :meth:`audit_record` would make them invent one. A row written
+        here carries no structured before/after and no chain hash, which
+        :meth:`audit_chain_head` is explicit about.
         """
         with self.transaction() as connection:
             connection.execute(
@@ -1207,6 +1333,72 @@ class Store:
                 "VALUES (?,?,?,?,?)",
                 (_now(), actor, action, subject, detail),
             )
+
+    def audit_record(self, record: AuditRecord, *, detail: str | None = None) -> str:
+        """Record a change in both forms: the prose and the states behind it.
+
+        The prose goes in ``detail`` exactly as before, so a person reading the
+        Audit tab sees the line they have always seen; the canonical JSON of
+        both states goes beside it, so the same edit can now be filtered,
+        replayed and checked. Both come from one comparison — `AuditRecord`
+        renders its own changes — which is what stops the two halves drifting
+        into disagreeing about what happened.
+
+        ``detail`` overrides that rendering, for a call whose existing line says
+        more than a generic diff would: a camera's placement reads as
+        ``33.893800,35.501800 h=6.0 hdg=145.0`` and a diff of two poses would
+        replace that with JSON. **An overridden line is outside the hash**, which
+        covers the record's own fields and not this column. That is a real limit
+        and it is named here rather than implied away: the states are protected,
+        the sentence rendered from them is not.
+
+        Returns the chain hash written, so a caller can record the head
+        somewhere this process cannot reach — which is the only thing that turns
+        the chain into evidence of tampering rather than an integrity check.
+
+        ``record.at`` should be timezone-aware. A naive one is read in this
+        machine's local zone, which puts the row hours away from where it
+        belongs on a node whose clock is not UTC.
+        """
+        with self.transaction() as connection:
+            previous = self.audit_chain_head()
+            chain_hash = record.chain(previous)
+            connection.execute(
+                "INSERT INTO audit_logs "
+                "(at, actor, action, subject, detail, before_json, after_json, "
+                " node_id, chain_hash) VALUES (?,?,?,?,?,?,?,?,?)",
+                (
+                    int(record.at.timestamp() * 1000),
+                    record.actor,
+                    record.action,
+                    record.subject,
+                    record.describe() if detail is None else detail,
+                    record.before_json,
+                    record.after_json,
+                    record.node_id,
+                    chain_hash,
+                ),
+            )
+        return chain_hash
+
+    def audit_chain_head(self) -> str | None:
+        """The most recent chain hash, or ``None`` if nothing carries one.
+
+        By insertion order rather than by ``at``, because that is the order the
+        chain was folded in. Two rows written in the same millisecond — which
+        happens whenever an edit writes more than one — would otherwise be
+        chained one way and verified the other.
+
+        Rows written by :meth:`audit` are skipped, because they have no hash.
+        The chain therefore covers the structured records and reports nothing
+        about the prose-only rows between them: an honest chain over part of the
+        log beats a claim of coverage over all of it.
+        """
+        row = self._connection.execute(
+            "SELECT chain_hash FROM audit_logs WHERE chain_hash IS NOT NULL "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        return None if row is None else row["chain_hash"]
 
     def audit_trail(self, *, limit: int = 200) -> list[sqlite3.Row]:
         return self._connection.execute(

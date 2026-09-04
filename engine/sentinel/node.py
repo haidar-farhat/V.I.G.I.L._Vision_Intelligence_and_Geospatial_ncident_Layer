@@ -37,7 +37,7 @@ from __future__ import annotations
 
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from enum import StrEnum
 
@@ -45,6 +45,7 @@ import numpy as np
 from pathlib import Path
 from typing import Iterator, Sequence
 
+from .auditing import MISSING, AuditRecord
 from .core import CameraPose
 from .decode import REDACTED, DecodeError, VideoSource, is_live_source
 from .detect import Detector, DetectorInfo, MotionDetector
@@ -741,9 +742,23 @@ def _health_for(record: CameraRecord) -> CameraHealth:
 
 
 def _describe_zone_change(before: Zone, after: Zone) -> str:
-    """What changed, for the audit row. Every field, because a zone quietly
-    shrinking to exclude the door it was drawn around is exactly the edit an
-    audit log exists to record — and "name -> name" would have hidden it."""
+    """What a zone edit used to read as, kept as the sentence to match.
+
+    `Node.replace_zone` no longer calls this: it writes the audit row through
+    `auditing.AuditRecord`, which diffs the two zones and renders the same line
+    from the changes, so the prose and the structured record cannot drift into
+    disagreeing about what happened.
+
+    This stays because it is the baseline that comparison is measured against —
+    `test_auditing` runs both spellings over the same pair of zones and asserts
+    they are character-identical, and names the three cases where they are not.
+    Deleting it would leave that comparison with nothing to compare to, and the
+    prose could then change voice on operators without a single test failing.
+
+    Every field, because a zone quietly shrinking to exclude the door it was
+    drawn around is exactly the edit an audit log exists to record — and
+    "name -> name" would have hidden it.
+    """
     parts: list[str] = []
     if before.name != after.name:
         parts.append(f"name {before.name!r} -> {after.name!r}")
@@ -972,6 +987,48 @@ class Node:
         record = self.camera(camera_id)
         return REDACTED in record.source
 
+    # ------------------------------------------------------------------ audit
+
+    def _audit(
+        self,
+        action: str,
+        subject: str | None,
+        *,
+        before=MISSING,
+        after=MISSING,
+        detail: str | None = None,
+    ) -> None:
+        """Record an edit as both the sentence and the two states behind it.
+
+        The prose is what an operator reads and it does not change; the states
+        are what makes the row answerable to a question nobody asked at the
+        time — "which corner moved, and by how far" — and they come from the
+        same comparison as the sentence, so the two halves cannot disagree.
+
+        Pass :data:`MISSING` for a side that does not exist: a removal has no
+        after, and reporting every field of a deleted thing as "changed to
+        nothing" would make it indistinguishable from an edit that blanked it.
+
+        ``detail`` overrides the rendered line for a call whose existing wording
+        says more than a generic diff would — a camera's placement, which reads
+        as a coordinate and a bearing rather than as JSON.
+        """
+        self.store.audit_record(
+            AuditRecord.of(
+                actor=self._actor,
+                action=action,
+                subject=subject,
+                node_id=self._node_id,
+                # Aware, and UTC. A naive timestamp is read back in whatever
+                # zone the reader is in, which puts an audit row hours from
+                # where it belongs on the one machine that is not in UTC.
+                at=datetime.now(timezone.utc),
+                before=before,
+                after=after,
+            ),
+            detail=detail,
+        )
+
     # ---------------------------------------------------------------- cameras
 
     def add_camera(
@@ -1034,14 +1091,33 @@ class Node:
 
         del self._cameras[camera_id]
         self.store.delete_camera(camera_id)
-        self.store.audit(self._actor, "camera.removed", camera_id, record.display_source)
+        # The redacted source and the placement, never the raw source: this row
+        # outlives the camera, and it is the only surviving record of where the
+        # thing that produced the evidence was pointing. A removal has no after.
+        self._audit(
+            "camera.removed",
+            camera_id,
+            before={
+                "camera_id": record.camera_id,
+                "source": record.display_source,
+                "pose": record.pose,
+            },
+            detail=record.display_source,
+        )
         self._running = any(r.is_running for r in self._cameras.values())
         _log.info("node %s: removed camera %s (%s)", self._node_id, camera_id,
                   record.display_source)
 
     def place_camera(self, camera_id: str, pose: CameraPose | None) -> None:
-        """Set where a camera is and where it points, running or not."""
+        """Set where a camera is and where it points, running or not.
+
+        Audited with the pose it had as well as the one it was given. A camera
+        nudged three degrees is the difference between a track that lands in the
+        zone and one that does not, and until both poses were recorded the log
+        could say where it ended up and never where it had been.
+        """
         record = self.camera(camera_id)
+        was = record.pose
         record.pose = pose
         if record.runner is not None:
             record.runner.set_pose(pose)
@@ -1049,11 +1125,20 @@ class Node:
         self.store.save_camera(
             camera_id, camera_id, record.display_source, pose=pose
         )
-        self.store.audit(
-            self._actor, "camera.placed", camera_id,
-            f"{pose.position.lat:.6f},{pose.position.lon:.6f} "
-            f"h={pose.mount_height} hdg={pose.heading} pitch={pose.pitch}"
-            if pose else "unplaced",
+        # The line is the one this log has always carried: a coordinate to six
+        # places and the angles, which is what a person checking a placement
+        # reads. A diff of two poses would replace it with JSON, and that is a
+        # worse sentence for the reader, so the structured pair goes beside it
+        # rather than over it.
+        self._audit(
+            "camera.placed", camera_id,
+            before=was,
+            after=pose,
+            detail=(
+                f"{pose.position.lat:.6f},{pose.position.lon:.6f} "
+                f"h={pose.mount_height} hdg={pose.heading} pitch={pose.pitch}"
+                if pose else "unplaced"
+            ),
         )
 
     def add_zone(self, zone: Zone) -> None:
@@ -1096,7 +1181,9 @@ class Node:
         before = self._zones[index]
         self._zones[index] = zone
         self.store.save_zone(zone)
-        self.store.audit(self._actor, "zone.changed", zone.id, _describe_zone_change(before, zone))
+        # The sentence is rendered from the same comparison that is stored, so
+        # the log cannot say the kind changed while the record says it did not.
+        self._audit("zone.changed", zone.id, before=before, after=zone)
         if self._running:
             _log.warning(
                 "node %s: zone %s changed; cameras already running keep the old "

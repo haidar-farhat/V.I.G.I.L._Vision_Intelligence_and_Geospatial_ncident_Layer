@@ -8,7 +8,8 @@ route to the Internet.
 
 The layout answers four questions, in the order an operator asks them:
 
-1. *What is happening?* — the camera wall, top left.
+1. *What is happening?* — the camera list on the far left, one row per camera
+   with what that camera is actually doing, and the wall of pictures beside it.
 2. *Where is it happening?* — the plan view beside it, with every camera's
    footprint on one piece of ground.
 3. *What does the system claim, and why?* — the incident list.
@@ -81,13 +82,14 @@ from sentinel import devices, logs, telemetry
 from sentinel.zones import Zone, ZoneKind, zone_warnings
 
 from . import theme
+from .camera_list import CameraListPanel
 from .incident_view import IncidentView
 from .map_view import MODE_DRAW, MODE_MEASURE, MODE_SELECT, MapView
 from .placement import PlacementDialog
 from .session import CameraSession
 from .add_camera import AddCameraDialog
 from .video_view import VideoView
-from .selection import Selection, SelectionBus
+from .selection import CAMERA as CAMERA_KIND, Selection, SelectionBus
 from .zones_view import ZoneDialog, ZonePropertiesPanel, ZonesView
 
 _log = logs.get(__name__)
@@ -307,6 +309,14 @@ class ConsoleWindow(QMainWindow):
         #: "the user picked a row" signal, which would come straight back here.
         self._syncing = False
 
+        # Every camera, one row each, with the status strip that says which of
+        # them is delivering frames. Built here rather than in the toolbar
+        # because it is a view, not a control: the combo box beside Place… is
+        # still where "which camera do these buttons act on" is *stored*, and
+        # the two are kept saying the same thing in `_selection_changed`.
+        self.camera_list = CameraListPanel()
+        self.camera_list.selected.connect(self._camera_row_selected)
+
         self.map = MapView()
         self.map.picked.connect(self._map_picked)
         self.map.selected.connect(self.selection.select)
@@ -315,6 +325,12 @@ class ConsoleWindow(QMainWindow):
         self.map.drawn.connect(self._zone_drawn)
         self.map.edited.connect(self._zone_outline_edited)
         self.map.zone_clicked.connect(self._zone_clicked_on_map)
+        # Dragging a mast on the plan view is a placement, so it commits through
+        # the node like every other one. Wired to bound methods, never to a
+        # lambda closing over `self`: a closure cell holding this window is the
+        # reference cycle that keeps it alive until interpreter shutdown.
+        self.map.camera_moved.connect(self._camera_dragged)
+        self.map.camera_aimed.connect(self._camera_turned)
         #: What the next picked map point is for: ("zone", (name, kind, radius))
         #: or ("camera", camera_id). Nothing, when nobody is picking.
         self._pick_action: tuple | None = None
@@ -333,10 +349,17 @@ class ConsoleWindow(QMainWindow):
         outer.addLayout(self._build_toolbar())
 
         top = QSplitter(Qt.Orientation.Horizontal)
-        top.addWidget(_panel("CAMERAS", self.wall))
+        top.addWidget(self.camera_list)
+        top.addWidget(_panel("CAMERA WALL", self.wall))
         top.addWidget(_panel("GROUND — NO EXTERNAL TILES", self.map))
-        top.setStretchFactor(0, 3)
-        top.setStretchFactor(1, 2)
+        top.setStretchFactor(0, 1)
+        top.setStretchFactor(1, 3)
+        top.setStretchFactor(2, 2)
+        # Not collapsible. The list is the only place a dark camera announces
+        # itself, and a splitter handle dragged shut on the first day would put
+        # the console back to reporting eight cameras identically whether all
+        # eight were delivering frames or seven had been dark since midnight.
+        top.setCollapsible(0, False)
 
         # Incidents beside tracks, and larger. Tracks are how the system reached
         # its conclusions; incidents are the conclusions, and they are what an
@@ -426,6 +449,11 @@ class ConsoleWindow(QMainWindow):
             "Which camera the placement dialog applies to. Every camera is "
             "analysed whichever is selected here."
         )
+        # The picker and the camera list are two views of one choice. This is
+        # the half that carries a change made here out to the bus; the other
+        # half is in `_selection_changed`, which brings a change made anywhere
+        # else back to the picker.
+        self.camera_picker.currentIndexChanged.connect(self._picker_changed)
         row.addWidget(self.camera_picker)
 
         self.place_button = QPushButton("Place…")
@@ -664,6 +692,7 @@ class ConsoleWindow(QMainWindow):
         session = self._attach(record)
 
         self._relayout_wall()
+        self._refresh_cameras()
         self.start_button.setEnabled(True)
         return session
 
@@ -811,6 +840,11 @@ class ConsoleWindow(QMainWindow):
         was, self._configuring = self._configuring, bool(on)
         for control in self._configure_only():
             control.setEnabled(self._configuring)
+        # Dragging a mast on the plan view is a configuration change, so it is
+        # behind the same lock and not a second, quieter one. Turning it off
+        # mid-gesture reverts the gesture: the lock coming back is not the
+        # operator saying yes.
+        self.map.set_editable(self._configuring)
         if self.configure_button.isChecked() != self._configuring:
             self.configure_button.setChecked(self._configuring)
 
@@ -883,6 +917,25 @@ class ConsoleWindow(QMainWindow):
         self.node.place_camera(session.camera_id, pose)
         self._refresh_placement()
 
+    def _refresh_cameras(self) -> None:
+        """Re-read what each camera is actually doing, and show it in both
+        places that claim to know.
+
+        The state is the node's — `camera_health()` decides LIVE/DARK/… from the
+        last-frame clock — and it is read once here and given to both the list
+        and the map. Asking twice, or letting either derive its own, is how the
+        strip comes to call a camera dark while the map beside it paints the
+        same camera's footprint as watched ground.
+        """
+        health = self.node.camera_health()
+        self.camera_list.show_cameras(self.node.cameras, health)
+        # A camera that is nominally up and delivering nothing keeps its pose,
+        # and until this was connected it kept the full wedge that goes with
+        # one: ground nobody is watching, drawn as covered.
+        self.map.set_dark_cameras(
+            [camera_id for camera_id, facts in health.items() if facts.is_dark]
+        )
+
     def _refresh_placement(self) -> None:
         placed = {
             session.camera_id: session.pose
@@ -903,6 +956,10 @@ class ConsoleWindow(QMainWindow):
         self._zone_reports, self._zone_warnings = self._assess_zones(placed)
         self.zones_view.show_zones(self._zones, self._zone_reports, self._zone_warnings)
         self._sync_zone_properties()
+        # The "Placed" column is part of this same fact, so the list is rebuilt
+        # on the same call rather than waiting for the next poll — which, with
+        # nothing running, never comes.
+        self._refresh_cameras()
 
         if not placed:
             self.placement_label.setText("No camera placed — objects will not be located")
@@ -998,6 +1055,48 @@ class ConsoleWindow(QMainWindow):
         elif what == "zone":
             name, kind, radius = payload
             self._add_zone(name=name, kind=kind, radius=radius, centre=point)
+
+    def _camera_dragged(self, camera_id: str, point: LatLon) -> None:
+        """A mast was dragged across the plan view and let go.
+
+        The same call the placement dialog makes, on the same object, so there
+        is one meaning of "this camera is here" however the operator said it.
+        Built with `replace`, exactly as `_map_picked` does: a drag across the
+        ground says nothing about the mast's height or which way it faces, and
+        a placement that reset either would silently re-aim a camera the
+        operator only meant to shift.
+
+        The map is *asking*. It is not told the node agreed, so a refusal is
+        answered by taking the drag back — otherwise the map goes on drawing
+        the camera metres from where the node has it, indefinitely.
+        """
+        self._touch()
+        session = self._sessions.get(camera_id)
+        if session is None or session.pose is None:
+            self.map.revert_uncommitted(camera_id)
+            self._set_status(f"{camera_id} was not moved: it has no placement.")
+            return
+        self.node.place_camera(camera_id, replace(session.pose, position=point))
+        self._refresh_placement()
+        self._set_status(f"Moved {camera_id}.")
+
+    def _camera_turned(self, camera_id: str, heading: float) -> None:
+        """A heading grip was dragged and let go.
+
+        Kept apart from `_camera_dragged` for the reason the map keeps the two
+        signals apart: turning a camera and moving it are different mistakes,
+        and an operator who reads "Moved gate" after aiming it goes looking for
+        a move that never happened.
+        """
+        self._touch()
+        session = self._sessions.get(camera_id)
+        if session is None or session.pose is None:
+            self.map.revert_uncommitted(camera_id)
+            self._set_status(f"{camera_id} was not turned: it has no placement.")
+            return
+        self.node.place_camera(camera_id, replace(session.pose, heading=heading))
+        self._refresh_placement()
+        self._set_status(f"{camera_id} now faces {heading:.0f}°.")
 
     def _add_zone_dialog(self) -> None:
         """Ask what kind of zone, how big, and where, then create it."""
@@ -1111,6 +1210,8 @@ class ConsoleWindow(QMainWindow):
         self._syncing = True
         try:
             self.map.set_selection(selection)
+            self.camera_list.set_selection(selection)
+            self._show_selected_camera(selection)
             for session in self._sessions.values():
                 session.view.set_selection(selection)
             self.incidents.set_selection(selection)
@@ -1126,6 +1227,53 @@ class ConsoleWindow(QMainWindow):
         finally:
             self._syncing = False
         self._refresh_status()
+
+    def _camera_row_selected(self, selection) -> None:
+        """A row was clicked in the camera list. It is the same choice as the
+        picker's, so it goes to the bus and comes back to the picker from there.
+
+        Guarded like every other panel's answer: `_selection_changed` hands the
+        list a selection, and a list that answered that with a selection of its
+        own would push the bus round in a circle.
+        """
+        if self._syncing:
+            return
+        self.selection.select(selection)
+
+    def _picker_changed(self, index: int) -> None:
+        """The toolbar's combo box moved. Say so, so the list moves with it.
+
+        The combo box is still where "which camera do Place…, Move on map and
+        Remove act on" is *stored* — `_selected` reads it — so this does not
+        replace it; it stops the two disagreeing. A console showing one camera
+        highlighted in the list while the buttons acted on another is a worse
+        interface than the combo box alone was.
+        """
+        if self._syncing:
+            return
+        camera_id = self.camera_picker.currentData()
+        if camera_id is None:
+            # The last camera has gone. Only a camera selection is cleared:
+            # removing a camera must not take the operator's zone selection
+            # with it.
+            current = self.selection.current
+            if current is not None and current.kind == CAMERA_KIND:
+                self.selection.clear()
+            return
+        self.selection.select(Selection.camera(camera_id))
+
+    def _show_selected_camera(self, selection) -> None:
+        """Point the picker at the selected camera. Called under `_syncing`.
+
+        Deliberately does nothing for a selection of any other kind. Clearing
+        the picker when a zone is selected would leave Place… and Remove with
+        no camera to act on, which is not what selecting a zone meant.
+        """
+        if selection is None or selection.kind != CAMERA_KIND:
+            return
+        index = self.camera_picker.findData(selection.camera_id)
+        if index >= 0 and index != self.camera_picker.currentIndex():
+            self.camera_picker.setCurrentIndex(index)
 
     def _show_selected_track_row(self, selection) -> None:
         if selection is None or selection.kind != "track":
@@ -1584,6 +1732,11 @@ class ConsoleWindow(QMainWindow):
             self.map.set_tracks(update.result.tracks, session.camera_id)
 
         self._show_faults()
+        # On the poll timer, because "is this camera still delivering frames"
+        # is only true of the instant it was asked. A strip refreshed on
+        # placement alone would have gone on reading "live" for a camera whose
+        # decoder wedged an hour ago.
+        self._refresh_cameras()
         self.incidents.show_incidents(self._incidents)
         self.export_button.setEnabled(bool(self.node.incidents))
 

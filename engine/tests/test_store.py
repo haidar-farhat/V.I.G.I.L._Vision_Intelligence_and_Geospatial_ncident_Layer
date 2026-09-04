@@ -653,7 +653,13 @@ def test_the_site_table_arrives_and_leaves_without_touching_the_evidence(store: 
     before = store.applied_versions()
     events, incidents = store.event_count(), store.incident_count()
 
+    # Down to and including `sites`, rather than one step. A single `rollback()`
+    # only reached this migration while it happened to be the newest, and this
+    # test broke the moment one was added after it — which is exactly when a
+    # rollback test matters most.
     undone = store.rollback()
+    while undone is not None and undone.name != "sites":
+        undone = store.rollback()
 
     assert undone is not None and undone.name == "sites"
     assert "sites" not in store.table_names(), "the table survived its own down"
