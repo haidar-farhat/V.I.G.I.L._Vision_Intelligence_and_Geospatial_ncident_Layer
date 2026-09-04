@@ -197,24 +197,30 @@ def test_a_bright_square_crossing_in_a_minority_of_frames_leaves_no_trace(refere
     """
     def crossing(index: int, image: np.ndarray) -> None:
         if index % 3 == 1:  # 1, 4, ..., 19: seven of twenty
-            top = 180 + 8 * index
-            image[top:top + 160, 120 + 12 * index:420 + 12 * index] = 255
+            top, left = 120 + 6 * index, 100 + 10 * index
+            image[top:top + 200, left:left + 300] = 255
 
     builder = BasemapBuilder(cell_size_m=1.0)
     feed(builder, "cam-a", reference_pose, 20, paint=crossing)
     asset = builder.build(now=1_100.0)
 
-    painted = flat(GROUND)
-    crossing(19, painted)
-    alone = sample_frame(reference_pose, painted, asset.grid, camera_id="cam-a")
-    struck = int(np.count_nonzero(np.all(alone.colour == 255, axis=2) & alone.valid))
+    def struck_by(index: int) -> int:
+        painted = flat(GROUND)
+        crossing(index, painted)
+        alone = sample_frame(reference_pose, painted, asset.grid, camera_id="cam-a")
+        return int(np.count_nonzero(np.all(alone.colour == 255, axis=2) & alone.valid))
 
+    # Far ground is many cells per pixel and near ground the reverse, so the
+    # first pass strikes over a hundred cells and the last, lower in the
+    # frame, a few dozen. Both land; neither survives.
+    first, last = struck_by(1), struck_by(19)
     colours = np.unique(asset.colour[asset.valid].reshape(-1, 3), axis=0)
     print(
-        f"the square covers {struck} cells in one frame alone; colours surviving "
-        f"the median: {colours.tolist()}"
+        f"the square covers {first} cells in its first frame alone and {last} in "
+        f"its last; colours surviving the median: {colours.tolist()}"
     )
-    assert struck > 200
+    assert first > 100
+    assert last > 20
     assert colours.tolist() == [list(GROUND)]
 
 
@@ -390,24 +396,32 @@ def test_a_camera_pointed_at_the_sky_feeds_nothing_and_alone_builds_nothing():
 def test_a_sky_camera_beside_a_real_one_is_recorded_as_contributing_nothing(
     reference_pose, tmp_path: Path
 ):
-    """Provenance, not an absence: the asset names it, with zero cells."""
-    sky = camera(ORIGIN, 180.0, pitch=30.0)
+    """Provenance, not an absence: the asset names it, with zero cells.
+
+    The blind camera's id sorts *before* the real one's on purpose. ``source``
+    indexes the asset's full camera list, and the mosaic underneath knows only
+    the cameras that produced a patch — so without the re-indexing in
+    ``build()`` every mapped cell here would name the camera that saw nothing.
+    """
+    aloft = camera(ORIGIN, 180.0, pitch=30.0)
     builder = BasemapBuilder(cell_size_m=1.0)
     feed(builder, "cam-a", reference_pose, 4)
-    feed(builder, "sky", sky, 4)
+    feed(builder, "aloft", aloft, 4)
     asset = builder.build(now=1_100.0)
 
-    assert asset.cameras == ("cam-a", "sky")
-    assert asset.poses == {"cam-a": reference_pose, "sky": sky}
-    assert asset.cells_from("sky") == 0
-    assert not (asset.source == asset.cameras.index("sky")).any()
+    assert asset.cameras == ("aloft", "cam-a")
+    assert asset.poses == {"aloft": aloft, "cam-a": reference_pose}
+    assert asset.cells_from("aloft") == 0
+    assert not (asset.source == asset.cameras.index("aloft")).any()
+    assert np.all(asset.source[asset.valid] == asset.cameras.index("cam-a"))
     assert asset.cells_from("cam-a") == asset.covered_cells > 2_000
 
     _, json_path = save_basemap(asset, tmp_path)
     document = json.loads(json_path.read_text(encoding="utf-8"))
     print(f"cells per camera on disk: {document['coverage']['cells_per_camera']}")
-    assert document["coverage"]["cells_per_camera"] == {"cam-a": asset.covered_cells, "sky": 0}
-    assert set(document["poses"]) == {"cam-a", "sky"}
+    assert document["coverage"]["cells_per_camera"] == {"aloft": 0, "cam-a": asset.covered_cells}
+    assert set(document["poses"]) == {"aloft", "cam-a"}
+    assert load_basemap(tmp_path).cameras == ("aloft", "cam-a")
 
 
 def test_too_few_frames_is_refused_rather_than_saved_as_an_empty_map(reference_pose):

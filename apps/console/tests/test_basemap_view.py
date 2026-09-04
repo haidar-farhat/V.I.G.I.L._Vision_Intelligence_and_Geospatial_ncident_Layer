@@ -240,14 +240,16 @@ def test_ground_shows_the_basemap_colour_and_empty_cells_show_the_panel(qt_app):
 
 def test_taking_the_basemap_away_removes_it(qt_app):
     view = _shown_map(_asset())
+    where = _cell_screen(view, 5, 5)
     assert view.basemap_rect() is not None
+    assert _at(_render(view), where) != PANEL_RGB
 
     view.set_basemap(None)
     QApplication.processEvents()
 
     assert view.basemap is None
     assert view.basemap_rect() is None
-    assert _at(_render(view), _cell_screen(_shown_map(_asset()), 5, 5)) == PANEL_RGB
+    assert _at(_render(view), where) == PANEL_RGB
 
 
 def test_the_opacity_is_applied_and_nought_draws_nothing(qt_app):
@@ -329,7 +331,7 @@ def test_the_grid_is_drawn_over_the_basemap(qt_app):
     compared with the same colour of ground a few cells north of it. Drawn
     under the map at 85 % opacity the line would show through at 15 % — a few
     units of green — so the bar is a large drop, not any drop. Measured: 95
-    on the line against 139 off it, with the line antialiased over two rows.
+    on the line against 140 off it, with the line antialiased over two rows.
     """
     view = _shown_map(_asset())
     image = _render(view)
@@ -463,7 +465,12 @@ def test_the_rendering_is_cached_until_the_asset_changes(qt_app):
 
 
 def test_hovering_bare_ground_reports_what_the_basemap_knows(qt_app):
-    view = _shown_map(_asset(cameras=("gate", "yard"), source=1, sigma=0.8, age=300.0))
+    built = 1_800_000_000.0
+    view = _shown_map(
+        _asset(cameras=("gate", "yard"), source=1, sigma=0.8, age=300.0, built_at=built)
+    )
+    # The clock held at the build, so the age reported is the asset's own.
+    view.clock = lambda: built
 
     _move(view, _cell_screen(view, 5, 5))
     assert view.hovered is None, "nothing of the console's own is there"

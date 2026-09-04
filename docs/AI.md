@@ -155,31 +155,44 @@ Raw prompts containing operational secrets are not stored.
 
 ## Privacy
 
-**As built today: no facial recognition, no biometric identification, no identity
-database.** The optional appearance embedding used for cross-camera association is
-a similarity vector compared only against other tracks in the same time window —
-never against an enrolled set, because there is no enrolled set and no code path
-to create one.
+**As built today: facial recognition and plate reading exist, and both are off
+for every site until an operator turns them on.** The register of named people
+and vehicles (`sentinel.registry`) is part of every deployment's schema, and a
+per-site switch (`Site.identity`) decides whether anything is ever put into it or
+matched against it. Off is the state every site starts in and every site written
+before the switch existed reads as. The optional appearance embedding used for
+cross-camera association is unchanged by this: a similarity vector compared only
+against other tracks in the same time window, never against the register.
 
-**As designed, and not yet built:** an opt-in People register (FEATURES.md,
-"People: named identity"). It is written down here rather than left to surprise
-somebody reading this page after it ships. The guarantee it replaces is not
-"there are no biometrics" but a narrower and checkable set:
+The guarantee is not "there are no biometrics" but a narrower and checkable set,
+each item of which is a mechanism in the engine rather than a note here:
 
 - It is **off until an operator turns it on**, per site, and off means no face is
-  detected, embedded or stored — enforced in the pipeline, not by hiding a column.
-- **Nobody is enrolled by being seen.** Enrolment is an operator naming a track,
-  deliberately, once. There is no gallery of unknown faces, because that is an
-  identity database assembled by accident.
-- What is stored is a **128-float template**, not a photograph. A crop is kept only
-  if the operator opts in to that separately.
-- A name is **never asserted without its evidence**: the score and the matched face
-  travel with it, and a middling score reads *possible match*, fires no rule, and is
-  drawn differently from a confident one.
+  detected, embedded or stored and no plate is cropped — the node builds no face
+  engine and hands no plate reader to a pipeline, and a test proves the stand-in
+  models were shown no pixels. Not a hidden column.
+- **Turning it on is audited**, with a before, an after and a recorded reason, on
+  the site row so it survives a restart. Faces are then looked for only inside a
+  track the detector labelled a person, at most once every few frames per track,
+  and the models are files the operator placed in the models directory; with none
+  there the status line says which files it is waiting for and nothing runs.
+- **Nobody is enrolled by being seen.** The last few templates of a live track are
+  held in memory and dropped when the track ends; one reaches the register only
+  when an operator names that track, with a lawful basis. There is no gallery of
+  unknown faces, because that is an identity database assembled by accident.
+- What is stored is a **128-float template**, not a photograph. The face-crop flag
+  is a separate opt-in that is stored and audited and **kept by nothing in this
+  build**; the status line says so when it is set.
+- A name is **never asserted without its evidence**: a verdict is decided over the
+  frames of a track, never one frame; a middling score is recorded as *possible
+  match*, fires no rule, and is never promoted. The audit row for an enrolment or a
+  sighting carries the subject id — never the name, the plate text or the vector.
 - **Forgetting works.** Deleting a person removes the templates and unlinks the
-  history, and the deletion is audited. Templates expire on a retention policy.
+  history, and the deletion is audited with counts only. Templates expire on a
+  retention policy swept with the recordings.
 - Nothing biometric leaves the machine; the offline guarantee is unchanged.
 
-Number-plate reading is designed the same way and under the same switch, with the
-difference that a plate is a legally displayed identifier rather than a measurement
-of somebody's body.
+Number-plate reading is built the same way and under the same switch — read only
+inside vehicle tracks, a half-read plate never matched, sightings audited by
+subject id — with the difference that a plate is a legally displayed identifier
+rather than a measurement of somebody's body.

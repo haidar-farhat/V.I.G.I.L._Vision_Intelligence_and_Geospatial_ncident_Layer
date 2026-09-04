@@ -895,3 +895,184 @@ def test_a_starved_live_run_exits_non_zero_and_says_so(
 
     assert code == 1
     assert "STARVED" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------- the basemap
+
+
+def placement_of(pose) -> str:
+    """A pose in `--place` syntax, optics included, so it comes back exactly."""
+    return (
+        f"{pose.position.lat},{pose.position.lon},{pose.mount_height},"
+        f"{pose.heading},{pose.pitch},{pose.horizontal_fov},{pose.vertical_fov},"
+        f"{pose.range_meters}"
+    )
+
+
+def test_basemap_build_on_the_reference_video_writes_both_files_and_exits_0(
+    reference_video: Path, reference_pose, tmp_path: Path, capsys
+):
+    from sentinel.basemap import load_basemap
+
+    out = tmp_path / "basemap"
+    code = cli.main([
+        "--quiet", "basemap", "build", str(reference_video),
+        "--id", "gate", "--place", placement_of(reference_pose),
+        "--for", "3", "--cell", "0.5", "--out", str(out),
+    ])
+    printed = capsys.readouterr()
+
+    assert code == 0, printed.err
+    assert (out / "basemap.png").is_file() and (out / "basemap.json").is_file()
+    asset = load_basemap(out)
+    assert asset is not None
+    # The stored poses are the ones given, exactly — not re-rounded on the way.
+    assert asset.poses == {"gate": reference_pose}
+    assert asset.cameras == ("gate",)
+    assert asset.covered_cells > 1_000
+    # Thinned to at most four frames a second of media time: three seconds of
+    # a 15 fps file is a dozen frames, not forty-five.
+    assert 9 <= asset.frames_used <= 13
+    # Never a frame, and never the source: a camera URL carries a credential.
+    text = (out / "basemap.json").read_text(encoding="utf-8")
+    assert reference_video.name not in text
+    assert "basemap" in printed.out
+    assert str(out / "basemap.png") in printed.out and str(out / "basemap.json") in printed.out
+    assert "gate" in printed.out
+
+    # And `show` reads it back, verifying the fingerprint on the way.
+    assert cli.main(["--quiet", "basemap", "show", "--dir", str(out)]) == 0
+    shown = capsys.readouterr().out
+    assert asset.fingerprint in shown
+    assert "gate" in shown and "cell" in shown
+
+
+def test_basemap_show_with_no_asset_exits_1(tmp_path: Path, capsys):
+    code = cli.main(["--quiet", "basemap", "show", "--dir", str(tmp_path / "nothing")])
+
+    assert code == 1
+    printed = capsys.readouterr().out
+    assert "no basemap" in printed
+    assert "basemap build" in printed, "it must say how to get one"
+
+
+def test_basemap_show_refuses_a_tampered_asset(reference_pose, tmp_path: Path, capsys):
+    import numpy as np
+
+    from sentinel.basemap import BasemapBuilder, save_basemap
+
+    builder = BasemapBuilder(cell_size_m=1.0)
+    for index in range(3):
+        builder.feed("gate", reference_pose, np.full((480, 640, 3), 90, np.uint8), 1_000.0 + index)
+    _, json_path = save_basemap(builder.build(now=1_100.0), tmp_path)
+    document = json.loads(json_path.read_text(encoding="utf-8"))
+    document["poses"]["gate"]["heading"] = 90.0
+    json_path.write_text(json.dumps(document), encoding="utf-8")
+
+    code = cli.main(["--quiet", "basemap", "show", "--dir", str(tmp_path)])
+
+    assert code == 1
+    assert "fingerprint" in capsys.readouterr().err
+
+
+def test_basemap_build_refuses_a_camera_without_a_bound_before_opening_it(
+    monkeypatch, capsys
+):
+    import cv2
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("a camera was opened")
+
+    monkeypatch.setattr(cv2, "VideoCapture", forbidden)
+
+    code = cli.main([
+        "--quiet", "basemap", "build", "device:0", "--place", "33.8938,35.5018,6,180,-22",
+    ])
+
+    assert code == 2
+    assert "--for" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["--place", "33.8938,35.5018,6,180,-22", "--place", "33.8938,35.5018,6,180,-22"],
+        ["--place", "33.8938,35.5018,6,180,-22", "--id", "a", "--id", "b"],
+        ["--place", "33.8938,35.5018,6,180,-22", "--for", "0"],
+        ["--place", "33.8938,35.5018,6,180,-22", "--cell", "0"],
+    ],
+)
+def test_an_impossible_basemap_build_is_refused_before_anything_opens(
+    arguments, reference_video: Path, tmp_path: Path
+):
+    code = cli.main([
+        "--quiet", "basemap", "build", str(reference_video), *arguments,
+        "--out", str(tmp_path / "bm"),
+    ])
+
+    assert code == 2
+    assert not (tmp_path / "bm").exists()
+
+
+def test_basemap_build_refuses_a_missing_file(tmp_path: Path):
+    code = cli.main([
+        "--quiet", "basemap", "build", str(tmp_path / "absent.mp4"),
+        "--place", "33.8938,35.5018,6,180,-22",
+    ])
+
+    assert code == 2
+
+
+def test_a_starved_basemap_build_exits_1_and_writes_nothing(
+    reference_video: Path, tmp_path: Path, monkeypatch, capsys
+):
+    import time
+
+    from sentinel import decode
+
+    monkeypatch.setattr(decode.VideoSource, "is_live", property(lambda self: True))
+
+    class Silent:
+        """A camera another program holds: it opens and never delivers."""
+
+        def __init__(self, source):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def read(self, timeout=10.0):
+            time.sleep(min(timeout, 0.02))
+            return None
+
+    monkeypatch.setattr(decode, "LiveStream", Silent)
+
+    code = cli.main([
+        "--quiet", "basemap", "build", str(reference_video),
+        "--place", "33.8938,35.5018,6,180,-22", "--for", "0.2",
+        "--out", str(tmp_path / "bm"),
+    ])
+
+    assert code == 1
+    assert "STARVED" in capsys.readouterr().err
+    assert not (tmp_path / "bm").exists()
+
+
+def test_a_basemap_build_from_a_camera_that_sees_no_ground_exits_1(
+    reference_video: Path, tmp_path: Path, capsys
+):
+    # `_pose` refuses a non-negative pitch, so this is the other way to point a
+    # camera at nothing: tilted down, but not enough for the bottom of the
+    # frame to reach the ground within any range.
+    code = cli.main([
+        "--quiet", "basemap", "build", str(reference_video),
+        "--place", "33.8938,35.5018,6,180,-0.01,62,0.001,90", "--for", "1",
+        "--out", str(tmp_path / "bm"),
+    ])
+
+    assert code == 1
+    assert "no ground" in capsys.readouterr().err
+    assert not (tmp_path / "bm").exists()

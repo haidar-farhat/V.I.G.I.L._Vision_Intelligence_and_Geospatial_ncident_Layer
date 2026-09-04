@@ -376,18 +376,33 @@ is not a trail.
 
 ## Privacy by design
 
-- **Today: no facial recognition, no biometric identification, no identity
-  database.** Identity is designed but unbuilt; see below and FEATURES.md.
+- **Facial recognition and plate reading exist and are off for every site until
+  an operator turns them on.** A register of named people and vehicles
+  (`sentinel.registry`) ships in the schema of every deployment, and a per-site
+  switch (`Site.identity`, migration 9) decides whether anything is ever put into
+  it or matched against it. Off — the state every site is in until somebody
+  changes it, and every site written before the switch existed — means no face
+  is detected, no template computed, no plate cropped: the node builds no face
+  engine and hands no plate reader to a pipeline, and a test proves the models
+  were shown no pixels. It is not a hidden column.
 - Tracking is appearance-based and identity-free; the optional embedding used for
   cross-camera association is a similarity vector, not an identifier, and is never
   matched against any enrolled set.
-- **When the opt-in People register ships**, the guarantee becomes narrower and
-  stays checkable: off per site until switched on and enforced in the pipeline;
-  enrolment only ever by an operator naming a track; a template rather than a
-  photograph unless the crop is separately opted into; every enrolment, match,
-  rename and deletion audited; a delete that removes templates and unlinks
-  history; template retention swept like recordings; and nothing biometric
-  leaving the machine. Biometric templates are special-category personal data in
+- **Turning the switch on** is an audited change with a before, an after and a
+  recorded reason, persisted on the site row so it survives a restart. It does
+  what it says and no more: faces are looked for only inside a track the detector
+  labelled a person, at most once every few frames per track; the last few
+  templates of a live track are held in memory and dropped when the track ends;
+  **nobody is enrolled by being seen** — a template reaches the register only
+  when an operator names a track, with a lawful basis, and the audit row for it
+  carries the subject id and never the name or the vector. A match is decided
+  over the track, not a frame; a middling score is recorded as *possible*, never
+  promoted, and fires nothing. Plates are read only inside vehicle tracks, and a
+  half-read plate is never matched. Face crops are a separate flag that is
+  stored and audited and **kept by nothing in this build**. A delete removes the
+  templates and unlinks the history; the retention sweep expires templates like
+  recordings; the models are operator-supplied files and nothing biometric
+  leaves the machine. Biometric templates are special-category personal data in
   most jurisdictions — the switch, the audit trail, the retention sweep and the
   delete are what make operating it lawful, not optional extras around it.
 - Detection classes are physical and non-biometric.
