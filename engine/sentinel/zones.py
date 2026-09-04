@@ -125,6 +125,98 @@ def ring_problem(ring) -> str | None:
     return None
 
 
+def zone_warnings(zone: "Zone", report, others: Sequence["Zone"] = ()) -> tuple[str, ...]:
+    """Everything wrong with this zone that the geometry can prove.
+
+    Warnings, never refusals. An operator who draws a zone somewhere no camera
+    looks has made a mistake worth telling them about immediately — a zone that
+    can never fire is the most dangerous object in the system, because it looks
+    exactly like protection — but they may be about to place the camera that
+    fixes it, and a tool that refuses the zone makes that impossible.
+
+    ``report`` is anything carrying ``covered_fraction``, ``confident_fraction``
+    and ``area_m2``; :class:`sentinel.coverage.ZoneReport` is what the console
+    passes. Duck-typed on purpose, so that neither the tests nor a future
+    caller has to build a full coverage report to ask this question.
+    """
+    from shapely.geometry import Polygon
+
+    messages: list[str] = []
+
+    if report.covered_fraction <= 0.0:
+        messages.append("no camera can see this zone — it can never fire")
+    elif report.confident_fraction < 0.5 and not zone.accept_uncertain:
+        # A zone whose own width is smaller than the error over it cannot say
+        # which side of its line somebody is on. It will still raise
+        # memberships; they will be UNCERTAIN, and a restricted area does not
+        # act on those — so it is armed and silent, which is the worst state.
+        beyond = round((1.0 - report.confident_fraction) * 100)
+        messages.append(
+            f"{beyond}% of this zone is beyond confident range "
+            "(σ larger than half its width) — it will mostly report UNCERTAIN"
+        )
+
+    frame = _metric_frame(zone.ring[0])
+    mine = Polygon([frame(point) for point in zone.ring])
+    if not mine.is_valid:
+        mine = mine.buffer(0)
+
+    for other in others:
+        if other.id == zone.id or len(other.ring) < 3:
+            continue
+        theirs = Polygon([frame(point) for point in other.ring])
+        if not theirs.is_valid:
+            theirs = theirs.buffer(0)
+        shared = mine.intersection(theirs)
+        if shared.is_empty or shared.area <= 0.0:
+            continue
+
+        if other.kind is zone.kind:
+            # Two zones of one kind over the same ground raise two events for
+            # one person, and the correlator has no way to know they were the
+            # same fence drawn twice.
+            messages.append(
+                f"overlaps {other.name} ({other.kind.value}), {shared.area:.0f} m²"
+            )
+        elif other.kind is ZoneKind.EXCLUSION and zone.kind in (
+            ZoneKind.RESTRICTED, ZoneKind.PERIMETER
+        ):
+            # An exclusion zone is "deliberately ignore this". Laid over an
+            # alarm zone it silences it there, and nothing else on screen says
+            # so: both are drawn, both look armed.
+            messages.append(f"inside exclusion {other.name}: silenced there")
+
+    schedule = zone.schedule
+    if schedule is not None and schedule.start == schedule.end:
+        # Not "all day": `covers` asks ``start <= now < end``, which no moment
+        # satisfies when they are equal. The zone is disarmed permanently, and
+        # it reads on screen as a zone with a schedule.
+        messages.append(
+            f"schedule {schedule.start:%H:%M}–{schedule.end:%H:%M} covers no time"
+        )
+
+    if report.area_m2 < 1.0:
+        # Smaller than the ground a person stands on, and far smaller than the
+        # position error anywhere on a real site.
+        messages.append(f"area {report.area_m2:.1f} m² is under 1 m²")
+
+    return tuple(messages)
+
+
+def _metric_frame(origin: LatLon):
+    """Metres east and north of ``origin``, for planar geometry.
+
+    Areas in degrees are wrong by the cosine of the latitude, and an overlap
+    reported as "0 m²" because of that is a warning nobody sees. Borrowed from
+    `sentinel.coverage`, which owns this conversion, rather than copied —
+    two tangent planes that came to differ would be a bug nobody could find.
+    """
+    from .coverage import _Frame
+
+    frame = _Frame(origin)
+    return frame.to_xy
+
+
 @dataclass(frozen=True, slots=True)
 class Zone:
     """A named area on the ground.

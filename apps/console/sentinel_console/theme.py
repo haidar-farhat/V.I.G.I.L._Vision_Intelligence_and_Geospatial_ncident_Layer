@@ -60,6 +60,15 @@ def zone_colour(kind) -> QColor:
 CAMERA = QColor(226, 232, 240)
 FOOTPRINT = QColor(96, 165, 250, 28)
 FOOTPRINT_EDGE = QColor(96, 165, 250, 110)
+#: Alphas of the footprint blue for the ≤ 5 / ≤ 2 / ≤ 1 / ≤ 0.5 m position-error
+#: bands, loosest first. The bands nest and are painted widest first, so the
+#: alphas accumulate and the ground the camera knows best ends up the most
+#: strongly coloured — brightest where its answer can be trusted, fading to the
+#: bare footprint where the error passes five metres.
+SIGMA_BANDS = (22, 36, 52, 70)
+#: A zone's part that no camera can see, hatched in the fault colour.
+OUTSIDE_HATCH = QColor(248, 113, 113, 60)
+WARNING = STALE
 GRID = QColor(44, 50, 60)
 GRID_MAJOR = QColor(60, 68, 82)
 

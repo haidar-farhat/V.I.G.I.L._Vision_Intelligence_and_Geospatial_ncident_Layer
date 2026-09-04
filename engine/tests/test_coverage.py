@@ -24,7 +24,16 @@ import pytest
 
 from sentinel import logs
 from sentinel.core import CameraPose, LatLon, destination_point, haversine_distance
-from sentinel.coverage import ARC_SEGMENTS, Coverage, CoverageError, Gap, analyse
+from sentinel.coverage import (
+    ARC_SEGMENTS,
+    SIGMA_THRESHOLDS_M,
+    Coverage,
+    CoverageError,
+    Gap,
+    analyse,
+    sigma_bands,
+    zone_report,
+)
 
 SITE_METRES = 120.0
 ORIGIN = LatLon(33.8938, 35.5018)
@@ -251,3 +260,152 @@ def test_the_projection_round_trips(site):
         x, y = frame.to_xy(point)
         back = frame.to_latlon(x, y)
         assert haversine_distance(point, back) < 0.01
+
+
+# ------------------------------------------- what the camera can actually rule on
+#
+# Coverage says a camera can *reach* this ground. These say how well it knows
+# where anything on it is — which is the question that decides whether a zone
+# drawn there can be adjudicated or will only ever report UNCERTAIN.
+
+
+GATE = CameraPose(
+    position=ORIGIN, mount_height=6.0, heading=180.0, pitch=-22.0,
+    horizontal_fov=62.0, vertical_fov=36.0, range_meters=90.0,
+)
+
+
+def square_at(distance: float, half: float, pose: CameraPose = GATE) -> tuple[LatLon, ...]:
+    """A square of side ``2 * half``, centred ``distance`` ahead of the camera."""
+    centre = destination_point(pose.position, pose.heading, distance)
+    return tuple(
+        destination_point(centre, bearing, half * math.sqrt(2))
+        for bearing in (45.0, 135.0, 225.0, 315.0)
+    )
+
+
+def band_reach(band) -> float:
+    """How far from the mast the band extends."""
+    return max(haversine_distance(GATE.position, point) for point in band.ring)
+
+
+def test_sigma_bands_lie_further_out_the_looser_they_are():
+    # The whole premise: position error grows with distance, so the ground a
+    # camera knows to half a metre is a band hugging its near edge, and the
+    # ground it knows to five metres reaches much further.
+    bands = sigma_bands(GATE)
+
+    assert [band.threshold_m for band in bands] == list(SIGMA_THRESHOLDS_M)
+    reaches = [band_reach(band) for band in bands]
+    assert reaches == sorted(reaches), f"bands are not nested: {reaches}"
+
+    # Measured on the reference pose (6 m mast, -22°, 36° vertical field), then
+    # floored: 8.2 m for the tightest band and 33.0 m for the loosest.
+    assert 6.0 < reaches[0] <= 10.0, f"the half-metre band reaches {reaches[0]:.1f} m"
+    assert 25.0 <= reaches[-1] <= 40.0, f"the five-metre band reaches {reaches[-1]:.1f} m"
+    # And none of them beyond the range the pose claims.
+    assert reaches[-1] < GATE.range_meters
+
+
+def test_sigma_bands_are_computed_once_per_pose():
+    # Roughly two thousand calls across the FFI. Once per placement that is
+    # nothing; once per repaint it would make the map unusable, so the cache is
+    # a correctness property of the drawing path, not an optimisation.
+    sigma_bands.cache_clear()
+    first = sigma_bands(GATE)
+    hits_before = sigma_bands.cache_info().hits
+
+    again = sigma_bands(
+        CameraPose(
+            position=ORIGIN, mount_height=6.0, heading=180.0, pitch=-22.0,
+            horizontal_fov=62.0, vertical_fov=36.0, range_meters=90.0,
+        )
+    )
+    assert again is first, "an equal pose recomputed the bands"
+    assert sigma_bands.cache_info().hits == hits_before + 1
+
+    steeper = sigma_bands(
+        CameraPose(
+            position=ORIGIN, mount_height=6.0, heading=180.0, pitch=-23.0,
+            horizontal_fov=62.0, vertical_fov=36.0, range_meters=90.0,
+        )
+    )
+    assert steeper is not first, "a different pose returned a cached answer"
+
+
+def test_a_camera_pointed_at_the_sky_has_no_bands():
+    blind = CameraPose(
+        position=ORIGIN, mount_height=6.0, heading=180.0, pitch=10.0,
+        horizontal_fov=62.0, vertical_fov=36.0, range_meters=90.0,
+    )
+    assert sigma_bands(blind) == ()
+
+
+def test_a_zone_at_the_near_edge_can_be_adjudicated():
+    # Measured: covered 0.982 (a corner falls in the blind foreground under the
+    # mast), confident 0.982, best 0.5 m, worst 1.0 m.
+    report = zone_report(square_at(9.0, 2.0), {"gate": GATE})
+
+    assert report.covered_fraction >= 0.95
+    assert report.confident_fraction >= 0.9
+    assert report.cameras == ("gate",)
+    assert report.best_sigma_m == 0.5
+    assert report.worst_sigma_m is not None and report.worst_sigma_m <= 2.0
+    assert 15.0 <= report.area_m2 <= 17.0
+
+
+def test_a_zone_at_the_far_edge_is_covered_and_unadjudicable():
+    # The failure this exists to make visible: fully covered, and the system
+    # still cannot say which side of a four-metre line somebody is on.
+    report = zone_report(square_at(70.0, 2.0), {"gate": GATE})
+
+    assert report.covered_fraction >= 0.9, "the far zone is inside the footprint"
+    assert report.confident_fraction <= 0.1
+    assert report.best_sigma_m is None, "no band reaches 70 m"
+    assert report.worst_sigma_m is None, "which reads as 'beyond five metres'"
+
+
+def test_a_zone_outside_every_footprint_can_never_fire():
+    behind = destination_point(GATE.position, GATE.heading + 180.0, 40.0)
+    ring = tuple(
+        destination_point(behind, bearing, 3.0 * math.sqrt(2))
+        for bearing in (45.0, 135.0, 225.0, 315.0)
+    )
+    report = zone_report(ring, {"gate": GATE})
+
+    assert report.covered_fraction == 0.0
+    assert report.outside_fraction == 1.0
+    assert report.cameras == ()
+    assert report.confident_fraction == 0.0
+
+
+def test_a_zone_the_width_of_a_threshold_is_not_dropped_by_rounding():
+    """A four-metre square at 20 m must report the confidence it has.
+
+    Its half-width is 2 m, exactly a threshold — but built from geodesic
+    destination points the square measures 3.999990 m, so an exact `<=`
+    excluded the two-metre band and reported 0% confident on a zone that is
+    half inside it. Five microns, one wrong answer, and invisible in every
+    zone whose width does not happen to match a threshold.
+    """
+    report = zone_report(square_at(20.0, 2.0), {"gate": GATE})
+
+    assert report.covered_fraction >= 0.99
+    assert report.confident_fraction >= 0.4, "the two-metre band was dropped"
+    assert report.best_sigma_m == 2.0
+
+
+def test_the_zone_report_agrees_with_the_coverage_analysis(site):
+    # One union code path. Two that came to differ would have the zone panel
+    # calling a zone covered while the blind-spot report showed a hole in
+    # exactly that place.
+    cameras = {"north": camera(on_north_edge(60.0), 180.0)}
+
+    assert zone_report(site, cameras).covered_fraction == pytest.approx(
+        analyse(site, cameras).covered_fraction, abs=1e-6
+    )
+
+
+def test_a_zone_needs_three_points():
+    with pytest.raises(CoverageError, match="three points"):
+        zone_report((ORIGIN, on_north_edge(10.0)), {"gate": GATE})

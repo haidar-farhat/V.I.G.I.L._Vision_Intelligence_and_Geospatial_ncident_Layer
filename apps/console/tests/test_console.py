@@ -1696,3 +1696,164 @@ def test_clicking_a_zone_on_the_map_selects_it_in_the_list(qt_app, window, refer
     assert window.zones_view.selected_zone_id() == far.id
     assert window.detail_tabs.currentIndex() == 1, "the zones tab did not come forward"
     assert window.zone_properties.zone is not None and window.zone_properties.zone.id == far.id
+
+
+# --------------------------------- what the cameras can rule on, on the screen
+#
+# The map used to draw a footprint as one flat wedge, which says "this camera
+# can reach this ground" and nothing about whether it can tell one side of a
+# line from the other there. These cover the shading, the numbers beside it,
+# and the warnings that come from them.
+
+
+def _behind_the_camera(pose, distance: float = 40.0, half: float = 3.0):
+    import math
+
+    centre = destination_point(pose.position, pose.heading + 180.0, distance)
+    return tuple(
+        destination_point(centre, bearing, half * math.sqrt(2))
+        for bearing in (45.0, 135.0, 225.0, 315.0)
+    )
+
+
+def test_the_footprint_is_shaded_by_how_well_it_can_locate(qt_app):
+    """Near ground is drawn strongly, far ground fades to the bare footprint.
+
+    A flat wedge claims the far edge of a 90 m range is as good as the near
+    edge. It is not: the position error there is tens of metres, and a zone
+    drawn on it can never be adjudicated.
+    """
+    from sentinel.coverage import sigma_bands
+
+    view = MapView()
+    view.resize(600, 600)
+    view.set_cameras({"gate": SITE_POSE})
+    view.set_sigma_bands({"gate": sigma_bands(SITE_POSE)})
+    # The legend is an overlay in the bottom-right, and the far sample lands
+    # under it. Turning it off is what `show_legend` is for; the legend has its
+    # own test.
+    view.show_legend = False
+    view.show()
+    qt_app.processEvents()
+
+    image = view.grab().toImage()
+
+    def brightness_at(distance: float) -> int:
+        point = destination_point(SITE_POSE.position, SITE_POSE.heading, distance)
+        screen = view._to_screen(*view._to_local(point))
+        colour = image.pixelColor(int(screen.x()), int(screen.y()))
+        return colour.red() + colour.green() + colour.blue()
+
+    near, middle, far = brightness_at(9.0), brightness_at(25.0), brightness_at(80.0)
+    assert near > middle > far, f"the shading is not graded: {near}, {middle}, {far}"
+
+    # The far end is still inside the footprint, so it is not bare panel.
+    panel = theme.PANEL.red() + theme.PANEL.green() + theme.PANEL.blue()
+    assert far > panel, "the far footprint vanished into the background"
+
+
+def test_the_legend_does_not_sit_on_the_scale_bar(qt_app):
+    view = MapView()
+    view.resize(600, 600)
+    view.set_cameras({"gate": SITE_POSE})
+
+    legend = view.legend_rect()
+    assert not legend.intersects(view.scale_bar_rect())
+    assert legend.left() >= 0 and legend.right() <= view.width()
+    assert legend.top() >= 0 and legend.bottom() <= view.height()
+    # It overlays the ground it explains, so it has to stay small. A measured
+    # rewrite of it once came out 489 px wide on a 600 px view.
+    assert legend.width() <= view.width() * 0.45, f"the legend is {legend.width():.0f} px wide"
+
+
+def test_the_zone_list_says_how_much_of_each_zone_is_covered(qt_app, window, reference_video: Path):
+    from sentinel.zones import ZoneKind
+
+    session = _placed_window(window, reference_video)
+    window._add_zone(radius=3.0)                       # in front of the camera
+    window._create_zone(
+        _behind_the_camera(session.pose), name="Back lot", kind=ZoneKind.RESTRICTED
+    )
+
+    rows = {
+        window.zones_view.topLevelItem(i).text(0): window.zones_view.topLevelItem(i)
+        for i in range(window.zones_view.topLevelItemCount())
+    }
+    assert set(rows) == {"Restricted Area A", "Back lot"}
+
+    covered = rows["Restricted Area A"].text(3)
+    assert covered.endswith("%") and int(covered.rstrip("%")) >= 50, covered
+
+    unseen = rows["Back lot"]
+    assert unseen.text(3) == "⚠ 0%", unseen.text(3)
+    assert "never fire" in unseen.toolTip(3)
+
+
+def test_the_properties_panel_reports_what_the_cameras_can_rule_on(qt_app, window, reference_video: Path):
+    _placed_window(window, reference_video)
+    window._add_zone(radius=3.0)
+    zone = window._zones[0]
+    window.zones_view.select(zone.id)
+
+    panel = window.zone_properties
+    # One line, not two: "87% · 62% confidently" — the second number is the one
+    # that decides whether the zone can be adjudicated, and separating them put
+    # the answer two rows away from the question.
+    assert "%" in panel._covered.text() and "confidently" in panel._covered.text()
+    assert panel._seen_by.text().startswith("cam-07")
+    assert panel._seen_by.text().endswith("m²")
+    # `isVisibleTo`, not `isVisible`: the window is never shown in the suite,
+    # so `isVisible` is False for every widget and would pass this either way.
+    assert not panel._warnings.isVisibleTo(panel), "a healthy zone was warned about"
+
+
+def test_a_zone_nothing_can_see_is_created_anyway_and_says_so(qt_app, window, reference_video: Path):
+    """A warning, never a refusal.
+
+    The operator may be about to place the camera that fixes it, and a tool
+    that refuses the zone makes that impossible. So it is created, the status
+    bar says why it is useless, and the properties panel keeps saying so.
+    """
+    from sentinel.zones import ZoneKind
+
+    session = _placed_window(window, reference_video)
+
+    created = window._create_zone(
+        _behind_the_camera(session.pose), name="Back lot", kind=ZoneKind.RESTRICTED
+    )
+
+    assert created is not None, "the zone was refused"
+    assert created in window._zones
+    status = window.status.currentMessage()
+    assert "⚠" in status and "never fire" in status, status
+
+    window.zones_view.select(created.id)
+    assert window.zone_properties._warnings.isVisibleTo(window.zone_properties)
+    assert "never fire" in window.zone_properties._warnings.text()
+
+
+def test_the_banner_reports_coverage_while_an_outline_is_being_drawn(qt_app, window, reference_video: Path):
+    # The number an operator needs *before* committing the zone, not after.
+    from PySide6.QtTest import QTest
+
+    session = _placed_window(window, reference_video)
+    window.map.resize(500, 500)
+    qt_app.processEvents()
+    window._draw_zone()
+
+    assert "covered" not in (window.map._banner() or ""), "reported before there was an area"
+
+    for bearing, distance in ((-10.0, 14.0), (10.0, 14.0), (10.0, 22.0)):
+        point = destination_point(session.pose.position, session.pose.heading + bearing, distance)
+        QTest.mouseClick(
+            window.map, Qt.MouseButton.LeftButton,
+            pos=window.map._to_screen(*window.map._to_local(point)).toPoint(),
+        )
+
+    assert window.map.draw_points == 3
+    banner = window.map._banner()
+    assert "covered" in banner and "confident" in banner, banner
+    assert "seen by cam-07" in banner, banner
+
+    report = window.map.live_report()
+    assert report is not None and report.area_m2 > 0

@@ -242,6 +242,33 @@ Five kinds of zone, each drawn in its own colour on the plan view so a rule to
 Every change is written to the audit log with what changed — a restricted area
 quietly becoming an exclusion zone is exactly the edit an audit log is for.
 
+### The footprint is shaded by how well the camera can locate
+
+A flat wedge would claim the far edge of a 90 m range is as good as the near
+edge. It is not: position error grows super-linearly with distance, so the map
+draws four nested bands — 1σ within 0.5 m, 1 m, 2 m and 5 m — and leaves the
+rest of the footprint bare. Bare does not mean unseen. It means seen, with the
+position known to worse than five metres.
+
+That distinction decides whether a zone can work at all:
+
+| the zone panel says | what it means |
+|---|---|
+| **Covered 100% · 92% confidently** | every part is in view, and nearly all of it is known well enough to say which side of the line somebody is on |
+| **Covered 100% · 0% confidently** | fully in view, and the system still cannot adjudicate it — memberships will be UNCERTAIN, which a restricted area does not act on. The zone is armed and silent |
+| **⚠ 0%** in the list | no camera can see it. It can never fire |
+
+"Confidently" is measured against the zone's *own* narrowest width: two metres
+of error is fine for a car park and useless for a doorway.
+
+While you draw an outline the same numbers appear in the band across the top of
+the map, from the third corner onward — before the zone is committed, not after.
+The part of a selected zone that no camera can see is hatched.
+
+Every warning is a warning, never a refusal. A zone nothing can see is still
+created, because you may be about to place the camera that fixes it; the status
+bar and the properties panel say what is wrong with it until you do.
+
 ### Reading the plan view
 
 | what you see | what it means |

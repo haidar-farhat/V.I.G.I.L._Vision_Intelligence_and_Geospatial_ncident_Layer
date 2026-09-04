@@ -19,10 +19,13 @@ from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QScrollArea,
     QDialog,
     QDialogButtonBox,
     QDoubleSpinBox,
     QFormLayout,
+    QFrame,
+    QGroupBox,
     QHeaderView,
     QLabel,
     QHBoxLayout,
@@ -73,30 +76,48 @@ class ZonesView(QTreeWidget):
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
-        self.setColumnCount(4)
-        self.setHeaderLabels(["Zone", "Kind", "Across", "Points"])
+        self.setColumnCount(5)
+        self.setHeaderLabels(["Zone", "Kind", "Across", "Covered", "Points"])
         self.setRootIsDecorated(False)
         self.setAlternatingRowColors(True)
         header = self.header()
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         header.setStretchLastSection(True)
-        for index, width in enumerate((220, 120, 90)):
+        self.setMinimumWidth(330)
+        for index, width in enumerate((150, 90, 62, 74)):
             self.setColumnWidth(index, width)
 
-    def show_zones(self, zones) -> None:
-        """Replace the list, keeping the selection by id."""
+    def show_zones(self, zones, reports: dict | None = None, warnings: dict | None = None) -> None:
+        """Replace the list, keeping the selection by id.
+
+        ``reports`` and ``warnings`` (by zone id) fill the Covered column: how
+        much of the zone any camera can see, and a warning glyph with every
+        warning as the tooltip. A zone nothing can see reads "⚠ 0%" — the one
+        number an operator needs before trusting a zone with an alarm.
+        """
+        reports = reports or {}
+        warnings = warnings or {}
         selected = self.selected_zone_id()
         self.clear()
         for zone in zones:
+            report = reports.get(zone.id)
+            warned = tuple(warnings.get(zone.id, ()))
+            covered = "—" if report is None else f"{report.covered_fraction:.0%}"
+            if warned:
+                covered = f"⚠ {covered}"
             item = QTreeWidgetItem([
                 zone.name,
                 zone.kind.value.lower(),
                 f"{zone_extent_meters(zone):.0f} m",
+                covered,
                 str(len(zone.ring)),
             ])
             item.setData(0, Qt.ItemDataRole.UserRole, zone.id)
             item.setForeground(1, QBrush(theme.zone_colour(zone.kind)))
             item.setToolTip(1, KIND_DESCRIPTIONS.get(zone.kind, ""))
+            if warned:
+                item.setForeground(3, QBrush(theme.WARNING))
+                item.setToolTip(3, "\n".join(warned))
             self.addTopLevelItem(item)
             if zone.id == selected:
                 item.setSelected(True)
@@ -310,6 +331,36 @@ class ZonePropertiesPanel(QWidget):
         )
         form.addRow("Release after", self._exit)
 
+        self._report_box = QGroupBox("What the cameras can rule on")
+        report_form = QFormLayout(self._report_box)
+        report_form.setContentsMargins(8, 4, 8, 6)
+        self._report_caption = QLabel("A geometric upper bound — nothing here models occlusion.")
+        self._report_caption.setObjectName("Caption")
+        self._report_caption.setWordWrap(True)
+        report_form.addRow(self._report_caption)
+        self._covered = QLabel("—")
+        self._covered.setToolTip(
+            "How much of the zone any camera can reach, and of that, how much it "
+            "can locate well enough to adjudicate — where the position error is "
+            "smaller than half the zone's narrowest width. The rest reports "
+            "UNCERTAIN, which a restricted area does not act on."
+        )
+        report_form.addRow("Covered", self._covered)
+        self._seen_by = QLabel("—")
+        report_form.addRow("Seen by", self._seen_by)
+        self._sigma = QLabel("—")
+        report_form.addRow("Position error", self._sigma)
+        self._warnings = QLabel("")
+        self._warnings.setWordWrap(True)
+        self._warnings.setStyleSheet(f"color: {theme.WARNING.name()};")
+        report_form.addRow(self._warnings)
+
+        # Directly under the name and kind, above everything an operator tunes:
+        # this is the part they read rather than edit, and it decides whether
+        # the rest is worth setting at all. Below the schedule it fell off the
+        # bottom of the panel on any window shorter than about 900 px.
+        form.insertRow(2, self._report_box)
+
         self._uncertain = QCheckBox("An uncertain position may count as inside")
         self._uncertain.setToolTip(
             "A position whose uncertainty disc straddles the boundary. Right for an "
@@ -339,7 +390,17 @@ class ZonePropertiesPanel(QWidget):
         host.addLayout(form)
         host.addLayout(buttons)
         host.addStretch(1)
-        layout.addWidget(self._form_host)
+
+        # Scrolled, because it will not always fit. A QFormLayout given less
+        # height than it needs does not clip — it compresses every row into
+        # every other, and the first photograph of this panel was six rows of
+        # overlapping text. Scrolling degrades honestly.
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._scroll.setWidget(self._form_host)
+        self._scroll.setMinimumWidth(380)
+        layout.addWidget(self._scroll)
         self.show_zone(None)
 
     # ------------------------------------------------------------------ state
@@ -350,7 +411,7 @@ class ZonePropertiesPanel(QWidget):
 
     def show_zone(self, zone: Zone | None) -> None:
         self._zone = zone
-        self._form_host.setVisible(zone is not None)
+        self._scroll.setVisible(zone is not None)
         self._empty.setVisible(zone is None)
         if zone is None:
             return
@@ -377,6 +438,27 @@ class ZonePropertiesPanel(QWidget):
 
     def set_clock(self, label: str) -> None:
         self._clock.setText(f"Times are read against {label}." if label else "")
+
+    def show_report(self, report, warnings=()) -> None:
+        """Fill the 'What the cameras can rule on' group for the shown zone."""
+        warnings = tuple(warnings)
+        if report is None:
+            for label in (self._covered, self._seen_by, self._sigma):
+                label.setText("—")
+        else:
+            self._covered.setText(
+                f"{report.covered_fraction:.0%} · {report.confident_fraction:.0%} confidently"
+            )
+            seen = ", ".join(report.cameras) if report.cameras else "no camera"
+            self._seen_by.setText(f"{seen} · {report.area_m2:.0f} m²")
+            if report.best_sigma_m is None and report.worst_sigma_m is None:
+                self._sigma.setText("beyond 5 m everywhere")
+            else:
+                best = "—" if report.best_sigma_m is None else f"≤ {report.best_sigma_m:g} m"
+                worst = "beyond 5 m" if report.worst_sigma_m is None else f"≤ {report.worst_sigma_m:g} m"
+                self._sigma.setText(f"{best} best · {worst} worst")
+        self._warnings.setText("\n".join(f"⚠ {w}" for w in warnings))
+        self._warnings.setVisible(bool(warnings))
 
     def zone_from_fields(self) -> Zone:
         """The selected zone with the fields as they are on screen."""

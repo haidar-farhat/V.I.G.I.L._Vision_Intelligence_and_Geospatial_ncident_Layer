@@ -33,26 +33,26 @@ Related: [STATUS.md](STATUS.md) — measurements and honest gaps ·
 
 ## The scoreboard
 
-421 capabilities, each with a state. Many lines cover several related things —
+426 capabilities, each with a state. Many lines cover several related things —
 "heading · pitch · roll" is one row — so this counts *claims*, not code.
 
 | | Count | Share | What it means |
 |---|---:|---:|---|
-| **`TESTED`** | 157 | 37% | A test fails if it stops working |
-| **`IMPL`** | 21 | 5% | Works; a regression would go unnoticed |
+| **`TESTED`** | 163 | 38% | A test fails if it stops working |
+| **`IMPL`** | 22 | 5% | Works; a regression would go unnoticed |
 | **`SKEL`** | 32 | 8% | Something is there; it does not do the job |
-| **`PLAN`** | 211 | 50% | Designed, no code |
+| **`PLAN`** | 209 | 49% | Designed, no code |
 
 ```mermaid
 pie showData
-    title Sentinel Vision — 421 capabilities by state
-    "TESTED" : 157
-    "IMPLEMENTED" : 21
+    title Sentinel Vision — 426 capabilities by state
+    "TESTED" : 163
+    "IMPLEMENTED" : 22
     "SKELETON" : 32
-    "PLANNED" : 211
+    "PLANNED" : 209
 ```
 
-**Read that 37% carefully.** It is not "a third of the product is finished" — it
+**Read that 38% carefully.** It is not "a third of the product is finished" — it
 is that the part which is finished is the analytical core plus, now, the
 recording that makes its evidence real, while most of what is planned is the
 product surface around them. The parts a demonstration shows off are the parts
@@ -315,6 +315,9 @@ two identical webcams are indistinguishable by name.
 | Cursor ground readout and copy-to-clipboard | `PLAN` | The status bar shows the ground point under the cursor as site metres east/north, distance and bearing from the selected camera, and lat/lon only when the site is georeferenced — never for a local frame. Ctrl+C copies it; right-click a track gives 'Copy position'. The plan view exists so somebody can be sent to a place, and today no position can be read off it. |
 | Footprint and coverage reflect camera health | `PLAN` | A stopped, stale or faulted camera has its footprint drawn hollow and hatched with 'dark since HH:MM'; the coverage layer and per-zone covered % exclude dark cameras; a zone whose every covering camera is dark gets an 'unwatched now' warning and pulses. Driven by the same `PipelineStats` and fault the camera list reads. A solid footprint over a dead camera is the most dangerous false claim the map can make — Roadmap 3.4's 'the absence of events is itself a signal'. |
 | Obstruction polygons cast shadows in the footprint | `PLAN` | A building or wall drawn on the plan (or promoted from GeoJSON) with a height becomes an obstruction; Shapely casts its shadow from the camera across the footprint and subtracts it. The visible part stays solid, the shadowed part is drawn hollow, coverage uses the visible part, and a zone behind it reports UNCERTAIN there. Roadmap 5.1. |
+| Footprint shaded by position error | `TESTED` | `coverage.sigma_bands` walks the image by bisection for the 0.5 / 1 / 2 / 5 m 1σ contours and the map paints them nested over the footprint, so the ground a camera can *adjudicate* is visibly distinct from the ground it can merely reach. Memoised per pose — about two thousand FFI calls, once per placement, never from a paint |
+| Map legend for the shading | `TESTED` | Two lines, bottom-right, measured to its own text and kept clear of the scale bar and under 45% of the view width — the first fixed-size version clipped its last line to "…not de", and the first measured one came out 489 px wide on a 600 px view |
+| A zone is always inside the fitted view | `TESTED` | `_fit_view` frames zones as well as cameras and footprints. A zone drawn behind the camera — precisely the one whose warning says it can never fire — used to be framed out of the only view that could show the operator why |
 
 ## 📐 Spatial & camera geometry
 
@@ -356,7 +359,7 @@ two identical webcams are indistinguishable by name.
 | Zone cooldowns | `TESTED` | |
 | Enter · exit · dwell detection | `TESTED` | Hysteresis on both edges; exit slower than entry |
 | Direction violations | `PLAN` | |
-| Zone validation against what the cameras can actually adjudicate | `PLAN` | `coverage.zone_report(ring, cameras)` — Shapely against the footprint union and each camera's 1σ bands — gives the fraction of the zone inside any footprint, the fraction where σ exceeds half the zone's narrowest width ('will mostly report UNCERTAIN'), the cameras that see it, best and worst σ, and the area. Shown live in the map band while drawing or reshaping (bands cached per pose; only the intersection runs per mouse move), as a Covered column with a warning glyph in the Zones list, and as a group in the properties panel. Warnings, never refusals, except invalid geometry: outside every footprint ('can never fire'); more than half beyond confident range; overlaps a zone of the same kind, with area; RESTRICTED covered by an EXCLUSION (silenced there); a schedule that covers no time; area under 1 m². Numbers are stored on the zone version once versions exist and the warning acknowledgement is audited. Roadmap 4.1's 'live count of how much of the polygon each camera can actually adjudicate'. |
+| Zone validation against what the cameras can actually adjudicate | `TESTED` | `coverage.zone_report` gives covered / confident fractions, the cameras that see it, best and worst 1σ and the area; `zones.zone_warnings` turns those into an ordered list: nothing can see it, most of it beyond confident range, same-kind overlap with its area, silenced by an exclusion, a schedule covering no time, under a square metre. Warnings, never refusals — the operator may be about to place the camera that fixes it. Shown live in the map band while drawing, as a Covered column with a warning glyph in the zone list, and in the properties panel |
 | Versioned zone geometry — an edit creates a new version, never overwrites the ring | `PLAN` | Migration v4: `zone_versions (zone_id, version, ring, kind, name, schedule, enter/exit millis, accept_uncertain, valid_from, superseded_at, actor, sha256)` written on every save; `zones` becomes the current version; remove marks `superseded_at` instead of deleting; `Zone` gains `version` defaulted so every existing constructor call still works; `events.zone_version` is nullable so v3 rows read back. The migration round-trips up and down on a populated database. This is what lets the reshape that already ships stay honest: last month's alarm keeps pointing at the ring it was measured against. |
 | Site time zone, declared and used by schedules | `IMPL` | Schedules are now read against the machine's own clock (`Node(site_tz=…)`, default `datetime.now().astimezone().tzinfo`), labelled as such under the schedule fields and in the after-hours condition (`19:30 UTC+0300 falls within 18:00–06:00`); `Event.occurred_at` stays UTC. Tested with a fixed offset. Still to do: a *declared* IANA zone on a site record, so a site is not at the mercy of the machine it happens to run on |
 | Zone health in the list: last fired, events in 24 h, open presences, silent zones | `PLAN` | Columns from the `events` table, which already carries `zone_id` and is indexed by it, plus open presences from a small `Node.open_presences()` accessor. A zone armed longer than a configurable period that has never fired is flagged 'silent — nothing happened, or nothing can see it; check coverage' beside its coverage warning. The cheapest signal a site has that a zone is misdrawn, and today it is discovered only when an incident is missed. |
@@ -364,6 +367,8 @@ two identical webcams are indistinguishable by name.
 | Zones drawn by their arming state | `PLAN` | A zone outside its schedule, temporarily disarmed, or carrying a 'can never fire' warning is drawn dotted with no fill and a small state glyph, and the legend says so. Kind colours say what a zone means; this says whether it is doing anything right now, so an after-hours zone at 14:00 reads as asleep rather than watched. |
 | Disarm a zone temporarily, with a reason and an automatic re-arm | `PLAN` | Right-click: 'Disarm for 30 min / 1 h / until…' with a reason. The zone is drawn hatched with a countdown, its rules do not fire, it re-arms itself, and both edges are audited. Disarmed zones are always listed in the status bar so a bypass is never silent. A delivery to a restricted bay should not produce forty alerts, and the alternative — deleting the zone — is how zones go missing. |
 | Weakening a zone asks for confirmation and records it | `PLAN` | Changing kind from RESTRICTED or PERIMETER to EXCLUSION or INTEREST, lengthening the entry delay, or removing a schedule shows the effect ('this zone will stop raising events') and the audit row carries `confirmed_weakening = true`. The edit most worth auditing is the one that makes the system quieter; it should be possible, visible afterwards, and impossible by accident. Nothing else in the panel confirms — undo covers it. |
+| Live adjudicability while an outline is drawn | `TESTED` | The map band's second line reads "covered 100% · confident 0% · 7 m² · seen by gate" from the third corner onward, so the number arrives before the zone is committed rather than after |
+| The part of a zone no camera can see is hatched | `TESTED` | On the selected zone, the area outside every footprint is drawn with a diagonal hatch — a zone half outside the coverage is half a zone, and an operator should see which half |
 
 ## 🧠 Behavioural intelligence
 

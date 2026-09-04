@@ -203,7 +203,7 @@ still needs the dialog; there is no basemap under any of it.
 ### Docs
 
 FEATURES.md +8 rows (155 `TESTED` of 379). STATUS.md counts corrected (they
-were stale: 648 → 705 tests, 36 → 41 diagrams) and a row for the contact
+were stale: 648 → 732 tests, 36 → 41 diagrams) and a row for the contact
 crossing. USAGE §7 says the dot is where the position came from. README file
 map.
 
@@ -279,6 +279,47 @@ the ROADMAP text. Its separable part — the site clock — is already done:
   place, so an event raised before a reshape now points at a shape that no
   longer exists. Slice 5 (versioned geometry) is what lifts that; until then
   the audit row is the only record of the previous outline.
+
+### Slice 1 of the map programme is built: zone adjudicability
+
+The engine half was written by hand after both workflow implementers died on a
+session limit — worth knowing before trusting a workflow with a long slice.
+
+- `coverage.sigma_bands(pose)` — the 0.5 / 1 / 2 / 5 m 1σ contours, found by
+  bisecting image rows (error falls monotonically down the frame, which is what
+  makes bisection valid). `lru_cache`d on the frozen pose: ~2,000 FFI calls,
+  fine once per placement, ruinous per repaint. A cache-hit test guards it.
+- `coverage.zone_report(ring, cameras)` → area, covered / outside / confident
+  fractions, contributing cameras, best and worst σ. `_footprint_polygons` is
+  now the single union path shared with `analyse`, and a test asserts the two
+  agree to 1e-6.
+- `zones.zone_warnings(zone, report, others)` — six warnings in a fixed order,
+  duck-typing the report so tests need no camera pose.
+- Console: bands painted nested under the zones, a compact measured legend, the
+  Covered column with a ⚠ glyph and warning tooltip, a "What the cameras can
+  rule on" group at the *top* of the properties panel, the live coverage line
+  in the drawing band, and a hatch over the part of the selected zone nothing
+  can see.
+
+**Three defects this slice found in its own code, all fixed and tested:**
+
+1. A 4 m square built from geodesic points measures 3.999990 m, so
+   `threshold <= half_width` dropped the 2 m band from a zone sized for exactly
+   that band — 0% confident on a zone that is half inside it. Five microns.
+   `_WIDTH_TOLERANCE` and `test_a_zone_the_width_of_a_threshold_is_not_dropped_by_rounding`.
+2. `worst_sigma_m` was measured against the whole zone, so a zone with one
+   corner in the blind foreground reported "beyond 5 m" when the real answer was
+   1 m and the hole was already reported by `covered_fraction`. Now measured
+   against the reachable part.
+3. `_refresh_placement` called `set_cameras` (which refits) before `set_zones`,
+   so the fit was always one zone behind and a zone drawn behind the camera was
+   framed out of the only view that could explain it.
+
+**And three the photograph found, which no test would have:** the properties
+panel crushed its own rows into each other on a short window (a `QFormLayout`
+given too little height compresses rather than clips — it is a `QScrollArea`
+now); the zone list's five columns were cut off; and the legend was first
+clipped to "…not de", then measured and 489 px wide on a 600 px view.
 
 **Immediate:**
 

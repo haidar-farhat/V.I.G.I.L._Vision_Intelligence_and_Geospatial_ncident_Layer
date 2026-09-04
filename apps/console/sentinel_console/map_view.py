@@ -31,6 +31,7 @@ from PySide6.QtGui import (
     QBrush,
     QColor,
     QFont,
+    QFontMetricsF,
     QKeyEvent,
     QMouseEvent,
     QPainter,
@@ -94,6 +95,12 @@ class MapView(QWidget):
         # where it does not, and that needs more than one camera on it.
         self._cameras: dict[str, CameraPose] = {}
         self._footprints: dict[str, list[LatLon]] = {}
+        #: Per camera, its position-error bands, tightest first (see
+        #: `coverage.sigma_bands`). Set by the owner; never computed here.
+        self._bands: dict[str, tuple] = {}
+        #: The last live coverage report and the outline it was computed for.
+        self._report_cache: tuple | None = None
+        self.show_legend = True
         self._tracks: tuple[Track, ...] = ()
         # Trails are keyed by camera and track, because a track id is only
         # unique within one camera. Merging them would draw one path jumping
@@ -520,6 +527,88 @@ class MapView(QWidget):
         self._fit_view()
         self.update()
 
+    def set_sigma_bands(self, bands: dict) -> None:
+        """Each camera's position-error bands, from `coverage.sigma_bands`."""
+        self._bands = dict(bands)
+        self.update()
+
+    def live_report(self):
+        """What the cameras can rule on for the outline being drawn or reshaped,
+        or ``None`` when nothing is in progress or it has fewer than three
+        corners. The bands are cached per pose upstream, so only the Shapely
+        intersection runs here."""
+        points = None
+        if self._draw_points is not None and len(self._draw_points) >= 3:
+            points = self._draw_points
+        elif self._edit is not None and len(self._edit["points"]) >= 3:
+            points = self._edit["points"]
+        if points is None or self._origin is None or not self._cameras:
+            return None
+
+        # Cached on the outline itself. This runs from the paint path, and
+        # measured at 1 ms for one camera, 9.6 ms for eight and 21 ms for
+        # sixteen — most of it Shapely, not the projection. Most repaints while
+        # drawing move only the pointer and leave the corners alone, and those
+        # now cost nothing. A reshape drag does change them every frame, and on
+        # a large site that is the 21 ms; it is bounded, and it happens only
+        # inside an explicit edit gesture.
+        key = (
+            tuple((round(east, 3), round(north, 3)) for east, north in points),
+            tuple(sorted(self._cameras)),
+        )
+        if self._report_cache is not None and self._report_cache[0] == key:
+            return self._report_cache[1]
+
+        from sentinel.coverage import zone_report
+
+        try:
+            report = zone_report([self._from_local(e, n) for e, n in points], self._cameras)
+        except Exception:  # noqa: BLE001 - a half-drawn bow tie is not an error worth a dialog
+            report = None
+        self._report_cache = (key, report)
+        return report
+
+    #: The legend's two lines. Swatches are drawn inline on the first.
+    _LEGEND_HEADING = "1σ ≤"
+    _LEGEND_SWATCHES = ("0.5", "1", "2", "5 m")
+    _LEGEND_CAPTION = "unshaded: beyond 5 m"
+
+    def legend_rect(self) -> QRectF:
+        """Sized to the text it holds, and sitting clear of the scale bar.
+
+        A fixed 236 px box clipped its own last line to "…not de" in the first
+        photograph of it, and the measured replacement was wider than a narrow
+        view. Anything with text in it has to measure that text *and* be told
+        where the edges are.
+        """
+        metrics = QFontMetricsF(self._legend_font())
+        swatches = sum(
+            metrics.horizontalAdvance(label) + 20.0 for label in self._LEGEND_SWATCHES
+        )
+        width = max(
+            metrics.horizontalAdvance(self._LEGEND_HEADING) + 8.0 + swatches,
+            metrics.horizontalAdvance(self._LEGEND_CAPTION),
+        ) + 16.0
+        width = min(width, max(80.0, self.width() - 20.0))
+        height = metrics.height() * 2 + 12.0
+        # Above the scale bar, never over it: two overlaid captions in the same
+        # corner are unreadable, and the scale bar is the one an operator needs
+        # to judge a distance by eye.
+        bottom = self.scale_bar_rect().top() - 8.0
+        return QRectF(
+            max(6.0, self.width() - width - 10.0), bottom - height, width, height
+        )
+
+    def _legend_font(self) -> QFont:
+        font = QFont(self.font())
+        font.setPointSize(8)
+        font.setBold(False)
+        return font
+
+    def scale_bar_rect(self) -> QRectF:
+        step = _nice_step(self._span_meters)
+        return QRectF(8.0, self.height() - 40.0, step * self._scale() + 8.0, 36.0)
+
     def set_zones(self, zones) -> None:
         """Areas whose boundaries mean something.
 
@@ -575,6 +664,10 @@ class MapView(QWidget):
             for point in footprint
         ]
         points += [self._to_local(pose.position) for pose in self._cameras.values()]
+        # Zones too. A zone drawn behind the camera — the very case the coverage
+        # warning exists for — was off the edge of the only view that could have
+        # shown the operator why it will never fire.
+        points += [self._to_local(point) for zone in self._zones for point in zone.ring]
         if len(points) < 2:
             self._view_centre = (0.0, 0.0)
             self._span_meters = 60.0
@@ -643,10 +736,74 @@ class MapView(QWidget):
         self._paint_outline_in_progress(painter)
         self._paint_edit_handles(painter)
         self._paint_scale_bar(painter)
+        if self.show_legend and self._bands:
+            self._paint_legend(painter)
         banner = self._banner()
         if banner is not None:
             self._paint_banner(painter, banner)
         painter.end()
+
+    def _outside_parts(self, zone) -> list[QPolygonF]:
+        """Screen polygons of the zone's area outside every footprint."""
+        if not self._footprints:
+            return []
+        try:
+            from shapely.geometry import Polygon
+            from shapely.ops import unary_union
+        except ImportError:  # pragma: no cover - shapely is a dependency
+            return []
+        try:
+            area = Polygon([self._to_local(p) for p in zone.ring])
+            union = unary_union([
+                Polygon([self._to_local(p) for p in ring]) for ring in self._footprints.values() if len(ring) >= 3
+            ])
+            outside = area.difference(union)
+        except Exception:  # noqa: BLE001 - degenerate geometry is not worth a repaint failure
+            return []
+        parts = getattr(outside, "geoms", [outside])
+        return [
+            QPolygonF([self._to_screen(x, y) for x, y in part.exterior.coords])
+            for part in parts
+            if not part.is_empty and part.area > 0.05
+        ]
+
+    def _paint_legend(self, painter: QPainter) -> None:
+        """What the shading means: two lines, bottom-right, clear of the scale bar.
+
+        Deliberately small. It overlays the ground, and a legend that hides the
+        site it explains is worse than no legend — so the swatches sit inline on
+        one row rather than stacked down the corner of the map.
+        """
+        rect = self.legend_rect()
+        painter.setPen(QPen(theme.BORDER))
+        painter.setBrush(QBrush(QColor(0, 0, 0, 170)))
+        painter.drawRoundedRect(rect, 4, 4)
+
+        font = self._legend_font()
+        painter.setFont(font)
+        metrics = QFontMetricsF(font)
+        baseline = rect.top() + metrics.ascent() + 4.0
+
+        painter.setPen(QPen(theme.TEXT_MUTED))
+        heading = self._LEGEND_HEADING
+        painter.drawText(QPointF(rect.left() + 8, baseline), heading)
+        x = rect.left() + 8 + metrics.horizontalAdvance(heading) + 8.0
+
+        # Loosest alpha first, to match the order of the labels.
+        for label, alpha in zip(self._LEGEND_SWATCHES, reversed(theme.SIGMA_BANDS)):
+            swatch = QColor(theme.FOOTPRINT)
+            swatch.setAlpha(alpha + 60)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(swatch))
+            painter.drawRect(QRectF(x, baseline - 8.0, 12.0, 9.0))
+            painter.setPen(QPen(theme.TEXT_MUTED))
+            painter.drawText(QPointF(x + 14.0, baseline), label)
+            x += metrics.horizontalAdvance(label) + 20.0
+
+        painter.setPen(QPen(theme.TEXT_FAINT))
+        painter.drawText(
+            QPointF(rect.left() + 8, baseline + metrics.height()), self._LEGEND_CAPTION
+        )
 
     def _banner(self) -> str | None:
         if self._pick_prompt is not None:
@@ -656,13 +813,27 @@ class MapView(QWidget):
             return (
                 f"{getattr(self, '_draw_prompt', 'Draw a zone')}: {placed} point(s) — "
                 "click to add, double-click or Enter to close, right-click to undo, Esc to abandon"
+                + self._report_line()
             )
         if self._edit is not None:
             return (
                 "Reshape: drag a corner, click an edge to add one, right-click a "
                 "corner to remove it, drag inside to move — Enter to apply, Esc to revert"
+                + self._report_line()
             )
         return None
+
+    def _report_line(self) -> str:
+        """A second banner line: what the cameras could rule on for the outline
+        as it stands. Empty until there are three corners."""
+        report = self.live_report()
+        if report is None:
+            return ""
+        seen = ", ".join(report.cameras) if report.cameras else "no camera"
+        return (
+            f"\ncovered {report.covered_fraction:.0%} · confident {report.confident_fraction:.0%}"
+            f" · {report.area_m2:.0f} m² · seen by {seen}"
+        )
 
     def _paint_banner(self, painter: QPainter, text: str) -> None:
         """Say what the next click will do, across the top of the view."""
@@ -670,7 +841,8 @@ class MapView(QWidget):
         font.setPointSize(10)
         font.setBold(True)
         painter.setFont(font)
-        band = self.rect().adjusted(0, 0, 0, -(self.height() - 30))
+        lines = text.count("\n") + 1
+        band = self.rect().adjusted(0, 0, 0, -(self.height() - 16 - 16 * lines))
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QBrush(QColor(0, 0, 0, 170)))
         painter.drawRect(band)
@@ -771,6 +943,24 @@ class MapView(QWidget):
                 QPolygonF([self._to_screen(*self._to_local(p)) for p in footprint])
             )
 
+        # The bands: how well a position inside the footprint is actually known.
+        # Widest first so each tighter band paints over the looser one, and the
+        # far half of a long footprint stays as pale as the footprint itself —
+        # "beyond 5 m" is the honest reading there, and the legend says so.
+        painter.setPen(Qt.PenStyle.NoPen)
+        for bands in self._bands.values():
+            for index, band in enumerate(reversed(tuple(bands))):
+                alpha = theme.SIGMA_BANDS[min(index, len(theme.SIGMA_BANDS) - 1)]
+                colour = QColor(theme.FOOTPRINT)
+                colour.setAlpha(alpha)
+                painter.setBrush(QBrush(colour))
+                ring = getattr(band, "ring", band)
+                if len(ring) < 3:
+                    continue
+                painter.drawPolygon(
+                    QPolygonF([self._to_screen(*self._to_local(p)) for p in ring])
+                )
+
     def _paint_zones(self, painter: QPainter) -> None:
         font = QFont(painter.font())
         font.setPointSize(8)
@@ -794,6 +984,15 @@ class MapView(QWidget):
             painter.setPen(QPen(edge, 3.0 if selected else 1.6, Qt.PenStyle.SolidLine if selected else Qt.PenStyle.DashLine))
             painter.setBrush(QBrush(fill))
             painter.drawPolygon(polygon)
+            if selected:
+                # The part of the selected zone no camera can see, hatched: a
+                # zone half outside every footprint is half a zone, and an
+                # operator drawing one should see which half.
+                for outside in self._outside_parts(zone):
+                    painter.setPen(Qt.PenStyle.NoPen)
+                    painter.setBrush(QBrush(theme.OUTSIDE_HATCH, Qt.BrushStyle.BDiagPattern))
+                    painter.drawPolygon(outside)
+                painter.setPen(QPen(edge, 3.0))
 
             painter.setPen(QPen(edge))
             centroid = polygon.boundingRect().center()

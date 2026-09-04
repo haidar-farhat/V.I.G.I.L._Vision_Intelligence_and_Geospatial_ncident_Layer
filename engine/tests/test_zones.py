@@ -11,6 +11,8 @@ from datetime import datetime, time, timezone
 
 import pytest
 
+from dataclasses import dataclass
+
 from sentinel.core import (
     BoundingBox,
     LatLon,
@@ -20,7 +22,7 @@ from sentinel.core import (
     destination_point,
     zone_membership,
 )
-from sentinel.zones import Schedule, Zone, ZoneEvaluator, ZoneKind
+from sentinel.zones import Schedule, Zone, ZoneEvaluator, ZoneKind, zone_warnings
 
 SITE = LatLon(33.8938, 35.5018)
 
@@ -372,3 +374,118 @@ def test_schedules_are_read_in_the_site_clock_not_utc():
     for step in range(3):
         early.update([track], step * 200, datetime(2026, 8, 30, 4, 30, tzinfo=timezone.utc))
     assert early.open_presences() == ()
+
+
+# ------------------------------------------ what is wrong with this zone
+
+
+@dataclass
+class FakeReport:
+    """Stands in for `coverage.ZoneReport`, which `zone_warnings` duck-types.
+
+    Deliberately not the real thing: these tests are about the warnings, and
+    building a real report would tie them to a camera pose and make a change in
+    the projection show up as a failure here.
+    """
+
+    covered_fraction: float = 1.0
+    confident_fraction: float = 1.0
+    area_m2: float = 100.0
+
+
+def square(centre: LatLon, half: float) -> tuple[LatLon, ...]:
+    return tuple(
+        destination_point(centre, bearing, half * 1.4142135623730951)
+        for bearing in (45.0, 135.0, 225.0, 315.0)
+    )
+
+
+def area_zone(zone_id: str, name: str, kind: ZoneKind, centre: LatLon, half: float = 5.0,
+              **overrides) -> Zone:
+    return Zone(id=zone_id, name=name, kind=kind, ring=square(centre, half), **overrides)
+
+
+def test_a_zone_nothing_can_see_is_named_as_unable_to_fire():
+    # The most dangerous object in the system: it looks exactly like protection.
+    yard = area_zone("a", "Yard", ZoneKind.RESTRICTED, SITE)
+
+    (warning,) = zone_warnings(yard, FakeReport(covered_fraction=0.0, confident_fraction=0.0))
+
+    assert "no camera can see this zone" in warning
+    assert "never fire" in warning
+
+
+def test_a_zone_wider_than_its_own_position_error_is_warned():
+    yard = area_zone("a", "Yard", ZoneKind.RESTRICTED, SITE)
+
+    (warning,) = zone_warnings(yard, FakeReport(confident_fraction=0.2))
+
+    assert warning.startswith("80% of this zone is beyond confident range")
+    assert "UNCERTAIN" in warning
+
+
+def test_a_zone_that_accepts_uncertainty_is_not_warned_about_it():
+    # An interest or exclusion zone is allowed to act on an uncertain position;
+    # warning about it would be noise, and noise is how warnings stop working.
+    watching = area_zone("a", "Car park", ZoneKind.INTEREST, SITE, accept_uncertain=True)
+
+    assert zone_warnings(watching, FakeReport(confident_fraction=0.2)) == ()
+
+
+def test_an_exclusion_over_a_restricted_zone_is_reported_as_silencing_it():
+    yard = area_zone("a", "Yard", ZoneKind.RESTRICTED, SITE)
+    pavement = area_zone(
+        "x", "Public pavement", ZoneKind.EXCLUSION, destination_point(SITE, 90.0, 6.0)
+    )
+
+    (warning,) = zone_warnings(yard, FakeReport(), [pavement])
+
+    assert warning == "inside exclusion Public pavement: silenced there"
+
+
+def test_same_kind_overlaps_are_reported_with_their_area():
+    # Two 10 m squares, one 6 m east of the other: they share 4 m by 10 m.
+    yard = area_zone("a", "Yard", ZoneKind.RESTRICTED, SITE)
+    twin = area_zone(
+        "b", "Second yard", ZoneKind.RESTRICTED, destination_point(SITE, 90.0, 6.0)
+    )
+
+    (warning,) = zone_warnings(yard, FakeReport(), [twin])
+
+    assert warning.startswith("overlaps Second yard (RESTRICTED),")
+    assert "40 m²" in warning, warning
+
+
+def test_a_zone_does_not_report_overlapping_itself():
+    yard = area_zone("a", "Yard", ZoneKind.RESTRICTED, SITE)
+
+    assert zone_warnings(yard, FakeReport(), [yard]) == ()
+
+
+def test_a_schedule_that_covers_no_time_is_warned():
+    # `covers` asks start <= now < end, which no moment satisfies when they are
+    # equal — so the zone is disarmed for ever and reads as merely scheduled.
+    dead = area_zone(
+        "a", "Yard", ZoneKind.RESTRICTED, SITE, schedule=Schedule(time(9, 0), time(9, 0))
+    )
+
+    (warning,) = zone_warnings(dead, FakeReport())
+
+    assert warning == "schedule 09:00–09:00 covers no time"
+
+
+def test_a_zone_smaller_than_a_square_metre_is_warned():
+    tiny = area_zone("a", "Speck", ZoneKind.RESTRICTED, SITE, half=0.3)
+
+    (warning,) = zone_warnings(tiny, FakeReport(area_m2=0.36))
+
+    assert warning == "area 0.4 m² is under 1 m²"
+
+
+def test_a_healthy_zone_produces_no_warnings():
+    yard = area_zone("a", "Yard", ZoneKind.RESTRICTED, SITE)
+    elsewhere = area_zone(
+        "b", "Far field", ZoneKind.RESTRICTED, destination_point(SITE, 90.0, 400.0)
+    )
+
+    assert zone_warnings(yard, FakeReport(), [elsewhere]) == ()

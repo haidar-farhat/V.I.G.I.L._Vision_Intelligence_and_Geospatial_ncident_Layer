@@ -201,12 +201,18 @@ def main() -> int:
         name="Public pavement", kind=ZoneKind.EXCLUSION, radius=6.0,
         centre=destination_point(session.pose.position, session.pose.heading + 28.0, 30.0),
     )
-    # A drawn outline — five corners, not a square — selected so the properties
-    # panel is populated in the photograph.
-    anchor = destination_point(session.pose.position, session.pose.heading - 30.0, 40.0)
+    # A drawn outline — five corners, not a square — straddling the far edge
+    # of the footprint so its outside part shows the hatch, selected so the
+    # properties panel is populated in the photograph.
+    anchor = destination_point(session.pose.position, session.pose.heading - 24.0, 80.0)
     drawn = window._create_zone(
-        tuple(destination_point(anchor, b, 9.0) for b in (10.0, 80.0, 150.0, 230.0, 300.0)),
+        tuple(destination_point(anchor, b, 12.0) for b in (10.0, 80.0, 150.0, 230.0, 300.0)),
         name="Delivery yard", kind=ZoneKind.INTEREST,
+    )
+    # And one nothing can see: 40 m behind the camera. It must read "⚠ 0%".
+    window._add_zone(
+        name="Back lot", kind=ZoneKind.RESTRICTED, radius=6.0,
+        centre=destination_point(session.pose.position, session.pose.heading + 180.0, 40.0),
     )
     if drawn is not None:
         window.zones_view.select(drawn.id)
@@ -223,6 +229,20 @@ def main() -> int:
     window.detail_tabs.setCurrentIndex(1)
     shoot(window.detail_tabs, f"{prefix}08-zones")
     window.detail_tabs.setCurrentIndex(0)
+
+    # Mid-drawing: three corners placed and the pointer moving, so the
+    # coverage line in the band is photographed with the rubber band.
+    from PySide6.QtCore import QPoint, Qt
+    from PySide6.QtTest import QTest
+
+    if window.map.begin_draw("Draw a zone"):
+        view = window.map
+        for bearing in (-12.0, 8.0, 20.0):
+            point = destination_point(session.pose.position, session.pose.heading + bearing, 25.0)
+            QTest.mouseClick(view, Qt.MouseButton.LeftButton, pos=view._to_screen(*view._to_local(point)).toPoint())
+        QTest.mouseMove(view, pos=view.rect().center() + QPoint(40, 30))
+        shoot(view, f"{prefix}09-drawing")
+        view.cancel_draw()
     shoot(window.incidents, f"{prefix}06-incidents")
     if window._sessions:
         shoot(next(iter(window._sessions.values())).view, f"{prefix}07-camera-view")
@@ -231,7 +251,9 @@ def main() -> int:
     # blank-looking screenshot can be told apart from a blank one that is right.
     print()
     print(f"  cameras     {len(window._sessions)}")
-    print(f"  zones       {len(window._zones)}")
+    warned = sum(1 for w in getattr(window, "_zone_warnings", {}).values() if w)
+    bands = {len(b) for b in window.map._bands.values()}
+    print(f"  zones       {len(window._zones)} · warned {warned} · bands per camera {', '.join(str(b) for b in sorted(bands)) or 0}")
     print(f"  tracks      {window.tracks.topLevelItemCount()} row(s)")
     print(f"  incidents   {len(window._incidents)}")
     print(f"  status      {window.status.currentMessage()}")

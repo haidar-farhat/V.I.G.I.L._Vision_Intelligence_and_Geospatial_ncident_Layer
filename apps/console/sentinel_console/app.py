@@ -72,11 +72,12 @@ from sentinel.events import (
     ZoneEntryRule,
 )
 from sentinel.evidence import ExportError, export_incident
+from sentinel.coverage import sigma_bands, zone_report
 from sentinel.node import Node, NodeError, Update
 from sentinel.paths import default_model_path
 from sentinel.store import default_database_path
 from sentinel import devices, logs, telemetry
-from sentinel.zones import Zone, ZoneKind
+from sentinel.zones import Zone, ZoneKind, zone_warnings
 
 from . import theme
 from .incident_view import IncidentView
@@ -137,7 +138,7 @@ def _detector_summary(info) -> str:
 
 
 #: The least height the incident and track panels are ever given. See `_build`.
-LOWER_PANEL_MINIMUM_HEIGHT = 210
+LOWER_PANEL_MINIMUM_HEIGHT = 260
 
 
 class ConsoleWindow(QMainWindow):
@@ -486,8 +487,9 @@ class ConsoleWindow(QMainWindow):
         body.addWidget(self.zones_view)
         body.addWidget(self.zone_properties)
         body.setStretchFactor(0, 3)
-        body.setStretchFactor(1, 2)
+        body.setStretchFactor(1, 4)
         body.setCollapsible(1, False)
+        body.setCollapsible(0, False)
         layout.addWidget(body, 1)
         return panel
 
@@ -666,9 +668,19 @@ class ConsoleWindow(QMainWindow):
             for session in self._sessions.values()
             if session.pose is not None
         }
-        self.map.set_cameras(placed)
+        # Zones first: `set_cameras` is what refits the view, and it can only
+        # frame the zones the map already knows about. The other order left the
+        # fit one zone behind, so a zone drawn behind the camera — exactly the
+        # one whose warning says it can never fire — was framed out of the only
+        # view that could show the operator why.
         self.map.set_zones(self._zones)
-        self.zones_view.show_zones(self._zones)
+        self.map.set_cameras(placed)
+        # What each camera can rule on, and what that means for every zone.
+        # The bands are memoised per pose upstream, so this costs one Shapely
+        # pass per zone and never runs from a paint.
+        self.map.set_sigma_bands({camera_id: sigma_bands(pose) for camera_id, pose in placed.items()})
+        self._zone_reports, self._zone_warnings = self._assess_zones(placed)
+        self.zones_view.show_zones(self._zones, self._zone_reports, self._zone_warnings)
         self._sync_zone_properties()
 
         if not placed:
@@ -845,17 +857,46 @@ class ConsoleWindow(QMainWindow):
         self.node.replace_zone(reshaped)
         self._refresh_placement()
         self.zones_view.select(zone_id)
-        self._set_status(f"{zone.name} reshaped: {len(ring)} corners.")
+        warned = getattr(self, "_zone_warnings", {}).get(zone_id, ())
+        self._set_status(
+            f"{zone.name} reshaped: {len(ring)} corners."
+            + (f" ⚠ {warned[0]}" if warned else "")
+        )
 
     def _zone_selection_changed(self) -> None:
         zone_id = self.zones_view.selected_zone_id()
         self.map.select_zone(zone_id)
         self._sync_zone_properties()
 
+    def _assess_zones(self, placed: dict) -> tuple[dict, dict]:
+        """Coverage report and warnings for every zone, by id."""
+        reports: dict = {}
+        warnings: dict = {}
+        if not placed:
+            return reports, warnings
+        zones = list(self._zones)
+        for zone in zones:
+            try:
+                reports[zone.id] = zone_report(zone.ring, placed)
+            except Exception:  # noqa: BLE001 - a report is advisory; a failure must not take the map down
+                _log.exception("coverage report failed for %s", zone.id)
+                continue
+        for zone in zones:
+            report = reports.get(zone.id)
+            if report is None:
+                continue
+            warnings[zone.id] = zone_warnings(zone, report, [z for z in zones if z.id != zone.id])
+        return reports, warnings
+
     def _sync_zone_properties(self) -> None:
         zone_id = self.zones_view.selected_zone_id()
         zone = next((z for z in self._zones if z.id == zone_id), None)
         self.zone_properties.show_zone(zone)
+        reports = getattr(self, "_zone_reports", {})
+        warnings = getattr(self, "_zone_warnings", {})
+        self.zone_properties.show_report(
+            reports.get(zone_id) if zone else None, warnings.get(zone_id, ()) if zone else ()
+        )
 
     def _zone_clicked_on_map(self, zone_id: str) -> None:
         self.zones_view.select(zone_id)
@@ -980,11 +1021,16 @@ class ConsoleWindow(QMainWindow):
         # until there is one and must not stay dead once there is.
         self.node.add_zone(zone)
 
-        self.map.set_zones(self._zones)
-        self.zones_view.show_zones(self._zones)
+        # Refresh through the same path placement uses, so the new zone gets
+        # its coverage report and warnings at once; then say the first warning
+        # in the status bar rather than a modal — the zone is created either
+        # way, and the operator can see the hatch on the map.
+        self._refresh_placement()
         self.zones_view.select(zone.id)
+        warned = getattr(self, "_zone_warnings", {}).get(zone.id, ())
         self._set_status(
             f"{len(self._zones)} zone(s). Rules apply to cameras started from now."
+            + (f" ⚠ {zone.name}: {warned[0]}" if warned else "")
         )
         return zone
 
