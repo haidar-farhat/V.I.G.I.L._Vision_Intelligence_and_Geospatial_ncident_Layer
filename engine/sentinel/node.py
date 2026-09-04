@@ -39,7 +39,7 @@ import threading
 import time
 from datetime import datetime
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 
 import numpy as np
 from pathlib import Path
@@ -114,7 +114,7 @@ class Update:
         return self.result.image
 
 
-class CameraState(str, Enum):
+class CameraState(StrEnum):
     """The one word an operator gets for a camera, and what it is allowed to mean.
 
     Five states rather than two, because "running" was the lie this exists to
@@ -123,6 +123,12 @@ class CameraState(str, Enum):
     a second, and the console's own strip showed it green. The distinction that
     matters is not running versus stopped — it is *producing frames* versus
     *not*, and only the last-frame clock knows which.
+
+    :class:`~enum.StrEnum`, not ``(str, Enum)``, and the difference is visible
+    to an operator: with the mixin, ``f"{CameraState.LIVE}"`` renders
+    ``"CameraState.LIVE"`` on this interpreter — measured — so the first
+    f-string an interface writes around the state puts a Python repr on the
+    status strip. Comparison against ``"LIVE"`` is unaffected.
     """
 
     #: The thread is alive and frames have arrived recently. The only state that
@@ -204,10 +210,24 @@ class CameraHealth:
 
     @property
     def covers_ground(self) -> bool:
-        """Whether it may claim its footprint on the map at all.
+        """Whether ground is being watched *right now*. Not "draw this camera".
 
-        Placed *and* producing frames. Either half alone is a footprint drawn
-        over ground nobody is watching.
+        Placed *and* producing frames. Either half alone is a footprint filled
+        in over ground nobody is watching.
+
+        **It is deliberately not the draw-at-all test**, and reading it as one
+        erases the entire coverage map whenever the node is stopped — including
+        the moment an operator is placing cameras and most needs to see what
+        they would cover. The map draws the *planned* footprint from the pose,
+        as it does today, and uses this only to decide how: filled where this is
+        True, hatched where :attr:`is_dark`, dimmed or outlined where the camera
+        is placed and merely STOPPED.
+
+        A camera silent for twenty-nine seconds still claims its ground, on
+        purpose. :data:`DARK_AFTER_SECONDS` is the one threshold in this module;
+        a second, quieter one for the map would have the map and the status
+        strip disagreeing about the same camera, and an operator cannot tell
+        which of the two is lying.
         """
         return self.is_placed and self.state is CameraState.LIVE
 
@@ -220,18 +240,23 @@ class CameraHealth:
         parts = [self.state.value]
         if self.state is CameraState.FAULTED and self.fault:
             parts.append(self.fault)
-        elif self.state is CameraState.DARK:
+        elif self.state in (CameraState.LIVE, CameraState.DARK):
             silent = (
                 self.seconds_since_frame
                 if self.seconds_since_frame is not None
                 else self.seconds_since_started
             )
-            parts.append(
-                f"no frame for {silent:.0f}s" if silent is not None
-                else "no frame ever"
-            )
-        elif self.state is CameraState.LIVE:
-            parts.append(f"{self.analysis_fps:.0f} fps")
+            if silent is None:
+                parts.append("no frame ever")
+            elif silent > 1.0:
+                # The rate window is one second wide, so a camera that last
+                # delivered twenty seconds ago has a *measured* rate of zero and
+                # is still inside the grace period before DARK. Quoting it read
+                # "LIVE — 0 fps", a line that contradicts itself in four words.
+                # The silence is the fact that is actually known, so say that.
+                parts.append(f"no frame for {silent:.0f}s")
+            else:
+                parts.append(f"{self.analysis_fps:.0f} fps")
         if self.reconnects:
             parts.append(f"{self.reconnects} reconnect(s)")
         if not self.is_placed:

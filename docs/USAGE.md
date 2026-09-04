@@ -931,7 +931,7 @@ Not limitations. Design rules, each enforced by something other than intention.
 | Reach the Internet | Zero WAN, checked three ways: a static source audit at commit, an offline CI job that drops all outbound traffic, and the runtime egress guard |
 | Download a model | Models are supplied by you and placed in `models/`. A missing model is an error that says so, not a cue to go and find one |
 | Send telemetry | Nothing here, and onnxruntime's own telemetry is switched off explicitly — the promise has to hold for every dependency |
-| Identify a person | No facial recognition, no biometrics, no identity database. Objects are tracked; people are not identified. Enforced by absence |
+| Identify a person | Today: no facial recognition, no biometrics, no identity database — objects are tracked, people are not identified, enforced by absence. An opt-in People register is designed (FEATURES.md); when it ships it is off per site until switched on, nobody is enrolled by being seen, and a name never appears without the score and face behind it |
 | Control a camera or take a security action | The AI is an analyst. The operator is the decision maker |
 | Invent a position | A projection that cannot be made returns nothing. It never guesses and never clamps |
 | Report speed it cannot measure | Speed is withheld below 1.2 s of observation, because dividing a distance by one frame interval amplifies position error fivefold |

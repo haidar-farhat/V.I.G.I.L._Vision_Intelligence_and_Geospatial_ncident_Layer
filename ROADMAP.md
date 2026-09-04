@@ -474,3 +474,66 @@ LOCAL-frame sites with floor plans as levels, the NOT GEOGRAPHIC badge and metre
 *Depends on:* Cameras you can see and move; Working incidents; Versions: zones and poses that history can point at
 
 *Rows:* Track position samples persisted at 1 Hz for replay and heatmaps · Site activity heatmaps · track density maps · Incident replay · Uncertainty as an ellipse from the pinhole Jacobian
+
+### 17. The site draws its own map — L
+
+The cameras already know where the ground is: every placed camera has a pinhole
+projection from image to ground. Inverting it over a grid of ground cells samples
+each frame into a top-down patch, and a running median per cell over minutes
+removes everything that moves — what is left is the empty site. Patches from every
+camera composite in the site frame, each cell taken from the camera with the
+smallest position error there. The result is drawn as the basemap under the plan
+view, with per-cell freshness, uncovered ground left empty, and a fingerprint
+against the site record. Not in this slice: any imported imagery, and any claim
+about surfaces above the ground plane.
+
+*Why here:* it turns "a metric grid, not a site plan" into a real map using only
+footage the site already has — no tiles, no download, no aerial photograph an
+offline site cannot obtain. It needs the site frame to composite into and is far
+better with calibration, so it sits after both.
+
+*Depends on:* The site record: one frame, a boundary, the blind spots on the map · The picture as the truth
+
+*Rows:* Ground orthophoto from one camera · A temporal median makes the moving objects vanish · Site orthomosaic from every camera · The generated map is drawn under the plan view · Per-cell freshness and coverage, drawn honestly · The generated basemap is a site asset with a fingerprint
+
+### 18. Vehicles and their plates — L
+
+Vehicle classes already come from the segmenter. This adds an operator-supplied
+plate detector and `cv2.dnn.TextRecognitionModel` run only inside a vehicle's box,
+a read aggregated across a track rather than taken from one frame, a vehicles
+register normalised to the site's plate format, a watchlist that raises an event,
+and a movement history per vehicle. Unresolved characters are shown as `?` beside
+the crop and never completed by guesswork. Off per site until switched on, audited,
+retained and deletable. Not in this slice: faces.
+
+*Why here:* it is the identity feature with the weakest claim on a person — a
+legally displayed identifier rather than a measurement of somebody's body — so it
+proves the register, the watchlist, the history panel and the retention machinery
+before any of that machinery touches biometrics.
+
+*Depends on:* Working incidents · The site record: one frame, a boundary, the blind spots on the map
+
+*Rows:* Plate detection inside a vehicle track · Plate text recognition · A plate is read from a track, not from a frame · A partial or unsure read is never shown as a plate · Vehicles register: plate, name, notes · Watchlist: a plate that raises an event when read · Movement history for a vehicle · Vehicles menu: register, name, watchlist, forget · Off by default, audited, retained and deletable
+
+### 19. People, by name and only on purpose — XL
+
+YuNet and SFace, both already in OpenCV 5, with operator-supplied weights: a face
+detector run only inside a person track, a 128-float template, and a match
+aggregated over a track. A People register where enrolment is an operator naming a
+track — never automatic, with no gallery of unknown faces. The name appears with
+its score and the matched crop wherever it appears, and a middling score reads
+*possible match*, fires no rule and is drawn differently. A movement history per
+person across cameras and time. Off per site until switched on and enforced in the
+pipeline; every enrolment, match, rename and deletion audited; templates swept by
+retention; a delete that really deletes. Face crops kept only under a second,
+separate opt-in.
+
+*Why here:* last of the identity work, deliberately. Biometric templates are
+special-category personal data in most jurisdictions, so this ships only once the
+switch, the audit trail, the retention sweep and the delete have been built and
+proven by the vehicle register — the safeguards are the feature, not decoration
+around it. It reuses that slice's register, history panel and watchlist wholesale.
+
+*Depends on:* Vehicles and their plates · Structured before/after audit records for every map, zone and camera edit
+
+*Rows:* Face detection · Face embedding · People register: enrol a face and give it a name · A track is matched to a person, with its score · The name is shown on the track, in the table and on the map · Movement history for a person, across cameras and time · People menu: register, enrol, rename, merge, forget · Off by default, switched on per site, audited both ways · Forget a person, completely · Retention for biometric templates · Face crops stored only when the operator opts in separately · Nothing biometric leaves the machine · An unmatched face is never enrolled, counted or stored

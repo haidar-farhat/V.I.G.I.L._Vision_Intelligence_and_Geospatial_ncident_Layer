@@ -89,6 +89,10 @@ FAR_EDGE_HORIZON = "horizon"
 #: an edge within a few centimetres of the range is the range.
 _FAR_EDGE_TOLERANCE_M = 0.05
 
+#: The hatch a dark camera's ground is drawn in: the idle grey rather than the
+#: footprint blue, because blue in this view means a camera is seeing.
+_DARK_HATCH = QColor(theme.IDLE.red(), theme.IDLE.green(), theme.IDLE.blue(), 110)
+
 
 class MapView(QWidget):
     """A north-up plan view in metres, centred on the camera."""
@@ -455,6 +459,18 @@ class MapView(QWidget):
                 reach = [haversine_distance(pose.position, p) for p in footprint]
                 lines.append(f"sees {min(reach):.0f} m to {max(reach):.0f} m ahead")
             lines.append(f"{pose.mount_height:.1f} m up, facing {pose.heading:.0f}°")
+            # Which of the two things stopped it there. An operator who wants to
+            # see further reaches for the range setting, and on a camera the
+            # ground already runs out under, raising it changes nothing at all.
+            kind = self.far_edge_kind(hover.camera_id)
+            if kind == FAR_EDGE_RANGE:
+                lines.append(f"stopped by its {pose.range_meters:.0f} m range")
+            elif kind == FAR_EDGE_HORIZON:
+                lines.append(
+                    f"stopped by the ground, short of its {pose.range_meters:.0f} m range"
+                )
+            if hover.camera_id in self._dark:
+                lines.append("delivering nothing — this ground is not being watched")
             return "\n".join(lines)
 
         if hover.kind == "zone":
@@ -1109,6 +1125,10 @@ class MapView(QWidget):
 
     def set_cameras(self, cameras: dict[str, CameraPose]) -> None:
         """Show every placed camera and its ground footprint."""
+        # Whatever was being dragged is gone: the owner has just said where the
+        # cameras are, and a half-finished gesture holding a pose from before
+        # that would commit it on release over the top of the new one.
+        self._camera_drag = None
         self._cameras = dict(cameras)
         self._trails.clear()
         self._footprints = {
@@ -1163,10 +1183,30 @@ class MapView(QWidget):
         self._report_cache = (key, report)
         return report
 
-    #: The legend's two lines. Swatches are drawn inline on the first.
+    #: The legend's rows. Swatches are drawn inline on the sigma heading.
     _LEGEND_HEADING = "1σ ≤"
     _LEGEND_SWATCHES = ("0.5", "1", "2", "5 m")
     _LEGEND_CAPTION = "unshaded: beyond 5 m"
+    #: The two far edges, one row each. The distinction is the whole reason
+    #: these lines exist: one of them is a number in a dialog and the other is
+    #: the site. Kept to two short rows because the measured one-line version
+    #: came out 451 px wide on a 600 px view and the legend sits on the ground.
+    _LEGEND_FAR_EDGE = ("solid edge: range", "dashed edge: horizon")
+    _LEGEND_DARK = "hatched: no frames"
+
+    def _legend_captions(self) -> tuple[str, ...]:
+        """The caption rows, and only the ones describing something on screen.
+
+        A legend line for a case the view is not drawing is one more thing to
+        read at three in the morning, and the legend sits on the ground it
+        explains.
+        """
+        captions = [self._LEGEND_CAPTION] if self._bands else []
+        if any(len(ring) >= 3 for ring in self._footprints.values()):
+            captions.extend(self._LEGEND_FAR_EDGE)
+        if any(camera_id in self._footprints for camera_id in self._dark):
+            captions.append(self._LEGEND_DARK)
+        return tuple(captions) or (self._LEGEND_CAPTION,)
 
     def legend_rect(self) -> QRectF:
         """Sized to the text it holds, and sitting clear of the scale bar.
@@ -1177,15 +1217,19 @@ class MapView(QWidget):
         where the edges are.
         """
         metrics = QFontMetricsF(self._legend_font())
-        swatches = sum(
-            metrics.horizontalAdvance(label) + 20.0 for label in self._LEGEND_SWATCHES
-        )
-        width = max(
-            metrics.horizontalAdvance(self._LEGEND_HEADING) + 8.0 + swatches,
-            metrics.horizontalAdvance(self._LEGEND_CAPTION),
-        ) + 16.0
-        width = min(width, max(80.0, self.width() - 20.0))
-        height = metrics.height() * 2 + 12.0
+        captions = self._legend_captions()
+        rows = len(captions)
+        width = max(metrics.horizontalAdvance(caption) for caption in captions)
+        if self._bands:
+            swatches = sum(
+                metrics.horizontalAdvance(label) + 20.0 for label in self._LEGEND_SWATCHES
+            )
+            width = max(
+                width, metrics.horizontalAdvance(self._LEGEND_HEADING) + 8.0 + swatches
+            )
+            rows += 1
+        width = min(width + 16.0, max(80.0, self.width() - 20.0))
+        height = metrics.height() * rows + 12.0
         # Above the scale bar, never over it: two overlaid captions in the same
         # corner are unreadable, and the scale bar is the one an operator needs
         # to judge a distance by eye.
@@ -1222,6 +1266,10 @@ class MapView(QWidget):
         located — by a camera the node no longer has.
         """
         self._live.pop(camera_id, None)
+        self._dark.discard(camera_id)
+        if self._camera_drag is not None and self._camera_drag["camera_id"] == camera_id:
+            # Not reverted — there is nothing left to revert it onto.
+            self._camera_drag = None
         self._tracks = tuple(t for group in self._live.values() for t in group)
         for key in [k for k in self._trails if k[0] == camera_id]:
             del self._trails[key]
@@ -1357,7 +1405,9 @@ class MapView(QWidget):
         self._paint_edit_handles(painter)
         self._paint_scale_bar(painter)
         self._paint_measure(painter)
-        if self.show_legend and self._bands:
+        # Footprints without bands still need the legend: the far edge means
+        # two different things whether or not the error has been computed.
+        if self.show_legend and (self._bands or self._footprints):
             self._paint_legend(painter)
         banner = self._banner()
         if banner is not None:
@@ -1436,26 +1486,32 @@ class MapView(QWidget):
         metrics = QFontMetricsF(font)
         baseline = rect.top() + metrics.ascent() + 4.0
 
-        painter.setPen(QPen(theme.TEXT_MUTED))
-        heading = self._LEGEND_HEADING
-        painter.drawText(QPointF(rect.left() + 8, baseline), heading)
-        x = rect.left() + 8 + metrics.horizontalAdvance(heading) + 8.0
-
-        # Loosest alpha first, to match the order of the labels.
-        for label, alpha in zip(self._LEGEND_SWATCHES, reversed(theme.SIGMA_BANDS)):
-            swatch = QColor(theme.FOOTPRINT)
-            swatch.setAlpha(alpha + 60)
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QBrush(swatch))
-            painter.drawRect(QRectF(x, baseline - 8.0, 12.0, 9.0))
+        # The swatches explain the shading, so they are drawn only when there is
+        # shading. Without bands the footprint is one flat blue, and a row
+        # reading "unshaded: beyond 5 m" over it would be a claim about the
+        # error out there that nobody has computed.
+        if self._bands:
             painter.setPen(QPen(theme.TEXT_MUTED))
-            painter.drawText(QPointF(x + 14.0, baseline), label)
-            x += metrics.horizontalAdvance(label) + 20.0
+            heading = self._LEGEND_HEADING
+            painter.drawText(QPointF(rect.left() + 8, baseline), heading)
+            x = rect.left() + 8 + metrics.horizontalAdvance(heading) + 8.0
+
+            # Loosest alpha first, to match the order of the labels.
+            for label, alpha in zip(self._LEGEND_SWATCHES, reversed(theme.SIGMA_BANDS)):
+                swatch = QColor(theme.FOOTPRINT)
+                swatch.setAlpha(alpha + 60)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QBrush(swatch))
+                painter.drawRect(QRectF(x, baseline - 8.0, 12.0, 9.0))
+                painter.setPen(QPen(theme.TEXT_MUTED))
+                painter.drawText(QPointF(x + 14.0, baseline), label)
+                x += metrics.horizontalAdvance(label) + 20.0
+            baseline += metrics.height()
 
         painter.setPen(QPen(theme.TEXT_FAINT))
-        painter.drawText(
-            QPointF(rect.left() + 8, baseline + metrics.height()), self._LEGEND_CAPTION
-        )
+        for caption in self._legend_captions():
+            painter.drawText(QPointF(rect.left() + 8, baseline), caption)
+            baseline += metrics.height()
 
     def _banner(self) -> str | None:
         if self.measuring:
@@ -1604,22 +1660,35 @@ class MapView(QWidget):
         where a hand-off between cameras can happen, and so where an operator
         should expect one object rather than two.
         """
-        painter.setPen(QPen(theme.FOOTPRINT_EDGE, 1.5))
-        painter.setBrush(QBrush(theme.FOOTPRINT))
-
-        for footprint in self._footprints.values():
+        for camera_id, footprint in self._footprints.items():
             if len(footprint) < 3:
                 continue
-            painter.drawPolygon(
-                QPolygonF([self._to_screen(*self._to_local(p)) for p in footprint])
+            local = [self._to_local(point) for point in footprint]
+            points = [self._to_screen(east, north) for east, north in local]
+            dark = camera_id in self._dark
+            painter.setPen(Qt.PenStyle.NoPen)
+            # Hatched, never filled. A fill is how this view says "seen", and a
+            # camera producing no frames is not seeing this ground — it is the
+            # ground nobody is watching, drawn the way the uncovered part of a
+            # zone is drawn.
+            painter.setBrush(
+                QBrush(_DARK_HATCH, Qt.BrushStyle.FDiagPattern)
+                if dark
+                else QBrush(theme.FOOTPRINT)
             )
+            painter.drawPolygon(QPolygonF(points))
+            self._paint_far_edge(painter, camera_id, local, points, dark)
 
         # The bands: how well a position inside the footprint is actually known.
         # Widest first so each tighter band paints over the looser one, and the
         # far half of a long footprint stays as pale as the footprint itself —
         # "beyond 5 m" is the honest reading there, and the legend says so.
         painter.setPen(Qt.PenStyle.NoPen)
-        for bands in self._bands.values():
+        for camera_id, bands in self._bands.items():
+            # A dark camera's bands say how well it *would* locate something.
+            # It is locating nothing, so they are not drawn.
+            if camera_id in self._dark:
+                continue
             for index, band in enumerate(reversed(tuple(bands))):
                 alpha = theme.SIGMA_BANDS[min(index, len(theme.SIGMA_BANDS) - 1)]
                 colour = QColor(theme.FOOTPRINT)
@@ -1631,6 +1700,68 @@ class MapView(QWidget):
                 painter.drawPolygon(
                     QPolygonF([self._to_screen(*self._to_local(p)) for p in ring])
                 )
+
+    def _far_arc_count(self, camera_id: str, local: list) -> int | None:
+        """How many of the footprint's leading vertices lie on its far edge.
+
+        Measured off the ring the view is holding, not assumed from the segment
+        count the core was asked for. If the core ever stopped emitting the far
+        arc first this answers ``None``, and the outline is drawn undecorated —
+        a dash across the wrong side of a footprint would say the operator's
+        range clamp is the thing they cannot change.
+        """
+        pose = self._cameras.get(camera_id)
+        if pose is None or len(local) < 3:
+            return None
+        origin = self._to_local(pose.position)
+        # Planar, off coordinates already computed for the screen points: a
+        # site is metres across, and this is a comparison rather than a
+        # measurement anybody reads.
+        distances = [math.hypot(e - origin[0], n - origin[1]) for e, n in local]
+        furthest = max(distances)
+        if furthest <= 0.0:
+            return None
+        floor = furthest - max(0.25, furthest * 0.002)
+        count = 0
+        for distance in distances:
+            if distance < floor:
+                break
+            count += 1
+        return count if 2 <= count < len(local) else None
+
+    def _paint_far_edge(
+        self, painter: QPainter, camera_id: str, local: list, points: list, dark: bool
+    ) -> None:
+        """The footprint's outline, with its far edge drawn for what bounds it.
+
+        Solid where the pose's stated range clamps the view — a number somebody
+        typed, and can raise — and dashed where the ground runs out first,
+        which no setting will move. An operator who wants another twenty metres
+        needs to know whether to change the range or the mast.
+        """
+        colour = QColor(theme.IDLE if dark else theme.FOOTPRINT_EDGE)
+        if dark:
+            colour.setAlpha(150)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+
+        count = self._far_arc_count(camera_id, local)
+        kind = self.far_edge_kind(camera_id)
+        if count is None or kind is None:
+            # Nothing honest to say about which edge is which, so the outline is
+            # drawn in one weight and claims nothing.
+            painter.setPen(QPen(colour, 1.5))
+            painter.drawPolygon(QPolygonF(points))
+            return
+
+        # The near edge and the two sides first, then the far arc over them.
+        painter.setPen(QPen(colour, 1.5))
+        painter.drawPolyline(QPolygonF(points[count - 1:] + points[:1]))
+        painter.setPen(QPen(
+            colour,
+            2.2,
+            Qt.PenStyle.SolidLine if kind == FAR_EDGE_RANGE else Qt.PenStyle.DashLine,
+        ))
+        painter.drawPolyline(QPolygonF(points[:count]))
 
     def _paint_zones(self, painter: QPainter) -> None:
         font = QFont(painter.font())
@@ -1692,8 +1823,12 @@ class MapView(QWidget):
                 painter.setBrush(Qt.BrushStyle.NoBrush)
                 painter.drawEllipse(centre, 13, 13)
 
-            painter.setPen(QPen(theme.CAMERA, 2))
-            painter.setBrush(QBrush(theme.PANEL))
+            # A dark camera is hollow, struck through, and in the colour the
+            # console uses for "nothing is running". The same shape, so it is
+            # still recognisably a camera; unmistakably not this one's evidence.
+            dark = camera_id in self._dark
+            painter.setPen(QPen(theme.IDLE if dark else theme.CAMERA, 2))
+            painter.setBrush(Qt.BrushStyle.NoBrush if dark else QBrush(theme.PANEL))
             painter.drawEllipse(centre, 5, 5)
 
             # A short stalk showing where it is pointed.
@@ -1705,9 +1840,37 @@ class MapView(QWidget):
                     centre.y() - math.cos(heading) * 16,
                 ),
             )
+            if dark:
+                painter.drawLine(
+                    QPointF(centre.x() - 6.0, centre.y() - 6.0),
+                    QPointF(centre.x() + 6.0, centre.y() + 6.0),
+                )
+
+            self._paint_heading_handle(painter, camera_id)
 
             painter.setPen(QPen(theme.TEXT_MUTED))
-            painter.drawText(QPointF(centre.x() + 8, centre.y() + 12), camera_id)
+            painter.drawText(
+                QPointF(centre.x() + 8, centre.y() + 12),
+                f"{camera_id} · dark" if dark else camera_id,
+            )
+
+    def _paint_heading_handle(self, painter: QPainter, camera_id: str) -> None:
+        """The grip that turns a camera, out on the far edge of its own wedge.
+
+        Drawn only while the view is editable, and that is the point: a handle
+        offered in Monitor advertises a gesture the lock is going to refuse.
+        """
+        point = self.heading_handle(camera_id)
+        if point is None:
+            return
+        turning = (
+            self._camera_drag is not None
+            and self._camera_drag["camera_id"] == camera_id
+            and self._camera_drag["kind"] == "aim"
+        )
+        painter.setPen(QPen(theme.SELECTION, 2.0 if turning else 1.4))
+        painter.setBrush(QBrush(theme.PANEL))
+        painter.drawEllipse(point, 5.0, 5.0)
 
     def _paint_trails(self, painter: QPainter) -> None:
         painter.setBrush(Qt.BrushStyle.NoBrush)
@@ -1809,6 +1972,39 @@ class MapView(QWidget):
         painter.drawText(
             QPointF(left, bottom + 14), "wheel: zoom   drag: pan   double-click: fit"
         )
+
+
+@lru_cache(maxsize=64)
+def _far_edge_kind(pose: CameraPose) -> str | None:
+    """Whether this pose's footprint is stopped by its range or by the ground.
+
+    The core builds the wedge out to ``min(top of frame, range_meters)``, so the
+    question is which of the two won, and it is answered by asking for the top
+    row of the frame with the range clamp switched off. No answer means that row
+    is at or above the horizon and only the range is holding the wedge in; an
+    answer shorter than the range means the ground ran out first. ``None`` only
+    when the core cannot be asked, and then nothing is claimed either way.
+
+    Cached on the pose — frozen, so it hashes — because a repaint asks for it.
+    """
+    try:
+        far = project_to_ground(pose, 0.5, 0.0, enforce_range=False)
+    except Exception:  # noqa: BLE001 - a broken core must not take a repaint with it
+        return None
+    if far is None:
+        return FAR_EDGE_RANGE
+    if far.ground_distance_meters >= pose.range_meters - _FAR_EDGE_TOLERANCE_M:
+        return FAR_EDGE_RANGE
+    return FAR_EDGE_HORIZON
+
+
+def _angle_difference(a: float, b: float) -> float:
+    """Degrees from `a` to `b`, signed, in -180..180.
+
+    So that 359° and 1° are two degrees apart rather than three hundred and
+    fifty eight, which is what decided whether a nudged camera was re-aimed.
+    """
+    return (b - a + 180.0) % 360.0 - 180.0
 
 
 def _distance(a: tuple[float, float], b: tuple[float, float]) -> float:

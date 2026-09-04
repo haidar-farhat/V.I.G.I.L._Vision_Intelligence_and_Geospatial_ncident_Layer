@@ -376,10 +376,20 @@ is not a trail.
 
 ## Privacy by design
 
-- No facial recognition. No biometric identification. No identity database.
+- **Today: no facial recognition, no biometric identification, no identity
+  database.** Identity is designed but unbuilt; see below and FEATURES.md.
 - Tracking is appearance-based and identity-free; the optional embedding used for
   cross-camera association is a similarity vector, not an identifier, and is never
   matched against any enrolled set.
+- **When the opt-in People register ships**, the guarantee becomes narrower and
+  stays checkable: off per site until switched on and enforced in the pipeline;
+  enrolment only ever by an operator naming a track; a template rather than a
+  photograph unless the crop is separately opted into; every enrolment, match,
+  rename and deletion audited; a delete that removes templates and unlinks
+  history; template retention swept like recordings; and nothing biometric
+  leaving the machine. Biometric templates are special-category personal data in
+  most jurisdictions — the switch, the audit trail, the retention sweep and the
+  delete are what make operating it lawful, not optional extras around it.
 - Detection classes are physical and non-biometric.
 - The AI analyst is forbidden from asserting identity, inferring protected traits,
   or claiming criminality, and reports violating that are rejected before display.

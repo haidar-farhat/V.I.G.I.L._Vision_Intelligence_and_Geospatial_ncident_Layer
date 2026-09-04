@@ -33,26 +33,26 @@ Related: [STATUS.md](STATUS.md) — measurements and honest gaps ·
 
 ## The scoreboard
 
-427 capabilities, each with a state. Many lines cover several related things —
+456 capabilities, each with a state. Many lines cover several related things —
 "heading · pitch · roll" is one row — so this counts *claims*, not code.
 
 | | Count | Share | What it means |
 |---|---:|---:|---|
-| **`TESTED`** | 169 | 40% | A test fails if it stops working |
-| **`IMPL`** | 22 | 5% | Works; a regression would go unnoticed |
+| **`TESTED`** | 169 | 37% | A test fails if it stops working |
+| **`IMPL`** | 23 | 5% | Works; a regression would go unnoticed |
 | **`SKEL`** | 32 | 7% | Something is there; it does not do the job |
-| **`PLAN`** | 204 | 48% | Designed, no code |
+| **`PLAN`** | 232 | 51% | Designed, no code |
 
 ```mermaid
 pie showData
-    title Sentinel Vision — 427 capabilities by state
+    title Sentinel Vision — 456 capabilities by state
     "TESTED" : 169
-    "IMPLEMENTED" : 22
+    "IMPLEMENTED" : 23
     "SKELETON" : 32
-    "PLANNED" : 204
+    "PLANNED" : 232
 ```
 
-**Read that 40% carefully.** It is not "a third of the product is finished" — it
+**Read that 37% carefully.** It is not "a third of the product is finished" — it
 is that the part which is finished is the analytical core plus, now, the
 recording that makes its evidence real, while most of what is planned is the
 product surface around them. The parts a demonstration shows off are the parts
@@ -266,6 +266,61 @@ two identical webcams are indistinguishable by name.
 | Track history search | `PLAN` | |
 | Track position samples persisted at 1 Hz for replay and heatmaps | `PLAN` | Migration: `track_samples (camera_id, track_id, at_millis, lat, lon, uncertainty_m, class_label)` written by the node from `poll()` at most once per second per track — about 100 bytes × tracks × 86,400 per camera per day, stated in the docs as a budget. Retention by age, except that samples inside a preserved incident window are preserved like segments and never deleted, and the evidence package includes them as `tracks.jsonl`. Turns 'trails are context, not a recording' into replayable trails and a heatmap of movement rather than of alerts. |
 
+## 🧑 People: named identity, opt-in
+
+Until now the answer to "who is that?" was *the system does not know and will not
+guess*. This is the design for knowing, on purpose, where an operator has decided
+their site needs it — a warehouse with twelve staff, a depot with a contractor
+list — and it is built so that the decision stays visible and reversible.
+
+Three properties hold the whole section up, and every row below is downstream of
+them. **It is off until somebody turns it on**, and off means no face is detected,
+embedded or stored, not that the column is hidden. **Nobody is enrolled by being
+seen** — enrolment is an operator naming a track, once, deliberately. **A name is
+never asserted without the evidence for it**: the score and the matched face are
+shown wherever the name is, because a security product that says "this is Ali"
+with nothing behind it is worse than one that says nothing.
+
+Face work runs only inside a person track's box, so a scene with no people costs
+nothing, and only while the feature is on.
+
+| Capability | State | Notes |
+|---|---|---|
+| Face detection | `PLAN` | `cv2.FaceDetectorYN` — YuNet, which OpenCV 5 already ships. The operator supplies the ONNX, as with the segmenter; nothing is ever downloaded. Run only inside an existing person track, never over the whole frame |
+| Face embedding | `PLAN` | `cv2.FaceRecognizerSF` — SFace, also in OpenCV 5. A 128-float template per face, compared by cosine distance. A template is not an image and cannot be turned back into one, which is what makes storing it defensible where storing the crop would not be |
+| People register: enrol a face and give it a name | `PLAN` | `people` and `face_templates` tables. Enrolment is only ever an explicit act on a track — "Name this person…" — never automatic and never from a passer-by. The row records who enrolled, when, and the lawful basis they chose from a list the site configured |
+| A track is matched to a person, with its score | `PLAN` | Aggregated across the frames of a track, never decided on one. Above the high threshold it reads *match*; between the two thresholds it reads *possible match*, is drawn differently and fires no rule; below, nothing is claimed at all. The score and the matched crop travel with the name everywhere it appears |
+| The name is shown on the track, in the table and on the map | `PLAN` | With the same *match* / *possible match* distinction in all three, so an operator cannot see the certain form in one panel and the hedged form in another |
+| Movement history for a person, across cameras and time | `PLAN` | Every track matched to that person, listed with camera and time and drawn as a trail on the plan view. This is the feature the rest exists to serve: *where has this person been* |
+| People menu: register, enrol, rename, merge, forget | `PLAN` | One place that lists everybody enrolled, how many templates each has, when they were last seen, and what they are allowed to be matched against |
+| Off by default, switched on per site, audited both ways | `PLAN` | With it off, no face is detected, no template computed and none stored — enforced in the pipeline, not in the interface. Turning it on and off is an audit row like any other configuration change |
+| Forget a person, completely | `PLAN` | Deletes every template, unlinks the movement history, and audits the deletion. A biometric register with no delete is not lawful in most jurisdictions and not defensible in any of them |
+| Retention for biometric templates | `PLAN` | Templates expire on a per-site policy unless the person is pinned, swept by the same retention job that deletes recorded video. The default is short on purpose |
+| Face crops stored only when the operator opts in separately | `PLAN` | The template is the default and the crop is not kept. A crop is a photograph of somebody's face and needs its own justification, its own retention and its own audit row |
+| Nothing biometric leaves the machine | `PLAN` | Covered by the existing offline guarantee — no network at runtime — and by extending the evidence exporter's credential scanner to refuse any package carrying templates unless the operator explicitly included them |
+| An unmatched face is never enrolled, counted or stored | `PLAN` | A stranger walking past produces a track like any other and nothing else. There is no "unknown persons" gallery, because that is an identity database built by accident |
+
+## 🚗 Vehicles and number plates
+
+The same shape as people, for the object a site can identify without touching
+anybody's biometrics: the plate on the front of a vehicle. The safeguards are
+kept anyway — a plate is personal data in most of the world — but the evidence
+is a photograph of a legally displayed identifier, which is a materially weaker
+claim on someone than their face.
+
+| Capability | State | Notes |
+|---|---|---|
+| A track is known to be a vehicle | `IMPL` | `car`, `truck`, `bus` and `motorcycle` already come from the COCO segmenter; nothing new is needed to know a track is a vehicle, only to read it |
+| Plate detection inside a vehicle track | `PLAN` | An operator-supplied ONNX detector run only inside a vehicle's box, never over the frame. Off with the feature, like faces |
+| Plate text recognition | `PLAN` | `cv2.dnn.TextRecognitionModel` (CRNN), which OpenCV 5 ships; the operator supplies the weights and the character set for their country |
+| A plate is read from a track, not from a frame | `PLAN` | One frame is a guess. The same characters agreeing across several frames of one track is a reading, and the count is kept and shown |
+| A partial or unsure read is never shown as a plate | `PLAN` | Unresolved characters are drawn as `?` with the crop beside them. A plate that reads `B?7 4?21` must never be presented, matched or exported as `BX7 4921` |
+| Vehicles register: plate, name, notes | `PLAN` | Normalised per the site's country format so `B 7421` and `B-7421` are one vehicle, with the raw read kept beside the normalised form |
+| Watchlist: a plate that raises an event when read | `PLAN` | The one place plate reading becomes a rule rather than a record. Severity and schedule per entry, like a zone |
+| Movement history for a vehicle | `PLAN` | Every track its plate was read on, across cameras and time, drawn on the plan view — the same panel as a person's history |
+| Vehicles menu: register, name, watchlist, forget | `PLAN` | |
+| Off by default, audited, retained and deletable | `PLAN` | The same machinery as people: a per-site switch enforced in the pipeline, an audit row for every change, a retention sweep, and a delete that really deletes |
+
 ## 🔗 Multi-camera intelligence
 
 | Capability | State | Note |
@@ -319,6 +374,12 @@ two identical webcams are indistinguishable by name.
 | Map legend for the shading | `TESTED` | Two lines, bottom-right, measured to its own text and kept clear of the scale bar and under 45% of the view width — the first fixed-size version clipped its last line to "…not de", and the first measured one came out 489 px wide on a 600 px view |
 | A zone is always inside the fitted view | `TESTED` | `_fit_view` frames zones as well as cameras and footprints. A zone drawn behind the camera — precisely the one whose warning says it can never fire — used to be framed out of the only view that could show the operator why |
 | Measure a distance on the ground | `TESTED` | Two clicks give metres and bearing, drawn on the map and in the band. Read-only, so it is allowed while the site is locked — the only map gesture that changes nothing |
+| Ground orthophoto from one camera | `PLAN` | Every placed camera already has a pinhole ground projection; inverting it over a grid of ground cells samples the frame into a top-down patch. Only the ground plane is correct — anything with height smears radially away from the camera, which is exactly why the next row exists |
+| A temporal median makes the moving objects vanish | `PLAN` | Each ground cell keeps a running median over minutes, so a person walking through contributes to no cell's final value. What is left is the empty site, which is what a basemap should be — and it is built from footage the site already has rather than from an aerial photograph nobody can obtain offline |
+| Site orthomosaic from every camera | `PLAN` | Patches composited in the site frame. Where footprints overlap, each cell is taken from the camera with the smallest position error there — `coverage.sigma_bands` already computes precisely that, so the sharpest available view wins every cell |
+| The generated map is drawn under the plan view | `PLAN` | As a basemap layer beneath zones, footprints and tracks: the real ground under the virtual map, with no tile server, no download and no external imagery. The layer panel toggles it like any other |
+| Per-cell freshness and coverage, drawn honestly | `PLAN` | A cell last updated an hour ago is drawn faded and the layer reports its age; cells no camera covers are left empty rather than interpolated, because inventing ground nobody has seen is the one thing a map under a security overlay must not do |
+| The generated basemap is a site asset with a fingerprint | `PLAN` | Stored against the site record with the SHA-256 of its bytes, the poses it was built from and when, so an incident judged 'inside the fence' against it can be re-checked later — the same treatment as an imported plan or tile package |
 
 ## 📐 Spatial & camera geometry
 

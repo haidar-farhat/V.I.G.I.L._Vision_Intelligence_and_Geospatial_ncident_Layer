@@ -155,7 +155,31 @@ Raw prompts containing operational secrets are not stored.
 
 ## Privacy
 
-No facial recognition. No biometric identification. No identity database. The
-optional appearance embedding used for cross-camera association is a similarity
-vector compared only against other tracks in the same time window — never against
-an enrolled set, because there is no enrolled set and no code path to create one.
+**As built today: no facial recognition, no biometric identification, no identity
+database.** The optional appearance embedding used for cross-camera association is
+a similarity vector compared only against other tracks in the same time window —
+never against an enrolled set, because there is no enrolled set and no code path
+to create one.
+
+**As designed, and not yet built:** an opt-in People register (FEATURES.md,
+"People: named identity"). It is written down here rather than left to surprise
+somebody reading this page after it ships. The guarantee it replaces is not
+"there are no biometrics" but a narrower and checkable set:
+
+- It is **off until an operator turns it on**, per site, and off means no face is
+  detected, embedded or stored — enforced in the pipeline, not by hiding a column.
+- **Nobody is enrolled by being seen.** Enrolment is an operator naming a track,
+  deliberately, once. There is no gallery of unknown faces, because that is an
+  identity database assembled by accident.
+- What is stored is a **128-float template**, not a photograph. A crop is kept only
+  if the operator opts in to that separately.
+- A name is **never asserted without its evidence**: the score and the matched face
+  travel with it, and a middling score reads *possible match*, fires no rule, and is
+  drawn differently from a confident one.
+- **Forgetting works.** Deleting a person removes the templates and unlinks the
+  history, and the deletion is audited. Templates expire on a retention policy.
+- Nothing biometric leaves the machine; the offline guarantee is unchanged.
+
+Number-plate reading is designed the same way and under the same switch, with the
+difference that a plate is a legally displayed identifier rather than a measurement
+of somebody's body.
