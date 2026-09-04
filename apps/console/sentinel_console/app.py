@@ -33,7 +33,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QAction, QCloseEvent, QFont
+from PySide6.QtGui import QKeySequence, QShortcut, QAction, QCloseEvent, QFont
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -74,7 +74,7 @@ from sentinel.events import (
 )
 from sentinel.evidence import ExportError, export_incident
 from sentinel.coverage import sigma_bands, zone_report
-from sentinel.node import ACTOR, Node, NodeError, Update
+from sentinel.node import Node, NodeError, Update
 from sentinel.paths import default_model_path
 from sentinel.store import default_database_path
 from sentinel import devices, logs, telemetry
@@ -138,6 +138,12 @@ def _detector_summary(info) -> str:
     digest = f" · {info.model_sha256[:12]}" if info.model_sha256 else ""
     return f"{info.name} — {len(info.class_names)} classes{masks}{digest}"
 
+
+#: Who the console is, in the audit log. Not `node.ACTOR`: the node acts on
+#: its own behalf when it restores or correlates, and an operator unlocking the
+#: site is a different actor doing a different thing. A trail that cannot tell
+#: them apart cannot answer "who changed this".
+CONSOLE_ACTOR = "console"
 
 #: How long the console stays in Configure with nobody touching it. A lock
 #: that never re-arms is a lock somebody props open on the first day.
@@ -373,19 +379,25 @@ class ConsoleWindow(QMainWindow):
         self.ground_label.setToolTip(
             "The ground point under the pointer. Ctrl+C copies it."
         )
+        # Bound, because the tooltip above promises it. It was written before
+        # the shortcut and the promise went unkept for as long as it took a
+        # review to read the two lines together.
+        copy = QShortcut(QKeySequence.StandardKey.Copy, self)
+        copy.setContext(Qt.ShortcutContext.WindowShortcut)
+        copy.activated.connect(self._copy_ground)
         self.status.addPermanentWidget(self.ground_label)
         self._ground_text = ""
 
-        # Locked to start with. After the status bar exists, not before: this
-        # puts the map into Select, which reports its mode, which writes to the
-        # status bar. Called too early it raised inside a Qt slot, and the
-        # swallowed exception's traceback held the whole window alive — the
-        # freeing test caught it, having been written for the same defect in a
-        # different disguise this morning.
-        self._set_configuring(False)
-
         self._set_status("Ready. Add a camera to begin.")
         self._build_menu()
+
+        # Locked to start with. Last, and both halves of that matter: after the
+        # status bar, because this puts the map into Select, which reports its
+        # mode, which writes to the status bar — called earlier it raised inside
+        # a Qt slot and the swallowed exception's traceback held the whole
+        # window alive. And after the menu, because the menu's actions are
+        # among the things being locked.
+        self._set_configuring(False)
 
     def _build_toolbar(self) -> QHBoxLayout:
         row = QHBoxLayout()
@@ -534,10 +546,15 @@ class ConsoleWindow(QMainWindow):
         layout.setSpacing(4)
 
         row = QHBoxLayout()
-        add = QPushButton("Add zone…")
-        add.setToolTip("A square of a chosen size, in front of the camera or at a clicked point.")
-        add.clicked.connect(self._add_zone_dialog)
-        row.addWidget(add)
+        # Kept on the instance so the lock can reach it: this is a second
+        # door to the same room as the toolbar's Add zone, and a lock that
+        # covers one door is not a lock.
+        self.add_zone_button = QPushButton("Add zone…")
+        self.add_zone_button.setToolTip(
+            "A square of a chosen size, in front of the camera or at a clicked point."
+        )
+        self.add_zone_button.clicked.connect(self._add_zone_dialog)
+        row.addWidget(self.add_zone_button)
         self.draw_zone_button = QPushButton("Draw zone")
         self.draw_zone_button.setToolTip(
             "Draw any outline on the plan view: click each corner, double-click "
@@ -598,15 +615,19 @@ class ConsoleWindow(QMainWindow):
     def _build_menu(self) -> None:
         file_menu = self.menuBar().addMenu("&File")
 
-        open_action = QAction("&Add camera…", self)
-        open_action.setShortcut("Ctrl+O")
-        open_action.triggered.connect(self._choose_source)
-        file_menu.addAction(open_action)
+        # Kept, because these are the same two actions as the toolbar buttons
+        # and the lock has to cover them: a shortcut that changes the site while
+        # the console says it is locked is not a lock. Ctrl+O and Ctrl+P did
+        # exactly that until an audit of every path to `node.*` found them.
+        self.add_camera_action = QAction("&Add camera…", self)
+        self.add_camera_action.setShortcut("Ctrl+O")
+        self.add_camera_action.triggered.connect(self._choose_source)
+        file_menu.addAction(self.add_camera_action)
 
-        place_action = QAction("&Camera placement…", self)
-        place_action.setShortcut("Ctrl+P")
-        place_action.triggered.connect(self._place_camera)
-        file_menu.addAction(place_action)
+        self.place_action = QAction("&Camera placement…", self)
+        self.place_action.setShortcut("Ctrl+P")
+        self.place_action.triggered.connect(self._place_camera)
+        file_menu.addAction(self.place_action)
 
         file_menu.addSeparator()
         quit_action = QAction("&Quit", self)
@@ -679,7 +700,9 @@ class ConsoleWindow(QMainWindow):
         light a webcam, and on macOS does not raise a permission prompt for a
         camera nobody asked to use.
         """
+        self._touch()
         dialog = AddCameraDialog(self)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
 
@@ -752,7 +775,11 @@ class ConsoleWindow(QMainWindow):
         checked after that is the ambiguity this was built to remove.
         """
         for name, button in self.mode_buttons.items():
-            button.setChecked(name == mode or (mode == "place" and name == MODE_SELECT))
+            # Place is not Select. Lighting Select while the next click moves a
+            # camera permanently is the exact lie these buttons exist to stop;
+            # during a pick none of them is lit and the map band says what the
+            # click will do.
+            button.setChecked(name == mode)
         # Deliberately does not touch the status bar. It used to call
         # `_refresh_status`, which overwrote the very message that said why a
         # mode had been refused — the operator saw the refusal for no frames at
@@ -767,6 +794,10 @@ class ConsoleWindow(QMainWindow):
             self.remove_button, self.zone_button, self.draw_zone_button,
             self.reshape_zone_button, self.remove_zone_button,
             self.zone_properties.apply_button,
+            # The menu duplicates of the first two buttons, with shortcuts.
+            self.add_camera_action, self.place_action,
+            # And the Zones tab's own copy of Add zone.
+            self.add_zone_button,
         ]
 
     def _set_configuring(self, on: bool) -> None:
@@ -794,7 +825,7 @@ class ConsoleWindow(QMainWindow):
 
         if was != self._configuring:
             self.store.audit(
-                ACTOR,
+                CONSOLE_ACTOR,
                 "console.configure.entered" if self._configuring else "console.configure.left",
                 self.node.node_id,
                 "unlocked the controls that change the site"
@@ -911,6 +942,7 @@ class ConsoleWindow(QMainWindow):
             return
 
         self._sessions.pop(session.camera_id, None)
+        self.map.forget_camera(session.camera_id)
         index = self.camera_picker.findData(session.camera_id)
         if index >= 0:
             self.camera_picker.removeItem(index)
@@ -1083,7 +1115,10 @@ class ConsoleWindow(QMainWindow):
                 session.view.set_selection(selection)
             self.incidents.set_selection(selection)
             self._show_selected_track_row(selection)
-            if selection is not None and selection.kind == "zone":
+            if selection is None:
+                self.zones_view.clearSelection()
+                self._sync_zone_properties()
+            elif selection.kind == "zone":
                 self.zones_view.select(selection.zone_id)
                 self.detail_tabs.setCurrentIndex(1)
             elif selection is not None and selection.kind == "track":
@@ -1172,13 +1207,23 @@ class ConsoleWindow(QMainWindow):
         if item is None:
             return
         key = item.data(0, Qt.ItemDataRole.UserRole)
-        where = item.text(8) if item.columnCount() > 8 else ""
+        where = item.text(8)
+        # The coordinate never travels alone. A position pasted into a radio
+        # call or a report without its uncertainty — or worse, without the fact
+        # that it is a *fallback* and not a location at all — is exactly how
+        # somebody gets sent to a place the system never claimed.
+        copied = f"{where}  ±{item.text(9).lstrip('±')}  ({item.text(10)})"
         menu = QMenu(self)
         action = menu.addAction("Copy position")
-        action.setEnabled(bool(where) and where != "not placed")
-        if menu.exec(self.tracks.viewport().mapToGlobal(position)) is action and action.isEnabled():
-            QGuiApplication.clipboard().setText(where)
-            self._set_status(f"Copied #{key[1]} on {key[0]}: {where}")
+        locatable = bool(where) and where != "not placed"
+        action.setEnabled(locatable)
+        if not locatable:
+            action.setToolTip("This camera is not placed, so there is no position.")
+        chosen = menu.exec(self.tracks.viewport().mapToGlobal(position))
+        menu.deleteLater()
+        if chosen is action and locatable:
+            QGuiApplication.clipboard().setText(copied)
+            self._set_status(f"Copied #{key[1]} on {key[0]}: {copied}")
 
     def _assess_zones(self, placed: dict) -> tuple[dict, dict]:
         """Coverage report and warnings for every zone, by id."""
@@ -1513,7 +1558,9 @@ class ConsoleWindow(QMainWindow):
 
     def _teardown(self) -> None:
         self._timer.stop()
-        self.open_button.setEnabled(True)
+        # Only if the site is unlocked. This used to re-enable it flatly, so
+        # stopping a camera silently undid the lock for Add camera.
+        self.open_button.setEnabled(self._configuring)
         self.start_button.setEnabled(bool(self._sessions))
         self.stop_button.setEnabled(False)
 
@@ -1586,6 +1633,11 @@ class ConsoleWindow(QMainWindow):
                 self.tracks.addTopLevelItem(
                     self._track_row(session.camera_id, track, update, info)
                 )
+
+        # The table is rebuilt about thirty times a second. Without this the
+        # selected row lost its highlight on the very next frame while the bus
+        # still held the selection — the map stayed lit and the table did not.
+        self._show_selected_track_row(self.selection.current)
 
     def _track_row(self, camera_id: str, track, update, info) -> QTreeWidgetItem:
         # The row's key is (camera, id): a track id is only unique within one

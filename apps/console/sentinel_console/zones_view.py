@@ -62,6 +62,19 @@ IN_FRONT_OF_CAMERA = "In front of the selected camera"
 PICK_ON_MAP = "Pick the centre on the map"
 
 
+def _floor_percent(fraction: float) -> str:
+    """A percentage that never rounds *up* to a reassuring number.
+
+    `f"{0.996:.0%}"` is "100%", and a zone with four square metres of blind
+    ground reading "Covered 100%" is the console telling an operator there is
+    nothing to check. Only a genuinely complete fraction may say 100%.
+    """
+    percent = fraction * 100.0
+    if percent >= 99.95 and fraction < 1.0:
+        return "99%"
+    return f"{int(percent) if percent < 100 else 100}%"
+
+
 def zone_extent_meters(zone: Zone) -> float:
     """How far across a zone is, roughly: twice the furthest vertex from the
     centroid. Enough to tell a 6 m doorway from a 60 m yard in a list."""
@@ -102,7 +115,7 @@ class ZonesView(QTreeWidget):
         for zone in zones:
             report = reports.get(zone.id)
             warned = tuple(warnings.get(zone.id, ()))
-            covered = "—" if report is None else f"{report.covered_fraction:.0%}"
+            covered = "—" if report is None else _floor_percent(report.covered_fraction)
             if warned:
                 covered = f"⚠ {covered}"
             item = QTreeWidgetItem([
@@ -447,11 +460,17 @@ class ZonePropertiesPanel(QWidget):
                 label.setText("—")
         else:
             self._covered.setText(
-                f"{report.covered_fraction:.0%} · {report.confident_fraction:.0%} confidently"
+                f"{_floor_percent(report.covered_fraction)} · "
+                f"{_floor_percent(report.confident_fraction)} confidently"
             )
             seen = ", ".join(report.cameras) if report.cameras else "no camera"
             self._seen_by.setText(f"{seen} · {report.area_m2:.0f} m²")
-            if report.best_sigma_m is None and report.worst_sigma_m is None:
+            if not report.cameras:
+                # Not a large error — no error at all, because nothing is
+                # looking. "Beyond 5 m" invited the operator to move the zone
+                # closer, when the answer is to point a camera at it.
+                self._sigma.setText("—  no camera sees this")
+            elif report.best_sigma_m is None and report.worst_sigma_m is None:
                 self._sigma.setText("beyond 5 m everywhere")
             else:
                 best = "—" if report.best_sigma_m is None else f"≤ {report.best_sigma_m:g} m"

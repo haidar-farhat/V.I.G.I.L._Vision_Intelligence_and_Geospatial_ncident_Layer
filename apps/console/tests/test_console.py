@@ -2115,8 +2115,26 @@ def test_the_video_pane_ignores_a_selection_from_another_camera(qt_app):
     ))
 
     assert view.hit_test(QPointF(0.45 * 640, 0.5 * 480)) == Selection.track("gate", 4)
-    # The same id, a different camera: not this pane's track.
-    assert not Selection.track("yard", 4).is_track("gate", 4)
+
+    def highlight_pixels() -> int:
+        from PySide6.QtGui import QImage
+
+        rendered = view.grab().toImage().convertToFormat(QImage.Format.Format_RGB888)
+        wanted = theme.SELECTION.name()
+        return sum(
+            rendered.pixelColor(x, y).name() == wanted
+            for y in range(0, rendered.height(), 2)
+            for x in range(0, rendered.width(), 2)
+        )
+
+    # The same id on another camera must light nothing here. The earlier
+    # version of this test never set a selection at all, so it passed no matter
+    # what `set_selection` did with the camera id.
+    view.set_selection(Selection.track("yard", 4))
+    assert highlight_pixels() == 0, "another camera's track #4 was highlighted here"
+
+    view.set_selection(Selection.track("gate", 4))
+    assert highlight_pixels() > 0, "this camera's own track #4 was not highlighted"
 
 
 def test_hovering_a_track_reports_how_its_position_was_obtained(qt_app):
@@ -2371,3 +2389,244 @@ def test_measuring_is_allowed_while_the_site_is_locked(qt_app, window, reference
     window._choose_mode(MODE_MEASURE)
 
     assert window.map.measuring
+
+
+def test_the_keyboard_cannot_walk_around_the_lock(qt_app, window):
+    """Ctrl+O and Ctrl+P change the site, so Monitor must disable them too.
+
+    They were connected straight to the same slots as the toolbar buttons but
+    left out of the lock, so the console could say it was locked while a
+    shortcut added or placed a camera. Found by listing every path that reaches
+    `node.add_camera` / `node.place_camera` and asking what could trigger it.
+    """
+    assert not window._configuring
+    assert not window.add_camera_action.isEnabled()
+    assert not window.place_action.isEnabled()
+
+    window.configure_button.setChecked(True)
+    assert window.add_camera_action.isEnabled()
+    assert window.place_action.isEnabled()
+
+    window.configure_button.setChecked(False)
+    assert not window.add_camera_action.isEnabled()
+    assert not window.place_action.isEnabled()
+
+
+def test_every_path_that_changes_the_site_goes_through_the_lock(qt_app, window):
+    """A structural check, so a new control cannot quietly skip the lock.
+
+    Every method that calls a mutating `node.*` must either be a slot the lock
+    disables, or be reachable only from one that is. The two lists are written
+    out rather than derived, so adding a control that changes the site is a
+    deliberate decision about which of those it is — and a new one that is
+    neither fails here rather than in a control room.
+    """
+    import inspect
+
+    from sentinel_console import app as app_module
+
+    gated_slots = {
+        "_choose_source", "_place_camera", "_place_camera_on_map",
+        "_remove_camera", "_add_zone_dialog", "_draw_zone", "_edit_outline",
+        "_remove_zone", "_edit_zone",
+    }
+    reachable_only_from_gated = {
+        "_create_zone": "from _add_zone and _zone_drawn",
+        "_change_zone": "from _edit_zone",
+        "add_camera": "from _choose_source",
+        "_map_picked": "only after a gated control began a pick",
+        "_zone_outline_edited": "only after Reshape",
+        "_zone_properties_applied": "only from the Apply button",
+        "_add_zone": "from _add_zone_dialog and the screenshot tool",
+    }
+    mutators = (
+        "self.node.add_camera", "self.node.remove_camera", "self.node.place_camera",
+        "self.node.add_zone", "self.node.replace_zone", "self.node.remove_zone",
+    )
+
+    current = None
+    offenders = set()
+    for line in inspect.getsource(app_module).splitlines():
+        if line.startswith("    def "):
+            current = line.split("def ", 1)[1].split("(", 1)[0]
+        if current is not None and any(call in line for call in mutators):
+            if current not in gated_slots and current not in reachable_only_from_gated:
+                offenders.add(current)
+
+    assert not offenders, (
+        f"{sorted(offenders)} change the site but are neither disabled by the "
+        "lock nor listed as reachable only from something that is"
+    )
+
+
+# --------------------------------------------- what the review found missing
+
+
+def test_moving_the_pointer_while_drawing_still_paints(qt_app):
+    """The repaint during a draw must survive the pointer moving.
+
+    `_hover` held two types at once — a `Selection` for what is under the
+    pointer, and a `QPointF` for the rubber band — so one mouse move after
+    pressing Draw raised inside `paintEvent`. Qt swallows that: the plan view
+    silently stopped drawing its corners, its rubber band, the scale bar and
+    the coverage banner, and the retained traceback kept the widget alive past
+    its last reference. No test covered draw-mode plus a move plus a repaint.
+    """
+    view, track, where = _map_with_a_track()
+    assert view.begin_draw("Draw a zone")
+    view._draw_points.append(view._to_local(where))
+
+    _move(view, QPointF(120.0, 140.0))
+
+    # `grab()` runs paintEvent synchronously and lets the exception out.
+    image = view.grab().toImage()
+    assert not image.isNull()
+    assert view.draw_points == 1, "the corner was lost"
+    assert view.hovered is None or hasattr(view.hovered, "kind"), (
+        "hover holds something that is not a Selection"
+    )
+
+
+def test_the_whole_plan_view_still_renders_while_drawing(qt_app):
+    # The failure above was silent, so assert the parts that vanished with it.
+    view, _, where = _map_with_a_track()
+    view.begin_draw("Draw a zone")
+    for offset in (-30.0, 30.0):
+        view._draw_points.append(
+            view._to_local(destination_point(where, offset + 90.0, 8.0))
+        )
+    _move(view, QPointF(200.0, 200.0))
+
+    assert view._banner() is not None, "the band went with the paint"
+    image = view.grab().toImage()
+    assert not image.isNull()
+
+
+def test_control_c_copies_the_ground_readout(qt_app, window, reference_video: Path):
+    """Through the real shortcut, not by calling the slot.
+
+    The readout's tooltip promised Ctrl+C while nothing was bound to it, and
+    the only test called `_copy_ground` directly — so the whole feature could
+    be unwired and the suite stayed green.
+    """
+    from PySide6.QtGui import QGuiApplication
+    from PySide6.QtTest import QTest
+
+    _placed_window(window, reference_video)
+    QGuiApplication.clipboard().setText("")
+    window._ground_moved(destination_point(SITE_POSE.position, SITE_POSE.heading, 22.0))
+    expected = window.ground_label.text()
+    assert expected
+
+    window.show()
+    QApplication.processEvents()
+    QTest.keyClick(window, Qt.Key.Key_C, Qt.KeyboardModifier.ControlModifier)
+    QApplication.processEvents()
+
+    assert QGuiApplication.clipboard().text() == expected
+
+
+def test_clicking_a_box_on_a_camera_pane_selects_that_track(qt_app):
+    # The pane's own click-to-select had no test at all.
+    import numpy as np
+
+    from sentinel.core import BoundingBox
+    from sentinel.node import Update
+    from sentinel.pipeline import FrameResult, PipelineStats
+    from sentinel_console.selection import Selection
+
+    view = VideoView()
+    view.camera_id = "gate"
+    view.resize(640, 480)
+    view.set_detector_info(MotionDetector().info)
+    track = _located_track(4, SITE_POSE.position, box=BoundingBox(0.3, 0.3, 0.3, 0.4))
+    view.show_update(Update(
+        result=FrameResult(index=1, timestamp_millis=1000, source_id="gate",
+                           detections=(), tracks=(track,), ended=(),
+                           image=np.zeros((480, 640, 3), dtype=np.uint8)),
+        analysis_fps=30.0, skipped=0, stats=PipelineStats(),
+    ))
+
+    caught: list = []
+    view.clicked.connect(caught.append)
+    _press(view, QPointF(0.45 * 640, 0.5 * 480))
+    assert caught == [Selection.track("gate", 4)]
+
+    # And a click on bare frame reports nothing selected.
+    caught.clear()
+    _press(view, QPointF(0.05 * 640, 0.05 * 480))
+    assert caught == [None]
+
+
+def test_copying_a_track_position_carries_its_uncertainty_and_provenance(qt_app, window, reference_video: Path):
+    """A coordinate must never travel alone.
+
+    Pasted into a radio call or a report without its uncertainty — or without
+    the fact that it is a *fallback* and not a location at all — is how
+    somebody gets sent to a place the system never claimed.
+    """
+    session = _placed_window(window, reference_video)
+    where = destination_point(SITE_POSE.position, SITE_POSE.heading, 20.0)
+    _feed_track(window, session, _located_track(7, where, radius=2.5))
+
+    row = window.tracks.topLevelItem(0)
+    assert row.data(0, Qt.ItemDataRole.UserRole) == ("cam-07", 7)
+    assert row.text(9).startswith("±2.5")
+    assert row.text(10) == "projected"
+
+    # What the menu would put on the clipboard, assembled the same way.
+    copied = f"{row.text(8)}  ±{row.text(9).lstrip('±')}  ({row.text(10)})"
+    assert "±2.5 m" in copied and "projected" in copied
+    assert row.text(8) in copied
+
+
+def test_a_fallback_position_is_copied_as_a_fallback(qt_app, window, reference_video: Path):
+    session = _placed_window(window, reference_video)
+    _feed_track(window, session, _located_track(
+        8, SITE_POSE.position, source="CAMERA_FALLBACK", radius=30.0
+    ))
+
+    row = window.tracks.topLevelItem(0)
+    assert row.text(10) == "fallback", "the provenance column lost the fallback"
+    copied = f"{row.text(8)}  ±{row.text(9).lstrip('±')}  ({row.text(10)})"
+    assert "fallback" in copied, "a fallback would be pasted as if it were a location"
+
+
+def test_the_incident_panel_keeps_its_selection_across_a_rebuild(qt_app):
+    # The panel is rebuilt on every collection tick. A selection that did not
+    # survive that would flicker off about thirty times a second.
+    from sentinel_console.incident_view import IncidentView
+    from sentinel_console.selection import Selection
+
+    view = IncidentView()
+    incidents = _incident_from_events(3)
+    view.show_incidents(incidents)
+    view.set_selection(Selection.incident(incidents[0].id))
+    assert view.selected_incident_id() == incidents[0].id
+
+    view.show_incidents(incidents)          # the rebuild
+
+    assert view.selected_incident_id() == incidents[0].id
+    assert view.topLevelItem(0).isSelected()
+
+    view.set_selection(None)
+    assert not view.topLevelItem(0).isSelected()
+
+
+def test_the_lock_covers_the_controls_by_name(qt_app, window):
+    """Named, not derived.
+
+    `test_the_console_opens_locked` iterates `_configure_only()` itself, so a
+    control left out of that list passes it. This names the controls that must
+    be in it, so removing one fails here.
+    """
+    gated = set(window._configure_only())
+    for name in (
+        "open_button", "place_button", "map_place_button", "remove_button",
+        "zone_button", "add_zone_button", "draw_zone_button",
+        "reshape_zone_button", "remove_zone_button",
+        "add_camera_action", "place_action",
+    ):
+        control = getattr(window, name)
+        assert control in gated, f"{name} is not covered by the lock"
+    assert window.zone_properties.apply_button in gated

@@ -356,6 +356,46 @@ refused; and a `_touch()` inserted by a sloppy patch landed in
 `_selection_changed`, which would have held the Configure lock open for ever
 just by clicking around — there is now a test for exactly that.
 
+### A five-dimension adversarial review of slice 2, and what it found
+
+Forty agents: five reviewers (Qt lifetime, logic, honesty, tests, integration)
+and a skeptic per finding told to refute it. **35 findings, 21 confirmed, 14
+refuted.** Every confirmed one is fixed. Worth running again on the next slice
+— the two most expensive defects were invisible to a green suite.
+
+**The blocker all five dimensions found independently.** `MapView._hover` held
+two types: the rubber-band pointer (a `QPointF`, pre-existing) and what the
+pointer is over (a `Selection`, new). One mouse move after pressing Draw raised
+`AttributeError` inside `paintEvent`. Qt swallows that, so the plan view simply
+stopped drawing — no corners, no rubber band, no scale bar, no banner — and the
+retained traceback pinned the widget and a still-active `QPainter` past their
+last reference. The rubber band is `_draw_cursor` now, and two tests cover
+draw-plus-move-plus-repaint (verified failing against the old name).
+
+**Two more ways past the Configure lock**, on top of the Ctrl+O / Ctrl+P
+shortcuts found earlier: the Zones tab has its *own* Add zone button, and
+`_teardown()` re-enabled Add camera flatly whenever a run stopped. A lock with
+three doors and a bolt on one is not a lock.
+
+**Honesty defects the geometry did not support:** "Copy position" put a bare
+coordinate on the clipboard with neither its ±1σ nor the fact that it might be
+a `CAMERA_FALLBACK` — pasted into a radio call, that sends somebody to a place
+the system never claimed. Hovering a fallback led with "0.0 m at 0° from the
+camera", a measurement of nothing. A zone no camera can see reported "beyond
+5 m everywhere" as though the error were the problem. And coverage rounded
+*up*, so a zone with real blind ground read "Covered 100%" — it reads 99% now,
+and only a genuinely complete fraction may say 100%.
+
+**Tests that could not fail:** the ground readout was only ever tested by
+calling its slot, so the feature could be unwired and stay green (it *was*
+unwired — the tooltip promised Ctrl+C and nothing was bound); the video-pane
+test never set a selection; `VideoView` click-to-select had no test at all; and
+the lock tests iterated the very list they were meant to police.
+
+**Note for next time:** the reviewers wrote scratch `test_zz_*.py` files into
+`apps/console/tests/` and one edited a source file to prove a finding. Both
+were cleaned up, but a review workflow should be told to work outside the repo.
+
 **Immediate:**
 
 1. **1.3 appearance re-ID.** The tracker fragments (17 tracks over 15 s on one

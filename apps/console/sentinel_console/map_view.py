@@ -97,7 +97,11 @@ class MapView(QWidget):
         #: Vertices of an outline being drawn, in local metres. `None` when not
         #: drawing; an empty list when drawing has begun and nothing is placed.
         self._draw_points: list[tuple[float, float]] | None = None
-        self._hover: QPointF | None = None
+        #: Where the pointer is while an outline is being drawn, for the
+        #: rubber band. Named apart from `_hover`, which is a `Selection`:
+        #: the two shared a name, and every repaint during a draw called
+        #: `.kind` on a QPointF and killed the paint.
+        self._draw_cursor: QPointF | None = None
         #: The outline being reshaped: its zone id, vertices in local metres,
         #: the original ring (to tell a no-op from a change), and drag state.
         self._edit: dict | None = None
@@ -284,7 +288,7 @@ class MapView(QWidget):
                 self.setToolTip(self._hover_text(hover) or "")
                 self.update()
         if self._draw_points is not None:
-            self._hover = position
+            self._draw_cursor = position
             self.update()
             return
         if self._edit is not None:
@@ -341,18 +345,20 @@ class MapView(QWidget):
                     continue
                 lines = [f"#{track.id} on {hover.camera_id}"]
                 if track.position is not None:
-                    metres = haversine_distance(
-                        self._cameras[hover.camera_id].position, track.position.point
-                    ) if hover.camera_id in self._cameras else None
-                    if metres is not None:
-                        bearing = bearing_degrees(
-                            self._cameras[hover.camera_id].position, track.position.point
+                    projected = track.position.source == "GROUND_PROJECTION"
+                    # Range and bearing only for a real projection. A fallback
+                    # sits *on* the camera, so it would read "0.0 m at 0°" — a
+                    # measurement, of nothing, that the operator would believe.
+                    if projected and hover.camera_id in self._cameras:
+                        origin = self._cameras[hover.camera_id].position
+                        lines.append(
+                            f"{haversine_distance(origin, track.position.point):.1f} m "
+                            f"at {bearing_degrees(origin, track.position.point):.0f}° from the camera"
                         )
-                        lines.append(f"{metres:.1f} m at {bearing:.0f}° from the camera")
                     lines.append(f"±{track.position.radius_meters:.1f} m (1σ)")
                     lines.append(
                         "projected onto the ground"
-                        if track.position.source == "GROUND_PROJECTION"
+                        if projected
                         else "projection failed — shown at the camera, not located"
                     )
                 else:
@@ -425,7 +431,12 @@ class MapView(QWidget):
             elif self.measuring:
                 self.cancel_measure()
             else:
-                self.select_zone(None)
+                # Nothing of the map's own to abandon, so the key belongs to
+                # the window, which clears the selection. Accepting it here
+                # made Escape do nothing whenever the map had focus.
+                self.mode_changed.emit(self.mode)
+                super().keyPressEvent(event)
+                return
             self.mode_changed.emit(self.mode)
             return
         if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
@@ -453,6 +464,11 @@ class MapView(QWidget):
         """
         if self._draw_points is not None:
             return MODE_DRAW
+        if self._edit is not None:
+            # Reshaping is a drawing gesture: the next click adds or grabs a
+            # corner, and reporting Select while it does that is the ambiguity
+            # this property exists to remove.
+            return MODE_DRAW
         if self._pick_prompt is not None:
             return MODE_PLACE
         if self._measuring:
@@ -465,6 +481,7 @@ class MapView(QWidget):
             return False
         self.cancel_draw()
         self.cancel_edit()
+        self.cancel_pick()
         self._measuring = True
         self._measure = []
         self._measure_to = None
@@ -510,8 +527,10 @@ class MapView(QWidget):
             return False
         self.cancel_edit()
         self.cancel_measure()
+        self.cancel_pick()
         self._draw_points = []
         self._draw_prompt = prompt
+        self._draw_cursor = None
         self._hover = None
         self.mode_changed.emit(MODE_DRAW)
         self.setCursor(Qt.CursorShape.CrossCursor)
@@ -543,6 +562,7 @@ class MapView(QWidget):
 
     def cancel_draw(self) -> None:
         self._draw_points = None
+        self._draw_cursor = None
         self._hover = None
         # Tracking stays on: hover inspection needs it whether or not anything
         # is being drawn, and switching it off here disabled hover for the rest
@@ -878,6 +898,23 @@ class MapView(QWidget):
         self._zones = list(zones)
         self.update()
 
+    def forget_camera(self, camera_id: str) -> None:
+        """Drop everything belonging to a camera that has gone.
+
+        Its tracks stayed in `_live` after the camera was removed: still
+        drawn, still hit-testable, and still described by the hover text as
+        located — by a camera the node no longer has.
+        """
+        self._live.pop(camera_id, None)
+        self._tracks = tuple(t for group in self._live.values() for t in group)
+        for key in [k for k in self._trails if k[0] == camera_id]:
+            del self._trails[key]
+        if self._selection is not None and self._selection.camera_id == camera_id:
+            self._selection = None
+        if self._hover is not None and self._hover.camera_id == camera_id:
+            self._hover = None
+        self.update()
+
     def set_tracks(self, tracks: tuple[Track, ...], camera_id: str = "camera") -> None:
         """Replace the tracks belonging to one camera.
 
@@ -972,6 +1009,15 @@ class MapView(QWidget):
 
     def paintEvent(self, _event) -> None:  # noqa: N802 - Qt naming
         painter = QPainter(self)
+        try:
+            self._paint(painter)
+        finally:
+            # An exception in here would otherwise leave an active QPainter
+            # attached to the widget — and Qt keeps the traceback, which keeps
+            # the widget, which is the leak this codebase already knows well.
+            painter.end()
+
+    def _paint(self, painter: QPainter) -> None:
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.fillRect(self.rect(), theme.PANEL)
 
@@ -984,7 +1030,6 @@ class MapView(QWidget):
                 Qt.AlignmentFlag.AlignCenter,
                 "This camera has not been placed.\nTracks are found but cannot be located.",
             )
-            painter.end()
             return
 
         self._paint_footprint(painter)
@@ -1001,7 +1046,6 @@ class MapView(QWidget):
         banner = self._banner()
         if banner is not None:
             self._paint_banner(painter, banner)
-        painter.end()
 
     def _outside_parts(self, zone) -> list[QPolygonF]:
         """Screen polygons of the zone's area outside every footprint."""
@@ -1169,12 +1213,12 @@ class MapView(QWidget):
         painter.setBrush(Qt.BrushStyle.NoBrush)
         if len(points) >= 2:
             painter.drawPolyline(QPolygonF(points))
-        if points and self._hover is not None:
-            painter.drawLine(points[-1], self._hover)
+        if points and self._draw_cursor is not None:
+            painter.drawLine(points[-1], self._draw_cursor)
             if len(points) >= 2:
                 faint = QPen(theme.TEXT_FAINT, 1.0, Qt.PenStyle.DotLine)
                 painter.setPen(faint)
-                painter.drawLine(self._hover, points[0])
+                painter.drawLine(self._draw_cursor, points[0])
         painter.setPen(QPen(theme.TEXT, 1.0))
         painter.setBrush(QBrush(theme.PANEL))
         for point in points:
