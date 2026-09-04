@@ -232,6 +232,11 @@ def main() -> int:
     shoot(window.tracks, f"{prefix}05-track-table")
     window.detail_tabs.setCurrentIndex(1)
     shoot(window.detail_tabs, f"{prefix}08-zones")
+    # The investigation tab, searched: the run above produced events and an
+    # incident, so "showing N of M" has something to count.
+    window.detail_tabs.setCurrentIndex(2)
+    window.investigation.search()
+    shoot(window.detail_tabs, f"{prefix}11-investigation")
     window.detail_tabs.setCurrentIndex(0)
 
     # Mid-drawing: three corners placed and the pointer moving, so the

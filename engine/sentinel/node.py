@@ -1519,7 +1519,23 @@ class Node:
         }
 
     def summary(self) -> str:
-        """What happened, for a person to read."""
+        """What happened, for a person to read — including what was recorded.
+
+        The audit block is here because nothing else reads the log. Every zone
+        edit, every placement and every removal has been written with its two
+        states and its chain hash since those columns existed, and an operator
+        had no way to see that any of it happened: the writing was end to end
+        and the reading stopped at the database. Three numbers close that, and
+        they are the three a person checking a log actually needs — how much is
+        there, how much of it is chained, and what the head is.
+
+        The head is printed in full, never shortened. Its whole purpose is to be
+        copied somewhere this process cannot reach, and a prefix copied into a
+        logbook is not the head: it would verify nothing and look as though it
+        had. The rows the chain does not cover are stated as a count rather than
+        passed over, because a chain over part of a log is worth having and
+        worth being honest about.
+        """
         lines = [f"node {self._node_id}"]
         for record in self._cameras.values():
             stats = record.runner.stats if record.runner else None
@@ -1537,4 +1553,15 @@ class Node:
                 )
             lines.append(f"    events        {len(record.events)}")
         lines.append(f"  incidents       {len(self._incidents)}")
+
+        written, chained = self.store.audit_totals()
+        lines.append(
+            f"  audit log       {written} row(s), {chained} chained, "
+            f"{written - chained} prose-only"
+        )
+        head = self.store.audit_chain_head()
+        lines.append(
+            f"  chain head      {head}" if head
+            else "  chain head      none — nothing chained has been written yet"
+        )
         return "\n".join(lines)

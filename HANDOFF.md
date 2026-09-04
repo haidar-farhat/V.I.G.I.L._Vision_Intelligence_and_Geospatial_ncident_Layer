@@ -396,6 +396,47 @@ the lock tests iterated the very list they were meant to police.
 `apps/console/tests/` and one edited a source file to prove a finding. Both
 were cleaned up, but a review workflow should be told to work outside the repo.
 
+### Three parallel workflows, 41 agents, and the wiring that made them count
+
+Run in this order, each with disjoint file ownership per agent, a skeptic per
+piece and a repair pass — the only arrangement that has not lost work to a
+collision:
+
+1. **Slices 3 and 4** (4 builders): `Node.camera_health()`, the `sites`
+   migration and `SiteFrame`, `CameraListPanel`, and camera dragging / dark
+   hatching / far-edge styling in `MapView`.
+2. **Six new engine modules** (6 builders): `plates`, `faces`, `registry`,
+   `orthophoto`, `search`, `auditing` — 231 tests, none needing a model file,
+   because every heavy model sits behind an injectable seam. Verified by hand:
+   a lone 99%-confident frame yields `???????`, three disagreeing frames yield
+   `B7?4921`, and `faces` is inert while disabled with the band at 0.363/0.5.
+3. **Wiring** (4 builders): the register behind migration 5 and
+   `Store.register`; structured audit records behind migration 6 with the prose
+   unchanged; plates read per vehicle track in `Pipeline`; the camera list,
+   dragging and dark cameras in `app.py`; the `InvestigationPanel`. Skeptics
+   were told to *remove each wire and see whether a test failed*; three of four
+   proved it, and the fourth's repair added the failing test.
+
+Then by hand, the two things no agent could reach from its own files: the
+Investigation tab placed in the window and fed the node's store, and a Plate
+column in the track table showing `display` (never `text`) with the agreement
+count for a thin read. Both have tests that fail if the wire is pulled.
+
+**Lessons that cost something today.** Reviewers must be told to keep scratch
+files out of the repo (probe files broke CI once). No literal URL may appear in
+shipped source even as a docstring example (an illustrative RTSP credential in
+a docstring failed the offline audit). Exceptions raised inside Qt slots are
+silently retained and pin the widget — a third route to the exit-time heap
+corruption, and the freeing test caught it. And the recurring defect, "tested
+code nothing calls", is now the *default* outcome of a build workflow: budget a
+wiring pass for every build pass, and leave operator-facing rows `PLAN` until
+it has run.
+
+**Still unwired, honestly:** nothing enrols into the register and the retention
+job does not sweep it; no event is raised from a plate and no reading persists;
+`orthophoto` and `faces` have no caller at all; the audit chain covers only rows
+that carry a hash; the site record has no console screen.
+
 **Immediate:**
 
 1. **1.3 appearance re-ID.** The tracker fragments (17 tracks over 15 s on one

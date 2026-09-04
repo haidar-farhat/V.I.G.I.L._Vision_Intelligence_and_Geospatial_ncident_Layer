@@ -90,6 +90,7 @@ from .session import CameraSession
 from .add_camera import AddCameraDialog
 from .video_view import VideoView
 from .selection import CAMERA as CAMERA_KIND, Selection, SelectionBus
+from .investigation import InvestigationPanel
 from .zones_view import ZoneDialog, ZonePropertiesPanel, ZonesView
 
 _log = logs.get(__name__)
@@ -150,6 +151,22 @@ CONSOLE_ACTOR = "console"
 #: How long the console stays in Configure with nobody touching it. A lock
 #: that never re-arms is a lock somebody props open on the first day.
 CONFIGURE_IDLE_MILLIS = 10 * 60 * 1000
+
+def _plate_cell(plate) -> str:
+    """The plate column for one track: the reading with its evidence.
+
+    Empty for a track that is not a vehicle or has not been read — an empty
+    cell is honest here because the column is named, and "—" would suggest a
+    read was attempted. A resolved-but-unconfident reading is shown with the
+    agreement count, so an operator sees "B7X4921 (3)" and knows three frames
+    is thin; a confident one is shown plainly.
+    """
+    if plate is None:
+        return ""
+    if plate.is_confident:
+        return plate.display
+    return f"{plate.display} ({plate.agreement})"
+
 
 #: The least height the incident and track panels are ever given. See `_build`.
 LOWER_PANEL_MINIMUM_HEIGHT = 260
@@ -372,6 +389,12 @@ class ConsoleWindow(QMainWindow):
         self.detail_tabs = QTabWidget()
         self.detail_tabs.addTab(self.tracks, "Tracked objects")
         self.detail_tabs.addTab(self._build_zones_panel(), "Zones")
+        # The investigation surface was built, tested, and placed in no window:
+        # the one blocker the wiring pass could not close from outside this
+        # file. It searches the node's own store, never a database of its own.
+        self.investigation = InvestigationPanel(self.node.store)
+        self.investigation.selected.connect(self.selection.select)
+        self.detail_tabs.addTab(self.investigation, "Investigation")
         lower.addWidget(_panel("TRACKED OBJECTS · ZONES", self.detail_tabs))
         lower.setStretchFactor(0, 3)
         lower.setStretchFactor(1, 2)
@@ -627,7 +650,7 @@ class ConsoleWindow(QMainWindow):
         tree.setUniformRowHeights(True)
         tree.setHeaderLabels(
             ["Camera", "ID", "Class", "Confidence", "Seen", "Duration", "Speed",
-             "Heading", "Position", "Uncertainty", "Source"]
+             "Heading", "Position", "Uncertainty", "Source", "Plate"]
         )
         header = tree.header()
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
@@ -955,6 +978,10 @@ class ConsoleWindow(QMainWindow):
         self.map.set_sigma_bands({camera_id: sigma_bands(pose) for camera_id, pose in placed.items()})
         self._zone_reports, self._zone_warnings = self._assess_zones(placed)
         self.zones_view.show_zones(self._zones, self._zone_reports, self._zone_warnings)
+        # The search pickers follow the site, so a camera added or a zone drawn
+        # a minute ago can be searched for without restarting the console.
+        self.investigation.set_cameras(list(self._sessions))
+        self.investigation.set_zones(self._zones)
         self._sync_zone_properties()
         # The "Placed" column is part of this same fact, so the list is rebuilt
         # on the same call rather than waiting for the next poll — which, with
@@ -1215,6 +1242,7 @@ class ConsoleWindow(QMainWindow):
             for session in self._sessions.values():
                 session.view.set_selection(selection)
             self.incidents.set_selection(selection)
+            self.investigation.set_selection(selection)
             self._show_selected_track_row(selection)
             if selection is None:
                 self.zones_view.clearSelection()
@@ -1617,6 +1645,20 @@ class ConsoleWindow(QMainWindow):
             RapidMovementRule(speed_mps=6.0),
         ]
 
+    def start_on_launch(self) -> None:
+        """`--start`: run whatever the node restored, and say so if it is nothing.
+
+        Silence here would be the worst outcome — a console opened with
+        `--start` on a machine with no cameras would look exactly like one that
+        was starting, for as long as the operator waited.
+        """
+        if not self._sessions:
+            self._set_status("--start: no cameras to start. Add one to begin.")
+            _log.warning("--start given but the node has no cameras")
+            return
+        _log.info("--start: starting %d restored camera(s)", len(self._sessions))
+        self._start()
+
     def _start(self) -> None:
         if self._running or not self._sessions:
             return
@@ -1782,9 +1824,13 @@ class ConsoleWindow(QMainWindow):
 
             runner = session.record.runner
             info = runner.detector_info if runner is not None else None
+            # What the pipeline has read off each vehicle so far, by track. The
+            # pipeline published these and nothing displayed them; a plate the
+            # operator cannot see is a plate reader that might as well be off.
+            plates = {plate.track_id: plate for plate in getattr(update.result, "plates", ())}
             for track in sorted(update.result.tracks, key=lambda t: t.id):
                 self.tracks.addTopLevelItem(
-                    self._track_row(session.camera_id, track, update, info)
+                    self._track_row(session.camera_id, track, update, info, plates.get(track.id))
                 )
 
         # The table is rebuilt about thirty times a second. Without this the
@@ -1792,7 +1838,7 @@ class ConsoleWindow(QMainWindow):
         # still held the selection — the map stayed lit and the table did not.
         self._show_selected_track_row(self.selection.current)
 
-    def _track_row(self, camera_id: str, track, update, info) -> QTreeWidgetItem:
+    def _track_row(self, camera_id: str, track, update, info, plate=None) -> QTreeWidgetItem:
         # The row's key is (camera, id): a track id is only unique within one
         # camera, and a table holding two cameras' rows would otherwise select
         # the wrong object as soon as both ran.
@@ -1832,6 +1878,10 @@ class ConsoleWindow(QMainWindow):
             where,
             radius,
             origin,
+            # `display`, never `text`: display carries "?" for every character
+            # the frames have not agreed on, which is the honest form for a
+            # screen. `text` is None until all of them have, and is for rules.
+            _plate_cell(plate),
         ])
         item.setData(0, Qt.ItemDataRole.UserRole, (camera_id, track.id))
         item.setForeground(
@@ -1960,6 +2010,14 @@ def run(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--start", action="store_true",
+        help=(
+            "start every restored camera as soon as the window is up. For a "
+            "control room, where a console left idle until somebody finds the "
+            "Start button is a site unwatched for that long"
+        ),
+    )
+    parser.add_argument(
         "--no-model", action="store_true",
         help="ignore any installed model and detect motion only",
     )
@@ -1998,6 +2056,12 @@ def run(argv: list[str] | None = None) -> int:
 
         window = ConsoleWindow(database=arguments.database, model=model)
         window.show()
+        if arguments.start:
+            # After the event loop is running, not before: starting opens
+            # cameras on worker threads whose first frames arrive through
+            # signals, and a window that has not shown yet has nowhere to put
+            # them. A bound method, never a lambda — see the freeing test.
+            QTimer.singleShot(0, window.start_on_launch)
         code = app.exec()
     except Exception:
         # A packaged build has no terminal, so an unhandled exception would

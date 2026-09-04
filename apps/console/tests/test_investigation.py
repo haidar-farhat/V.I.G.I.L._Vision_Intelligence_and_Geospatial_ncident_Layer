@@ -11,8 +11,20 @@ must not have are the ones that make a search look like an answer when it is not
   the same picture, and the operator cannot tell them apart.
 - **Every control must narrow.** A filter that is wired to nothing looks exactly
   like a filter that matched everything.
+- **The affordances the panel advertises must be the ones under test.** The two
+  ways an operator runs a search are the Search button and Enter in the phrase
+  field, and both were once wired to nothing that any test touched: cutting both
+  connections left all twenty-four tests green, because every one of them drove a
+  combo box or called `search()` directly. So the button is clicked and
+  `returnPressed` is emitted here, through the widgets, exactly as a person does
+  it. The same goes for `set_store`, which is how the console hands over the
+  node's database once the node exists.
 - **`set_selection` must not emit.** It is called from the console's selection
   bus, and a re-emit goes straight back into the bus — a frozen window.
+- **Nothing reaches a Qt slot's caller.** Not a refused query, not a failed one,
+  and not a row the panel cannot draw — that last one escaped `returnPressed` as
+  a live `ValueError` until the render half of `search()` was brought inside the
+  guard its own docstring promised.
 
 The store underneath is the real one, built the way `engine/tests/test_search.py`
 builds it: five events across three cameras, four severities and two zones, two
@@ -52,7 +64,7 @@ from sentinel_console.investigation import (  # noqa: E402
     WHEN_COLUMN,
     InvestigationPanel,
 )
-from sentinel_console.selection import Selection  # noqa: E402
+from sentinel_console.selection import Selection, SelectionBus  # noqa: E402
 
 SITE = LatLon(33.8938, 35.5018)
 
@@ -187,6 +199,24 @@ def store() -> Store:
 
 
 @pytest.fixture
+def crowded_store() -> Store:
+    """One event more than the largest page this panel will ever ask for.
+
+    Real rows rather than a fabricated `Results`, because the sentence under test
+    is about what an operator can actually do next, and only a store that really
+    holds more than `MAX_RESULTS` puts the page size at its bound with the answer
+    still short.
+    """
+    with Store(":memory:") as db:
+        db.save_events([
+            make_event(camera="cam-01", track=n, offset_millis=n * 1000)
+            for n in range(MAX_RESULTS + 1)
+        ])
+        assert db.event_count() == MAX_RESULTS + 1
+        yield db
+
+
+@pytest.fixture
 def panel(qt_app, store: Store) -> InvestigationPanel:
     widget = InvestigationPanel(store)
     widget.set_cameras(["cam-01", "cam-02", "cam-03"])
@@ -236,6 +266,58 @@ def test_a_panel_with_no_database_says_so_instead_of_showing_nothing(qt_app):
     widget = InvestigationPanel()
     assert rows(widget) == 0
     assert "no database" in widget.summary.text().lower(), widget.summary.text()
+
+
+def test_a_panel_built_before_the_node_searches_the_store_it_is_handed(qt_app, store):
+    # The console very plausibly builds this panel before the node's store
+    # exists. If `set_store` only remembered the database and did not go and read
+    # it, the panel would sit in front of a live record still saying there is
+    # nothing to search, and nothing on screen would ever contradict it.
+    widget = InvestigationPanel()
+    assert rows(widget) == 0
+    assert "no database" in widget.summary.text().lower()
+
+    widget.set_store(store)
+    print(f"after set_store: {rows(widget)} row(s), summary {widget.summary.text()!r}")
+    assert rows(widget) == INCIDENTS_IN_STORE
+    assert str(INCIDENTS_IN_STORE) in widget.summary.text()
+    assert "no database" not in widget.summary.text().lower()
+
+
+# ------------------------------------------------- the two ways to run one
+
+
+def test_the_search_button_is_what_it_says_it_is(panel):
+    """The button the panel's own promise names, pressed the way a person does.
+
+    Not `panel.search()`: this asserts the connection, which is the part that was
+    missing. It also pins the other half of that decision — typing is not a
+    search, because a query per keystroke is four full scans while somebody
+    spells "loading".
+    """
+    show_events(panel)
+    before = rows(panel)
+    panel.term.setText("Loading Bay")
+    assert rows(panel) == before, "typing alone must not re-run the search"
+
+    panel.search_button.click()
+    print(f'button pressed: {rows(panel)} of {before}, summary {panel.summary.text()!r}')
+    assert rows(panel) == 1, "only the after-hours event mentions the loading bay"
+    assert rows(panel) < before
+
+
+def test_enter_in_the_phrase_field_runs_the_search(panel):
+    # The other advertised affordance, and the one that reaches `search` as a
+    # direct slot — so it is also the path an exception would escape through.
+    show_events(panel)
+    before = rows(panel)
+    panel.term.setText("Loading Bay")
+    assert rows(panel) == before
+
+    panel.term.returnPressed.emit()
+    print(f"Enter pressed: {rows(panel)} of {before}")
+    assert rows(panel) == 1
+    assert rows(panel) < before
 
 
 # ------------------------------------------------------------- every filter
@@ -347,6 +429,31 @@ def test_the_page_size_cannot_be_raised_past_the_bound(panel):
     assert panel.limit.value() == MAX_RESULTS
 
 
+def test_a_page_already_at_the_bound_does_not_advise_raising_it(qt_app, crowded_store):
+    """Honest UI: never offer an operator a move they are not allowed to make.
+
+    Below the bound, "raise the page size" is real advice. At it, the spin box
+    refuses to go further, and a line that keeps suggesting it is teaching the
+    operator that this line can be ignored — the one line on the panel that says
+    the answer is bigger than the screen.
+    """
+    widget = InvestigationPanel(crowded_store)
+    widget.subject.setCurrentIndex(widget.subject.findData(SUBJECT_EVENTS))
+
+    widget.limit.setValue(MAX_RESULTS // 2)
+    below = widget.summary.text()
+    print(f"below the bound: {below!r}")
+    assert "raise the page size" in below
+
+    widget.limit.setValue(MAX_RESULTS)
+    at_bound = widget.summary.text()
+    print(f"at the bound: {at_bound!r}")
+    assert widget.limit.value() == MAX_RESULTS
+    assert f"showing {MAX_RESULTS:,} of {MAX_RESULTS + 1:,}" in at_bound, at_bound
+    assert "raise the page size" not in at_bound, "advice the spin box will refuse"
+    assert "narrowing the search" in at_bound, at_bound
+
+
 def test_a_complete_page_does_not_claim_to_be_truncated(panel):
     show_events(panel)
     text = panel.summary.text()
@@ -381,6 +488,33 @@ def test_a_window_that_ends_before_it_starts_is_reported_not_raised(panel):
 
     assert rows(panel) == 0
     assert "cannot be run" in text.lower(), text
+
+
+def _unbuildable_row(_item):
+    """A row this panel cannot draw — a column changed under it, say."""
+    raise ValueError("a row this panel cannot draw")
+
+
+def test_a_row_the_panel_cannot_draw_is_reported_rather_than_raised(panel):
+    """The query came back; the drawing failed. That must not leave the slot.
+
+    `search` is the direct target of ``term.returnPressed``, and an exception
+    escaping a Qt slot is retained by the interpreter, which pins this widget
+    past the QApplication's own destruction and corrupts the heap on the way out.
+    Building a row touches a summary, a severity and a set of zones on every item
+    that came back, so this is one column change away at any time.
+    """
+    panel._incident_row = _unbuildable_row
+
+    panel.term.returnPressed.emit()  # through the slot, the way it would happen
+    text = panel.summary.text()
+    print(f"undrawable rows: {rows(panel)} row(s), summary {text!r}")
+
+    assert rows(panel) == 0, "a half-built list reads as the whole of what matched"
+    assert "search failed" in text.lower(), text
+    assert "a row this panel cannot draw" in text, "the reason has to reach the line"
+
+    panel.search()  # and again, directly: still returns rather than raising
 
 
 # ---------------------------------------------------------------- selection
@@ -458,6 +592,64 @@ def test_the_highlighted_row_survives_the_same_search_being_run_again(panel):
 
     assert panel.selected_row() == wanted
     assert seen == [], "a rebuild is not the operator clicking"
+
+
+def test_a_clicked_row_reaches_a_real_selection_bus(panel):
+    """The connection the console has to make, made here and exercised.
+
+    `selected` is only worth having if what comes out of it is something
+    `SelectionBus.select` accepts and holds. This asserts the whole hop —
+    click, emit, bus — against the real bus rather than a list, so a Selection
+    this panel builds that no other panel could use would fail here.
+    """
+    bus = SelectionBus()
+    panel.selected.connect(bus.select)
+    panel.results.topLevelItem(0).setSelected(True)
+
+    expected = selections(panel)[0]
+    print(f"bus now holds {bus.current}")
+    assert bus.current == expected
+    assert bus.current.kind == "incident"
+
+
+def _undeliverable_selection():
+    """A selection that cannot be worked out — a row whose payload is gone."""
+    raise RuntimeError("this row is about nothing the console can select")
+
+
+def test_a_selection_that_cannot_be_delivered_is_reported_rather_than_silent(panel):
+    # Swallowing the traceback is right — it must not escape a Qt slot — but
+    # swallowing it *silently* leaves an operator clicking rows while every other
+    # panel sits on somebody else's choice, with no sign of it anywhere.
+    panel.selected_row = _undeliverable_selection
+    panel.results.topLevelItem(0).setSelected(True)
+    text = panel.summary.text()
+    print(f"undeliverable selection: {text!r}")
+
+    assert isinstance(panel.last_selection_failure, RuntimeError)
+    assert "could not be selected" in text.lower(), text
+    assert "nothing the console can select" in text
+
+
+def test_silence_nests_so_an_inner_rebuild_cannot_unmute_the_outer_one(panel):
+    """The guard is a depth count, not a flag.
+
+    No path in this panel nests these blocks today. One edit makes one — a
+    `_fill` inside a `set_selection` inside a rebuild — and with a flag the inner
+    `finally` would clear the outer guard half way through, so the rest of the
+    outer block would emit `selected` for a row nobody clicked and push every
+    other panel onto it.
+    """
+    seen: list = []
+    panel.selected.connect(seen.append)
+
+    with panel._silent():
+        panel.set_selection(None)  # an inner block, using the same guard
+        panel.results.topLevelItem(0).setSelected(True)
+
+    print(f"emitted from inside nested silence: {seen}")
+    assert seen == [], "the inner block unmuted its caller"
+    assert panel._quiet == 0, "the guard did not unwind"
 
 
 # ------------------------------------------------------------------ pickers

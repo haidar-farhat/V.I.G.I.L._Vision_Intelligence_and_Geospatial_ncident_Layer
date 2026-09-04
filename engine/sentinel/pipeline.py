@@ -52,6 +52,7 @@ from .plates import (
     MIN_AGREEMENT,
     MIN_CHARACTER_CONFIDENCE,
     PlateAccumulator,
+    PlateRead,
     PlateReader,
     Reading,
 )
@@ -69,6 +70,43 @@ _log = _get_logger(__name__)
 #: objects and none of that detail is read once the track has ended. The count
 #: of distinct objects is NOT derived from those, so trimming cannot change it.
 _MAX_TRACKED_DETAIL = 4096
+
+#: How often one track's plate is read, in reads per second of source time.
+#: The reader was called on every frame of every vehicle track until this
+#: existed, and that cost is quadratic rather than linear: each read is appended
+#: to that track's accumulator and every read already in it is re-tallied on the
+#: next frame. Measured on this machine, injected models, one parked vehicle:
+#: 3200 frames cost 11.64s with no bound and 0.10s with these, the accumulator
+#: holding one read per frame — 3199 of them — in the first case; longer runs
+#: went as far as 40.3s for 6400 frames. A car parked in front of a gate camera
+#: for four minutes is the ordinary case, not the adversarial one.
+#:
+#: Three a second is more evidence per second than a reading needs — a character
+#: resolves on :data:`~sentinel.plates.MIN_AGREEMENT` reads in total — and it is
+#: bounded by the clock rather than by the frame rate, so a 60 fps camera costs
+#: what a 25 fps one does instead of two and a half times as much.
+PLATE_READS_PER_SECOND = 3.0
+
+#: Reads one track's accumulator may hold before this stage stops reading that
+#: track at all. The stride above bounds the rate; this bounds the total, which
+#: is what a vehicle that parks in shot for a shift needs — at three a second
+#: and 387 bytes a read, an unbounded accumulator is 4 MB per hour per vehicle
+#: and a resolve() over it that grows without end.
+#:
+#: The cost of the ceiling, stated because it is real: a vehicle whose plate is
+#: unreadable for the first twenty seconds of its track — approaching from far
+#: enough away that every read is noise — is not read afterwards either. That is
+#: the wrong trade for a long approach road and the right one for everything
+#: else; the fix if footage shows it mattering is a sliding window inside
+#: :class:`~sentinel.plates.PlateAccumulator`, not a bigger number here, because
+#: a bigger number only moves where the growth stops.
+MAX_PLATE_READS_PER_TRACK = 64
+
+#: Frame rate assumed for the stride when the source reports none. A source that
+#: cannot say how fast it runs must still be rate-limited: falling back to
+#: "every frame" would restore the quadratic cost above on exactly the sources
+#: least able to afford it.
+_ASSUMED_FPS = 25.0
 
 #: Detector labels whose boxes a plate may be read inside. A reader pointed at
 #: anything else is a reader pointed at whatever text is in shot — a sign, a
@@ -190,7 +228,10 @@ class PipelineStats:
     #: Events raised. The number that matters most, and the one that should stay
     #: small: this system is measured by how little it says.
     events: int = 0
-    #: Plate reads accumulated, across every vehicle track. Counted because a
+    #: Plate reads that *voted*, across every vehicle track — not reads the
+    #: reader returned. A read whose text normalises to nothing is dropped by
+    #: the accumulator without a vote, and counting those here would show a
+    #: reader lifting only garbage as a reader finding plates. Counted because a
     #: reader that is running and finding nothing looks exactly like a reader
     #: that is switched off, and the two want different remedies.
     plate_reads: int = 0
@@ -242,7 +283,8 @@ class Pipeline:
                  "_resolved_epoch", "_epoch_basis",
                  "_record_to", "_segment_seconds", "_on_segment", "_recorder",
                  "_stopping", "_stream",
-                 "_plate_reader", "_plate_settings", "_plates", "_vehicle_class_ids")
+                 "_plate_reader", "_plate_settings", "_plates", "_vehicle_class_ids",
+                 "_plate_last", "_plate_next_read", "_plate_stride", "_plate_fault")
 
     def __init__(
         self,
@@ -282,7 +324,9 @@ class Pipeline:
         The two thresholds beside it are the bars a character has to clear to
         vote and to resolve; they default to the ones `plates.py` argues for,
         and lowering them lowers the standard of every plate this camera
-        reports.
+        reports. What a supplied reader costs per second is fixed by
+        :data:`PLATE_READS_PER_SECOND` and :data:`MAX_PLATE_READS_PER_TRACK`
+        rather than by the frame rate — see :meth:`_read_plates`.
         """
         self._source = source
         self._detector = detector
@@ -320,6 +364,18 @@ class Pipeline:
         self._plate_settings = (plate_min_agreement, plate_min_character_confidence)
         #: One accumulator per live vehicle track, dropped as the track ends.
         self._plates: dict[int, PlateAccumulator] = {}
+        #: The last reading published for each live track, republished on the
+        #: frames between reads so a plate does not blink out between them.
+        self._plate_last: dict[int, TrackPlate] = {}
+        #: Frame index at which each live track may next be read. Per track
+        #: rather than per frame so twenty parked cars do not all come due on
+        #: the same frame and turn a rate limit into a periodic stall.
+        self._plate_next_read: dict[int, int] = {}
+        #: Frames between reads of one track. Replaced from the source's own
+        #: frame rate in `run()`; the value here is what an unopened pipeline
+        #: would use.
+        self._plate_stride = max(1, round(_ASSUMED_FPS / PLATE_READS_PER_SECOND))
+        self._plate_fault: str | None = None
         self._vehicle_class_ids: frozenset[int] = frozenset()
         if plate_reader is not None:
             info = detector.info
@@ -398,11 +454,26 @@ class Pipeline:
         if self._tracker is not None:
             self._tracker.close()
             self._tracker = None
-        # Each accumulator holds the reads of one vehicle, crops included.
-        # Keeping them past the run would hold the plates of every vehicle in
-        # the last camera this object watched.
+        # Each accumulator holds the reads of one vehicle, crops included, and
+        # each published reading holds that vehicle's plate. Keeping either past
+        # the run would hold the plates of every vehicle in the last camera this
+        # object watched.
         self._plates.clear()
+        self._plate_last.clear()
+        self._plate_next_read.clear()
         self._source.close()
+
+    @property
+    def plate_fault(self) -> str | None:
+        """Why plate reading stopped, or ``None`` if it did not.
+
+        Read it the way `RecorderStats.fault` is read: a camera whose plate
+        models died in the first minute must not report the same summary as one
+        that read plates all night. The run continues either way — see
+        :meth:`_read_plates` for why a plate model's failure is not treated as
+        the analysis failing.
+        """
+        return self._plate_fault
 
     @property
     def recorder(self) -> Recorder | None:
@@ -422,6 +493,15 @@ class Pipeline:
         """Process the source, yielding one result per frame."""
         info = self._source.open()
         self._tracker = Tracker(self._pose, **self._config)
+
+        # Reads are spaced by the clock, not by the frame: the cost of reading
+        # a stationary vehicle must not double because the camera was swapped
+        # for a faster one.
+        self._plate_stride = max(
+            1,
+            round((info.fps if info.fps and info.fps > 0 else _ASSUMED_FPS)
+                  / PLATE_READS_PER_SECOND),
+        )
 
         if self._record_to is not None:
             self._recorder = Recorder(
@@ -449,7 +529,8 @@ class Pipeline:
             # Named in the same line as the detector because a plate is
             # personal data almost everywhere, and a run that reads them should
             # be visibly a run that reads them.
-            f", plates in {self._plate_reader.country}"
+            f", plates in {self._plate_reader.country} every "
+            f"{self._plate_stride} frame(s)"
             if self._plate_reader is not None
             else "",
         )
@@ -595,6 +676,39 @@ class Pipeline:
         same unbounded growth the per-track statistics were trimmed to stop,
         and each of these holds a track's reads and a crop with them.
 
+        **It stops reading a vehicle it has already read.** Bounding the number
+        of accumulators bounds nothing on its own — the *contents* grew too.
+        Reading every vehicle on every frame appended a read per frame to a list
+        this stage then re-tallied per frame, which is quadratic in how long a
+        vehicle stays in shot and is worst for the vehicle that is easiest to
+        read: the parked one. Three bounds replace it, and the reading published
+        between reads is the last one, so a plate does not blink out —
+
+        * a track whose reading is already confident is never read again: the
+          bar `plates.py` sets for acting on a plate has been cleared, and the
+          fortieth read of a stationary plate buys nothing the fourth did not;
+        * a track due no sooner than :data:`PLATE_READS_PER_SECOND` a second is
+          not read on the frames between;
+        * a track holding :data:`MAX_PLATE_READS_PER_TRACK` reads is not read
+          again at all, so a vehicle parked in shot for a shift costs a fixed
+          amount rather than an accumulating one.
+
+        :meth:`~sentinel.plates.PlateAccumulator.resolve` runs only on the
+        frames where a read was actually taken *into* the accumulator, for the
+        same reason: it re-tallies everything, and re-tallying an unchanged list
+        cannot change the answer.
+
+        **A failing plate model stops the plates, not the camera.** The models
+        are third-party files the operator supplied, and their failure modes are
+        not the detector's. Anything raised out of a read is caught, logged once
+        with the camera it happened on, and ends plate reading for the rest of
+        the run — the zone, rule and recording stages, which have nothing to do
+        with plates, keep running, exactly as recording is deliberately isolated
+        from an analysis failure. Once rather than per track because a model
+        that throws on one crop is a model, not a crop, and per-track
+        suppression would produce one error line per vehicle forever;
+        :attr:`plate_fault` is how a caller finds out it happened.
+
         Returns nothing at all, having done nothing at all, when no reader was
         supplied.
         """
@@ -603,35 +717,91 @@ class Pipeline:
 
         for track_id in ended:
             self._plates.pop(track_id, None)
+            self._plate_last.pop(track_id, None)
+            self._plate_next_read.pop(track_id, None)
 
         min_agreement, min_confidence = self._plate_settings
         plates: list[TrackPlate] = []
         for track in tracks:
             if track.class_id not in self._vehicle_class_ids:
                 continue
-            accumulator = self._plates.get(track.id)
-            if accumulator is None:
-                accumulator = PlateAccumulator(
-                    country=self._plate_reader.country,
-                    min_agreement=min_agreement,
-                    min_character_confidence=min_confidence,
-                )
-                self._plates[track.id] = accumulator
+            plate = self._plate_last.get(track.id)
+            if self._is_due_a_read(track.id, frame.index, plate):
+                accumulator = self._plates.get(track.id)
+                if accumulator is None:
+                    accumulator = PlateAccumulator(
+                        country=self._plate_reader.country,
+                        min_agreement=min_agreement,
+                        min_character_confidence=min_confidence,
+                    )
+                    self._plates[track.id] = accumulator
+                self._plate_next_read[track.id] = frame.index + self._plate_stride
 
-            reads = self._plate_reader.read(
-                frame.image, track.bbox, frame_index=frame.index
-            )
-            accumulator.add_all(reads)
-            self.stats.plate_reads += len(reads)
+                held = len(accumulator)
+                accumulator.add_all(self._read_one(frame, track))
+                # What the accumulator took, not what the reader returned. A
+                # read whose text normalises to nothing is dropped without a
+                # vote, and counting it here would show a reader finding only
+                # garbage as a reader finding plates — the exact confusion this
+                # statistic was added to remove.
+                voted = len(accumulator) - held
+                self.stats.plate_reads += voted
 
-            if not len(accumulator):
+                if voted:
+                    plate = TrackPlate.of(track.id, accumulator.resolve())
+                    self._plate_last[track.id] = plate
+
+            if plate is None:
                 # Nothing has been read on this vehicle yet, which is the normal
                 # state of a car that is still too far away. An empty reading
                 # published beside it every frame would read as "no plate"
                 # rather than "not yet", and those are different claims.
                 continue
-            plates.append(TrackPlate.of(track.id, accumulator.resolve()))
+            plates.append(plate)
         return tuple(plates)
+
+    def _is_due_a_read(
+        self, track_id: int, frame_index: int, plate: TrackPlate | None
+    ) -> bool:
+        """Whether reading this track again on this frame could tell us anything.
+
+        The three bounds :meth:`_read_plates` describes, in the order that costs
+        least to test. A track never read before is due immediately: the first
+        read is the one that puts a plate on the operator's screen, and making
+        it wait a third of a second would be a delay bought for nothing.
+        """
+        if self._plate_fault is not None:
+            return False
+        if plate is not None and plate.is_confident:
+            return False
+        accumulator = self._plates.get(track_id)
+        if accumulator is not None and len(accumulator) >= MAX_PLATE_READS_PER_TRACK:
+            return False
+        return frame_index >= self._plate_next_read.get(track_id, frame_index)
+
+    def _read_one(self, frame: Frame, track: Track) -> Sequence[PlateRead]:
+        """One track's reads on one frame, or none at all if the model failed.
+
+        The whole read is inside the guard rather than the model call alone,
+        because a plate reader is a crop, a detector, a decode and a
+        normalisation, and any of the four can raise on input the operator's
+        models were not built for.
+        """
+        assert self._plate_reader is not None
+        try:
+            return self._plate_reader.read(
+                frame.image, track.bbox, frame_index=frame.index
+            )
+        except Exception as error:  # noqa: BLE001 - see the docstring above
+            self._plate_fault = f"{type(error).__name__}: {error}"
+            _log.error(
+                "%s: PLATE READING STOPPED — %s. The camera is still running "
+                "and everything else about it is unaffected; no plate will be "
+                "read on it until it is restarted.",
+                self._source.source_id, self._plate_fault,
+                exc_info=True,
+            )
+            return ()
 
     def _wall_clock_epoch(self) -> int:
         """When media time zero happened, in real-world milliseconds.

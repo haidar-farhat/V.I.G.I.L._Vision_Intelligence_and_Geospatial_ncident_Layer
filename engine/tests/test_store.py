@@ -1195,3 +1195,211 @@ def test_an_audit_row_written_before_the_columns_existed_still_reads(store: Stor
     # on a predecessor that has no hash.
     head = store.audit_record(make_record())
     assert head and store.audit_chain_head() == head
+
+
+def test_the_totals_count_the_chained_rows_apart_from_the_rest(store: Store):
+    # The difference between the two numbers is the honest part: how much of
+    # the log a later reader can prove was not edited afterwards. One number
+    # would imply the chain covers everything, which it does not.
+    store.audit("node", "node.started", "gatehouse")
+    store.audit_record(make_record())
+    store.audit("node", "node.stopped", "gatehouse")
+
+    written, chained = store.audit_totals()
+
+    assert (written, chained) == (3, 1)
+    assert written - chained == 2, "the prose-only rows were counted as chained"
+
+
+# ------------------------------------------------------------------ two writers
+
+
+def test_two_writers_do_not_strand_each_others_audit_rows(tmp_path: Path):
+    """An audit row must not be lost because somebody else was mid-commit.
+
+    `audit_record` reads the chain head and then writes, and those two
+    statements are one unit of work. Under a deferred ``BEGIN`` the read takes a
+    snapshot, and a commit from the other writer in between makes the insert
+    fail *immediately* with "database is locked" — the busy handler is never
+    consulted, because waiting cannot make a stale snapshot current. Measured:
+    0.00 s to fail, on a connection whose timeout was five seconds.
+
+    So this is not a timeout test. Remove ``immediate=True`` from
+    `audit_record` and this fails with a stranded audit row, which is what the
+    console and a `sentinel` command sharing one file would do to each other.
+
+    Two stores rather than two threads on one, because a `sqlite3` connection
+    may only be used from the thread that opened it — and two processes on one
+    file is the real case anyway. Both are opened before either writes, so the
+    only thing under test is the writing; opening concurrently is its own test.
+    The barrier makes the two collide instead of leaving it to the scheduler,
+    and twenty rounds each was measured as far more than enough to.
+    """
+    import threading
+
+    database = tmp_path / "n.db"
+    rounds = 20
+    failed: list[BaseException] = []
+    together = threading.Barrier(2, timeout=30)
+
+    def write_from_the_other_process() -> None:
+        try:
+            with Store(database) as other:
+                together.wait()
+                for index in range(rounds):
+                    other.audit_record(make_record(subject=f"other-{index}"))
+        except BaseException as failure:  # reported, never swallowed
+            failed.append(failure)
+            together.abort()
+
+    with Store(database) as mine:
+        thread = threading.Thread(target=write_from_the_other_process)
+        thread.start()
+        try:
+            together.wait()
+            for index in range(rounds):
+                mine.audit_record(make_record(subject=f"mine-{index}"))
+        except threading.BrokenBarrierError:
+            pass  # the other writer failed first and is reported below
+        finally:
+            thread.join(60.0)
+
+        assert not failed, f"a writer lost an audit row: {failed!r}"
+
+        written, chained = mine.audit_totals()
+        print(f"{written} row(s) from two writers, {chained} chained")
+        assert (written, chained) == (rounds * 2, rounds * 2), (
+            "an audit row went missing between two writers"
+        )
+
+
+def test_two_processes_can_open_the_same_new_database_at_once(tmp_path: Path):
+    """The console starting while a command runs must not read as corruption.
+
+    `pending` is read before any lock is held, so two openers of the same new
+    file both saw an empty ladder and both applied migration 1. The loser got
+    "table cameras already exists", wrapped as `Migration 1 (initial) failed` —
+    which is what a corrupt database looks like to an operator, and this is not
+    one.
+
+    A barrier rather than a hope: both openers are held until the other is ready
+    so that they actually collide, instead of relying on the scheduler to make
+    the race happen.
+    """
+    import threading
+
+    database = tmp_path / "n.db"
+    together = threading.Barrier(2, timeout=30)
+    failed: list[BaseException] = []
+    seen: list[tuple[int, ...]] = []
+
+    def open_the_database() -> None:
+        try:
+            together.wait()
+            with Store(database) as opened:
+                seen.append(tuple(opened.applied_versions()))
+        except BaseException as failure:  # reported, never swallowed
+            failed.append(failure)
+
+    threads = [threading.Thread(target=open_the_database) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(60.0)
+
+    assert not failed, f"opening the same new database twice failed: {failed!r}"
+    assert len(seen) == 2 and seen[0] == seen[1], (
+        f"the two openers disagree about the schema: {seen}"
+    )
+    assert len(seen[0]) == len(MIGRATIONS), "the ladder was not fully applied"
+
+    with Store(database) as reopened:
+        applied = reopened._connection.execute(
+            "SELECT COUNT(*) AS n FROM schema_migrations"
+        ).fetchone()["n"]
+    assert applied == len(MIGRATIONS), "a migration was recorded twice"
+
+
+def test_a_migration_somebody_else_applied_first_is_not_applied_twice(
+    tmp_path: Path, monkeypatch
+):
+    """A stale pending list is what the race above actually leaves behind.
+
+    `pending` is read before any lock is held. Another opener finishing the same
+    ladder in between turns that list into a lie, and the deterministic stand-in
+    for it is simply to hand `migrate` a list of migrations that are already
+    applied — which is what the loser of the race is holding.
+
+    Without the check under the write lock, this re-runs the first migration's
+    DDL and fails with "table cameras already exists", wrapped as
+    `Migration 1 (initial) failed`: a message that reads like a corrupt
+    database to the operator who gets it, and is not one.
+    """
+    database = tmp_path / "n.db"
+    with Store(database) as store:
+        assert store.pending() == [], "the fixture is not fully migrated"
+
+        monkeypatch.setattr(Store, "pending", lambda self: list(MIGRATIONS[:1]))
+
+        assert store.migrate() == [], "a migration already applied was applied again"
+        assert store.applied_versions() == [m.version for m in MIGRATIONS], (
+            "the ladder changed under a no-op migrate"
+        )
+
+
+def test_a_store_opens_while_another_one_is_writing(tmp_path, caplog):
+    """A console must not fail to start because a command is mid-write.
+
+    Setting the journal mode needs a lock no other connection holds, and SQLite
+    refuses it outright rather than queueing it — the busy timeout does not
+    cover this one. Measured: it fails in 0.01 s, not after five seconds. So
+    opening a second store on a database somebody was writing to died inside the
+    constructor, before the caller had asked for anything, and an operator saw a
+    console that would not start for a reason unrelated to what they were doing.
+
+    Found by the two-writer test above, which could not reliably open its second
+    store at all.
+
+    The mode is forced back to a rollback journal first, because a file already
+    in WAL is skipped and the line never runs. That is the state a database is
+    in the first time it is opened by two processes at once.
+    """
+    import sqlite3
+
+    database = tmp_path / "n.db"
+    with Store(database):
+        pass  # the schema exists, so opening again writes nothing
+
+    holder = sqlite3.connect(str(database), isolation_level=None)
+    try:
+        holder.execute("PRAGMA journal_mode = DELETE")
+        holder.execute("BEGIN IMMEDIATE")
+        holder.execute(
+            "INSERT INTO audit_logs (at, actor, action) VALUES (?,?,?)",
+            (1_700_000_000_000, "holder", "node.started"),
+        )
+
+        with caplog.at_level("WARNING"), Store(database) as opened:
+            assert "audit_logs" in opened.table_names(), "the store opened unusable"
+            assert opened.audit_totals() == (0, 0), "it read the uncommitted write"
+
+        assert any("WAL" in record.getMessage() for record in caplog.records), (
+            "the journal mode was quietly left alone with nothing said"
+        )
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+
+
+def test_the_register_is_gone_once_the_store_that_held_it_is_closed(tmp_path: Path):
+    # The register is the object most likely to outlive its store — a panel
+    # holding one while the node behind it shuts down. Left cached, it points at
+    # a closed connection and fails from inside `registry` with a bare
+    # "cannot operate on a closed database", three modules from what actually
+    # went.
+    store = Store(tmp_path / "n.db")
+    assert store.register is not None
+    store.close()
+
+    with pytest.raises(StoreError, match="closed"):
+        store.register

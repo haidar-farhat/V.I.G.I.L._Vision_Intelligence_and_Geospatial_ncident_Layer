@@ -913,6 +913,96 @@ def test_a_removed_camera_leaves_the_placement_it_took_with_it(
         )
 
 
+def test_a_dragged_corner_reads_as_the_corner_that_moved(tmp_path: Path, yard: Zone):
+    """The one operator-facing line this change rewrote, pinned so it holds.
+
+    `_describe_zone_change` said "outline 4 -> 4 points, moved" for a ring whose
+    corners moved without changing count, which names the one number that did
+    not change and hides the one that did. `auditing.describe` says which corner,
+    and that is an improvement rather than a drift — but until now nothing held
+    the new wording, so the only three lines this change altered were the three
+    with no test on them.
+
+    Both spellings are asserted, so the day somebody makes the two agree again
+    this test says which one moved.
+    """
+    from sentinel.node import _describe_zone_change
+
+    moved = Zone(
+        id=yard.id, name=yard.name, kind=yard.kind,
+        ring=(
+            yard.ring[0], yard.ring[1],
+            LatLon(33.893500, 35.501850), yard.ring[3],
+        ),
+        schedule=yard.schedule, enter_after_millis=yard.enter_after_millis,
+        exit_after_millis=yard.exit_after_millis,
+        accept_uncertain=yard.accept_uncertain,
+    )
+    assert len(moved.ring) == len(yard.ring), "the count changed; that is the other case"
+
+    with Node(tmp_path / "n.db", zones=[yard], node_id="gatehouse") as node:
+        node.replace_zone(moved)
+
+    with Store(tmp_path / "n.db") as store:
+        row = audit_row(store, "zone.changed")
+        print(f"now: {row['detail']!r}; was: {_describe_zone_change(yard, moved)!r}")
+
+        assert row["detail"] == "outline corner 2 moved"
+        assert _describe_zone_change(yard, moved) == "outline 4 -> 4 points, moved", (
+            "the line this replaced changed, so the comparison is against nothing"
+        )
+
+
+def test_the_summary_carries_the_chain_head_an_operator_has_to_write_down(
+    tmp_path: Path, yard: Zone
+):
+    """Somebody has to be able to read the log, or writing it proved nothing.
+
+    Every zone edit has been stored with both its states and a chain hash, and
+    an operator had no way to see that any of it happened: `audit_trail` had no
+    reader anywhere. `summary` is what `sentinel run` prints when a run ends, so
+    the three numbers that matter go there — how much was recorded, how much of
+    it is chained, and the head.
+
+    The head is asserted in full. Its only use is to be copied somewhere this
+    process cannot reach, and a prefix copied into a logbook verifies nothing
+    while looking as though it would.
+
+    Delete the audit block from `summary` and this fails, which is the point of
+    it: the write path already had tests, and none of them needed a reader.
+    """
+    renamed = Zone(
+        id=yard.id, name="Loading bay", kind=yard.kind, ring=yard.ring,
+        schedule=yard.schedule, enter_after_millis=yard.enter_after_millis,
+        exit_after_millis=yard.exit_after_millis,
+        accept_uncertain=yard.accept_uncertain,
+    )
+
+    with Node(tmp_path / "n.db", zones=[yard], node_id="gatehouse") as node:
+        before_any_edit = node.summary()
+        assert "chain head      none" in before_any_edit, (
+            "a node that has changed nothing claimed a chain it does not have"
+        )
+
+        node.replace_zone(renamed)
+        head = node.store.audit_chain_head()
+        written, chained = node.store.audit_totals()
+        summary = node.summary()
+        print(summary)
+
+    assert head is not None and len(head) == 64, "the head stopped being a SHA-256"
+    assert head in summary, (
+        "the head an operator has to record is not on the only screen that shows it"
+    )
+    assert f"{written} row(s)" in summary and f"{chained} chained" in summary
+    assert chained == 1 and written > chained, (
+        "the fixture stopped exercising both kinds of row, so the counts prove nothing"
+    )
+    assert f"{written - chained} prose-only" in summary, (
+        "the rows the chain does not cover were passed over in silence"
+    )
+
+
 def test_a_node_names_the_clock_its_schedules_are_read_against(tmp_path: Path):
     from datetime import timedelta, timezone
 

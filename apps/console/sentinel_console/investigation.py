@@ -39,6 +39,8 @@ would not look wrong while doing it.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 from PySide6.QtCore import QDateTime, QTimeZone, Qt, Signal
 from PySide6.QtGui import QBrush, QFont
 from PySide6.QtWidgets import (
@@ -144,10 +146,18 @@ class InvestigationPanel(QWidget):
     def __init__(self, store=None, parent: QWidget | None = None):
         super().__init__(parent)
         self._store = store
-        #: True while the panel is changing its own highlight, or filling its own
-        #: pickers, so Qt's signals are not mistaken for the operator acting.
-        self._quiet = False
+        #: How many nested reasons there are to ignore Qt's signals — the panel
+        #: changing its own highlight, or filling its own pickers. A depth count
+        #: rather than a flag: `_fill` inside `set_selection` inside a rebuild is
+        #: a shape this panel does not have today but is one edit away from, and
+        #: with a flag the inner `finally` would clear the outer guard and turn a
+        #: rebuild into a `selected` emit the operator never asked for.
+        self._quiet = 0
         self._selected: Selection | None = None
+        #: The last exception `_row_selected` swallowed, kept for the tests and
+        #: for anyone reading a bug report. A click that fails silently leaves an
+        #: operator prodding rows that do nothing, with nothing anywhere to read.
+        self.last_selection_failure: Exception | None = None
 
         self.subject = QComboBox()
         self.subject.addItem("Incidents", SUBJECT_INCIDENTS)
@@ -283,7 +293,26 @@ class InvestigationPanel(QWidget):
         self.severity.currentIndexChanged.connect(self._filters_changed)
         self.limit.valueChanged.connect(self._filters_changed)
 
-        # WIRING REMOVED
+        self.search()
+
+    # --------------------------------------------------------------- silence
+
+    @contextmanager
+    def _silent(self):
+        """Ignore Qt's signals for the duration, however deeply nested.
+
+        Every one of these blocks is the panel acting on itself — clearing a
+        tree, filling a picker, moving a highlight — and each of those fires the
+        same signals an operator's click does. Counted rather than flagged so a
+        block inside a block cannot unmute its caller half way through: that
+        would emit `selected` for a row nobody chose, and the console's selection
+        bus would push every other panel to a thing the operator never clicked.
+        """
+        self._quiet += 1
+        try:
+            yield
+        finally:
+            self._quiet -= 1
 
     # ---------------------------------------------------------------- the node
 
@@ -323,8 +352,7 @@ class InvestigationPanel(QWidget):
         showing what it already showed.
         """
         was = combo.currentData()
-        self._quiet = True
-        try:
+        with self._silent():
             combo.clear()
             combo.addItem(any_label, None)
             for label, value in entries:
@@ -333,8 +361,6 @@ class InvestigationPanel(QWidget):
                 combo.addItem(str(label), str(value))
             index = combo.findData(was)
             combo.setCurrentIndex(index if index >= 0 else 0)
-        finally:
-            self._quiet = False
 
     # ------------------------------------------------------------- the query
 
@@ -396,7 +422,12 @@ class InvestigationPanel(QWidget):
         exception escaping one is retained by the interpreter, which pins this
         widget past the QApplication's own destruction and corrupts the heap at
         exit. A refused query and a failed one are both reported on the line
-        under the results, where the counts are.
+        under the results, where the counts are — and so is a failure to *draw*
+        the answer, which is the half that was left outside the guard once and
+        put a `ValueError` straight out through `returnPressed`. Building a row
+        touches a summary, a severity and a set of zones on every item that came
+        back; a column this panel does not expect is a live possibility, not a
+        theoretical one.
         """
         if self._store is None:
             self._fill(())
@@ -418,8 +449,16 @@ class InvestigationPanel(QWidget):
             self.summary.setText(f"The search failed: {failure}")
             return
 
-        self._fill(results.items)
-        self.summary.setText(self._summarise(results, query))
+        try:
+            self._fill(results.items)
+            self.summary.setText(self._summarise(results, query))
+        except Exception as failure:
+            # The query came back; this panel could not draw it. Reported the
+            # same way a refusal is, and the half-built list is cleared, because
+            # rows from an answer that was never finished are worse than none:
+            # they read as the whole of what matched.
+            self._fill(())
+            self.summary.setText(f"The search failed: {failure}")
 
     def _search_clicked(self, _checked: bool = False) -> None:
         """The button. Its ``clicked(bool)`` argument is not a filter."""
@@ -444,6 +483,12 @@ class InvestigationPanel(QWidget):
         The truncated wording comes from `Results.describe` rather than being
         retyped here, so the number an operator reads and the number the engine
         counted cannot come to differ.
+
+        The advice that follows it is conditional for the same reason. The page
+        size stops at `MAX_RESULTS`, so telling an operator already at the bound
+        to raise it is advice they cannot take — and a panel that hands out an
+        impossible instruction teaches them to stop reading this line, which is
+        the one line here that matters.
         """
         plural, singular = SUBJECT_NOUNS[self.subject_kind]
         if results.total == 0:
@@ -455,10 +500,15 @@ class InvestigationPanel(QWidget):
             )
         noun = plural if results.total != 1 else singular
         if results.truncated:
-            return (
-                f"{results.describe()} {noun} matching {query.describe()} — "
-                "narrow the search, or raise the page size, to see the rest."
-            )
+            if query.limit < MAX_RESULTS:
+                advice = "narrow the search, or raise the page size, to see the rest"
+            else:
+                advice = (
+                    f"the page is already at its bound of {MAX_RESULTS:,}, so "
+                    "narrowing the search — a camera, a zone or a time window — is "
+                    "the only way to see the rest"
+                )
+            return f"{results.describe()} {noun} matching {query.describe()} — {advice}."
         return f"{results.total:,} {noun} matching {query.describe()}."
 
     def _fill(self, items) -> None:
@@ -468,8 +518,7 @@ class InvestigationPanel(QWidget):
         row can keep a stale value in a column that failed to update, and in an
         evidence view a stale cell is worse than a flicker.
         """
-        self._quiet = True
-        try:
+        with self._silent():
             self.results.clear()
             for item in items:
                 row = (
@@ -481,8 +530,6 @@ class InvestigationPanel(QWidget):
                 if row.data(WHEN_COLUMN, Qt.ItemDataRole.UserRole) == self._selected:
                     row.setSelected(True)
                     self.results.setCurrentItem(row)
-        finally:
-            self._quiet = False
 
     def _incident_row(self, incident) -> QTreeWidgetItem:
         item = QTreeWidgetItem([
@@ -543,6 +590,13 @@ class InvestigationPanel(QWidget):
         Nothing may raise out of here: a traceback escaping a Qt slot is retained
         by the interpreter and pins the widget it came from past the
         QApplication's own destruction.
+
+        Caught is not the same as hidden. A selection that never reaches the bus
+        leaves an operator clicking rows while the map, the wall and the track
+        table sit on somebody else's choice — and if this handler says nothing,
+        there is no sign of it anywhere, on screen or in a bug report. So the
+        failure goes on the same line the counts and the refusals go on, and is
+        kept where a test can read it.
         """
         if self._quiet:
             return
@@ -550,8 +604,12 @@ class InvestigationPanel(QWidget):
             selection = self.selected_row()
             self._selected = selection
             self.selected.emit(selection)
-        except Exception:  # pragma: no cover - defensive, see the docstring
-            pass
+        except Exception as failure:
+            self.last_selection_failure = failure
+            self.summary.setText(
+                f"That row could not be selected: {failure}. The other panels are "
+                "still showing whatever was selected before."
+            )
 
     def selected_row(self) -> Selection | None:
         """What the highlighted row is about, or ``None`` when none is."""
@@ -577,8 +635,7 @@ class InvestigationPanel(QWidget):
         kind = getattr(selection, "kind", None) if selection is not None else None
         wanted = selection if kind in (INCIDENT_KIND, TRACK_KIND) else None
         self._selected = wanted
-        self._quiet = True
-        try:
+        with self._silent():
             if wanted is None:
                 self.results.clearSelection()
                 self.results.setCurrentItem(None)
@@ -592,5 +649,3 @@ class InvestigationPanel(QWidget):
                     return
             self.results.clearSelection()
             self.results.setCurrentItem(None)
-        finally:
-            self._quiet = False

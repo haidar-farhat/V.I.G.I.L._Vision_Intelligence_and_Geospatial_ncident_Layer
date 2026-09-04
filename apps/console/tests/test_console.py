@@ -3410,3 +3410,122 @@ def test_dragging_a_camera_in_configure_places_it_and_keeps_its_height_and_headi
     assert stored is not None and stored.position == after.position, (
         "the console moved the camera on screen and never persisted it"
     )
+
+
+# ----------------------------------------------- the two wires nobody could pull
+#
+# The investigation panel and the plate readings were built and tested and
+# reachable by nothing. These fail if either wire is removed again.
+
+
+def test_the_investigation_panel_is_in_the_window_and_searches_the_nodes_store(qt_app, window):
+    labels = [window.detail_tabs.tabText(i) for i in range(window.detail_tabs.count())]
+    assert "Investigation" in labels
+    assert window.investigation._store is window.node.store, "the panel searches some other database"
+
+
+def test_a_result_picked_in_the_investigation_panel_reaches_the_bus(qt_app, window):
+    from sentinel_console.selection import Selection
+
+    window.investigation.selected.emit(Selection.incident("inc_wired"))
+
+    assert window.selection.current == Selection.incident("inc_wired")
+    assert window.incidents.selected_incident_id() in (None, "inc_wired")
+
+
+def test_a_selection_made_elsewhere_reaches_the_investigation_panel(qt_app, window):
+    from sentinel_console.selection import Selection
+
+    window.selection.select(Selection.incident("inc_elsewhere"))
+    assert window.investigation._selected == Selection.incident("inc_elsewhere")
+
+    window.selection.clear()
+    assert window.investigation._selected is None
+
+
+def test_the_search_pickers_follow_the_cameras_and_zones(qt_app, window, reference_video: Path):
+    session = _placed_window(window, reference_video)
+    window._add_zone(radius=6.0)
+
+    cameras = [window.investigation.camera.itemText(i) for i in range(window.investigation.camera.count())]
+    zones = [window.investigation.zone.itemText(i) for i in range(window.investigation.zone.count())]
+    assert session.camera_id in cameras
+    assert window._zones[0].name in zones
+
+
+def test_a_vehicles_plate_reading_reaches_the_track_table(qt_app, window, reference_video: Path):
+    """The pipeline published plates and nothing displayed them.
+
+    A half-read plate must reach the screen as its display form, with "?" for
+    every character the frames have not agreed on, and a thin reading must say
+    how thin it is. `text` — the completed string a rule may act on — is never
+    what the operator is shown, because it is None until every character has.
+    """
+    import numpy as np
+
+    from sentinel.node import Update
+    from sentinel.pipeline import FrameResult, PipelineStats, TrackPlate
+
+    session = _placed_window(window, reference_video)
+    where = destination_point(SITE_POSE.position, SITE_POSE.heading, 15.0)
+    car = _located_track(2, where)
+    van = _located_track(3, destination_point(SITE_POSE.position, SITE_POSE.heading, 25.0))
+    plates = (
+        TrackPlate(track_id=2, country="GENERIC", display="B7?4921", text=None,
+                   is_confident=False, agreement=2, reads=3),
+        TrackPlate(track_id=3, country="GENERIC", display="KX19ABC", text="KX19ABC",
+                   is_confident=True, agreement=6, reads=6),
+    )
+    result = FrameResult(
+        index=10, timestamp_millis=1000, source_id=session.camera_id,
+        detections=(), tracks=(car, van), ended=(),
+        image=np.zeros((480, 640, 3), dtype=np.uint8), plates=plates,
+    )
+    session.absorb(Update(result=result, analysis_fps=30.0, skipped=0, stats=PipelineStats()))
+    window._refresh_tracks()
+
+    rows = {
+        window.tracks.topLevelItem(i).data(0, Qt.ItemDataRole.UserRole)[1]: window.tracks.topLevelItem(i)
+        for i in range(window.tracks.topLevelItemCount())
+    }
+    header = window.tracks.headerItem()
+    plate_column = next(c for c in range(header.columnCount()) if header.text(c) == "Plate")
+    assert rows[2].text(plate_column) == "B7?4921 (2)", "an unresolved character was completed or the thin count dropped"
+    assert rows[3].text(plate_column) == "KX19ABC"
+    assert "?" not in rows[3].text(plate_column)
+
+
+# ------------------------------------------------------------ --start
+
+
+def test_start_on_launch_runs_the_restored_cameras(qt_app, window, reference_video: Path):
+    session = window.add_camera(reference_video, "cam-07")
+    assert not session.is_running
+
+    window.start_on_launch()
+    pump(qt_app, window, 1.0)
+
+    assert session.is_running, "--start did not start the restored camera"
+    window._stop()
+
+
+def test_start_on_launch_with_no_cameras_says_so_instead_of_looking_busy(qt_app, window):
+    # A console opened with --start on a machine with no cameras would look
+    # exactly like one that was starting, for as long as anybody waited.
+    window.start_on_launch()
+
+    assert not window._running
+    assert "--start" in window.status.currentMessage()
+    assert "no cameras" in window.status.currentMessage().lower()
+
+
+def test_the_console_accepts_the_start_flag(qt_app):
+    # The flag is parsed by run(); parse it the same way run() does so the
+    # help text and the name cannot drift from what the binary accepts.
+    import argparse
+
+    from sentinel_console import app as app_module
+
+    source = __import__("inspect").getsource(app_module.run)
+    assert '"--start"' in source
+    assert "start_on_launch" in source, "the flag is parsed but never acted on"

@@ -462,7 +462,7 @@ class Store:
     transaction — a subtle way to commit half of somebody else's write.
     """
 
-    __slots__ = ("_connection", "_path", "_plate_format", "_register")
+    __slots__ = ("_closed", "_connection", "_path", "_plate_format", "_register")
 
     def __init__(
         self,
@@ -486,6 +486,7 @@ class Store:
         self._path = str(path)
         self._plate_format = plate_format
         self._register: Register | None = None
+        self._closed = False
         if self._path != ":memory:":
             Path(self._path).parent.mkdir(parents=True, exist_ok=True)
 
@@ -496,11 +497,46 @@ class Store:
         # interface is querying incidents while a pipeline is inserting events.
         # Not available in memory, where it is also unnecessary.
         if self._path != ":memory:":
-            self._connection.execute("PRAGMA journal_mode = WAL")
+            self._set_wal()
         # Off by default in SQLite, which silently permits orphaned evidence.
         self._connection.execute("PRAGMA foreign_keys = ON")
+        # No `busy_timeout` is set here on purpose. The driver already opens
+        # every connection with one — measured at five seconds on this build —
+        # so a second writer waits for the first rather than failing at once.
+        # What a timeout cannot fix is a unit of work that reads and then
+        # writes: SQLite refuses that one immediately, without consulting the
+        # busy handler at all, because waiting could not make the stale read
+        # current. `transaction(immediate=True)` is the answer to that, and
+        # `audit_record` is the caller that needs it.
 
         self._ensure_schema(auto_migrate)
+
+    def _set_wal(self) -> None:
+        """Put the file in WAL, but never fail to open because of it.
+
+        Changing the journal mode needs a lock no other connection holds, and it
+        is refused rather than queued: a busy timeout does not save it. So a
+        console opening the database while a `sentinel` command is mid-write
+        used to die on this line with "database is locked" — the store never
+        opened, and the reason had nothing to do with what the operator asked
+        for.
+
+        Skipped when the file is already in WAL, which is the usual case after
+        the first open, and downgraded to a warning when it cannot be set. The
+        journal mode is how well concurrent readers and writers get along; it is
+        not what makes a write correct, and refusing to open at all in order to
+        secure it trades a real failure for a hypothetical one.
+        """
+        row = self._connection.execute("PRAGMA journal_mode").fetchone()
+        if row is not None and str(row[0]).lower() == "wal":
+            return
+        try:
+            self._connection.execute("PRAGMA journal_mode = WAL")
+        except sqlite3.OperationalError as refused:
+            _log.warning(
+                "%s: could not switch to WAL (%s); staying in %s",
+                self._path, refused, row[0] if row is not None else "the current mode",
+            )
 
     @property
     def path(self) -> str:
@@ -523,7 +559,17 @@ class Store:
 
         Built once and kept, since constructing one runs its DDL, and reusing
         the object is what makes "the register" a single thing on this node.
+
+        Raises after :meth:`close`, naming this store. The register is the
+        object most likely to outlive the store that made it — a panel holding
+        one while the node behind it shuts down — and without this the caller
+        would get a bare ``sqlite3.ProgrammingError`` raised from inside
+        `registry`, three modules from the thing that actually went.
         """
+        if self._closed:
+            raise StoreError(
+                f"the store at {self._path} is closed; its register closed with it"
+            )
         if self._register is None:
             self._register = Register(
                 self._connection, plate_format=self._plate_format
@@ -531,6 +577,15 @@ class Store:
         return self._register
 
     def close(self) -> None:
+        """Close the connection, and let go of the register with it.
+
+        The cached `Register` is dropped rather than left pointing at a dead
+        connection, so that touching it afterwards fails from :attr:`register`
+        with this store's path in the message instead of from inside `registry`
+        with a bare "cannot operate on a closed database".
+        """
+        self._closed = True
+        self._register = None
         self._connection.close()
 
     def __enter__(self) -> "Store":
@@ -542,12 +597,29 @@ class Store:
     # ------------------------------------------------------------ transactions
 
     @contextmanager
-    def transaction(self) -> Iterator[sqlite3.Connection]:
+    def transaction(self, *, immediate: bool = False) -> Iterator[sqlite3.Connection]:
         """A unit of work that either lands completely or not at all.
 
         Nesting uses savepoints, because repositories compose — writing an
         incident also writes its events — and an inner failure must be able to
         roll back without abandoning the outer unit of work.
+
+        ``immediate`` takes the write lock at ``BEGIN`` instead of at the first
+        write. Use it for a unit that *reads a value it is about to extend* —
+        :meth:`audit_record` reads the chain head. A deferred ``BEGIN`` takes
+        its read snapshot at the first ``SELECT``, and if another connection
+        commits before this one reaches its ``INSERT``, SQLite refuses the write
+        with "database is locked" **immediately**: the busy handler is not
+        consulted, because no amount of waiting would make the snapshot current
+        again. Measured at 0.00 s against a connection whose busy timeout was
+        five seconds. A read-then-write is the only case that needs the early
+        lock; taking it everywhere would serialise readers behind writers for
+        nothing.
+
+        Only the outermost unit chooses. A nested call runs in a savepoint under
+        whatever lock the outer ``BEGIN`` took, and cannot upgrade it — SQLite
+        has no way to promote a deferred transaction — so a caller that needs
+        the early lock must be the one that opens the transaction.
         """
         in_transaction = self._connection.in_transaction
         if in_transaction:
@@ -562,7 +634,7 @@ class Store:
                 self._connection.execute(f"RELEASE {name}")
             return
 
-        self._connection.execute("BEGIN")
+        self._connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
         try:
             yield self._connection
             self._connection.execute("COMMIT")
@@ -603,11 +675,26 @@ class Store:
         A failure therefore leaves nothing partially applied, and nothing
         recorded as applied — an operator upgrading an air-gapped deployment
         must get a deterministic result or a clean refusal.
+
+        Each transaction is ``IMMEDIATE`` and re-asks, under that lock, whether
+        the migration is still pending. :meth:`pending` was read before any lock
+        was held, so two processes opening the same new database — a console
+        starting while a `sentinel` command runs — both saw the same empty
+        ladder and both tried to apply migration 1. The loser got "table
+        cameras already exists" wrapped as a failed migration, which reads like
+        a corrupt database and is not one. Whoever takes the lock second finds
+        the row already there and moves on.
         """
         done: list[Migration] = []
         for migration in self.pending():
             try:
-                with self.transaction() as connection:
+                with self.transaction(immediate=True) as connection:
+                    applied = connection.execute(
+                        "SELECT 1 FROM schema_migrations WHERE version = ?",
+                        (migration.version,),
+                    ).fetchone()
+                    if applied is not None:
+                        continue
                     for statement in _statements(migration.up):
                         connection.execute(statement)
                     connection.execute(
@@ -1359,8 +1446,17 @@ class Store:
         ``record.at`` should be timezone-aware. A naive one is read in this
         machine's local zone, which puts the row hours away from where it
         belongs on a node whose clock is not UTC.
+
+        The transaction is ``IMMEDIATE`` because this one reads before it
+        writes: the head it chains onto is read inside the unit of work. With a
+        deferred ``BEGIN``, a `sentinel` command running beside the console
+        could commit between this read and this insert, and the insert would
+        then be refused outright — not delayed, refused, with the busy timeout
+        never consulted. The write lost would be an audit row, which is the
+        write this database least wants to lose. Taking the lock at ``BEGIN``
+        turns that into a wait, which is what the timeout is for.
         """
-        with self.transaction() as connection:
+        with self.transaction(immediate=True) as connection:
             previous = self.audit_chain_head()
             chain_hash = record.chain(previous)
             connection.execute(
@@ -1399,6 +1495,25 @@ class Store:
             "ORDER BY id DESC LIMIT 1"
         ).fetchone()
         return None if row is None else row["chain_hash"]
+
+    def audit_totals(self) -> tuple[int, int]:
+        """How many audit rows there are, and how many carry a chain hash.
+
+        Two numbers because they answer different questions and the difference
+        between them is the honest part: the first is how much of what happened
+        was written down, the second is how much of it a later reader can prove
+        was not edited afterwards. Reporting only the first would imply the
+        chain covers the whole log, which :meth:`audit_chain_head` is explicit
+        that it does not.
+
+        Counts rather than rows, so that something showing the log's state on a
+        status line does not have to read the log to do it.
+        """
+        row = self._connection.execute(
+            "SELECT COUNT(*) AS rows_written, "
+            "COUNT(chain_hash) AS chained FROM audit_logs"
+        ).fetchone()
+        return row["rows_written"], row["chained"]
 
     def audit_trail(self, *, limit: int = 200) -> list[sqlite3.Row]:
         return self._connection.execute(

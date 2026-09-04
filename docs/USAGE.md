@@ -215,6 +215,14 @@ The footprint drawn on the plan view is an **annular sector**, not a pie slice â
 a downward-tilted camera cannot see the ground at its own mast, and drawing the
 slice would claim coverage it does not have.
 
+### Opening the console already running
+
+`SentinelVision.exe --start` (or `python tasks.py console -- --start`) starts
+every camera the node restored as soon as the window is up. For a control room
+that is the difference between a site watched from the moment the shift begins
+and one unwatched until somebody finds the Start button. With no cameras it says
+so in the status bar rather than looking busy.
+
 ### Cameras and zones are managed from the toolbar and the Zones tab
 
 | control | what it does |
