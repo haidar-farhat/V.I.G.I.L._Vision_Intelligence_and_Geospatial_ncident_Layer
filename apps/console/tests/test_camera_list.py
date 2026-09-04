@@ -134,6 +134,12 @@ def row_texts(panel: CameraListPanel, index: int) -> list[str]:
     return [item.text(column) for column in range(panel.tree.columnCount())]
 
 
+def row_texts_for(facts) -> str:
+    panel = CameraListPanel()
+    panel.show_cameras([record("cam-01")], {"cam-01": facts})
+    return row_texts(panel, 0)[STATUS_COLUMN]
+
+
 def every_string(panel: CameraListPanel) -> list[str]:
     """Every piece of text the panel could put in front of a person: cell text,
     tooltips and the summary line. What the redaction test scans."""
@@ -378,6 +384,49 @@ def test_a_failed_camera_reports_the_reason_it_failed(qt_app):
     print("failed:", readable(status))
     assert "not reachable" in status
     assert panel.tree.topLevelItem(0).foreground(STATUS_COLUMN).color() == theme.FAULT
+
+
+def test_a_live_camera_whose_frames_slowed_says_how_stale_it_is(qt_app):
+    # The engine quotes no frame rate unless a frame arrived in the last second,
+    # so a live camera can carry a measured 0.0 fps. Printing "live · 0.0 fps"
+    # would read as a stalled camera that is not stalled; the age is the fact
+    # that is actually known.
+    slowing = engine_health(analysis_fps=0.0, seconds_since_frame=4.0)
+    assert camera_state(slowing) == STATE_LIVE
+    panel = CameraListPanel()
+    panel.show_cameras([record("cam-01")], {"cam-01": slowing})
+    status = row_texts(panel, 0)[STATUS_COLUMN]
+    print("slowed:", readable(status))
+    assert "live" in status and "0.0 fps" not in status
+    assert "4s" in status
+
+
+def test_a_camera_that_stopped_delivering_says_when_it_stopped(qt_app):
+    # A camera that ran all day and went dark at 3 a.m. is a different fact from
+    # one that never delivered anything, and the strip must not flatten them.
+    went_dark = engine_health(
+        state=CameraState.DARK, analysis_fps=0.0, seconds_since_frame=45.0,
+    )
+    panel = CameraListPanel()
+    panel.show_cameras(
+        [record("cam-went-dark"), record("cam-never")],
+        {"cam-went-dark": went_dark, "cam-never": DARK},
+    )
+    stopped_status = row_texts(panel, 0)[STATUS_COLUMN]
+    never_status = row_texts(panel, 1)[STATUS_COLUMN]
+    print("went dark:", readable(stopped_status))
+    print("never    :", readable(never_status))
+    assert "dark" in stopped_status and "45s" in stopped_status
+    assert "no frame yet" in never_status
+    assert stopped_status != never_status
+
+
+def test_a_fault_with_no_reason_does_not_read_as_a_cut_off_message(qt_app):
+    nameless = health(state="FAULTED", fault=None)
+    text = row_texts_for(nameless)
+    print("faulted, no reason:", readable(text))
+    assert not text.endswith("— ")
+    assert "no reason reported" in text
 
 
 def test_the_summary_counts_the_cameras_nobody_would_go_looking_at(qt_app):

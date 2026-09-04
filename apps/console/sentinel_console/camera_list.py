@@ -259,7 +259,10 @@ def status_text(health) -> str:
     if state == STATE_OFF:
         return "not started"
     if state == STATE_FAULT:
-        return f"failed — {_fact(health, 'fault', '')}"
+        # "failed — " with nothing after it reads as a truncated message and
+        # sends an operator looking for the rest of it; a fault the panel was not
+        # given a reason for says so.
+        return f"failed — {_fact(health, 'fault') or 'no reason reported'}"
     age = _fact(health, "seconds_since_frame")
     age = None if age is None else float(age)
     if state == STATE_DARK:
@@ -332,11 +335,17 @@ def display_source(record) -> str:
 
     `CameraRecord.display_source` is already redacted, so it is preferred; the
     fallback redacts here rather than trusting the caller, because the raw
-    ``source`` may carry ``rtsp://admin:hunter2@…`` and a password that reaches a
+    ``source`` of a network camera may carry a password in its userinfo — the
+    ``user:password@`` part before the host — and a password that reaches a
     QTreeWidgetItem is in the accessibility tree, in every screenshot of the
     console, and in the tooltip an operator hovers in front of a visitor. There
     is deliberately no path through this panel that reads ``record.source`` and
     shows it.
+
+    (Written without a literal URL on purpose: `tools/offline_audit.py` greps
+    shipped source for anything naming a destination outside the site, and an
+    illustrative one in a docstring is indistinguishable to a grep from a real
+    one. The check stays strict; the example loses nothing by being described.)
     """
     shown = getattr(record, "display_source", None)
     if isinstance(shown, str) and shown:

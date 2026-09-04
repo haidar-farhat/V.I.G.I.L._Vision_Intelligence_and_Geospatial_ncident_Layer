@@ -156,6 +156,10 @@ class MapView(QWidget):
         #: heading the gesture changes, and the bands taken down for it. Nothing
         #: leaves this dictionary until the button comes up.
         self._camera_drag: dict | None = None
+        #: The last released drag, as (camera id, the pose the owner still has,
+        #: its bands), kept until the owner confirms the placement by calling
+        #: `set_cameras`. See `revert_uncommitted`.
+        self._uncommitted: tuple[str, CameraPose, tuple | None] | None = None
         #: Cameras that are placed but delivering nothing. Their ground is
         #: hatched and carries no bands. See `set_dark_cameras`.
         self._dark: set[str] = set()
@@ -488,7 +492,16 @@ class MapView(QWidget):
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if self._camera_drag is not None:
-            self._end_camera_drag()
+            if event.button() == Qt.MouseButton.LeftButton:
+                self._end_camera_drag()
+            else:
+                # A right-click is a live gesture in this view — it takes a
+                # vertex back while drawing — and an operator has every reason
+                # to press one mid-drag. It is not them saying yes to a
+                # placement, so it abandons the drag exactly as Escape does.
+                # Committing on it wrote a pose and an audit entry nobody
+                # confirmed.
+                self._revert_camera_drag()
             return
         if self._edit is not None:
             self._edit["drag"] = None
@@ -838,18 +851,29 @@ class MapView(QWidget):
         pose = self._cameras[camera_id]
         east, north = self._to_local(pose.position)
         cursor_east, cursor_north = self._from_screen(position)
+        # The bands come down for the duration. Recomputing them costs 1750
+        # calls across the FFI per camera — measured at 7.9 ms warm, 75 ms on
+        # the first — which is a slideshow at mouse-move rate. The footprint
+        # alone is one call at 0.03 ms, so that stays live.
+        bands = self._bands.pop(camera_id, None)
+        original = pose
+        stash = self._uncommitted
+        if stash is not None and stash[0] == camera_id:
+            # A previous release is still out for confirmation, so the pose
+            # the owner has is the one stashed then, not the one on screen.
+            # Measuring this gesture against the drawn pose would report a
+            # drag straight back to the stored position as a change.
+            original = stash[1]
+            bands = bands if bands is not None else stash[2]
+            self._uncommitted = None
         self._camera_drag = {
             "camera_id": camera_id,
             "kind": kind,
-            "original": pose,
+            "original": original,
             # Where the pointer grabbed it, so the mast does not jump to the
             # cursor on the first pixel of movement.
             "grab": (east - cursor_east, north - cursor_north),
-            # The bands come down for the duration. Recomputing them costs 1750
-            # calls across the FFI per camera — measured at 7.9 ms warm, 75 ms
-            # on the first — which is a slideshow at mouse-move rate. The
-            # footprint alone is one call at 0.03 ms, so that stays live.
-            "bands": self._bands.pop(camera_id, None),
+            "bands": bands,
         }
         self._hover = None
         self.setCursor(
@@ -929,6 +953,12 @@ class MapView(QWidget):
         # where the camera used to be. The owner recomputes them off this
         # signal, in practice before the next repaint; until it does, the bare
         # footprint is the honest drawing.
+        #
+        # The placement is a request, not a fact, so the pose the owner still
+        # has stays reachable until it confirms with `set_cameras`. Without it
+        # a refusal left the map drawing this camera metres from where the node
+        # has it, indefinitely. See `revert_uncommitted`.
+        self._uncommitted = (camera_id, original, drag.get("bands"))
         if drag["kind"] == "move":
             self.camera_moved.emit(camera_id, pose.position)
         else:
@@ -943,6 +973,29 @@ class MapView(QWidget):
         self._show_uncommitted_pose(drag["camera_id"], drag["original"])
         self._restore_bands(drag["camera_id"], drag)
         self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self.update()
+
+    def revert_uncommitted(self, camera_id: str | None = None) -> None:
+        """Take the last released drag back when the placement never happened.
+
+        `camera_moved` and `camera_aimed` ask; they are not told whether the
+        node agreed, and it can refuse — the camera is not placed, its session
+        has gone. Measured with nothing on the other end, the map went on
+        showing the camera 15.31 m from where the node had it, and the hover
+        text quoted a range for a pose that existed nowhere but this widget.
+        The owner calls this on the paths where it does not place the camera.
+        """
+        stash = self._uncommitted
+        if stash is None or (camera_id is not None and stash[0] != camera_id):
+            return
+        self._uncommitted = None
+        if stash[0] not in self._cameras:
+            # The camera went away while the placement was out. There is
+            # nothing to put the old pose back onto.
+            return
+        self._show_uncommitted_pose(stash[0], stash[1])
+        if stash[2] is not None:
+            self._bands[stash[0]] = stash[2]
         self.update()
 
     def _restore_bands(self, camera_id: str, drag: dict) -> None:
@@ -1129,6 +1182,9 @@ class MapView(QWidget):
         # cameras are, and a half-finished gesture holding a pose from before
         # that would commit it on release over the top of the new one.
         self._camera_drag = None
+        # And this is the owner saying where the cameras are, which is the
+        # confirmation the last release was waiting for.
+        self._uncommitted = None
         self._cameras = dict(cameras)
         self._trails.clear()
         self._footprints = {
@@ -1270,6 +1326,8 @@ class MapView(QWidget):
         if self._camera_drag is not None and self._camera_drag["camera_id"] == camera_id:
             # Not reverted — there is nothing left to revert it onto.
             self._camera_drag = None
+        if self._uncommitted is not None and self._uncommitted[0] == camera_id:
+            self._uncommitted = None
         self._tracks = tuple(t for group in self._live.values() for t in group)
         for key in [k for k in self._trails if k[0] == camera_id]:
             del self._trails[key]

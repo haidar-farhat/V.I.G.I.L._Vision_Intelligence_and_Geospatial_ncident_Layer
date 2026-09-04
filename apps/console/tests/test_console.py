@@ -2846,6 +2846,33 @@ def test_escape_during_a_drag_puts_the_camera_back(qt_app):
     assert moved == [], "the release committed a drag that had been abandoned"
 
 
+def test_a_right_click_during_a_drag_does_not_place_the_camera(qt_app):
+    """Only the release of the gesture that made the placement commits it.
+
+    A right-click is a live gesture in this view — it takes a vertex back
+    while drawing — so an operator has every reason to press one mid-drag.
+    Committing on any button coming up wrote a pose through `place_camera`
+    and left an audit entry nobody confirmed.
+    """
+    from PySide6.QtTest import QTest
+
+    view = _map_of_one_camera(editable=True)
+    moved = []
+    _watch(view.camera_moved, moved)
+    centre = _camera_centre(view)
+    away = QPointF(centre.x() + 80, centre.y() + 50)
+
+    _hold(view, centre)
+    _move(view, away)
+    assert view._cameras["gate"] != SITE_POSE, "the drag did nothing, so nothing is proven"
+
+    QTest.mouseRelease(view, Qt.MouseButton.RightButton, pos=away.toPoint())
+
+    assert moved == [], "a right-click placed the camera"
+    assert view._cameras["gate"] == SITE_POSE, "the camera stayed where the abandoned drag put it"
+    assert view.dragging_camera is None, "the gesture is still in flight"
+
+
 def test_relocking_the_view_mid_drag_reverts_it(qt_app):
     # The idle timer relocks the console on its own. A gesture in flight when
     # that happens is not the operator saying yes to it.
@@ -2861,6 +2888,45 @@ def test_relocking_the_view_mid_drag_reverts_it(qt_app):
     _let_go(view, away)
 
     assert moved == [], "a camera was placed by a lock coming back"
+    assert view._cameras["gate"] == SITE_POSE
+
+
+def test_a_move_the_node_refuses_does_not_stay_on_the_map(qt_app):
+    """`camera_moved` asks. It is not told whether the node agreed.
+
+    The node refuses a placement whose camera is not placed or whose session
+    has gone, and nothing comes back to say so. Left alone the map goes on
+    drawing the camera metres from where the node has it, and the hover text
+    quotes a range for a pose that exists nowhere but this widget.
+    """
+    from sentinel.core import haversine_distance
+
+    view = _map_of_one_camera(editable=True, bands=True)
+    moved = []
+    _watch(view.camera_moved, moved)
+    centre = _camera_centre(view)
+    away = QPointF(centre.x() + 70, centre.y() + 45)
+
+    _hold(view, centre)
+    _move(view, away)
+    _let_go(view, away)
+
+    assert len(moved) == 1, "nothing was asked for, so nothing can be refused"
+    drift = haversine_distance(SITE_POSE.position, view._cameras["gate"].position)
+    print(f"the map is showing the camera {drift:.2f} m from where the node has it")
+    # Measured at 13.50 m for this drag; any real distance makes the point.
+    assert drift > 5.0, "the drag barely moved it, so the divergence proves nothing"
+
+    # The owner's refusal path: it did not call set_cameras, so it says so.
+    view.revert_uncommitted("gate")
+
+    assert view._cameras["gate"] == SITE_POSE, "the refused pose is still on the map"
+    back = haversine_distance(SITE_POSE.position, view._cameras["gate"].position)
+    print(f"after the refusal: {back:.4f} m")
+    assert back < 0.01
+    assert view._bands.get("gate"), "the ground the camera knows best never came back"
+    # And a second call has nothing left to take back.
+    view.revert_uncommitted("gate")
     assert view._cameras["gate"] == SITE_POSE
 
 
