@@ -20,11 +20,24 @@ the actual 1-sigma horizontal error from the projection. Near the camera that
 disc is smaller than the marker; toward the horizon it is metres across. Drawing
 both at the same size would be the single most misleading thing this view could
 do — it would present a guess and a measurement identically.
+
+**A footprint's far edge is one of two different facts.** It is either the
+range the operator typed — a clamp, which they can raise — or the ground
+running out, which no setting will change. Drawn identically, an operator who
+wants to see further raises a range that was never what stopped them. The
+clamped edge is solid and the ground-limited one dashed, and the legend says
+which is which.
+
+**A camera delivering nothing covers nothing.** Its footprint is hatched rather
+than filled and carries no error bands, because a filled wedge under a camera
+that has stopped is a claim that ground is being watched.
 """
 
 from __future__ import annotations
 
 import math
+from dataclasses import replace
+from functools import lru_cache
 
 from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import (
@@ -49,6 +62,7 @@ from sentinel.core import (
     destination_point,
     field_of_view,
     haversine_distance,
+    project_to_ground,
 )
 
 from . import theme
@@ -63,6 +77,17 @@ MODE_SELECT = "select"
 MODE_DRAW = "draw"
 MODE_PLACE = "place"
 MODE_MEASURE = "measure"
+
+#: What stops a footprint at its far edge. `FAR_EDGE_RANGE` is the pose's
+#: stated range, a number somebody chose; `FAR_EDGE_HORIZON` is the top of the
+#: frame meeting the ground before that range, which is geometry and not a
+#: setting. See `_far_edge_kind`.
+FAR_EDGE_RANGE = "range"
+FAR_EDGE_HORIZON = "horizon"
+
+#: Metres of slack when comparing the two. The core takes `min(far, range)`, so
+#: an edge within a few centimetres of the range is the range.
+_FAR_EDGE_TOLERANCE_M = 0.05
 
 
 class MapView(QWidget):
@@ -83,11 +108,24 @@ class MapView(QWidget):
     ground_moved = Signal(object)
     #: The mode changed — including because a gesture finished on its own.
     mode_changed = Signal(str)
+    #: ``(camera_id, LatLon)`` once a camera has been dragged and let go. Emitted
+    #: once, on release, and never during the drag: a camera half-way through a
+    #: gesture is not where the operator is putting it, and every position that
+    #: camera has ever reported is derived from where it is said to be.
+    camera_moved = Signal(str, object)
+    #: ``(camera_id, heading_degrees)`` once its heading handle has been let go.
+    #: Separate from `camera_moved` because aiming and moving are different
+    #: mistakes to make, and an operator who turned a camera has not moved it.
+    camera_aimed = Signal(str, float)
 
     #: How close, in pixels, a click must be to a vertex to grab it, and to an
     #: edge to split it. Generous: a cross-hair on a 4K panel is small.
     HANDLE_PIXELS = 9.0
     EDGE_PIXELS = 6.0
+    #: How close a click must be to a camera marker to count as a click on it.
+    #: Larger than the marker: the marker is 5 px across and the mast it stands
+    #: for is a real thing an operator will want to grab.
+    CAMERA_PIXELS = 12.0
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -106,6 +144,17 @@ class MapView(QWidget):
         #: the original ring (to tell a no-op from a change), and drag state.
         self._edit: dict | None = None
         self._selected_zone: str | None = None
+        #: Whether a camera may be dragged on the map. False until the console
+        #: says otherwise: moving a camera is a configuration change and the
+        #: console has a lock for those. See `set_editable`.
+        self._editable = False
+        #: The camera being dragged: the pose it had, which of position and
+        #: heading the gesture changes, and the bands taken down for it. Nothing
+        #: leaves this dictionary until the button comes up.
+        self._camera_drag: dict | None = None
+        #: Cameras that are placed but delivering nothing. Their ground is
+        #: hatched and carries no bands. See `set_dark_cameras`.
+        self._dark: set[str] = set()
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMinimumSize(280, 280)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -260,6 +309,15 @@ class MapView(QWidget):
             event.accept()
             return
 
+        if left and self._editable:
+            # Before the hit test, because the handle sits out on bare ground
+            # where the test would find nothing and start a pan.
+            aimed = self._heading_handle_at(position)
+            if aimed is not None:
+                self._begin_camera_drag(aimed, "aim", position)
+                event.accept()
+                return
+
         if left:
             hit = self.hit_test(position)
             # Emitted even when nothing was hit: clicking bare ground is how an
@@ -268,6 +326,20 @@ class MapView(QWidget):
             self.selected.emit(hit)
             if hit is not None and hit.zone_id is not None:
                 self.zone_clicked.emit(hit.zone_id)
+            # A press on a camera picks the camera up rather than the ground
+            # under it — but only where that is allowed, and only after the
+            # selection has gone out, so a click that moves nothing still
+            # selects. Through `hit_test`, so a track standing on the mast is
+            # still the thing nearest the pointer and still wins.
+            if (
+                self._editable
+                and hit is not None
+                and hit.kind == "camera"
+                and hit.camera_id in self._cameras
+            ):
+                self._begin_camera_drag(hit.camera_id, "move", position)
+                event.accept()
+                return
             self._drag_from = position.toPoint()
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
 
@@ -277,6 +349,9 @@ class MapView(QWidget):
         if self.measuring:
             self._measure_to = position
             self.update()
+            return
+        if self._camera_drag is not None:
+            self._drag_camera_to(position)
             return
         if self._draw_points is None and self._edit is None and self._drag_from is None:
             # Hover only while nothing else is going on. A halo that followed
@@ -396,6 +471,9 @@ class MapView(QWidget):
         return None
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if self._camera_drag is not None:
+            self._end_camera_drag()
+            return
         if self._edit is not None:
             self._edit["drag"] = None
             self._edit["moving"] = None
@@ -422,6 +500,12 @@ class MapView(QWidget):
     def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802
         key = event.key()
         if key == Qt.Key.Key_Escape:
+            if self._camera_drag is not None:
+                # The mode never changed — dragging a camera is a Select-mode
+                # gesture — so nothing is announced, the camera simply goes
+                # back to where it was and the release commits nothing.
+                self._revert_camera_drag()
+                return
             if self._draw_points is not None:
                 self.cancel_draw()
             elif self._edit is not None:
@@ -620,6 +704,235 @@ class MapView(QWidget):
     def edit_vertex_count(self) -> int:
         return 0 if self._edit is None else len(self._edit["points"])
 
+    # -------------------------------------------------------- moving a camera
+
+    def set_editable(self, editable: bool) -> None:
+        """Allow, or forbid, dragging a camera on this view.
+
+        Off by default, and off whenever the console is in Monitor. Where a
+        camera is said to be is the input to every position it will ever
+        report, so a sleeve across a touchscreen must not be able to change it
+        while somebody is watching the wall. Taking the permission away
+        mid-gesture reverts the gesture rather than committing it, because the
+        lock coming back is not the operator saying yes.
+        """
+        editable = bool(editable)
+        if editable == self._editable:
+            return
+        self._editable = editable
+        if not editable:
+            self._revert_camera_drag()
+        self.update()
+
+    @property
+    def editable(self) -> bool:
+        return self._editable
+
+    @property
+    def dragging_camera(self) -> str | None:
+        """The camera being dragged right now, or ``None``.
+
+        Exposed so the owner can tell an uncommitted pose from a stored one —
+        nothing is persisted until the button comes up.
+        """
+        return None if self._camera_drag is None else self._camera_drag["camera_id"]
+
+    def set_dark_cameras(self, ids) -> None:
+        """The placed cameras that are delivering nothing.
+
+        A stopped or faulted camera keeps its pose, and until this existed it
+        kept the full blue wedge that goes with one: an operator reading the
+        plan view saw the yard covered by a camera that had not produced a
+        frame in an hour. Dark ground is hatched and carries no error bands,
+        because coverage is what a camera is doing and not where it points.
+        """
+        dark = set(ids)
+        if dark == self._dark:
+            return
+        self._dark = dark
+        self.update()
+
+    @property
+    def dark_cameras(self) -> frozenset:
+        return frozenset(self._dark)
+
+    def far_edge_kind(self, camera_id: str) -> str | None:
+        """What stops this camera's footprint: `FAR_EDGE_RANGE`,
+        `FAR_EDGE_HORIZON`, or ``None`` when the core cannot say.
+
+        Worked out from the same two facts the core builds the wedge from —
+        where the top row of the frame lands on the ground, and the pose's
+        stated range — rather than guessed from the drawn shape.
+        """
+        pose = self._cameras.get(camera_id)
+        return None if pose is None else _far_edge_kind(pose)
+
+    def far_edge_metres(self, camera_id: str) -> float | None:
+        """How far the drawn footprint reaches, down the camera's axis.
+
+        Read off the footprint the view is holding rather than recomputed, so
+        the grip and the edge styling can never disagree with the polygon they
+        are drawn on.
+        """
+        pose = self._cameras.get(camera_id)
+        ring = self._footprints.get(camera_id) or []
+        if pose is None or len(ring) < 3:
+            return None
+        return max(haversine_distance(pose.position, point) for point in ring)
+
+    def heading_handle(self, camera_id: str) -> QPointF | None:
+        """Where the heading grip sits, or ``None`` when there is none to grab.
+
+        On the footprint's own axis, at its far edge: an operator turning a
+        camera is aiming the wedge, and a grip anywhere else asks them to think
+        about the mast instead of about the ground. ``None`` when the view may
+        not be edited, when the camera has no footprint, or when the grip would
+        land on the marker — a rotate handle inside the thing it rotates steals
+        the drag that moves it.
+        """
+        if not self._editable:
+            return None
+        pose = self._cameras.get(camera_id)
+        distance = self.far_edge_metres(camera_id)
+        if pose is None or distance is None:
+            return None
+        centre = self._to_screen(*self._to_local(pose.position))
+        point = self._to_screen(
+            *self._to_local(destination_point(pose.position, pose.heading, distance))
+        )
+        reach = math.hypot(point.x() - centre.x(), point.y() - centre.y())
+        if reach <= self.CAMERA_PIXELS + self.HANDLE_PIXELS:
+            return None
+        return point
+
+    def _heading_handle_at(self, position: QPointF) -> str | None:
+        """The camera whose heading grip is under this point, nearest first."""
+        best: tuple[float, str] | None = None
+        for camera_id in self._cameras:
+            point = self.heading_handle(camera_id)
+            if point is None:
+                continue
+            distance = math.hypot(point.x() - position.x(), point.y() - position.y())
+            if distance <= self.HANDLE_PIXELS and (best is None or distance < best[0]):
+                best = (distance, camera_id)
+        return None if best is None else best[1]
+
+    def _begin_camera_drag(self, camera_id: str, kind: str, position: QPointF) -> None:
+        """Pick a camera up. Nothing is emitted and nothing is stored."""
+        pose = self._cameras[camera_id]
+        east, north = self._to_local(pose.position)
+        cursor_east, cursor_north = self._from_screen(position)
+        self._camera_drag = {
+            "camera_id": camera_id,
+            "kind": kind,
+            "original": pose,
+            # Where the pointer grabbed it, so the mast does not jump to the
+            # cursor on the first pixel of movement.
+            "grab": (east - cursor_east, north - cursor_north),
+            # The bands come down for the duration. Recomputing them costs 1750
+            # calls across the FFI per camera — measured at 7.9 ms warm, 75 ms
+            # on the first — which is a slideshow at mouse-move rate. The
+            # footprint alone is one call at 0.03 ms, so that stays live.
+            "bands": self._bands.pop(camera_id, None),
+        }
+        self._hover = None
+        self.setCursor(
+            Qt.CursorShape.ClosedHandCursor if kind == "move" else Qt.CursorShape.CrossCursor
+        )
+        # So Escape reaches this view rather than the window behind it.
+        self.setFocus()
+        self.update()
+
+    def _drag_camera_to(self, position: QPointF) -> None:
+        """Show the camera where the pointer is now, committing nothing."""
+        drag = self._camera_drag
+        if drag is None:
+            return
+        pose = self._cameras.get(drag["camera_id"])
+        if pose is None:
+            return
+        if drag["kind"] == "move":
+            east, north = self._from_screen(position)
+            moved = replace(
+                pose,
+                position=self._from_local(east + drag["grab"][0], north + drag["grab"][1]),
+            )
+        else:
+            point = self._from_local(*self._from_screen(position))
+            # A bearing taken from a point on top of the mast is noise, and the
+            # camera would spin to whatever the rounding said. Ignore it.
+            if haversine_distance(pose.position, point) < 0.5:
+                return
+            moved = replace(pose, heading=bearing_degrees(pose.position, point) % 360.0)
+        self._show_uncommitted_pose(drag["camera_id"], moved)
+
+    def _show_uncommitted_pose(self, camera_id: str, pose: CameraPose) -> None:
+        """Draw a pose that exists nowhere but this gesture.
+
+        The footprint is rebuilt with it, because the wedge is the thing the
+        operator is dragging *for*: they are watching where the coverage lands,
+        not where the marker is.
+        """
+        self._cameras[camera_id] = pose
+        try:
+            self._footprints[camera_id] = field_of_view(pose, arc_segments=28)
+        except Exception:  # noqa: BLE001 - a pose mid-drag is not worth killing the gesture
+            self._footprints[camera_id] = []
+        self.update()
+
+    def _end_camera_drag(self) -> None:
+        """Let the camera go, and say so exactly once.
+
+        A drag that put the camera back where it started says nothing at all:
+        an operator who thought better of it half way must not leave a
+        re-placement and an audit entry behind.
+        """
+        drag, self._camera_drag = self._camera_drag, None
+        if drag is None:
+            return
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        camera_id = drag["camera_id"]
+        pose = self._cameras.get(camera_id)
+        original = drag["original"]
+        if pose is None:
+            return
+
+        if drag["kind"] == "move":
+            changed = haversine_distance(original.position, pose.position) >= 0.01
+        else:
+            changed = abs(_angle_difference(original.heading, pose.heading)) >= 0.05
+
+        if not changed:
+            self._restore_bands(camera_id, drag)
+            self.update()
+            return
+
+        # The bands stay down. They say where this camera's error crosses each
+        # threshold, and the ones taken down at the start belong to the pose it
+        # no longer has — put back now they would draw the confident ground
+        # where the camera used to be. The owner recomputes them off this
+        # signal, in practice before the next repaint; until it does, the bare
+        # footprint is the honest drawing.
+        if drag["kind"] == "move":
+            self.camera_moved.emit(camera_id, pose.position)
+        else:
+            self.camera_aimed.emit(camera_id, pose.heading)
+        self.update()
+
+    def _revert_camera_drag(self) -> None:
+        """Put the camera back exactly as it was, and emit nothing."""
+        if self._camera_drag is None:
+            return
+        drag, self._camera_drag = self._camera_drag, None
+        self._show_uncommitted_pose(drag["camera_id"], drag["original"])
+        self._restore_bands(drag["camera_id"], drag)
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self.update()
+
+    def _restore_bands(self, camera_id: str, drag: dict) -> None:
+        if drag.get("bands") is not None:
+            self._bands[camera_id] = drag["bands"]
+
     # ------------------------------------------------------------- selection
 
     def select_zone(self, zone_id: str | None) -> None:
@@ -659,7 +972,10 @@ class MapView(QWidget):
 
         for camera_id, pose in self._cameras.items():
             point = self._to_screen(*self._to_local(pose.position))
-            if math.hypot(point.x() - position.x(), point.y() - position.y()) <= 12.0:
+            if (
+                math.hypot(point.x() - position.x(), point.y() - position.y())
+                <= self.CAMERA_PIXELS
+            ):
                 return Selection.camera(camera_id)
 
         zone_id = self.zone_at(position)

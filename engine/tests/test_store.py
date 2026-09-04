@@ -596,3 +596,279 @@ def test_recorded_at_is_not_rewritten_by_a_re_send(store: Store):
     second = store._connection.execute("SELECT recorded_at FROM events").fetchone()[0]
 
     assert first == second, "a re-send rewrote when the event was first accepted"
+
+
+# ------------------------------------------------------------------- the site
+
+
+def populate(store: Store) -> None:
+    """A database with something in it, so a migration is tested against one.
+
+    A migration that applies to an empty schema and destroys a populated one is
+    the failure worth catching, and it is invisible to every test that migrates
+    a database with no rows in it.
+    """
+    pose = CameraPose(position=SITE, mount_height=6.0, heading=90.0, pitch=-20.0)
+    store.save_camera("cam-07", "North gate", "file:///media/north.mp4", pose)
+    store.save_zone(
+        Zone(
+            id="zone-a",
+            name="Restricted Area A",
+            kind=ZoneKind.RESTRICTED,
+            ring=tuple(destination_point(SITE, b, 30.0) for b in (0.0, 90.0, 180.0)),
+        )
+    )
+    store.save_incident(Correlator().correlate([make_event(track=n) for n in (1, 2)])[0])
+    store.audit("operator:alice", "camera.placed", "cam-07")
+
+
+def make_site(**overrides) -> "Site":
+    from sentinel.site import FrameKind, Site
+
+    fields = dict(
+        id="default",
+        name="Beirut yard",
+        origin=SITE,
+        frame=FrameKind.GEOGRAPHIC,
+        timezone="Asia/Beirut",
+        boundary=tuple(
+            destination_point(SITE, bearing, 60.0)
+            for bearing in (45.0, 135.0, 225.0, 315.0)
+        ),
+    )
+    fields.update(overrides)
+    return Site(**fields)
+
+
+def test_the_site_table_arrives_and_leaves_without_touching_the_evidence(store: Store):
+    """The migration must apply, and undo, on a database that has rows in it.
+
+    An air-gapped deployment steps back a version to diagnose something and
+    steps forward again afterwards. If either direction took the cameras, zones
+    or incidents with it, the diagnosis would cost the evidence — and no test
+    over an empty schema would ever have shown it.
+    """
+    populate(store)
+    store.save_site(make_site())
+    before = store.applied_versions()
+    events, incidents = store.event_count(), store.incident_count()
+
+    undone = store.rollback()
+
+    assert undone is not None and undone.name == "sites"
+    assert "sites" not in store.table_names(), "the table survived its own down"
+    assert store.event_count() == events, "rolling back the site took the events"
+    assert store.incident_count() == incidents
+    assert len(store.cameras()) == 1
+    assert len(store.zones()) == 1
+    assert len(store.audit_trail()) == 1
+
+    store.migrate()
+
+    assert store.applied_versions() == before
+    assert "sites" in store.table_names()
+    assert store.site() is None, "the site row is not resurrected by re-applying"
+    store.save_site(make_site())
+    assert store.site() is not None
+
+
+def test_a_site_survives_a_round_trip_with_its_boundary_and_its_clock(store: Store):
+    # The frame kind and the time zone are the two fields a reader can drop
+    # silently: the first prints invented coordinates for a floor plan, the
+    # second evaluates an after-hours schedule in the wrong clock.
+    original = make_site()
+    store.save_site(original)
+
+    restored = store.site()
+
+    assert restored is not None
+    assert restored.id == original.id
+    assert restored.name == original.name
+    assert restored.origin.lat == pytest.approx(SITE.lat)
+    assert restored.origin.lon == pytest.approx(SITE.lon)
+    assert restored.frame is original.frame
+    assert restored.timezone == "Asia/Beirut", "the site's clock did not survive"
+    assert len(restored.boundary) == len(original.boundary)
+    for restored_point, original_point in zip(restored.boundary, original.boundary):
+        assert restored_point.lat == pytest.approx(original_point.lat)
+        assert restored_point.lon == pytest.approx(original_point.lon)
+
+
+def test_a_site_nobody_has_outlined_is_not_a_site_enclosing_nothing(store: Store):
+    # Stored as NULL rather than '[]'. "Not drawn yet" means coverage cannot be
+    # computed; "encloses nothing" means none of the site is covered, which is
+    # an alarm — and a reader that conflates them raises the second for the
+    # first.
+    store.save_site(make_site(boundary=()))
+
+    restored = store.site()
+    assert restored is not None
+    assert restored.boundary == ()
+    assert restored.has_boundary is False
+
+    stored = store._connection.execute("SELECT boundary_ring FROM sites").fetchone()
+    assert stored["boundary_ring"] is None
+
+
+def test_saving_a_site_twice_stores_it_once(store: Store):
+    store.save_site(make_site(name="Beirut yard"))
+    store.save_site(make_site(name="Beirut yard, north half"))
+
+    assert len(store.sites()) == 1
+    assert store.site().name == "Beirut yard, north half"
+
+
+def test_the_origin_does_not_move_when_the_first_camera_is_removed(store: Store):
+    """The bug this whole record exists for.
+
+    The plan view anchored its frame on the first placed camera, so deleting
+    that camera re-anchored everything and every zone, footprint and track
+    jumped on screen. Nothing had moved; the ruler had. An origin in a row
+    cannot be deleted by removing a camera.
+    """
+    first = CameraPose(
+        position=destination_point(SITE, 90.0, 120.0),
+        mount_height=6.0, heading=270.0, pitch=-20.0,
+    )
+    store.save_camera("cam-07", "North gate", "file:///media/north.mp4", first)
+    store.save_site(make_site())
+    origin = store.site().origin
+
+    assert store.delete_camera("cam-07") is True
+
+    after = store.site().origin
+    assert after.lat == pytest.approx(origin.lat)
+    assert after.lon == pytest.approx(origin.lon)
+    assert after.lat == pytest.approx(SITE.lat), "the origin followed the camera"
+
+
+def test_a_local_site_does_not_claim_to_be_a_place(store: Store):
+    # A floor plan's origin is fixed but arbitrary. Distances on it are real;
+    # its coordinates are not, and a screen that prints them is inventing
+    # precision the geometry cannot support.
+    from sentinel.site import FrameKind
+
+    store.save_site(make_site(frame=FrameKind.LOCAL))
+
+    restored = store.site()
+    assert restored.frame is FrameKind.LOCAL
+    assert restored.is_georeferenced is False
+
+
+def test_a_two_point_boundary_is_refused_before_it_reaches_the_database():
+    # Two points reach shapely as a line, whose area is zero, so every coverage
+    # figure computed against it is a division by zero or a confident 0% — a
+    # site reported as entirely unwatched because somebody clicked twice.
+    from sentinel.site import SiteError
+
+    with pytest.raises(SiteError):
+        make_site(boundary=(SITE, destination_point(SITE, 90.0, 40.0)))
+
+
+def test_the_site_clock_says_so_rather_than_falling_back_to_utc():
+    """An unresolvable zone must not become UTC in silence.
+
+    That fallback is how a window typed as 18:00 armed at 21:00 local, with
+    nothing on screen saying why. On Windows the tz database is not shipped with
+    Python, so this is the ordinary case, not an exotic one.
+    """
+    from sentinel.site import SiteError
+
+    site = make_site(timezone="Mars/Olympus_Mons")
+
+    with pytest.raises(SiteError) as raised:
+        site.clock()
+    assert "Mars/Olympus_Mons" in str(raised.value)
+    assert site.timezone == "Mars/Olympus_Mons", "the declared zone is still recorded"
+
+
+# ------------------------------------------------------------- the site frame
+
+
+def test_a_site_frame_round_trips_a_point_to_under_a_centimetre():
+    """Metres out and coordinates back, without walking the site off its fence.
+
+    A boundary is drawn in one direction and stored in the other, edit after
+    edit, so a conversion that lost a millimetre a trip would move a fence over
+    a season. Measured first and floored, never guessed.
+    """
+    from sentinel.core import haversine_distance
+    from sentinel.site import SiteFrame
+
+    frame = SiteFrame(SITE)
+    worst = 0.0
+    for bearing in range(0, 360, 7):
+        for distance in (0.5, 25.0, 250.0, 1000.0, 5000.0):
+            point = destination_point(SITE, float(bearing), distance)
+            east, north = frame.to_xy(point)
+            error = haversine_distance(point, frame.to_latlon(east, north))
+            worst = max(worst, error)
+
+    # Measured at 1.4e-9 m out to 5 km; the bound is six orders of magnitude
+    # looser than that, and still far inside the centimetre this has to hold.
+    print(f"worst round-trip error over 5 km: {worst * 1000:.9f} mm")
+    assert worst < 1e-3, "a round trip lost more than a millimetre"
+
+
+def test_the_origin_maps_to_the_origin():
+    # The zero-distance branch: the bearing from a point to itself is
+    # arbitrary, and an arbitrary bearing times a zero distance is harmless
+    # only until somebody changes the multiplication.
+    from sentinel.site import SiteFrame
+
+    frame = SiteFrame(SITE)
+    assert frame.to_xy(SITE) == (0.0, 0.0)
+    assert frame.to_latlon(0.0, 0.0) == SITE
+
+
+def test_the_site_frame_and_the_coverage_frame_are_the_same_conversion():
+    """Two tangent planes that came to differ would be a bug nobody could find.
+
+    `SiteFrame` is meant to replace `coverage._Frame`; while both exist they
+    must agree exactly, or the plan view and the coverage report would draw the
+    same gap in two places. Imported read-only — nothing in coverage is changed
+    here.
+    """
+    from sentinel.coverage import _Frame
+    from sentinel.site import SiteFrame
+
+    mine = SiteFrame(SITE)
+    theirs = _Frame(SITE)
+
+    worst_xy = 0.0
+    worst_latlon = 0.0
+    for bearing in (0.0, 37.0, 90.0, 143.0, 180.0, 271.0, 355.0):
+        for distance in (0.5, 25.0, 250.0, 1000.0):
+            point = destination_point(SITE, bearing, distance)
+            a, b = mine.to_xy(point), theirs.to_xy(point)
+            worst_xy = max(worst_xy, abs(a[0] - b[0]), abs(a[1] - b[1]))
+
+            back_mine = mine.to_latlon(*a)
+            back_theirs = theirs.to_latlon(*b)
+            worst_latlon = max(
+                worst_latlon,
+                abs(back_mine.lat - back_theirs.lat),
+                abs(back_mine.lon - back_theirs.lon),
+            )
+
+    print(f"worst disagreement: {worst_xy:.3e} m, {worst_latlon:.3e} degrees")
+    assert worst_xy == 0.0, "the two frames no longer do the same arithmetic"
+    assert worst_latlon == 0.0
+
+
+def test_a_stored_site_hands_out_the_frame_everything_should_share(store: Store):
+    # Constructed from the site rather than per caller: two frames on two
+    # origins are two answers to the same question, and the place they disagree
+    # is the far corner of a large site, which is the corner nobody checks.
+    from sentinel.site import SiteFrame
+
+    store.save_site(make_site())
+    restored = store.site()
+
+    frame = restored.metric_frame()
+    east, north = frame.to_xy(destination_point(SITE, 90.0, 100.0))
+
+    print(f"100 m due east reads as east={east:.4f} m, north={north:.4f} m")
+    assert east == pytest.approx(100.0, abs=0.01)
+    assert abs(north) < 0.01
+    assert SiteFrame.of(restored).origin == frame.origin

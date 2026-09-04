@@ -379,3 +379,32 @@ def test_an_attachment_cannot_overwrite_the_record_itself(tmp_path: Path):
     real = json.loads((export.directory / "incident.json").read_text(encoding="utf-8"))
     assert real["id"] == export.incident_id, "the attachment overwrote the record"
     assert verify_export(export.directory) == []
+
+
+def test_the_timeline_is_relative_to_the_incident_not_the_epoch(tmp_path: Path):
+    """"t+" must mean "after this incident opened".
+
+    `occurred_at_millis` is a wall clock. For a file source it starts near
+    zero, so this read correctly for as long as every test used one. The first
+    evidence package exported from a live camera timed its own first event at
+    "t+1788513275.8s" — the Unix epoch, fifty-six years after the incident it
+    belonged to, in the one file a reviewer reads without tooling.
+    """
+    epoch = 1_788_513_275_800          # a real wall clock, as a camera reports it
+    events = [
+        make_event(track=t, at_millis=epoch + t * 900) for t in (1, 2)
+    ]
+    incident = Correlator().correlate(events)[0]
+
+    export = export_incident(
+        incident, tmp_path / "exports", exported_by=EXPORTED_BY, at=MOMENT
+    )
+    report = (export.directory / "report.txt").read_text(encoding="utf-8")
+
+    timeline = [line for line in report.splitlines() if line.strip().startswith("t+")]
+    assert timeline, report
+    offsets = [float(line.split("t+")[1].split("s")[0]) for line in timeline]
+    assert offsets[0] == 0.0, "the first event is not at the incident's own zero"
+    assert max(offsets) < 3600, f"the timeline is an epoch, not an offset: {offsets}"
+    # The absolute time stays beside it: a package read a year later needs both.
+    assert "UTC" in timeline[0]

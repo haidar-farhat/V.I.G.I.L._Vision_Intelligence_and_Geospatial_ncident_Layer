@@ -266,9 +266,17 @@ def _readable_report(incident: Incident, exported_by: str, at: datetime) -> str:
 
     lines += ["", "TIMELINE", "-" * 70]
     for entry in incident.timeline():
+        # Relative to when the incident opened, which is what "t+" claims.
+        # `at_millis` is a wall clock: for a file it starts near zero and this
+        # read correctly, but for a live camera it is a Unix epoch, and the
+        # first real evidence package from a webcam timed its own first event
+        # at "t+1788513275.8s" — fifty-six years after the incident it belongs
+        # to. The absolute UTC time is printed beside it, because a package
+        # read a year later needs both.
+        offset = (entry.at_millis - incident.opened_at_millis) / 1000
         lines.append(
-            f"  t+{entry.at_millis / 1000:7.1f}s  [{entry.severity.value:8}]  "
-            f"{entry.camera_id}  {entry.summary}"
+            f"  t+{offset:7.1f}s  {entry.at:%H:%M:%S} UTC  "
+            f"[{entry.severity.value:8}]  {entry.camera_id}  {entry.summary}"
         )
 
     lines += ["", "EVIDENCE", "-" * 70]

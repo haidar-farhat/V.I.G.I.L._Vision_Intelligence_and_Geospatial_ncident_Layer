@@ -39,6 +39,7 @@ import threading
 import time
 from datetime import datetime
 from dataclasses import dataclass, field
+from enum import Enum
 
 import numpy as np
 from pathlib import Path
@@ -69,6 +70,12 @@ DEFAULT_CORRELATE_MILLIS = 2000
 #: How long `stop` waits for a camera thread to end before reporting that it did
 #: not. A decode blocked on a stalled camera is the ordinary way that happens.
 STOP_TIMEOUT_SECONDS = 10.0
+
+#: How long a nominally running camera may produce nothing before it is called
+#: dark rather than live. Thirty seconds is far longer than any gap a working
+#: camera leaves — a stalled RTSP stream, a decoder wedged inside a driver — and
+#: short enough that an operator finds out while it still matters.
+DARK_AFTER_SECONDS = 30.0
 
 #: Recorded in the audit log. There is no authentication yet, so there is nobody
 #: to name; recording the truth beats inventing an operator, because an audit
@@ -105,6 +112,131 @@ class Update:
         nobody watching has no use for a full-resolution image per result.
         """
         return self.result.image
+
+
+class CameraState(str, Enum):
+    """The one word an operator gets for a camera, and what it is allowed to mean.
+
+    Five states rather than two, because "running" was the lie this exists to
+    correct: a camera whose thread is alive and whose decoder has produced
+    nothing for a minute was reported exactly like one delivering thirty frames
+    a second, and the console's own strip showed it green. The distinction that
+    matters is not running versus stopped — it is *producing frames* versus
+    *not*, and only the last-frame clock knows which.
+    """
+
+    #: The thread is alive and frames have arrived recently. The only state that
+    #: entitles a camera to claim ground on the map.
+    LIVE = "LIVE"
+    #: Alive, and nothing has arrived for :data:`DARK_AFTER_SECONDS`. This is the
+    #: failure an operator must see, and the reason this enum has five members.
+    DARK = "DARK"
+    #: Alive, no frame yet, still inside the grace window. Opening an RTSP
+    #: stream takes seconds, and calling that camera dark for those seconds
+    #: would teach an operator to ignore the word.
+    STARTING = "STARTING"
+    #: Not running, and it did not fail: never started, or asked to stop, or a
+    #: file that reached its end. Says nothing about whether it once worked.
+    STOPPED = "STOPPED"
+    #: The run ended in, or was refused because of, a named fault. Distinct from
+    #: STOPPED because a camera nobody started and a camera that died overnight
+    #: are not the same fact.
+    FAULTED = "FAULTED"
+
+
+@dataclass(frozen=True, slots=True)
+class CameraHealth:
+    """Whether one camera is actually working, in the terms an operator needs.
+
+    Assembled rather than stored, so it cannot go stale: every field is read
+    from the runner and the pipeline at the moment it is asked for. Frozen
+    because a status strip that can write back into the node is a status strip
+    that will eventually place a camera by accident.
+
+    Nothing here is inferred. Each number is one the pipeline or the runner
+    already measured — the alternative, an interface computing a plausible-looking
+    frame rate of its own, is how a display ends up disagreeing with the log
+    about the same camera.
+    """
+
+    camera_id: str
+    state: CameraState
+    #: Its thread is alive. Deliberately *not* the same as working — see `state`.
+    is_running: bool
+    #: It has a pose, so its detections are locations rather than sightings.
+    is_placed: bool
+    #: Frames analysed per second over the last second, or 0.0 when there is no
+    #: measurement current enough to quote. A rate from a minute ago is a claim
+    #: about now that the data does not support.
+    analysis_fps: float
+    #: Frames the pipeline actually analysed, for the whole run.
+    frames: int
+    #: Frames the live decoder discarded to stay current, because the analytic
+    #: was behind. Always 0 for a file, which drops nothing.
+    frames_dropped: int
+    #: Results that were published and never collected, because the viewer was
+    #: busy. Nothing was lost from the analysis — only from the screen — but a
+    #: display showing a third of the frames must say so.
+    frames_not_drawn: int
+    #: How many times the live reader had to re-open the stream. A camera
+    #: reconnecting every few seconds is failing even while it looks alive.
+    reconnects: int
+    #: Why it stopped, or why it was never started. Redacted by construction.
+    fault: str | None
+    #: Since the last frame arrived. ``None`` when none ever has — which is a
+    #: different fact from "a long time ago", and the interface must not print
+    #: it as a number.
+    seconds_since_frame: float | None
+    #: Since its thread was started, or ``None`` if it never was. This is what
+    #: makes DARK defensible for a camera that has produced nothing at all.
+    seconds_since_started: float | None
+
+    @property
+    def is_dark(self) -> bool:
+        """Whether the map must hatch it and drop it from coverage.
+
+        A camera that is nominally running but silent still has a pose, and
+        painting its footprint as covered ground is the specific dishonesty this
+        answers: the ground is not being watched, and an operator reading that
+        map would believe it was.
+        """
+        return self.state in (CameraState.DARK, CameraState.FAULTED)
+
+    @property
+    def covers_ground(self) -> bool:
+        """Whether it may claim its footprint on the map at all.
+
+        Placed *and* producing frames. Either half alone is a footprint drawn
+        over ground nobody is watching.
+        """
+        return self.is_placed and self.state is CameraState.LIVE
+
+    def describe(self) -> str:
+        """One line for a status strip, with the reason attached.
+
+        The state word alone sends an operator to the camera to find out why;
+        the seconds and the fault are what stop that trip.
+        """
+        parts = [self.state.value]
+        if self.state is CameraState.FAULTED and self.fault:
+            parts.append(self.fault)
+        elif self.state is CameraState.DARK:
+            silent = (
+                self.seconds_since_frame
+                if self.seconds_since_frame is not None
+                else self.seconds_since_started
+            )
+            parts.append(
+                f"no frame for {silent:.0f}s" if silent is not None
+                else "no frame ever"
+            )
+        elif self.state is CameraState.LIVE:
+            parts.append(f"{self.analysis_fps:.0f} fps")
+        if self.reconnects:
+            parts.append(f"{self.reconnects} reconnect(s)")
+        if not self.is_placed:
+            parts.append("not placed")
+        return " — ".join(parts)
 
 
 @dataclass
@@ -151,6 +283,7 @@ class CameraRunner:
         "_segment_seconds", "_thread", "_lock", "_stopping",
         "_latest", "_skipped", "_pending_pose", "_pose_changed", "_fault",
         "_pipeline", "_new_events", "_new_segments", "_site_tz",
+        "_started_at", "_last_frame_at", "_analysis_fps",
     )
 
     def __init__(
@@ -200,6 +333,13 @@ class CameraRunner:
         self._pipeline: Pipeline | None = None
         self._new_events: list[Event] = []
         self._new_segments: list = []
+        # Monotonic, never wall clock: health is measured in elapsed seconds,
+        # and a machine that syncs its clock mid-run would otherwise report a
+        # camera as silent for two hours or as having produced a frame in the
+        # future.
+        self._started_at: float | None = None
+        self._last_frame_at: float | None = None
+        self._analysis_fps = 0.0
 
     # ------------------------------------------------------------------ state
 
@@ -229,6 +369,78 @@ class CameraRunner:
     def stats(self) -> PipelineStats | None:
         return self._pipeline.stats if self._pipeline is not None else None
 
+    @property
+    def skipped(self) -> int:
+        """Results published that nobody ever collected.
+
+        Read separately from `take_latest` because the count belongs to the
+        camera, not to whichever `Update` happened to be in the slot: a viewer
+        that never polls would otherwise see a skip count of zero forever.
+        """
+        with self._lock:
+            return self._skipped
+
+    @property
+    def analysis_fps(self) -> float:
+        """The last measured rate, or 0.0 if nothing has been measured yet.
+
+        Stale by construction once frames stop arriving — a rate is a
+        measurement over a window, and there is no window without frames. Whoever
+        quotes it must check `seconds_since_frame` first; `Node.camera_health`
+        does.
+        """
+        with self._lock:
+            return self._analysis_fps
+
+    @property
+    def seconds_since_frame(self) -> float | None:
+        """How long since a frame was analysed, or ``None`` if none ever was.
+
+        The one number that separates a camera that is working from a camera
+        whose thread is merely alive. `None` is deliberately not `inf` and not a
+        large number: "it has never produced a frame" and "it stopped producing
+        frames" are different faults with different first questions.
+        """
+        with self._lock:
+            if self._last_frame_at is None:
+                return None
+            return max(0.0, time.monotonic() - self._last_frame_at)
+
+    @property
+    def seconds_since_started(self) -> float | None:
+        """How long the thread has been up, or ``None`` if it never started.
+
+        Opening a stream takes seconds, so this is what keeps a camera three
+        seconds into its first connection from being reported as dark.
+        """
+        with self._lock:
+            if self._started_at is None:
+                return None
+            return max(0.0, time.monotonic() - self._started_at)
+
+    @property
+    def dropped_frames(self) -> int:
+        """Frames the live reader discarded to stay current. 0 for a file.
+
+        A file is iterated frame by frame and drops nothing; a camera drops
+        whatever arrived while the analytic was busy. Reporting the file's zero
+        as "unknown" would make every replay look suspect, and reporting a
+        camera's drops as zero would hide the failure the counter exists for.
+        """
+        stream = self._pipeline.stream if self._pipeline is not None else None
+        return stream.dropped_frames if stream is not None else 0
+
+    @property
+    def reconnects(self) -> int:
+        """How many times the live reader re-opened the stream. 0 for a file.
+
+        A camera that reconnects every few seconds looks alive in every other
+        measure — the thread runs, frames arrive, the fault stays `None` — and
+        is losing most of what it sees.
+        """
+        stream = self._pipeline.stream if self._pipeline is not None else None
+        return stream.reconnects if stream is not None else 0
+
     # ---------------------------------------------------------------- control
 
     def start(self) -> None:
@@ -239,6 +451,11 @@ class CameraRunner:
                 "half-stopped thread can never be revived underneath a new run."
             )
         self._stopping = False
+        # Before the thread, not inside it: a camera whose first `open()` blocks
+        # for thirty seconds has been running for thirty seconds, and health has
+        # to be able to say so while it is happening.
+        with self._lock:
+            self._started_at = time.monotonic()
         self._thread = threading.Thread(
             target=self._run, name=f"camera:{self.source_id}", daemon=True
         )
@@ -352,6 +569,12 @@ class CameraRunner:
             if self._latest is not None:
                 self._skipped += 1
             self._latest = update
+            # Stamped on publication rather than on collection, because health
+            # must describe the camera and not the viewer: a node with nobody
+            # polling it is still producing frames, and reading the clock in
+            # `take_latest` would have called every headless camera dark.
+            self._last_frame_at = time.monotonic()
+            self._analysis_fps = update.analysis_fps
 
     def _run(self) -> None:
         pipeline = Pipeline(
@@ -427,6 +650,66 @@ class CameraRunner:
                     f"({type(error).__name__})"
                 )
             _log.error("%s: analysis raised", self.source_id, exc_info=True)
+
+
+def _health_for(record: CameraRecord) -> CameraHealth:
+    """One camera's facts, read at the moment of asking. Never cached.
+
+    A cached health record is a status strip that keeps saying LIVE after the
+    camera has gone — which is the failure the whole type exists to prevent, so
+    the assembly is deliberately cheap enough to run on a repaint timer.
+    """
+    runner = record.runner
+    running = record.is_running
+    # The runner's fault is the thread's own account and wins; the record's is
+    # what the last poll saw, plus the faults the node sets itself for a camera
+    # it refused to start at all.
+    fault = (runner.fault if runner is not None else None) or record.fault
+
+    since_frame = runner.seconds_since_frame if runner is not None else None
+    since_start = runner.seconds_since_started if runner is not None else None
+
+    if fault is not None:
+        state = CameraState.FAULTED
+    elif not running:
+        state = CameraState.STOPPED
+    else:
+        # For a camera that has produced nothing at all, silence is measured
+        # from the moment its thread started — otherwise a camera that never
+        # connects would sit at STARTING forever, which is precisely the
+        # green-light-on-a-dead-camera this replaces.
+        silent_for = since_frame if since_frame is not None else since_start
+        if silent_for is not None and silent_for >= DARK_AFTER_SECONDS:
+            state = CameraState.DARK
+        elif since_frame is None:
+            state = CameraState.STARTING
+        else:
+            state = CameraState.LIVE
+
+    # The rate is measured over the last second and means nothing outside it. No
+    # frame in the last second is not a missing measurement — it is a measured
+    # zero, and quoting the old number instead is how a stalled camera keeps
+    # showing thirty frames a second on a strip.
+    fps = 0.0
+    if running and since_frame is not None and since_frame <= 1.0:
+        assert runner is not None  # `is_running` is false without one
+        fps = runner.analysis_fps
+
+    stats = runner.stats if runner is not None else None
+    return CameraHealth(
+        camera_id=record.camera_id,
+        state=state,
+        is_running=running,
+        is_placed=record.pose is not None,
+        analysis_fps=fps,
+        frames=stats.frames if stats is not None else 0,
+        frames_dropped=runner.dropped_frames if runner is not None else 0,
+        frames_not_drawn=runner.skipped if runner is not None else 0,
+        reconnects=runner.reconnects if runner is not None else 0,
+        fault=fault,
+        seconds_since_frame=since_frame,
+        seconds_since_started=since_start,
+    )
 
 
 def _describe_zone_change(before: Zone, after: Zone) -> str:
@@ -1100,6 +1383,25 @@ class Node:
             self._actor, "incident.exported", incident.id, str(export.directory)
         )
         return export, coverage
+
+    def camera_health(self) -> dict[str, CameraHealth]:
+        """Per camera, whether it is actually working. Keyed by camera id.
+
+        `summary()` is prose for a person reading a log after the fact; this is
+        the same question asked while it matters, in fields an interface can put
+        on a strip and a map can hatch from. The distinction they both need and
+        `is_running` cannot make: a camera whose thread is alive and whose
+        decoder has produced nothing for thirty seconds is not watching anything,
+        and until this existed it looked identical to one that was.
+
+        Safe to call on a repaint timer, and safe while cameras are running: it
+        reads each runner's published counters under that runner's own lock and
+        takes nothing from the analysis threads.
+        """
+        return {
+            camera_id: _health_for(record)
+            for camera_id, record in self._cameras.items()
+        }
 
     def summary(self) -> str:
         """What happened, for a person to read."""

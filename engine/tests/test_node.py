@@ -30,7 +30,14 @@ import pytest
 
 from sentinel import logs
 from sentinel.core import CameraPose, LatLon
-from sentinel.node import ACTOR, CameraRunner, Node, NodeError
+from sentinel.node import (
+    ACTOR,
+    DARK_AFTER_SECONDS,
+    CameraRunner,
+    CameraState,
+    Node,
+    NodeError,
+)
 from sentinel.store import Store
 from sentinel.zones import Zone, ZoneKind
 
@@ -777,3 +784,225 @@ def test_a_node_names_the_clock_its_schedules_are_read_against(tmp_path: Path):
     with Node(tmp_path / "m.db") as node:
         assert node.site_tz is not None, "a node with no clock declared falls back to the machine's"
         assert "UTC" in node.site_clock_label
+
+
+# --------------------------------------------------------------- camera health
+
+
+class _StalledRunner:
+    """Stands in for a camera whose thread is alive and whose decoder has died.
+
+    There is no way to produce the real thing inside a test in under thirty
+    seconds — that is the nature of the failure — so the clock is the only part
+    faked. Everything else is what a real runner would report.
+    """
+
+    def __init__(self, silent_for: float, *, running: bool = True):
+        self._silent_for = silent_for
+        self.is_running = running
+        self.fault = None
+        self.stats = None
+        self.skipped = 0
+        self.analysis_fps = 30.0  # the last rate it ever measured, now stale
+        self.dropped_frames = 0
+        self.reconnects = 0
+
+    @property
+    def seconds_since_frame(self):
+        return None
+
+    @property
+    def seconds_since_started(self):
+        return self._silent_for
+
+
+def test_a_camera_that_was_never_started_is_stopped_and_claims_no_rate(
+    tmp_path: Path, reference_video: Path, site: CameraPose
+):
+    # A stopped camera used to be indistinguishable from a working one in
+    # everything except `is_running`, and the numbers beside it were whatever
+    # the last run had left there.
+    with Node(tmp_path / "n.db") as node:
+        node.add_camera(reference_video, camera_id="gate", pose=site)
+
+        health = node.camera_health()["gate"]
+
+    assert health.state is CameraState.STOPPED
+    assert health.is_running is False
+    assert health.is_placed is True
+    assert health.fault is None
+    # Never ran, so there is no rate and no last frame — and neither is dressed
+    # up as a number that reads like a measurement.
+    assert health.analysis_fps == 0.0
+    assert health.frames == 0
+    assert health.seconds_since_frame is None
+    assert health.seconds_since_started is None
+    # Stopped is not dark: nothing failed. It covers no ground either way.
+    assert health.is_dark is False
+    assert health.covers_ground is False
+
+
+def test_a_running_camera_over_the_reference_video_reports_a_measured_rate(
+    tmp_path: Path, reference_video: Path, site: CameraPose
+):
+    # Paced to the file's own timeline so the run lasts long enough to be
+    # observed while it is happening — which is the only moment health is worth
+    # anything.
+    live = None
+    with Node(tmp_path / "n.db", realtime=True) as node:
+        node.add_camera(reference_video, camera_id="gate", pose=site)
+        node.start()
+
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            node.poll()
+            health = node.camera_health()["gate"]
+            if health.state is CameraState.LIVE:
+                live = health
+                break
+            time.sleep(0.05)
+
+        node.stop()
+
+    assert live is not None, "a camera analysing a file never reported itself live"
+    print(
+        f"live: {live.analysis_fps} fps, {live.frames} frames, "
+        f"{live.seconds_since_frame:.3f}s since the last, "
+        f"{live.frames_not_drawn} not drawn, {live.describe()}"
+    )
+
+    assert live.is_running is True
+    assert live.is_placed is True
+    assert live.fault is None
+    # Measured above, floored here: any positive rate proves frames are being
+    # analysed now, and the exact number depends on the machine.
+    assert live.analysis_fps > 0.0
+    assert live.frames > 0
+    assert live.seconds_since_frame is not None
+    assert live.seconds_since_frame < 1.0
+    # A file drops nothing and reconnects to nothing. Quoting a camera's
+    # counters against a replay would make every replay look suspect.
+    assert live.frames_dropped == 0
+    assert live.reconnects == 0
+    # Placed and producing frames is the only combination that may claim ground.
+    assert live.covers_ground is True
+    assert live.is_dark is False
+
+
+def test_a_camera_that_faulted_is_dark_and_says_why(tmp_path: Path, site: CameraPose):
+    # The map hatches this one and drops it from coverage. A placed camera that
+    # cannot open its source still has a footprint, and painting that footprint
+    # as watched ground is the dishonesty health exists to stop.
+    with Node(tmp_path / "n.db") as node:
+        node.add_camera(tmp_path / "absent.mp4", camera_id="gate", pose=site)
+        node.start()
+
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and node.camera("gate").fault is None:
+            node.poll()
+            time.sleep(0.05)
+
+        health = node.camera_health()["gate"]
+        node.stop()
+
+    print(f"faulted: {health.describe()}")
+
+    assert health.state is CameraState.FAULTED
+    assert health.fault is not None
+    assert "gate" in health.fault or "absent" in health.fault
+    assert health.is_dark is True, "a faulted camera must be excluded from coverage"
+    # Placed, and still covering nothing.
+    assert health.is_placed is True
+    assert health.covers_ground is False
+    assert health.analysis_fps == 0.0
+    assert health.fault in health.describe()
+
+
+def test_the_seconds_since_the_last_frame_grow_once_the_frames_stop(
+    tmp_path: Path, reference_video: Path, site: CameraPose
+):
+    # The number the whole state machine rests on. If it does not grow, a
+    # stalled camera stays LIVE forever and nobody is told.
+    with Node(tmp_path / "n.db") as node:
+        node.add_camera(reference_video, camera_id="gate", pose=site)
+        node.run_forever()
+
+        first = node.camera_health()["gate"]
+        assert first.seconds_since_frame is not None
+        time.sleep(0.5)
+        later = node.camera_health()["gate"]
+
+    grew = later.seconds_since_frame - first.seconds_since_frame
+    print(f"since last frame: {first.seconds_since_frame:.3f}s -> "
+          f"{later.seconds_since_frame:.3f}s (grew {grew:.3f}s)")
+
+    # Measured above; floored a little under the sleep to allow for timer
+    # granularity, and bounded above so a clock jump would be caught.
+    assert grew >= 0.4
+    assert grew < 5.0
+    # The run ended by itself, so this is completion and not a failure.
+    assert later.state is CameraState.STOPPED
+    assert later.frames > 0
+    # The rate is measured over the last second, and no frame arrived in it.
+    assert later.analysis_fps == 0.0
+
+
+def test_a_camera_running_and_producing_nothing_is_dark_rather_than_live(
+    tmp_path: Path, site: CameraPose
+):
+    # The failure an operator must see: the thread is alive, nothing is faulted,
+    # and no frame has arrived in a minute. This used to read as "running".
+    with Node(tmp_path / "n.db") as node:
+        node.add_camera("rtsp://10.0.0.9:554/stream", camera_id="gate", pose=site)
+        node.camera("gate").runner = _StalledRunner(DARK_AFTER_SECONDS * 2)
+
+        health = node.camera_health()["gate"]
+        node.camera("gate").runner = None
+
+    print(f"stalled: {health.describe()}")
+
+    assert health.state is CameraState.DARK
+    assert health.is_running is True, "the thread really is alive; that is the trap"
+    assert health.is_dark is True
+    assert health.covers_ground is False, "silent ground must not count as covered"
+    # The last rate it ever measured is not a rate now.
+    assert health.analysis_fps == 0.0
+    assert "no frame" in health.describe()
+
+
+def test_a_camera_still_opening_its_stream_is_not_yet_called_dark(
+    tmp_path: Path, site: CameraPose
+):
+    # Opening an RTSP stream takes seconds. Calling those seconds dark teaches
+    # an operator to ignore the word, which costs more than it saves.
+    with Node(tmp_path / "n.db") as node:
+        node.add_camera("rtsp://10.0.0.9:554/stream", camera_id="gate", pose=site)
+        node.camera("gate").runner = _StalledRunner(DARK_AFTER_SECONDS / 10)
+
+        health = node.camera_health()["gate"]
+        node.camera("gate").runner = None
+
+    assert health.state is CameraState.STARTING
+    assert health.is_dark is False
+    # It is not watching anything yet either, so it claims no ground.
+    assert health.covers_ground is False
+
+
+def test_health_covers_every_camera_and_survives_one_of_them_failing(
+    tmp_path: Path, reference_video: Path, site: CameraPose
+):
+    # A status strip is read when something is wrong, so the one broken camera
+    # must not be able to take the other fifteen off the screen with it.
+    with Node(tmp_path / "n.db") as node:
+        node.add_camera(tmp_path / "absent.mp4", camera_id="broken", pose=site)
+        node.add_camera(reference_video, camera_id="gate", pose=site)
+        node.run_forever()
+
+        health = node.camera_health()
+
+    assert set(health) == {"broken", "gate"}
+    assert health["broken"].state is CameraState.FAULTED
+    assert health["gate"].state is CameraState.STOPPED
+    assert health["gate"].frames > 0
+    # Exactly the split the map needs: one hatched, one merely finished.
+    assert [c for c, h in health.items() if h.is_dark] == ["broken"]

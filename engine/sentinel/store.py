@@ -49,6 +49,7 @@ from typing import Iterable, Iterator, Sequence
 from .core import LatLon
 from .events import Event, Evidence, EventType, Severity, utc_from_millis
 from .incidents import Association, Incident, Risk, RiskFactor
+from .site import DEFAULT_SITE_ID, FrameKind, Site
 from .zones import Schedule, Zone, ZoneKind
 
 from . import paths
@@ -59,7 +60,7 @@ _log = _get_logger(__name__)
 #: Schema version this build expects. A database at a different version is
 #: migrated forward, never opened as-is: opening a schema you do not understand
 #: and hoping the columns line up is how evidence is silently corrupted.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 class StoreError(RuntimeError):
@@ -288,6 +289,57 @@ MIGRATIONS: tuple[Migration, ...] = (
         DROP INDEX recordings_by_age;
         DROP INDEX recordings_by_camera_time;
         DROP TABLE recordings;
+        """,
+    ),
+    Migration(
+        version=4,
+        name="sites",
+        up="""
+        -- The site: the fixed thing every geographic answer is measured from.
+        --
+        -- Until now nothing recorded it, so each screen anchored its own frame
+        -- on whatever it happened to have: the plan view on the first placed
+        -- camera, coverage on the first vertex of the boundary it was handed.
+        -- Removing that camera therefore re-anchored the whole view and every
+        -- zone, footprint and track jumped — nothing had moved, the ruler had.
+        -- An origin in a row cannot be deleted by removing a camera.
+        --
+        -- One row per site, and one site per node today. The table exists
+        -- anyway, because "there is exactly one" is the kind of assumption that
+        -- otherwise ends up compiled into forty queries.
+        CREATE TABLE sites (
+            id             TEXT PRIMARY KEY,
+            name           TEXT NOT NULL,
+            -- The anchor of the local metric frame. Not the centroid of
+            -- anything: it must not move when what it was computed from does.
+            origin_lat     REAL NOT NULL,
+            origin_lon     REAL NOT NULL,
+            -- GEOGRAPHIC: the origin is a real coordinate, so latitudes shown
+            -- against it mean what they say. LOCAL: a floor plan or sketch
+            -- whose origin is fixed but arbitrary, where distances are real and
+            -- coordinates are not. Stored rather than guessed, because a screen
+            -- that guesses eventually prints an invented coordinate beside a
+            -- surveyed one with nothing to tell them apart. Constrained here so
+            -- a third spelling cannot reach the database and be interpreted as
+            -- neither.
+            frame          TEXT NOT NULL DEFAULT 'GEOGRAPHIC'
+                           CHECK (frame IN ('GEOGRAPHIC', 'LOCAL')),
+            -- An IANA name, never an offset. An offset is right for half the
+            -- year: a site saved as UTC+3 in August is UTC+2 in January, and an
+            -- after-hours window that shifts by an hour on the night the clocks
+            -- change disarms the site at the hour nobody is watching it.
+            timezone       TEXT NOT NULL DEFAULT 'UTC',
+            -- The outline, as JSON [[lat, lon], ...] — the same shape zones
+            -- store their ring in, so one reader serves both. NULL, not '[]',
+            -- when nobody has drawn one: "not drawn yet" and "encloses nothing"
+            -- are different answers, and only the second is worth alarming on.
+            boundary_ring  TEXT,
+            created_at     INTEGER NOT NULL,
+            updated_at     INTEGER NOT NULL
+        );
+        """,
+        down="""
+        DROP TABLE sites;
         """,
     ),
 )
@@ -568,6 +620,76 @@ class Store:
             vertical_fov=row["vertical_fov"],
             range_meters=row["range_meters"],
         )
+
+    # ------------------------------------------------------------------- sites
+
+    def save_site(self, site: Site) -> None:
+        """Record the place being watched: its origin, outline and clock.
+
+        Idempotent on the id, like every other write here, so a console that
+        saves the site on each edit updates one row rather than accumulating a
+        history nobody asked for. ``created_at`` is deliberately absent from the
+        update: it is when this site was first recorded, and re-saving the
+        boundary must not rewrite that any more than a re-sent event may rewrite
+        when it was accepted.
+
+        An empty boundary is stored as NULL rather than ``[]``. "Nobody has
+        drawn the outline yet" and "the outline encloses nothing" lead to
+        different screens — the first says coverage cannot be computed, the
+        second says none of the site is covered — and collapsing them is how a
+        site with no outline gets reported as entirely unwatched.
+        """
+        now = _now()
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO sites (
+                    id, name, origin_lat, origin_lon, frame, timezone,
+                    boundary_ring, created_at, updated_at
+                ) VALUES (?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(id) DO UPDATE SET
+                    name = excluded.name,
+                    origin_lat = excluded.origin_lat,
+                    origin_lon = excluded.origin_lon,
+                    frame = excluded.frame,
+                    timezone = excluded.timezone,
+                    boundary_ring = excluded.boundary_ring,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    site.id,
+                    site.name,
+                    site.origin.lat,
+                    site.origin.lon,
+                    site.frame.value,
+                    site.timezone,
+                    (
+                        json.dumps([[p.lat, p.lon] for p in site.boundary])
+                        if site.boundary
+                        else None
+                    ),
+                    now, now,
+                ),
+            )
+
+    def site(self, site_id: str = DEFAULT_SITE_ID) -> Site | None:
+        """The stored site, or ``None`` if this deployment has never named one.
+
+        ``None`` rather than a site invented from the cameras, which is the
+        behaviour this table exists to remove: an origin derived from whatever
+        was placed first moves the moment that camera is deleted, and every
+        object on the plan view moves with it. A caller with no site has to
+        decide what to do about it in the open.
+        """
+        row = self._connection.execute(
+            "SELECT * FROM sites WHERE id = ?", (site_id,)
+        ).fetchone()
+        return None if row is None else _site_from_row(row)
+
+    def sites(self) -> list[Site]:
+        """Every site, for the tooling that must not assume there is one."""
+        rows = self._connection.execute("SELECT * FROM sites ORDER BY id").fetchall()
+        return [_site_from_row(row) for row in rows]
 
     # ------------------------------------------------------------------- zones
 
@@ -1167,6 +1289,29 @@ def _event_from_row(row: sqlite3.Row) -> Event:
         evidence=evidence,
         triggering_conditions=tuple(json.loads(row["conditions"])),
         confidence=row["confidence"],
+    )
+
+
+def _site_from_row(row: sqlite3.Row) -> Site:
+    """Rebuild a site, losing neither its frame kind nor its clock.
+
+    Both have been dropped by a reader before, elsewhere in this file, and both
+    fail quietly: a site read back as GEOGRAPHIC when it is a floor plan prints
+    coordinates that mean nothing, and one read back as UTC evaluates an
+    after-hours schedule in the wrong clock.
+    """
+    ring = row["boundary_ring"]
+    return Site(
+        id=row["id"],
+        name=row["name"],
+        origin=LatLon(row["origin_lat"], row["origin_lon"]),
+        frame=FrameKind(row["frame"]),
+        timezone=row["timezone"],
+        # NULL stays empty: a site nobody has outlined has no boundary, which is
+        # not the same as one whose boundary is empty.
+        boundary=(
+            tuple(LatLon(lat, lon) for lat, lon in json.loads(ring)) if ring else ()
+        ),
     )
 
 
