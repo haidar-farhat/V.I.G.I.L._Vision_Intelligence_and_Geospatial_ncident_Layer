@@ -711,13 +711,15 @@ def destination_point(origin: LatLon, bearing_deg: float, distance_meters: float
 _MAX_TRACKS = 256
 
 #: How close to the frame's bottom edge a box's lower side may sit before its
-#: contact is taken as cut off by the frame rather than measured. Two per cent
-#: of the frame height — about ten rows at 480p — because a detector rarely
-#: lands a truncated box on exactly the last row. Measured on the laptop
-#: camera: a person seated at the desk, half a metre from the lens with their
-#: feet below the picture, had every contact between rows 0.989 and 1.0 and
-#: was projected to 2.16 m ± 0.13 m, whatever their true distance.
-FRAME_EDGE_TOLERANCE = 0.02
+#: contact is taken as cut off by the frame rather than measured. Four per cent
+#: of the frame height — about twenty rows at 480p — because a detector
+#: regresses a truncated box a little short of the last row rather than onto
+#: it. Measured on the laptop camera: a person seated at the desk, half a metre
+#: from the lens with their feet below the picture, had box bottoms between
+#: 0.975 and 1.0 across three probes and was projected to 2.16 m ± 0.13 m,
+#: whatever their true distance; at two per cent the packaged build still
+#: reported three confident entries into a zone that began 2 m out.
+FRAME_EDGE_TOLERANCE = 0.04
 
 
 class Tracker:

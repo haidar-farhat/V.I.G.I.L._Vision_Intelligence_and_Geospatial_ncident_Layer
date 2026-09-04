@@ -527,8 +527,8 @@ placed confidently two metres away by the nearest ground the camera could see.
 
 What changed, each with a test that fails without it:
 
-- **`FRAME_EDGE`** (`core.py`): a box whose lower side sits within 2 % of the
-  frame's bottom is one the frame truncated; its projection becomes a bound —
+- **`FRAME_EDGE`** (`core.py`): a box whose lower side sits within 4 % of the
+  frame's bottom (measured 0.975–1.0 for a seated person; 2 % missed it) is one the frame truncated; its projection becomes a bound —
   the middle of the camera-to-edge stretch, radius reaching both ends — and a
   zone beginning inside the stretch sees UNCERTAIN, not INSIDE. No ABI change:
   the Python tracker keeps the pose and judges the core's answer. The console
@@ -547,6 +547,16 @@ What changed, each with a test that fails without it:
   "distinct objects". Phase A's silence was unreadable without it.
 - **A starved live run fails** (`cli.py`): no frame, or under 1 fps after 5 s,
   prints `STARVED … is another program using the camera?` and exits 1. Phase C.
+
+Re-tested through the rebuilt binaries on the camera, same seated person:
+phase A raised **nothing** in two 20 s runs (person track held 16.9 s and
+18.7 s, every track named in the summary); phase C's second process once
+printed `STARVED 1 frame(s) in 10s` and exited 1, and once was given the
+camera by the OS — 14 frames, 3 reconnects — and ran. The analysed frame rate
+in that round (27–78 of ~520 in 20 s) is **not** a measurement of the build:
+another application held the machine at 93 % CPU throughout; check
+`Get-Process` before quoting throughput. The hand-off has unit tests only —
+no moving person was in front of the camera to split a track on demand.
 
 Not fixed, recorded: the core's speed comes from the raw projection, so a
 subject with feet below the frame reads as standing still whatever they do;
