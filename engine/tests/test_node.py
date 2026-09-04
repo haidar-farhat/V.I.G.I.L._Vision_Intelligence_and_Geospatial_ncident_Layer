@@ -793,23 +793,39 @@ class _StalledRunner:
     """Stands in for a camera whose thread is alive and whose decoder has died.
 
     There is no way to produce the real thing inside a test in under thirty
-    seconds — that is the nature of the failure — so the clock is the only part
-    faked. Everything else is what a real runner would report.
+    seconds — that is the nature of the failure — so the clocks are the only
+    part faked. Everything else is what a real runner would report.
+
+    ``silent_for`` is the time since the thread started; ``silent_since_frame``
+    is the time since the last frame, and leaving it ``None`` means *this camera
+    has never produced one*. Both are needed, because they are the two different
+    faults health exists to tell apart: a camera that never connected, and a
+    camera that was working and stopped.
     """
 
-    def __init__(self, silent_for: float, *, running: bool = True):
+    def __init__(
+        self,
+        silent_for: float,
+        *,
+        silent_since_frame: float | None = None,
+        running: bool = True,
+        skipped: int = 0,
+        dropped_frames: int = 0,
+        reconnects: int = 0,
+    ):
         self._silent_for = silent_for
+        self._silent_since_frame = silent_since_frame
         self.is_running = running
         self.fault = None
         self.stats = None
-        self.skipped = 0
+        self.skipped = skipped
         self.analysis_fps = 30.0  # the last rate it ever measured, now stale
-        self.dropped_frames = 0
-        self.reconnects = 0
+        self.dropped_frames = dropped_frames
+        self.reconnects = reconnects
 
     @property
     def seconds_since_frame(self):
-        return None
+        return self._silent_since_frame
 
     @property
     def seconds_since_started(self):
@@ -880,8 +896,11 @@ def test_a_running_camera_over_the_reference_video_reports_a_measured_rate(
     assert live.frames > 0
     assert live.seconds_since_frame is not None
     assert live.seconds_since_frame < 1.0
-    # A file drops nothing and reconnects to nothing. Quoting a camera's
-    # counters against a replay would make every replay look suspect.
+    # A file drops nothing and reconnects to nothing. These zeros are the
+    # file's real measured values — `Pipeline.stream` is None for a file, so
+    # there is no live reader to have dropped anything — and NOT a default: the
+    # stub test below drives the same fields to 12 and 3 and watches them
+    # arrive, so replacing the counters with `return 0` fails there.
     assert live.frames_dropped == 0
     assert live.reconnects == 0
     # Placed and producing frames is the only combination that may claim ground.
@@ -1006,3 +1025,114 @@ def test_health_covers_every_camera_and_survives_one_of_them_failing(
     assert health["gate"].frames > 0
     # Exactly the split the map needs: one hatched, one merely finished.
     assert [c for c, h in health.items() if h.is_dark] == ["broken"]
+
+
+def test_a_camera_that_stopped_delivering_frames_goes_dark(
+    tmp_path: Path, site: CameraPose
+):
+    # The wedged-RTSP case this whole type exists for, and the one arm of the
+    # DARK decision the other stub tests never reach: this camera *was* working.
+    # Its thread is alive, it has no fault, it delivered frames for ten minutes
+    # and then delivered nothing for a minute. Measuring from the start clock
+    # here would say "no frame for 600s" and send an operator looking for an
+    # outage that began at the wrong end of the shift.
+    silent = DARK_AFTER_SECONDS * 2
+    with Node(tmp_path / "n.db") as node:
+        node.add_camera("rtsp://10.0.0.11:554/stream", camera_id="gate", pose=site)
+        node.camera("gate").runner = _StalledRunner(
+            600.0, silent_since_frame=silent
+        )
+
+        health = node.camera_health()["gate"]
+        node.camera("gate").runner = None
+
+    print(f"stopped delivering: {health.describe()}")
+
+    assert health.state is CameraState.DARK
+    assert health.is_running is True, "the thread really is alive; that is the trap"
+    assert health.is_dark is True
+    assert health.covers_ground is False, "silent ground must not count as covered"
+    assert health.seconds_since_frame == silent
+    # The silence since the last *frame*, not since the thread started.
+    assert f"{silent:.0f}s" in health.describe()
+    assert "600s" not in health.describe(), (
+        "the line dated the outage from start-up rather than from the last frame"
+    )
+    # A rate from before the stall is a claim about now that nothing supports.
+    assert health.analysis_fps == 0.0
+
+
+def test_a_camera_quiet_for_seconds_says_so_rather_than_claiming_zero_fps(
+    tmp_path: Path, site: CameraPose
+):
+    # Between one second and thirty, a camera is still LIVE — the grace window
+    # is one threshold, deliberately — but the rate window is only a second
+    # wide, so the measured rate is zero. The line used to read "LIVE — 0 fps",
+    # which contradicts itself in four words and tells an operator nothing about
+    # which half to believe.
+    with Node(tmp_path / "n.db") as node:
+        node.add_camera("rtsp://10.0.0.12:554/stream", camera_id="gate", pose=site)
+        node.camera("gate").runner = _StalledRunner(
+            120.0, silent_since_frame=5.0
+        )
+
+        health = node.camera_health()["gate"]
+        node.camera("gate").runner = None
+
+    line = health.describe()
+    print(f"quiet but not yet dark: {line}")
+
+    assert health.state is CameraState.LIVE
+    assert health.analysis_fps == 0.0, "no frame in the last second is a measured zero"
+    assert "no frame for 5s" in line
+    assert "fps" not in line, "a zero rate was quoted beside a five-second silence"
+    # Still inside the grace window, so it still claims its ground — one
+    # threshold for the strip and the map, or they disagree about one camera.
+    assert health.is_dark is False
+    assert health.covers_ground is True
+
+
+def test_the_counters_that_reveal_a_flapping_camera_reach_the_strip(
+    tmp_path: Path, site: CameraPose
+):
+    # A camera reconnecting every few seconds looks alive in every other measure
+    # — the thread runs, frames arrive, the fault stays None — and is losing most
+    # of what it sees. These three numbers are the only evidence of it, and a
+    # file source reports zero for all of them, so nothing else in this suite
+    # would notice them being dropped on the floor between runner and health.
+    with Node(tmp_path / "n.db") as node:
+        node.add_camera("rtsp://10.0.0.13:554/stream", camera_id="gate", pose=site)
+        node.camera("gate").runner = _StalledRunner(
+            120.0, silent_since_frame=0.2,
+            dropped_frames=12, reconnects=3, skipped=7,
+        )
+
+        health = node.camera_health()["gate"]
+        node.camera("gate").runner = None
+
+    print(f"flapping: {health.describe()}")
+
+    assert health.state is CameraState.LIVE
+    assert health.frames_dropped == 12
+    assert health.reconnects == 3
+    assert health.frames_not_drawn == 7, (
+        "results the viewer never collected are a different failure from frames "
+        "the decoder discarded, and both must survive the trip"
+    )
+    # The one an operator has to be told without being asked.
+    assert "3 reconnect(s)" in health.describe()
+
+
+def test_the_state_word_is_what_an_interface_actually_prints():
+    # `class CameraState(str, Enum)` renders as "CameraState.LIVE" under str()
+    # and f-strings on this interpreter — measured, 3.14.7 — so the first
+    # f-string a UI writes around the state puts a Python repr on an operator's
+    # status strip. StrEnum is what makes the obvious code correct.
+    print(f"str: {str(CameraState.LIVE)!r}, format: {f'{CameraState.LIVE}'!r}")
+
+    assert f"{CameraState.LIVE}" == "LIVE"
+    assert str(CameraState.DARK) == "DARK"
+    assert "the gate is " + CameraState.FAULTED == "the gate is FAULTED"
+    # And the comparison every caller was told it could make still holds.
+    assert CameraState.LIVE == "LIVE"
+    assert CameraState.LIVE.value == "LIVE"

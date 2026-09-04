@@ -1721,10 +1721,13 @@ class MapView(QWidget):
         furthest = max(distances)
         if furthest <= 0.0:
             return None
-        floor = furthest - max(0.25, furthest * 0.002)
+        # A quarter of a metre of slack, or a fifth of a percent, whichever is
+        # looser: the arc's vertices are all at the same radius, and this only
+        # has to tell them from the near arc.
+        outermost = furthest - max(0.25, furthest * 0.002)
         count = 0
         for distance in distances:
-            if distance < floor:
+            if distance < outermost:
                 break
             count += 1
         return count if 2 <= count < len(local) else None

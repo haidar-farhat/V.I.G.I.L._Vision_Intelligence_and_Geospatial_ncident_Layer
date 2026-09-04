@@ -12,9 +12,19 @@ the runner's opinion of itself; frames arriving is the only evidence of it. A
 green dot on a camera whose decoder wedged an hour ago is the most expensive lie
 this window can tell, because the absence of events then reads as quiet.
 
-Health facts are duck-typed on purpose — see `HEALTH_FACTS`. The engine owns
-`Node.camera_health()`; the console must not import its type, or the panel could
-not be built or tested without a live node.
+The state itself is the engine's, not this panel's. `Node.camera_health()`
+already decides LIVE/DARK/STARTING/STOPPED/FAULTED from the same last-frame
+clock the map hatches ground from, and an interface that re-derived it with its
+own thresholds would eventually paint a camera as a dark row in this list while
+the map beside it painted its footprint as live coverage. So `camera_state`
+translates the engine's word into the operator's and decides nothing; the
+frame-clock path below it exists only for a health object that carries no state
+at all.
+
+Health facts are still read by name through `getattr` — see `HEALTH_FACTS` — so
+the panel can be built and tested without a live node, but the names are the
+engine's real ones. A spelling that drifts reads as "unknown" silently, which is
+how the first version of this file rendered LIVE, DARK and STOPPED identically.
 """
 
 from __future__ import annotations
@@ -32,48 +42,78 @@ from PySide6.QtWidgets import (
 
 from sentinel.decode import redact_url
 
+# The threshold, never the type: one number decides dark here and in the map's
+# hatching, and a second copy of it in the console is a guarantee that the two
+# windows will one day disagree about the same camera. `sentinel.node` is
+# already imported by `app.py`, so this costs nothing at start-up.
+from sentinel.node import DARK_AFTER_SECONDS
+
 from . import theme
 from .selection import CAMERA as CAMERA_KIND, Selection
 
-#: The attribute names read off each health object, all optional. Anything with
-#: these attributes will do — a dataclass from the engine, a namespace, a stub in
-#: a test. A fact that is missing is treated as unknown rather than as zero,
-#: because a panel that reports "0 fps" for a number nobody gave it is inventing
-#: a measurement, and this panel exists to stop exactly that.
+#: The attribute names read off each health object — the field names of the
+#: engine's `sentinel.node.CameraHealth`, read through `getattr` rather than by
+#: importing the type so the panel can still be built and tested without a live
+#: node. Anything carrying these names will do; anything carrying *other* names
+#: reads as unknown in silence, so this tuple is the contract and drifting from
+#: it is the one failure mode of duck typing here.
 #:
-#: * ``running`` — the runner believes this camera's pipeline is going.
-#: * ``fault`` — why it stopped, or ``None``. Any truthy value wins over
-#:   everything else: a camera that has failed is not late, it is failed.
-#: * ``analysis_fps`` — frames analysed per second, measured over the last
-#:   second. Shown, never used to decide the state; a slow camera is not a dark
-#:   one.
-#: * ``frames`` — frames analysed since the run began.
-#: * ``last_frame_age_seconds`` — how long ago the newest frame arrived, or
-#:   ``None`` when no frame ever has. This is the fact the state is decided on.
-#: * ``objects_now`` — tracks alive at this instant.
+#: * ``camera_id`` — which camera these facts are about.
+#: * ``state`` — the engine's `CameraState`: LIVE, DARK, STARTING, STOPPED or
+#:   FAULTED. **The authority.** Compared by its string value, so nothing of the
+#:   engine's type system is imported. See `camera_state`.
+#: * ``is_running`` — its thread is alive. Deliberately not the same as working,
+#:   which is the whole reason `state` exists and is preferred over this.
+#: * ``is_placed`` — it has a pose, so what it sees has a position.
+#: * ``analysis_fps`` — frames analysed per second over the last second, or 0.0
+#:   when no measurement is current enough to quote. Shown, never used to decide
+#:   the state; a slow camera is not a dark one.
+#: * ``frames`` — frames analysed for the whole run.
+#: * ``frames_dropped`` — frames the live decoder discarded to stay current.
+#: * ``frames_not_drawn`` — results published and never collected, lost from the
+#:   screen but not from the analysis.
 #: * ``reconnects`` — times the source has been reopened during this run.
-#: * ``dropped_fraction`` — of the frames offered to the recorder, the fraction
-#:   it could not write.
-#: * ``recording`` — whether footage is being written.
+#: * ``fault`` — why it stopped, or ``None``. Redacted by the engine.
+#: * ``seconds_since_frame`` — since the newest frame arrived, or ``None`` when
+#:   none ever has. The fallback state decision, and the tooltip's age.
+#: * ``seconds_since_started`` — since its thread started, or ``None``. What
+#:   makes "dark" defensible for a camera that has produced nothing at all.
 HEALTH_FACTS = (
-    "running",
-    "fault",
+    "camera_id",
+    "state",
+    "is_running",
+    "is_placed",
     "analysis_fps",
     "frames",
-    "last_frame_age_seconds",
-    "objects_now",
+    "frames_dropped",
+    "frames_not_drawn",
     "reconnects",
-    "dropped_fraction",
-    "recording",
+    "fault",
+    "seconds_since_frame",
+    "seconds_since_started",
 )
 
 #: The five things a camera can be, in the operator's terms rather than the
 #: runner's. Strings, so a caller can compare without importing this namespace.
 STATE_LIVE = "live"
-STATE_LATE = "late"
+STATE_STARTING = "starting"
 STATE_DARK = "dark"
 STATE_FAULT = "fault"
 STATE_OFF = "off"
+
+#: The engine's `CameraState` values, by name, in this panel's words. Keyed by
+#: string rather than by the enum so the console imports no engine type, and
+#: one-to-one so no engine state can be folded into a neighbour: STARTING is
+#: emphatically not DARK — an RTSP stream takes seconds to open, and calling
+#: those seconds dark teaches an operator to ignore the word by the end of the
+#: first shift.
+ENGINE_STATES: dict[str, str] = {
+    "LIVE": STATE_LIVE,
+    "DARK": STATE_DARK,
+    "STARTING": STATE_STARTING,
+    "STOPPED": STATE_OFF,
+    "FAULTED": STATE_FAULT,
+}
 
 #: A camera that is nominally up and delivering nothing. The one colour this
 #: module adds to `theme`, because none of the reserved state colours means this:
@@ -87,7 +127,7 @@ DARK = QColor(232, 121, 249)
 #: they are defined there and are nowhere reinterpreted.
 STATE_COLOURS: dict[str, QColor] = {
     STATE_LIVE: theme.LIVE,
-    STATE_LATE: theme.STALE,
+    STATE_STARTING: theme.STALE,
     STATE_DARK: DARK,
     STATE_FAULT: theme.FAULT,
     STATE_OFF: theme.IDLE,
@@ -98,21 +138,11 @@ STATE_COLOURS: dict[str, QColor] = {
 #: out. Filled means frames are arriving; hollow means they are not.
 STATE_GLYPHS: dict[str, str] = {
     STATE_LIVE: "●",
-    STATE_LATE: "◐",
+    STATE_STARTING: "◐",
     STATE_DARK: "○",
     STATE_FAULT: "✕",
     STATE_OFF: "·",
 }
-
-#: A frame older than this means the source is late — reconnecting, or a network
-#: camera in trouble. Two seconds is far longer than any frame interval a real
-#: source uses and far shorter than an operator would notice on their own.
-LATE_AFTER_SECONDS = 2.0
-
-#: A frame older than this, on a camera that says it is running, means dark. Ten
-#: seconds is past every legitimate reconnect this system performs, so nothing
-#: healthy ever reaches it.
-DARK_AFTER_SECONDS = 10.0
 
 CAMERA_COLUMN = 0
 SOURCE_COLUMN = 1
@@ -139,29 +169,45 @@ def _fact(health, name: str, default=None):
 
 
 def camera_state(health) -> str:
-    """Which of the five states a camera is in, decided on frames, not opinions.
+    """Which of the five words this panel shows for a camera. Translation, not
+    judgement.
 
-    The whole point of the panel is here. ``running`` is what the runner thinks;
-    ``last_frame_age_seconds`` is what actually happened. A camera claiming to
-    run with no frame in ten seconds is `STATE_DARK`, and a camera claiming to
-    run that has never produced a frame at all is dark from the first moment — a
-    source that has not opened has not opened, and saying "live" while waiting is
-    how a typo in an RTSP path passed for a working camera overnight.
+    The engine decided this already, from the last-frame clock, and the map
+    hatches ground from that same decision; deciding it again here with a second
+    threshold is how one window ends up calling a camera dark while the window
+    beside it paints its footprint as watched ground. So `state` wins whenever it
+    is there, compared by its string value so no engine type is imported.
 
-    Deliberately *not* decided on detections. A yard with nobody in it produces
-    no detections all night and is working perfectly; dark is about frames.
+    The frame-clock path below is the fallback for a health object that carries
+    no state — a stub, or an older engine. It is deliberately the *engine's*
+    rule, not a friendlier one: silence is measured from the newest frame, or
+    from the thread's start when no frame has ever arrived, so a camera that
+    never connects goes dark instead of sitting at "starting" all night.
+
+    Deliberately *not* decided on detections, in either path. A yard with nobody
+    in it produces no detections all night and is working perfectly; dark is
+    about frames.
     """
     if health is None:
         return STATE_OFF
+    state = _fact(health, "state")
+    if state is not None:
+        # `.value` for the engine's StrEnum, the object itself for a plain
+        # string. Never `str(state)`: on this interpreter that renders
+        # "CameraState.LIVE" for the enum, which matches nothing.
+        word = str(getattr(state, "value", state)).upper()
+        if word in ENGINE_STATES:
+            return ENGINE_STATES[word]
     if _fact(health, "fault"):
         return STATE_FAULT
-    if not _fact(health, "running", False):
+    if not _fact(health, "is_running", False):
         return STATE_OFF
-    age = _fact(health, "last_frame_age_seconds")
-    if age is None or float(age) >= DARK_AFTER_SECONDS:
+    age = _fact(health, "seconds_since_frame")
+    silent_for = age if age is not None else _fact(health, "seconds_since_started")
+    if silent_for is not None and float(silent_for) >= DARK_AFTER_SECONDS:
         return STATE_DARK
-    if float(age) >= LATE_AFTER_SECONDS:
-        return STATE_LATE
+    if age is None:
+        return STATE_STARTING
     return STATE_LIVE
 
 
@@ -186,6 +232,22 @@ def _age_text(seconds: float | None) -> str:
     return f"no frame for {seconds / 3600:.0f} h"
 
 
+def _newest_text(age, frames) -> str:
+    """When the newest frame arrived, phrased so it cannot deny the frame count.
+
+    "never" is a positive claim about the whole past, and the panel is only
+    entitled to make it while holding a frame count that agrees. Printing
+    "frames 1480" and "newest never" side by side — which is exactly what a
+    misspelled field name produced here — is worse than admitting ignorance,
+    because the operator cannot tell which of the two lines to believe.
+    """
+    if age is not None:
+        return f"{float(age):.1f}s ago"
+    if frames is not None and int(frames) > 0:
+        return "unknown"
+    return "never"
+
+
 def status_text(health) -> str:
     """The status strip's words for one camera.
 
@@ -198,22 +260,29 @@ def status_text(health) -> str:
         return "not started"
     if state == STATE_FAULT:
         return f"failed — {_fact(health, 'fault', '')}"
-    age = _fact(health, "last_frame_age_seconds")
+    age = _fact(health, "seconds_since_frame")
+    age = None if age is None else float(age)
     if state == STATE_DARK:
-        return f"dark — running, {_age_text(None if age is None else float(age))}"
-    if state == STATE_LATE:
-        return f"late — {_age_text(float(age))}"
+        return f"dark — running, {_age_text(age)}"
+    if state == STATE_STARTING:
+        # Its own word, and never "dark": opening a stream takes seconds, and a
+        # panel that cried dark for those seconds would train an operator to
+        # scroll past the row that means it.
+        started = _fact(health, "seconds_since_started")
+        waited = "" if started is None else f", {float(started):.0f}s so far"
+        return f"starting — opening the source{waited}"
     # Not `default=0.0`: a health object that does not carry a frame rate would
     # then read "live · 0.0 fps", which is a measurement nobody took and reads
     # as a camera in trouble. Unknown says unknown.
     fps = _fact(health, "analysis_fps")
-    parts = ["fps unknown" if fps is None else _fps_text(float(fps))]
-    objects = int(_fact(health, "objects_now", 0))
-    if objects:
-        parts.append(f"{objects} tracked")
-    if _fact(health, "recording", False):
-        parts.append("REC")
-    return "live · " + " · ".join(parts)
+    if fps is not None and float(fps) > 0:
+        return "live · " + _fps_text(float(fps))
+    # The engine quotes no rate unless a frame arrived within the last second,
+    # so a live camera without one is one whose frames have slowed rather than
+    # stopped — say how stale, rather than print a zero that reads as stalled.
+    if age is not None and age >= 1.0:
+        return f"live · {_age_text(age)}"
+    return "live · fps unknown"
 
 
 def health_tooltip(camera_id: str, health) -> str:
@@ -222,7 +291,10 @@ def health_tooltip(camera_id: str, health) -> str:
 
     The strip is a summary, and a summary is a claim; this is the evidence
     behind it. An unknown fact says "unknown" rather than showing a plausible
-    zero, because a fabricated zero is indistinguishable from a measured one.
+    zero, because a fabricated zero is indistinguishable from a measured one —
+    and, harder, it must not print two facts that contradict each other. "1480
+    frames" beside "newest never" is not an admission of ignorance, it is the
+    panel disagreeing with itself in front of the person who came here to check.
     """
     lines = [camera_id]
     if health is None:
@@ -230,18 +302,25 @@ def health_tooltip(camera_id: str, health) -> str:
         return "\n".join(lines)
     fps = _fact(health, "analysis_fps")
     frames = _fact(health, "frames")
-    age = _fact(health, "last_frame_age_seconds")
-    dropped = _fact(health, "dropped_fraction")
+    age = _fact(health, "seconds_since_frame")
+    dropped = _fact(health, "frames_dropped")
+    not_drawn = _fact(health, "frames_not_drawn")
     reconnects = _fact(health, "reconnects")
     lines.append(f"analysed   {'unknown' if fps is None else _fps_text(float(fps))}")
     lines.append(f"frames     {'unknown' if frames is None else int(frames)}")
-    lines.append("newest     " + ("never" if age is None else f"{float(age):.1f}s ago"))
+    lines.append(f"newest     {_newest_text(age, frames)}")
+    started = _fact(health, "seconds_since_started")
+    if started is not None:
+        lines.append(f"running    {float(started):.0f}s")
     if reconnects is not None:
         lines.append(f"reconnects {int(reconnects)}")
     if dropped is not None:
-        # Floored, never rounded: 0.996 rendering as a tidy "100%" written would
-        # be the recorder claiming a completeness it does not have.
-        lines.append(f"dropped    {int(float(dropped) * 100)}% of recorded frames")
+        lines.append(f"dropped    {int(dropped)} frames, to stay current")
+    if not_drawn is not None:
+        # "not shown", not "never shown": "never" belongs to the frame clock
+        # alone in this tooltip, so a test can hold the whole text to the rule
+        # that nothing claims never while counting frames.
+        lines.append(f"not drawn  {int(not_drawn)} analysed but not shown")
     fault = _fact(health, "fault")
     if fault:
         lines.append(f"fault      {fault}")

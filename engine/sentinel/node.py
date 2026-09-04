@@ -235,7 +235,10 @@ class CameraHealth:
         """One line for a status strip, with the reason attached.
 
         The state word alone sends an operator to the camera to find out why;
-        the seconds and the fault are what stop that trip.
+        the seconds and the fault are what stop that trip. No number appears
+        here that the last-frame clock contradicts — a rate is only quoted while
+        the measurement window it came from is still current, and otherwise the
+        silence is quoted instead.
         """
         parts = [self.state.value]
         if self.state is CameraState.FAULTED and self.fault:

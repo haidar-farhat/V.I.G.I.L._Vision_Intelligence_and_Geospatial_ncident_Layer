@@ -17,7 +17,7 @@ that fails: the evidence looks complete and is not.
 
 from __future__ import annotations
 
-from datetime import datetime, time, timezone
+from datetime import datetime, time, timedelta, timezone, tzinfo
 from pathlib import Path
 
 import pytest
@@ -763,6 +763,36 @@ def test_a_two_point_boundary_is_refused_before_it_reaches_the_database():
 
     with pytest.raises(SiteError):
         make_site(boundary=(SITE, destination_point(SITE, 90.0, 40.0)))
+
+
+def test_a_site_declares_a_clock_that_can_actually_be_read():
+    """The default site's clock has to work on the machine it ships to.
+
+    Every fresh deployment starts on DEFAULT_TIMEZONE, and node.py asks the site
+    for its clock before it can evaluate a single schedule. On Windows the tz
+    database is an optional package, so a clock() that always went through
+    ZoneInfo would leave a brand-new node with no clock at all — and tell the
+    operator to install tzdata for the one zone that has no rules to look up.
+
+    The two offsets are asserted six months apart so this cannot pass for a
+    summer-shifting zone that merely happens to sit on zero in January.
+    """
+    from sentinel.site import DEFAULT_TIMEZONE
+
+    site = make_site(timezone=DEFAULT_TIMEZONE)
+
+    clock = site.clock()
+
+    winter = datetime(2026, 1, 15, 12, 0)
+    summer = datetime(2026, 7, 15, 12, 0)
+    print("clock:", clock)
+    print("utcoffset January:", clock.utcoffset(winter))
+    print("utcoffset July:", clock.utcoffset(summer))
+
+    assert isinstance(clock, tzinfo), "the site handed back something unusable"
+    assert clock.utcoffset(winter) == timedelta(0)
+    assert clock.utcoffset(summer) == timedelta(0), "the site's clock moved in July"
+    assert winter.replace(tzinfo=clock).utcoffset() == timedelta(0)
 
 
 def test_the_site_clock_says_so_rather_than_falling_back_to_utc():

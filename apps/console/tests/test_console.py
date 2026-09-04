@@ -2630,3 +2630,466 @@ def test_the_lock_covers_the_controls_by_name(qt_app, window):
         control = getattr(window, name)
         assert control in gated, f"{name} is not covered by the lock"
     assert window.zone_properties.apply_button in gated
+# ------------------------------------------- moving a camera on the plan view
+#
+# Where a camera is said to be is the input to every position it will ever
+# report. So the map may move one only when it has been told it may, it says so
+# exactly once — on release, never during — and abandoning the gesture leaves
+# the site exactly as it was.
+
+
+def _hold(view, at):
+    """Press the left button and keep it down: the start of a drag."""
+    from PySide6.QtTest import QTest
+
+    QTest.mousePress(view, Qt.MouseButton.LeftButton, pos=at.toPoint())
+
+
+def _let_go(view, at):
+    """Release it, which is the only moment anything is committed."""
+    from PySide6.QtTest import QTest
+
+    QTest.mouseRelease(view, Qt.MouseButton.LeftButton, pos=at.toPoint())
+
+
+def _map_of_one_camera(pose=None, *, editable=False, dark=(), bands=False,
+                       camera_id="gate"):
+    """A shown 600x600 plan view of one placed camera.
+
+    Shown, and the events processed, because `grab()` on a widget that was
+    never realised returns a picture of nothing and every pixel assertion
+    against it passes for the wrong reason.
+    """
+    from sentinel.coverage import sigma_bands
+
+    view = MapView()
+    view.resize(600, 600)
+    view.set_cameras({camera_id: pose or SITE_POSE})
+    if bands:
+        view.set_sigma_bands({camera_id: sigma_bands(pose or SITE_POSE)})
+    if dark:
+        view.set_dark_cameras(dark)
+    view.set_editable(editable)
+    # The legend is an overlay in the bottom-right and several of these sample
+    # under it. Turning it off is what `show_legend` is for.
+    view.show_legend = False
+    view.show()
+    QApplication.processEvents()
+    return view
+
+
+def _camera_centre(view, camera_id="gate"):
+    return view._to_screen(*view._to_local(view._cameras[camera_id].position))
+
+
+def _watch(signal, into: list):
+    """Collect a two-argument signal's emissions as pairs.
+
+    A bound `list.append` takes one argument, and connecting one to a signal
+    that carries a camera id *and* a position drops half of every placement.
+    """
+    def remember(first, second):
+        into.append((first, second))
+
+    signal.connect(remember)
+    return remember
+
+
+def test_a_camera_does_not_move_until_the_view_is_told_it_may(qt_app):
+    """The console has a Monitor lock, and dragging a camera is a change.
+
+    A sleeve across a touchscreen in Monitor must not be able to move the mast
+    that every one of that camera's positions is measured from.
+    """
+    view = _map_of_one_camera()
+    moved = []
+    _watch(view.camera_moved, moved)
+    centre = _camera_centre(view)
+
+    _hold(view, centre)
+    _move(view, QPointF(centre.x() + 70, centre.y() + 40))
+    _let_go(view, QPointF(centre.x() + 70, centre.y() + 40))
+
+    assert moved == [], "a locked map moved a camera"
+    assert view._cameras["gate"] == SITE_POSE
+    assert view.heading_handle("gate") is None, "a handle was offered for a gesture that is refused"
+
+
+def test_dragging_a_placed_camera_commits_once_on_release(qt_app):
+    from sentinel.core import haversine_distance
+
+    view = _map_of_one_camera(editable=True)
+    moved = []
+    _watch(view.camera_moved, moved)
+    centre = _camera_centre(view)
+    target = QPointF(centre.x() + 60, centre.y() + 40)
+
+    _hold(view, centre)
+    _move(view, QPointF(centre.x() + 30, centre.y() + 20))
+    _move(view, target)
+    assert moved == [], "the camera was placed half way through the drag"
+    assert view.dragging_camera == "gate"
+
+    _let_go(view, target)
+
+    assert len(moved) == 1, f"one release, {len(moved)} placements"
+    assert view.dragging_camera is None
+    camera_id, point = moved[0]
+    assert camera_id == "gate"
+    assert point == view._cameras["gate"].position, "the map shows one place and reported another"
+    # Measured for this drag on a 600 px view at 6.17 px/m: 11.7 m.
+    metres = haversine_distance(SITE_POSE.position, point)
+    print(f"dragged {metres:.1f} m")
+    assert 8.0 < metres < 16.0, f"{metres:.1f} m is not the drag that was made"
+    # Only the position. A drag across the ground is not a claim about the mast.
+    assert view._cameras["gate"].heading == SITE_POSE.heading
+    assert view._cameras["gate"].mount_height == SITE_POSE.mount_height
+
+
+def test_a_click_on_a_camera_selects_it_without_moving_it(qt_app):
+    # Press and release in the same place is how an operator picks a camera to
+    # look at. It must not count as a placement, or every inspection would
+    # write a pose and an audit line.
+    from sentinel_console.selection import Selection
+
+    view = _map_of_one_camera(editable=True)
+    picked, moved = [], []
+    view.selected.connect(picked.append)
+    _watch(view.camera_moved, moved)
+
+    _press(view, _camera_centre(view))
+
+    assert picked == [Selection.camera("gate")]
+    assert moved == [], "clicking a camera re-placed it"
+
+
+def test_the_footprint_follows_the_camera_while_it_is_dragged(qt_app):
+    """The wedge is the thing being aimed, so it moves during the gesture.
+
+    A marker that moves while its coverage stays behind asks the operator to
+    imagine where the ground will end up.
+    """
+    view = _map_of_one_camera(editable=True)
+    centre = _camera_centre(view)
+    scanline = int(centre.y() + 300)
+
+    def footprint_span():
+        image = view.grab().toImage()
+        lit = [
+            x for x in range(view.width())
+            if image.pixelColor(x, scanline).blue() > theme.PANEL.blue() + 6
+        ]
+        return (min(lit), max(lit)) if lit else None
+
+    before = footprint_span()
+    _hold(view, centre)
+    _move(view, QPointF(centre.x() + 60, centre.y() + 40))
+    during = footprint_span()
+    print(f"footprint on row {scanline}: {before} then {during}")
+
+    assert before is not None and during is not None
+    # Measured: the west edge of the wedge moved 75 px east for a 60 px drag.
+    assert during[0] - before[0] > 40, "the footprint stayed behind the camera"
+
+
+def test_the_error_bands_come_down_for_the_length_of_a_drag(qt_app):
+    """Redrawing them per mouse move is not affordable, and stale ones lie.
+
+    `sigma_bands` is 1750 calls across the FFI per camera — measured at 7.9 ms
+    warm, 75 ms cold — which at mouse-move rate is a slideshow. Keeping the old
+    ones on screen instead would draw the ground this camera knows best where
+    the camera used to be, so during the drag only the footprint is drawn.
+    """
+    view = _map_of_one_camera(editable=True, bands=True)
+    centre = _camera_centre(view)
+
+    def near_ground_brightness():
+        pose = view._cameras["gate"]
+        point = destination_point(pose.position, pose.heading, 10.0)
+        screen = view._to_screen(*view._to_local(point))
+        colour = view.grab().toImage().pixelColor(int(screen.x()), int(screen.y()))
+        return colour.red() + colour.green() + colour.blue()
+
+    before = near_ground_brightness()
+    assert view._bands, "nothing was shaded, so nothing was checked"
+
+    _hold(view, centre)
+    for step in range(1, 6):
+        _move(view, QPointF(centre.x() + step * 12, centre.y() + step * 8))
+    during = near_ground_brightness()
+    print(f"near ground: {before} shaded, {during} while dragging")
+
+    assert not view._bands, "the bands were kept, and would be recomputed per move"
+    # Measured: 295 with the bands, 164 with the bare footprint.
+    assert during < before - 100, "the ground is still shaded from the old pose"
+
+    _let_go(view, QPointF(centre.x() + 60, centre.y() + 40))
+
+
+def test_escape_during_a_drag_puts_the_camera_back(qt_app):
+    from PySide6.QtTest import QTest
+
+    view = _map_of_one_camera(editable=True)
+    moved = []
+    _watch(view.camera_moved, moved)
+    centre = _camera_centre(view)
+    away = QPointF(centre.x() + 70, centre.y() + 50)
+
+    _hold(view, centre)
+    _move(view, away)
+    assert view._cameras["gate"] != SITE_POSE, "the drag did nothing, so the revert proves nothing"
+    QTest.keyClick(view, Qt.Key.Key_Escape)
+
+    assert view._cameras["gate"] == SITE_POSE, "Escape left the camera where the drag put it"
+    assert view.dragging_camera is None
+    _let_go(view, away)
+    assert moved == [], "the release committed a drag that had been abandoned"
+
+
+def test_relocking_the_view_mid_drag_reverts_it(qt_app):
+    # The idle timer relocks the console on its own. A gesture in flight when
+    # that happens is not the operator saying yes to it.
+    view = _map_of_one_camera(editable=True)
+    moved = []
+    _watch(view.camera_moved, moved)
+    centre = _camera_centre(view)
+    away = QPointF(centre.x() + 50, centre.y() + 50)
+
+    _hold(view, centre)
+    _move(view, away)
+    view.set_editable(False)
+    _let_go(view, away)
+
+    assert moved == [], "a camera was placed by a lock coming back"
+    assert view._cameras["gate"] == SITE_POSE
+
+
+def test_dragging_the_heading_handle_aims_the_camera_rather_than_moving_it(qt_app):
+    """Aiming and moving are different mistakes, so they are different signals."""
+    import math
+
+    view = _map_of_one_camera(editable=True)
+    aimed, moved = [], []
+    _watch(view.camera_aimed, aimed)
+    _watch(view.camera_moved, moved)
+
+    handle = view.heading_handle("gate")
+    centre = _camera_centre(view)
+    assert handle is not None, "there is no grip to turn the camera by"
+    # It sits on the footprint's axis, out at its far edge: due south of a
+    # camera facing 180°.
+    assert abs(handle.x() - centre.x()) < 1.0, "the grip is not on the camera's axis"
+    assert handle.y() > centre.y(), "the grip is behind the camera"
+
+    reach = math.hypot(handle.x() - centre.x(), handle.y() - centre.y())
+    due_east = QPointF(centre.x() + reach, centre.y())
+    _hold(view, handle)
+    _move(view, due_east)
+    assert aimed == [], "the camera was re-aimed half way through the gesture"
+    _let_go(view, due_east)
+
+    assert len(aimed) == 1 and aimed[0][0] == "gate"
+    print(f"aimed to {aimed[0][1]:.2f}°")
+    assert abs(aimed[0][1] - 90.0) < 0.5, aimed[0][1]
+    assert moved == [], "turning the camera reported it as moved"
+    assert view._cameras["gate"].position == SITE_POSE.position, "aiming moved the mast"
+
+
+def test_the_console_opens_with_a_map_that_cannot_be_dragged(qt_app, window, reference_video: Path):
+    # The console opens in Monitor, and the map is one of the things that is
+    # locked. A view that defaulted to editable would arrive unlocked.
+    _placed_window(window, reference_video)
+    assert not window.map.editable
+
+
+# ------------------------------------------------- a dark camera on the ground
+#
+# A camera keeps its pose when it stops delivering, and until this existed it
+# kept the full blue wedge that goes with one: an operator read the yard as
+# covered by a camera that had not produced a frame in an hour.
+
+
+def _bare_ground_samples(view, camera_id="gate"):
+    """How many samples across the wedge are still bare panel.
+
+    A filled footprint covers every one of them; a hatch leaves the gaps
+    between its strokes showing, which is the difference being claimed.
+    """
+    image = view.grab().toImage()
+    pose = view._cameras[camera_id]
+    panel = (theme.PANEL.red(), theme.PANEL.green(), theme.PANEL.blue())
+    bare = total = 0
+    for metres in range(12, 80, 2):
+        for offset in (-12.0, -6.0, 0.0, 6.0, 12.0):
+            point = destination_point(pose.position, pose.heading + offset, metres)
+            screen = view._to_screen(*view._to_local(point))
+            colour = image.pixelColor(int(screen.x()), int(screen.y()))
+            total += 1
+            bare += (colour.red(), colour.green(), colour.blue()) == panel
+    return bare, total
+
+
+def test_a_dark_cameras_ground_is_hatched_rather_than_filled(qt_app):
+    """A camera producing nothing covers nothing.
+
+    The fill is how this view says "seen". Left under a camera that has gone
+    silent it is a claim that somebody is watching that ground.
+    """
+    lit = _map_of_one_camera()
+    dark = _map_of_one_camera(dark=("gate",))
+
+    lit_bare, total = _bare_ground_samples(lit)
+    dark_bare, _ = _bare_ground_samples(dark)
+    print(f"bare panel inside the wedge: {lit_bare}/{total} lit, {dark_bare}/{total} dark")
+
+    # Measured: 0 of 170 under a working camera, 140 of 170 under a dark one.
+    assert lit_bare == 0, "the working camera's footprint is not filled"
+    assert dark_bare > 80, "the dark camera's ground is filled, not hatched"
+
+
+def test_a_dark_camera_draws_no_error_bands(qt_app):
+    # The bands say how well it *would* locate something. It is locating
+    # nothing, and shading them is the same false claim in a stronger colour.
+    lit = _map_of_one_camera(bands=True)
+    dark = _map_of_one_camera(bands=True, dark=("gate",))
+
+    def near_ground_brightness(view):
+        point = destination_point(SITE_POSE.position, SITE_POSE.heading, 10.0)
+        screen = view._to_screen(*view._to_local(point))
+        colour = view.grab().toImage().pixelColor(int(screen.x()), int(screen.y()))
+        return colour.red() + colour.green() + colour.blue()
+
+    shaded, unshaded = near_ground_brightness(lit), near_ground_brightness(dark)
+    print(f"near ground: {shaded} lit, {unshaded} dark")
+
+    assert dark._bands, "the bands were never given, so nothing was suppressed"
+    # Measured: 295 against 121.
+    assert unshaded < shaded - 100, "a dark camera is still shading its best ground"
+
+
+def test_a_dark_camera_is_drawn_distinctly_from_a_working_one(qt_app):
+    # Two markers that look alike put the operator's eye on the footprint to
+    # work out which camera is which, and that is the drawing they cannot trust.
+    lit = _map_of_one_camera()
+    dark = _map_of_one_camera(dark=("gate",))
+
+    def marker_colour(view):
+        centre = _camera_centre(view)
+        return view.grab().toImage().pixelColor(int(centre.x()) + 5, int(centre.y()))
+
+    working, silent = marker_colour(lit), marker_colour(dark)
+    print(f"marker: working {working.getRgb()[:3]}, dark {silent.getRgb()[:3]}")
+
+    assert working.getRgb()[:3] == theme.CAMERA.getRgb()[:3]
+    # The colour the console already uses for "nothing is running".
+    assert silent.getRgb()[:3] == theme.IDLE.getRgb()[:3]
+
+
+def test_the_hover_text_says_a_dark_camera_is_seeing_nothing(qt_app):
+    from sentinel_console.selection import Selection
+
+    view = _map_of_one_camera(dark=("gate",))
+    text = view._hover_text(Selection.camera("gate"))
+    print(text)
+
+    assert "delivering nothing" in text
+    assert "not being watched" in text
+
+
+# --------------------------------------------- what stops a footprint, exactly
+#
+# A footprint's far edge is one of two facts: the range somebody typed, which
+# they can raise, or the ground running out, which no setting will move. Drawn
+# alike, an operator who wants twenty more metres raises a range that was never
+# what stopped them.
+
+
+def test_the_far_edge_says_whether_the_range_or_the_ground_stopped_it(qt_app):
+    from dataclasses import replace
+
+    from sentinel_console.map_view import FAR_EDGE_HORIZON, FAR_EDGE_RANGE
+
+    # The site's own camera: 6 m up at -22°, so the top row of its frame lands
+    # 85.8 m out — short of the 90 m range it is allowed. The ground stops it.
+    view = _map_of_one_camera()
+    reach = view.far_edge_metres("gate")
+    print(f"the site camera reaches {reach:.1f} m of its {SITE_POSE.range_meters:.0f} m range")
+    assert 80.0 < reach < SITE_POSE.range_meters
+    assert view.far_edge_kind("gate") == FAR_EDGE_HORIZON
+
+    # The same camera with its range wound in to 50 m: now the number stops it.
+    clamped = _map_of_one_camera(replace(SITE_POSE, range_meters=50.0))
+    assert abs(clamped.far_edge_metres("gate") - 50.0) < 0.5
+    assert clamped.far_edge_kind("gate") == FAR_EDGE_RANGE
+
+    # And a camera the view does not have is not guessed about.
+    assert view.far_edge_kind("no-such-camera") is None
+
+
+def _far_edge_gaps(view, camera_id="gate"):
+    """Samples along the drawn far edge, and how many are not on a stroke.
+
+    Walked pixel by pixel along the arc the view itself calls its far edge, so
+    a solid stroke answers zero gaps and a dashed one answers its dashes.
+    """
+    import math
+
+    image = view.grab().toImage()
+    local = [view._to_local(point) for point in view._footprints[camera_id]]
+    count = view._far_arc_count(camera_id, local)
+    assert count, "the view cannot say which edge is the far one"
+    points = [view._to_screen(east, north) for east, north in local[:count]]
+
+    samples = gaps = 0
+    for start, end in zip(points, points[1:]):
+        steps = max(2, int(math.hypot(end.x() - start.x(), end.y() - start.y())))
+        for step in range(steps):
+            fraction = step / steps
+            x = int(round(start.x() + (end.x() - start.x()) * fraction))
+            y = int(round(start.y() + (end.y() - start.y()) * fraction))
+            if not (0 <= x < view.width() and 0 <= y < view.height()):
+                continue
+            samples += 1
+            gaps += image.pixelColor(x, y).blue() < 60
+    return samples, gaps
+
+
+def test_a_range_clamped_edge_is_drawn_solid_and_a_horizon_limited_one_dashed(qt_app):
+    from dataclasses import replace
+
+    horizon = _map_of_one_camera()
+    clamped = _map_of_one_camera(replace(SITE_POSE, range_meters=50.0))
+
+    solid_samples, solid_gaps = _far_edge_gaps(clamped)
+    dashed_samples, dashed_gaps = _far_edge_gaps(horizon)
+    print(f"solid: {solid_gaps}/{solid_samples} off the stroke; "
+          f"dashed: {dashed_gaps}/{dashed_samples}")
+
+    # Measured: 0 gaps in 560 samples solid, 72 in 560 dashed.
+    assert solid_gaps == 0, "the range-clamped edge is broken, and reads as the horizon"
+    assert dashed_gaps > 20, "the horizon-limited edge is unbroken, and reads as the clamp"
+
+
+def test_the_legend_explains_the_two_far_edges(qt_app):
+    from sentinel.coverage import sigma_bands
+
+    view = MapView()
+    view.resize(600, 600)
+    view.set_cameras({"gate": SITE_POSE})
+    view.set_sigma_bands({"gate": sigma_bands(SITE_POSE)})
+
+    captions = view._legend_captions()
+    print(captions, view.legend_rect())
+    assert "solid edge: range" in captions
+    assert "dashed edge: horizon" in captions
+    assert "hatched: no frames" not in captions, "explained a hatch nothing is drawn in"
+
+    view.set_dark_cameras({"gate"})
+    assert "hatched: no frames" in view._legend_captions()
+
+    # It grew by three rows and still has to stay off the scale bar and inside
+    # the view. Measured at 236 px wide and 67 px tall on a 600 px view.
+    legend = view.legend_rect()
+    assert not legend.intersects(view.scale_bar_rect())
+    assert legend.top() >= 0 and legend.bottom() <= view.height()
+    assert legend.width() <= view.width() * 0.45, f"the legend is {legend.width():.0f} px wide"

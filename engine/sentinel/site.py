@@ -47,7 +47,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from datetime import tzinfo
+from datetime import timezone as fixed_timezone, tzinfo
 from enum import Enum
 from typing import Sequence
 
@@ -61,7 +61,9 @@ DEFAULT_SITE_ID = "default"
 #: What a site's clock is when nobody has declared one. UTC rather than the
 #: machine's own zone: a schedule evaluated in a zone the operator never chose
 #: is wrong in a way nothing on screen explains, and UTC is at least wrong in a
-#: way somebody can spot.
+#: way somebody can spot. It is also the one name :meth:`Site.clock` can answer
+#: with no tz database installed, so the default site is never hostage to an
+#: optional package.
 DEFAULT_TIMEZONE = "UTC"
 
 
@@ -148,13 +150,25 @@ class Site:
         and an "after hours" window that moves by an hour on the night the clocks
         change disarms the site at exactly the hour nobody is watching it.
 
-        Raises :class:`SiteError` rather than falling back to UTC when the name
-        cannot be resolved — which on Windows means the optional ``tzdata``
-        package is missing. A silent fallback is how an evaluator came to arm at
+        UTC is answered from the stdlib without consulting the tz database at
+        all. It is the one zone with no rules to look up — no offset that
+        changes, no night the clocks move — and on Windows the database is an
+        optional package, so ``ZoneInfo("UTC")`` raises on a machine that has
+        not installed ``tzdata``. Since UTC is also :data:`DEFAULT_TIMEZONE`,
+        going through ZoneInfo for it would mean every fresh deployment had a
+        site whose clock could not be read until an operator installed a package
+        for a zone that needs no database — and the error would tell them to.
+
+        Raises :class:`SiteError` rather than falling back to UTC for every real
+        IANA name that cannot be resolved — which on Windows means ``tzdata`` is
+        genuinely missing. A silent fallback is how an evaluator came to arm at
         21:00 local instead of 18:00 with nothing on screen saying so; a caller
         that wants to carry on anyway has to choose that itself, somewhere the
         operator can see the choice.
         """
+        if self.timezone in ("UTC", "Etc/UTC"):
+            return fixed_timezone.utc
+
         from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
         try:

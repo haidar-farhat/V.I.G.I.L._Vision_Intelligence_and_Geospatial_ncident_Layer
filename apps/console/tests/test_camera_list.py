@@ -9,6 +9,13 @@ the ones checked hardest here:
 - A password must never reach a widget, by any route — cell, tooltip or
   accessibility text — including for a record that hands over a raw source.
 
+The live-versus-dark assertions are driven by the engine's own
+`sentinel.node.CameraHealth`, not by a stub. The first version of this file
+built every health object out of field names the panel had invented, so all
+twenty-one tests passed while the shipped panel rendered LIVE, DARK and STOPPED
+byte-identically as "not started" — a green suite for an absent feature. Stubs
+are kept only where degradation itself is the subject.
+
 Plus the loop that froze the first version: `set_selection` is what the console's
 selection bus calls, so it must not emit.
 """
@@ -27,20 +34,24 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import Qt  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
+from sentinel.node import CameraHealth, CameraState  # noqa: E402
+
 from sentinel_console import theme  # noqa: E402
 from sentinel_console.camera_list import (  # noqa: E402
     CAMERA_COLUMN,
     DARK_AFTER_SECONDS,
+    HEALTH_FACTS,
     PLACED_COLUMN,
     SOURCE_COLUMN,
     STATE_DARK,
     STATE_FAULT,
-    STATE_LATE,
     STATE_LIVE,
     STATE_OFF,
+    STATE_STARTING,
     STATUS_COLUMN,
     CameraListPanel,
     camera_state,
+    health_tooltip,
 )
 from sentinel_console.selection import Selection  # noqa: E402
 
@@ -68,20 +79,44 @@ def record(camera_id: str, source: str = "/site/gate.mp4", placed: bool = False)
 
 
 def health(**facts):
-    """A stand-in for whatever `Node.camera_health()` returns. Duck-typed, so
-    only the facts a test cares about need to exist on it."""
+    """A partial health object, for the tests about what happens when a fact is
+    missing or unreadable. Never used for a live-versus-dark assertion: that is
+    what `engine_health` is for, because a stub can only prove the panel agrees
+    with the test that wrote it."""
     return SimpleNamespace(**facts)
 
 
-LIVE_FACTS = dict(
-    running=True, fault=None, analysis_fps=24.6, frames=1480,
-    last_frame_age_seconds=0.04, objects_now=2, reconnects=0,
-    dropped_fraction=0.0, recording=True,
-)
-DARK_FACTS = dict(
-    running=True, fault=None, analysis_fps=0.0, frames=0,
-    last_frame_age_seconds=None, objects_now=0, reconnects=3,
-    dropped_fraction=0.0, recording=True,
+def engine_health(camera_id: str = "cam-01", **overrides) -> CameraHealth:
+    """The real `CameraHealth` the node hands the console, with real defaults.
+
+    Built from the engine's own dataclass so a renamed or removed field breaks
+    these tests loudly at construction, instead of degrading to "unknown" in
+    silence the way `getattr` does inside the panel.
+    """
+    facts = dict(
+        camera_id=camera_id,
+        state=CameraState.LIVE,
+        is_running=True,
+        is_placed=True,
+        analysis_fps=24.6,
+        frames=1480,
+        frames_dropped=0,
+        frames_not_drawn=0,
+        reconnects=0,
+        fault=None,
+        seconds_since_frame=0.04,
+        seconds_since_started=61.0,
+    )
+    facts.update(overrides)
+    return CameraHealth(**facts)
+
+
+#: A camera delivering frames, and one that is nominally running and delivering
+#: nothing. The engine decided both words; the panel only translates them.
+LIVE = engine_health()
+DARK = engine_health(
+    state=CameraState.DARK, analysis_fps=0.0, frames=0,
+    seconds_since_frame=None, seconds_since_started=45.0, reconnects=3,
 )
 
 
@@ -119,7 +154,7 @@ def test_every_camera_gets_a_row_in_the_order_it_was_given(qt_app):
     panel = CameraListPanel()
     panel.show_cameras(
         [record("cam-01"), record("cam-02", placed=True), record("cam-03")],
-        {"cam-01": health(**LIVE_FACTS)},
+        {"cam-01": LIVE},
     )
     assert panel.tree.topLevelItemCount() == 3
     assert [row_texts(panel, i)[CAMERA_COLUMN] for i in range(3)] == [
@@ -152,7 +187,7 @@ def test_a_password_never_reaches_any_cell_or_tooltip(qt_app):
     panel = CameraListPanel()
     panel.show_cameras(
         [record("cam-01", source=SECRET_SOURCE)],
-        {"cam-01": health(**LIVE_FACTS)},
+        {"cam-01": LIVE},
     )
     shown = row_texts(panel, 0)[SOURCE_COLUMN]
     print("source cell:", readable(shown))
@@ -181,11 +216,30 @@ def test_a_record_that_redacts_its_own_source_is_trusted_over_the_raw_one(qt_app
 # --------------------------------------------------------------- dark vs live
 
 
+def test_the_panel_reads_only_facts_the_engine_actually_ships(qt_app):
+    # The failure this catches has already happened once: the panel read
+    # `running`, `last_frame_age_seconds` and `objects_now`, none of which exist
+    # on `CameraHealth`, and `getattr`-with-default turned every one of them into
+    # "unknown" without a word in a log. A LIVE camera and a camera nobody had
+    # started rendered the same string. Nothing about that is visible in a test
+    # that builds its own health objects, so the field names are checked directly.
+    shipped = set(CameraHealth.__dataclass_fields__)
+    print("engine fields:", sorted(shipped))
+    print("panel reads  :", sorted(HEALTH_FACTS))
+    assert set(HEALTH_FACTS) <= shipped
+    # And the states, which are read by their string value rather than imported.
+    assert {state.value for state in CameraState} == {
+        "LIVE", "DARK", "STARTING", "STOPPED", "FAULTED",
+    }
+
+
 def test_a_running_camera_with_no_frames_is_not_shown_as_running(qt_app):
+    # Driven by real `CameraHealth` records, not stubs: this assertion is the
+    # feature, and against a stub it only proves the panel agrees with itself.
     panel = CameraListPanel()
     panel.show_cameras(
         [record("cam-live"), record("cam-dark")],
-        {"cam-live": health(**LIVE_FACTS), "cam-dark": health(**DARK_FACTS)},
+        {"cam-live": LIVE, "cam-dark": DARK},
     )
     live_row = panel.tree.topLevelItem(0)
     dark_row = panel.tree.topLevelItem(1)
@@ -209,6 +263,9 @@ def test_a_running_camera_with_no_frames_is_not_shown_as_running(qt_app):
         CAMERA_COLUMN
     ).color()
     assert dark_row.font(CAMERA_COLUMN).bold()
+    # Byte-identical strips are how the first version shipped: both rows read
+    # "·  not started", in the same grey, and the suite was green.
+    assert live_status != dark_status
 
 
 def test_the_live_and_dark_colours_are_far_apart_on_a_dim_screen(qt_app):
@@ -218,7 +275,7 @@ def test_the_live_and_dark_colours_are_far_apart_on_a_dim_screen(qt_app):
     panel = CameraListPanel()
     panel.show_cameras(
         [record("cam-live"), record("cam-dark")],
-        {"cam-live": health(**LIVE_FACTS), "cam-dark": health(**DARK_FACTS)},
+        {"cam-live": LIVE, "cam-dark": DARK},
     )
     live = panel.tree.topLevelItem(0).foreground(STATUS_COLUMN).color()
     dark = panel.tree.topLevelItem(1).foreground(STATUS_COLUMN).color()
@@ -231,36 +288,89 @@ def test_the_live_and_dark_colours_are_far_apart_on_a_dim_screen(qt_app):
 
 def test_a_camera_seeing_nothing_happen_is_still_live(qt_app):
     # An empty yard at 4 a.m. produces no detections and no tracks all night and
-    # is working perfectly. Dark is about frames, never about detections.
-    quiet = dict(LIVE_FACTS, objects_now=0, recording=False)
-    assert camera_state(health(**quiet)) == STATE_LIVE
+    # is working perfectly. Dark is about frames, never about detections — and
+    # structurally so: no fact this panel reads counts an object, so no amount of
+    # quiet can move a row towards dark.
+    assert not [
+        name for name in HEALTH_FACTS
+        if "object" in name or "detect" in name or "track" in name
+    ]
+    quiet = engine_health(state=CameraState.LIVE, analysis_fps=24.6)
+    assert camera_state(quiet) == STATE_LIVE
     panel = CameraListPanel()
-    panel.show_cameras([record("cam-01")], {"cam-01": health(**quiet)})
+    panel.show_cameras([record("cam-01")], {"cam-01": quiet})
     status = row_texts(panel, 0)[STATUS_COLUMN]
     print("quiet but live:", readable(status))
     assert "live" in status and "dark" not in status
 
 
-def test_a_late_camera_is_distinguished_from_a_dark_one(qt_app):
-    late = health(**dict(LIVE_FACTS, last_frame_age_seconds=3.0))
-    gone = health(**dict(LIVE_FACTS, last_frame_age_seconds=DARK_AFTER_SECONDS + 1))
-    assert camera_state(late) == STATE_LATE
-    assert camera_state(gone) == STATE_DARK
+def test_a_camera_still_opening_its_stream_is_not_called_dark(qt_app):
+    # The engine's STARTING exists because opening an RTSP stream takes seconds,
+    # and it is not `is_dark` — the map paints such a camera's ground as covered.
+    # A list calling it dark at the same moment would have the two windows
+    # contradicting each other about the same camera in front of the operator.
+    opening = engine_health(
+        state=CameraState.STARTING, analysis_fps=0.0, frames=0,
+        seconds_since_frame=None, seconds_since_started=3.0,
+    )
+    assert camera_state(opening) == STATE_STARTING
     panel = CameraListPanel()
     panel.show_cameras(
-        [record("cam-late"), record("cam-gone")],
-        {"cam-late": late, "cam-gone": gone},
+        [record("cam-opening"), record("cam-dark")],
+        {"cam-opening": opening, "cam-dark": DARK},
     )
-    late_status = row_texts(panel, 0)[STATUS_COLUMN]
-    gone_status = row_texts(panel, 1)[STATUS_COLUMN]
-    print("late:", readable(late_status))
-    print("gone:", readable(gone_status))
-    assert "late" in late_status and "dark" in gone_status
-    assert late_status[0] != gone_status[0]
+    starting_status = row_texts(panel, 0)[STATUS_COLUMN]
+    dark_status = row_texts(panel, 1)[STATUS_COLUMN]
+    print("starting:", readable(starting_status))
+    print("dark    :", readable(dark_status))
+    assert "starting" in starting_status and "dark" not in starting_status
+    assert starting_status[0] != dark_status[0]
+    assert panel.tree.topLevelItem(0).foreground(STATUS_COLUMN).color() == theme.STALE
+
+
+def test_a_stopped_camera_is_not_reported_as_a_failed_one(qt_app):
+    # STOPPED and FAULTED are different facts — nobody started it, versus it died
+    # overnight — and the engine keeps them apart, so the strip must too.
+    stopped = engine_health(
+        state=CameraState.STOPPED, is_running=False, analysis_fps=0.0,
+        seconds_since_frame=None, seconds_since_started=None,
+    )
+    assert camera_state(stopped) == STATE_OFF
+    panel = CameraListPanel()
+    panel.show_cameras([record("cam-01")], {"cam-01": stopped})
+    status = row_texts(panel, 0)[STATUS_COLUMN]
+    print("stopped:", readable(status))
+    assert "not started" in status
+    assert "fail" not in status and "dark" not in status
+
+
+def test_a_health_object_with_no_state_still_gets_the_engines_threshold(qt_app):
+    # The frame-clock fallback, for a health object that carries no state at all.
+    # It uses `sentinel.node.DARK_AFTER_SECONDS` rather than a second copy of the
+    # number, because two thresholds are two answers to "is this camera dark".
+    from sentinel import node
+
+    assert DARK_AFTER_SECONDS == node.DARK_AFTER_SECONDS
+    print("dark after", DARK_AFTER_SECONDS, "seconds")
+    recent = health(is_running=True, seconds_since_frame=1.0)
+    gone = health(is_running=True, seconds_since_frame=DARK_AFTER_SECONDS + 1)
+    opening = health(is_running=True, seconds_since_frame=None,
+                     seconds_since_started=2.0)
+    never = health(is_running=True, seconds_since_frame=None,
+                   seconds_since_started=DARK_AFTER_SECONDS + 1)
+    assert camera_state(recent) == STATE_LIVE
+    assert camera_state(gone) == STATE_DARK
+    assert camera_state(opening) == STATE_STARTING
+    # A camera that never connects must not sit at "starting" all night.
+    assert camera_state(never) == STATE_DARK
 
 
 def test_a_failed_camera_reports_the_reason_it_failed(qt_app):
-    facts = health(**dict(DARK_FACTS, fault="10.0.0.5 is not reachable: timed out"))
+    facts = engine_health(
+        state=CameraState.FAULTED, is_running=False, analysis_fps=0.0,
+        fault="10.0.0.5 is not reachable: timed out",
+        seconds_since_frame=None,
+    )
     assert camera_state(facts) == STATE_FAULT
     panel = CameraListPanel()
     panel.show_cameras([record("cam-01")], {"cam-01": facts})
@@ -274,7 +384,7 @@ def test_the_summary_counts_the_cameras_nobody_would_go_looking_at(qt_app):
     panel = CameraListPanel()
     panel.show_cameras(
         [record("cam-01", placed=True), record("cam-02", placed=True), record("cam-03")],
-        {"cam-01": health(**LIVE_FACTS), "cam-02": health(**DARK_FACTS)},
+        {"cam-01": LIVE, "cam-02": DARK},
     )
     summary = panel.summary.text()
     print("summary:", readable(summary))
@@ -297,7 +407,7 @@ def test_a_health_object_carrying_only_some_facts_is_accepted(qt_app):
     # The engine owns this type and it will gain and lose fields. Anything with
     # the attributes actually read must work, and a missing fact is unknown
     # rather than a plausible zero.
-    minimal = SimpleNamespace(running=True, last_frame_age_seconds=None)
+    minimal = SimpleNamespace(state="DARK")
     panel = CameraListPanel()
     panel.show_cameras([record("cam-01")], {"cam-01": minimal})
     status = row_texts(panel, 0)[STATUS_COLUMN]
@@ -309,8 +419,9 @@ def test_a_health_object_carrying_only_some_facts_is_accepted(qt_app):
 
 def test_a_health_fact_that_raises_does_not_take_the_panel_down(qt_app):
     class Exploding:
-        running = True
-        last_frame_age_seconds = 0.1
+        state = "LIVE"
+        is_running = True
+        seconds_since_frame = 0.1
 
         @property
         def analysis_fps(self):
@@ -329,7 +440,32 @@ def test_a_health_fact_that_raises_does_not_take_the_panel_down(qt_app):
 
 def test_a_camera_with_no_health_entry_at_all_is_off(qt_app):
     assert camera_state(None) == STATE_OFF
-    assert camera_state(health(running=False)) == STATE_OFF
+    assert camera_state(health(is_running=False)) == STATE_OFF
+    # An unrecognised state word is not trusted either: it falls through to the
+    # frame clock rather than being shown to an operator as a colour.
+    assert camera_state(health(state="SOMETHING_NEW", is_running=False)) == STATE_OFF
+
+
+def test_no_tooltip_claims_never_while_counting_frames(qt_app):
+    # The contradiction a misspelled field name produced: "frames 1480" one line
+    # above "newest never". An operator cannot tell which line to believe, and
+    # both were printed with the same confidence. Ignorance says "unknown";
+    # "never" is a claim about the whole past and needs a frame count that agrees.
+    counted = health(state="DARK", frames=1480, seconds_since_frame=None)
+    tip = health_tooltip("cam-01", counted)
+    print("tooltip:", readable(tip.replace(chr(10), " / ")))
+    assert "unknown" in tip and "never" not in tip
+
+    fresh = health(state="STARTING", frames=0, seconds_since_frame=None)
+    print("tooltip:", readable(health_tooltip("cam-01", fresh).replace(chr(10), " / ")))
+    assert "never" in health_tooltip("cam-01", fresh)
+
+    # And nothing the panel can render out of a real record does it either.
+    for facts in (LIVE, DARK, engine_health(state=CameraState.STARTING, frames=0,
+                                            seconds_since_frame=None)):
+        tip = health_tooltip(facts.camera_id, facts)
+        frames = facts.frames
+        assert not (frames > 0 and "never" in tip), tip
 
 
 # ------------------------------------------------------------------ selection
@@ -390,7 +526,7 @@ def test_the_selection_survives_the_list_being_rebuilt(qt_app):
     seen: list = []
     panel.selected.connect(seen.append)
     panel.show_cameras(
-        [record("cam-01"), record("cam-02")], {"cam-02": health(**DARK_FACTS)}
+        [record("cam-01"), record("cam-02")], {"cam-02": DARK}
     )
     assert panel.selected_camera_id() == "cam-02"
     assert seen == []
@@ -403,7 +539,7 @@ def test_the_panel_is_freed_when_its_last_reference_goes(qt_app):
     # every test has passed. A lambda closing over `self` in a signal connection
     # is how that happens, so the connection inside the panel is a bound method.
     panel = CameraListPanel()
-    panel.show_cameras([record("cam-01")], {"cam-01": health(**LIVE_FACTS)})
+    panel.show_cameras([record("cam-01")], {"cam-01": LIVE})
     ref = weakref.ref(panel)
     del panel
     gc.collect()
