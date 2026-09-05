@@ -331,7 +331,8 @@ def test_the_identity_switch_and_the_declared_flag_each_carry_a_way_back():
     by_version = {migration.version: migration for migration in MIGRATIONS}
     assert by_version[9].name == "site_identity"
     assert by_version[10].name == "site_declared"
-    assert MIGRATIONS[-1].version == 10, "a newer migration arrived; check it below too"
+    assert by_version[11].name == "camera_recording"
+    assert MIGRATIONS[-1].version == 11, "a newer migration arrived; check it below too"
     for migration in MIGRATIONS:
         assert migration.down.strip(), (
             f"migration {migration.version} ({migration.name}) has no way back — "
@@ -385,11 +386,17 @@ def test_the_site_row_survives_its_switch_and_flag_leaving_and_reads_as_off_and_
         store.save_site(make_site(identity=Identity(plates=True, faces=True)))
         before = store.applied_versions()
 
-        undone = store.rollback()
-        assert undone is not None and undone.name == "site_declared"
+        # Down through everything above the switch, in order, until the
+        # switch itself goes. Each migration's own down is exercised.
+        undone_names = []
+        while True:
+            undone = store.rollback()
+            assert undone is not None, "ran out of migrations before reaching site_identity"
+            undone_names.append(undone.name)
+            if undone.name == "site_identity":
+                break
+        assert undone_names == ["camera_recording", "site_declared", "site_identity"]
         assert "declared" not in store.column_names("sites"), "the flag survived its own down"
-        undone = store.rollback()
-        assert undone is not None and undone.name == "site_identity"
         columns = store.column_names("sites")
         assert not any(c.startswith("identity_") for c in columns), (
             "the flags survived their own down"

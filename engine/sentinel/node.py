@@ -874,7 +874,7 @@ def _health_for(record: CameraRecord) -> CameraHealth:
         fps = runner.analysis_fps
 
     stats = runner.stats if runner is not None else None
-    recorder = runner.recorder_stats if runner is not None else None
+    recorder = getattr(runner, "recorder_stats", None) if runner is not None else None
     return CameraHealth(
         camera_id=record.camera_id,
         state=state,
@@ -1056,16 +1056,18 @@ class Node:
         site_tz=None,
         face_backend: FaceBackend | None = None,
         plate_reader: PlateReader | None = None,
-        record_every_camera: bool = False,
+        record_every_camera: bool = True,
         retention=None,
         retention_every_seconds: float = RETENTION_EVERY_SECONDS,
     ):
         """
         ``record_to`` is where clips go; without it nothing records, whatever
-        the cameras ask. With it, a camera records when its stored flag says so
-        (`CameraRecord.record`, the console's checkbox) — or every camera does,
-        with ``record_every_camera``, which is what `sentinel node --record`
-        has always meant and still does.
+        the cameras ask. With it, every camera records — what `sentinel node
+        --record` has always meant — unless ``record_every_camera`` is False,
+        in which case a camera records only when its stored flag says so
+        (`CameraRecord.record`, the console's Record box). The console is the
+        caller that opts out: it always has somewhere to write, and recording
+        is a per-camera decision there.
 
         ``retention`` is the policy swept every ``retention_every_seconds``
         from :meth:`poll`, by this node, while it runs. It defaults to

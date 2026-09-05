@@ -114,10 +114,10 @@ the engine already computes.
 | Dark command-centre interface | `TESTED` | Distinct state colours, asserted distinguishable |
 | Arabic / English / French interface | `PLAN` | No string extraction yet |
 | RTL support | `PLAN` | |
-| Crash recovery | `SKEL` | An unhandled exception is logged with its traceback — including one raised inside a Qt slot, which Qt prints to a terminal the packaged console does not have and otherwise keeps on `sys.last_*`, pinning the widget it was raised in; the status bar names it. Nothing restarts |
+| Crash recovery | `SKEL` | An unhandled exception is logged with its traceback — including one raised inside a Qt slot, which Qt prints to a terminal the packaged console does not have and otherwise keeps on `sys.last_*`, pinning the widget it was raised in; the status bar names it; a hard crash — a segfault, an abort, a heap corruption — leaves every thread's Python stack in `crash.log` beside the log, written from C by `faulthandler`. Nothing restarts |
 | Automatic service recovery | `SKEL` | A camera reconnects with backoff — genuinely, since the pipeline began using it; the application does not |
 | Health monitoring | `PLAN` | |
-| Diagnostics centre | `SKEL` | `sentinel where` and the log are the whole of it |
+| Diagnostics centre | `SKEL` | `sentinel where` and the log are the whole of it — and both, with the About dialog, every evidence report and `HOW TO RUN.txt`, now open with the build: version, commit and build date from `sentinel.version`, stamped into `build.json` beside the executables at package time |
 | The console drivable from the command line — the shipped binary as the test medium | `TESTED` | `--camera`, `--place`, `--zone`, `--zone-classes` seed a site through the node, audited like a click; `--watch` and `--confidence` set what this run tracks without touching the machine's settings; `--settings FILE` keeps a test run out of the registry; `--for SECONDS` closes the console and prints every camera's frames, tracks by class, events and incidents; `--screenshots DIR` photographs the window and every panel first. `python tasks.py exetest` runs `dist/SentinelVision/SentinelVision-dev.exe` that way on `device:0` in an isolated data directory and reads the summary back. The standing rule behind it: test through the camera and the binary, never a prerecorded file |
 | Open the console already running (`--start`) | `TESTED` | Starts every restored camera once the window is up, via a bound method on a zero-delay timer so the event loop exists first. With no cameras it says so in the status bar rather than looking busy. Also what makes driving the packaged binary in a test deterministic — pressing Tab-Tab-Space to reach Start broke the day a pane was added to the left of the toolbar |
 
@@ -181,7 +181,7 @@ the engine already computes.
 | PTZ cameras · manual control · presets · home | `PLAN` | Permission-gated and audited by design |
 | Camera enable/disable | `PLAN` | |
 | Camera AI enable/disable | `PLAN` | |
-| Camera recording enable/disable | `PLAN` | `Recorder` and retention are `TESTED` and CLI-only. A per-camera checkbox in the camera list passed into `Node.add_camera`/`start()` as the CLI already does, a red dot while a segment is open, segment count and disk used from `RecorderStats`. A checkbox in front of finished work, and it gates every replay feature. |
+| Camera recording enable/disable | `TESTED` | A **Record** box per camera in the camera list, behind the Configure lock; stored with the camera (migration 11, `cameras.record`), set through `Node.set_recording` and audited with both states, read by `Node.start`, which hands the recordings directory only to cameras that asked — `sentinel node --record` still records every camera. The status cell shows `● rec` and the clip count while a recorder is open, the fault if it stopped early, and *will record when restarted* for a flag set mid-run. `SentinelVision.exe --camera … --record` ticks it from the command line. Retention sweeps itself from the node's own `poll` every ten minutes while anything runs. Still `PLAN`: a disk-watermark alert that leaves the process, and the sweep off the GUI thread |
 | Camera-specific AI policies | `PLAN` | |
 | Camera schedules | `PLAN` | Zone schedules exist; camera schedules do not |
 | Drag a placed camera on the map, with a live footprint and heading handle | `TESTED` | Press on a camera marker and drag; the footprint follows live (bands are restored on release — recomputing them per mouse move is ~2,000 FFI calls); a heading handle rotates it. Committed once on release through `node.place_camera`; Escape reverts. Only while the site is in Configure: `set_editable` follows the lock, so a mis-drag in Monitor is impossible rather than merely undoable |
@@ -552,11 +552,11 @@ event-linked jumps — and the console toggle.
 
 | Capability | State | Note |
 |---|---|---|
-| Continuous recording | `TESTED` | Segmented `mp4v`, wall-clock names, SHA-256 on close. **CLI only** — no console toggle yet |
+| Continuous recording | `TESTED` | Segmented `mp4v`, wall-clock names, SHA-256 on close. From the CLI with `--record`, and from the console per camera with the Record box |
 | Motion · event · manual recording | `PLAN` | Continuous came first: with it, pre-event footage is already on disk |
 | Pre-event recording buffer | `TESTED` | By construction — export asks for a lead window over continuous footage |
 | Post-event recording buffer | `TESTED` | Same mechanism, trailing side |
-| Configurable retention | `TESTED` | Age, total size and free-space bounds; dry-run by default; every deletion audited |
+| Configurable retention | `TESTED` | Age, total size and free-space bounds; dry-run by default from the command; every deletion audited. Swept by the node itself every ten minutes while it runs, with the defaults (14 days, 5 GiB free), and a shortfall — everything left is preserved evidence — reported by `Node.retention_shortfall` and the log |
 | Per-camera · per-event retention | `PLAN` | One policy for the store today |
 | Incident evidence preservation | `TESTED` | Exporting marks its clips as evidence and audits it; a preserved segment is never deleted, however old, however full the disk. Tested through the CLI, because for a while every part worked and nothing called them |
 | Segmented recordings | `TESTED` | A power cut costs at most one segment |
@@ -806,6 +806,34 @@ acknowledgement, alert history, escalation rules.
 | Versioned ABI across the Rust boundary | `TESTED` | Version- and layout-checked before a single call. At 6: `CDetection` carries a flagged contact point, `CTrack` reports the one it used |
 
 ---
+
+## 🧯 Production readiness — the audit's to-dos, as product rows
+
+[PRODUCTION_READINESS.md](PRODUCTION_READINESS.md) is the hostile audit: 109
+to-dos with evidence and a definition of done. The blockers and the critical
+items are carried here as rows so the product definition cannot describe a
+product the audit says must not ship. Every row below keeps its audit id; the
+full acceptance criteria live there.
+
+| Capability | State | Note |
+|---|---|---|
+| Authentication and permission-based authorization (SEC-01) | `PLAN` | Every action is attributed to the literal string `console`; there is nobody to name in a chain of custody |
+| Camera credentials in the OS keychain, never on the command line (SEC-02) | `PLAN` | A restored RTSP camera needs its password retyped; `--camera rtsp://user:pw@…` puts it in a process listing |
+| Process supervision and restart (REL-01) | `PLAN` | No service, no watchdog; a crash at 03:00 ends monitoring silently |
+| Recording from the console with self-running retention (REL-02) | `TESTED` | The Record box, `Node.set_recording`, the sweep from `poll` — above. Open: an alert that leaves the process |
+| Signed installers per platform (OPS-01) | `PLAN` | A folder, unsigned; SmartScreen warns, Gatekeeper refuses |
+| One remote CI run on three platforms (TEST-01) | `PLAN` | The workflow exists and has never executed remotely |
+| The egress override documented and loud (SEC-03) | `TESTED` | `SENTINEL_ALLOW_PUBLIC_SOURCES` was in the code and in the refusal's own message while USAGE said there was no override; now announced at every start and logged with the address on every connection it allows |
+| Console export through the node, with footage and preservation (REL-03) | `TESTED` | The console called the exporter directly and produced packages with no video; it goes through `Node.export_incident` now, and the package says how many clips it carries |
+| Version, commit and build date everywhere (UI-01) | `TESTED` | `sentinel.version`; `build.json` beside the executables; About, `sentinel where`, the log's first line, the evidence report, `HOW TO RUN.txt` |
+| Native crash diagnostics (OBS-03) | `TESTED` | `faulthandler` to `crash.log` beside the log |
+| Process-wide egress guard, connect to the checked address (SEC-04) | `PLAN` | The guard is decode-only and resolves twice |
+| onnxruntime telemetry decision (SEC-05) | `PLAN` | The uploader is still in the Linux and macOS wheels, disarmed by variable and API |
+| Locked, hash-pinned dependencies with vulnerability scanning (SEC-06) | `PLAN` | Floors only; no lock file; no `pip-audit`, no `cargo audit`, no SBOM |
+| Decode independent of analysis (REL-04) · persistence off the GUI thread (REL-05) · a wedged decoder cannot hold the process (REL-06) · a 72-hour soak (REL-07) | `PLAN` | Each is an audit item with its own definition of done |
+| Real-footage evaluation of the watch list and the floor (TEST-04) · an RTSP server in CI (TEST-03) · the packaged binary launched by CI (TEST-02) | `PLAN` | The camera runs recorded in the audit are the only evidence on real footage so far |
+| Backup and restore, tested by restoring (DATA-01) · DATABASE.md agrees with `store.py` (DATA-02) | `PLAN` | No backup tooling; the document claims checksummed migrations and `synchronous = NORMAL`, neither of which exists |
+| Alerting that leaves the process (OBS-01) · the documentation truth pass (DOC-01) · Linux and macOS run with a camera (XP-01) · one physical IP camera for an hour (NET-01) · the model licence reviewed (AI-02) | `PLAN` | See the audit |
 
 ## The ten that would make it feel like a platform
 

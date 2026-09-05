@@ -732,6 +732,43 @@ stdout, stderr and the log of each):
 - A full-page headless screenshot of a 26,000 px page tiles the masthead
   twice; the DOM had one. Ask the DOM before believing a picture of it.
 
+### On "continue in features in to dos" — five audit items closed, FEATURES carries the rest
+
+The audit's blockers and critical items are now rows in FEATURES.md (a
+"Production readiness" section keyed by audit id), and the five that were
+fully specified and needed no product decision were built, each with tests:
+
+- **REL-03** — the console's export goes through `Node.export_incident`
+  (footage + preservation); the "Evidence exported" box says how many clips
+  the package carries.
+- **UI-01** — `sentinel.version` is the one source of the version;
+  `tasks.py package` writes `build.json` beside the executables (commit,
+  `+dirty`, build time); About, `sentinel where`, the log's first line, the
+  evidence report and `HOW TO RUN.txt` all name the build.
+- **SEC-03** — `SENTINEL_ALLOW_PUBLIC_SOURCES` is kept, announced at WARNING
+  on every start, logged with the address on every connection it allows, and
+  USAGE/SECURITY/.env.example stop saying there is no override.
+- **OBS-03** — `faulthandler` writes every thread's stack to `crash.log`
+  beside the log; `logs.reset()` hands faulthandler back to whatever had it.
+- **REL-02** — recording from the console. Migration 11 `cameras.record`;
+  `Store.save_camera(record=None)` keeps the stored flag so a placement does
+  not switch recording off; `Node.set_recording` (audited, chained);
+  `Node(record_to, record_every_camera=True)` — **`record_to` alone still
+  means every camera** (the CLI's `--record`, five existing tests); the
+  console passes `record_every_camera=False` and records the cameras whose
+  box is ticked; `Node.poll` sweeps retention every ten minutes (first poll
+  sweeps at once) and `Node.retention_shortfall` carries the sweep's
+  complaint; `CameraHealth` gained `asked_to_record`, `recording`,
+  `clips_written`, `bytes_recorded`, `recording_fault`; the camera list has a
+  Record column behind the Configure lock and prints `● rec N clip(s)` /
+  `recording stopped: …` / `will record when restarted`; `--record` on the
+  console's command line ticks the cameras `--camera` names.
+
+Decisions worth knowing: the sweep runs on the node's thread (the GUI thread
+in the console) — REL-05 is the item that moves it; a flag set on a running
+camera applies at its next start and the status line says so; there is still
+no alert that leaves the process (OBS-01).
+
 **Immediate:**
 
 1. **1.3 appearance re-ID.** The tracker fragments (17 tracks over 15 s on one

@@ -91,6 +91,11 @@ HEALTH_FACTS = (
     "fault",
     "seconds_since_frame",
     "seconds_since_started",
+    "asked_to_record",
+    "recording",
+    "clips_written",
+    "bytes_recorded",
+    "recording_fault",
 )
 
 #: The five things a camera can be, in the operator's terms rather than the
@@ -148,6 +153,17 @@ CAMERA_COLUMN = 0
 SOURCE_COLUMN = 1
 PLACED_COLUMN = 2
 STATUS_COLUMN = 3
+RECORD_COLUMN = 4
+
+#: What the Record cell says, by whether the site is locked.
+RECORD_TOOLTIP = (
+    "Record this camera continuously whenever it runs. Stored with the camera; "
+    "takes effect when it is next started. Roughly 17.5 GB per camera per day "
+    "at 640×480/15fps; retention sweeps by itself every ten minutes."
+)
+RECORD_LOCKED_TOOLTIP = (
+    "Locked. Press Configure to change whether this camera records.\n\n" + RECORD_TOOLTIP
+)
 
 
 def _fact(health, name: str, default=None):
@@ -279,13 +295,32 @@ def status_text(health) -> str:
     # as a camera in trouble. Unknown says unknown.
     fps = _fact(health, "analysis_fps")
     if fps is not None and float(fps) > 0:
-        return "live · " + _fps_text(float(fps))
+        return "live · " + _fps_text(float(fps)) + _recording_text(health)
     # The engine quotes no rate unless a frame arrived within the last second,
     # so a live camera without one is one whose frames have slowed rather than
     # stopped — say how stale, rather than print a zero that reads as stalled.
     if age is not None and age >= 1.0:
-        return f"live · {_age_text(age)}"
-    return "live · fps unknown"
+        return f"live · {_age_text(age)}" + _recording_text(health)
+    return "live · fps unknown" + _recording_text(health)
+
+
+def _recording_text(health) -> str:
+    """The recorder's words, appended to a live camera's status.
+
+    A recorder that stopped early is said in the same cell as the camera it
+    stopped on; a camera asked to record after it started says the flag has
+    not reached it yet, because "recording" over a pipeline with no recorder
+    is the one lie a status line about evidence must not tell.
+    """
+    fault = _fact(health, "recording_fault")
+    if fault:
+        return f" · recording stopped: {fault}"
+    if _fact(health, "recording", False):
+        clips = _fact(health, "clips_written", 0) or 0
+        return f" · ● rec {int(clips)} clip(s)"
+    if _fact(health, "asked_to_record", False):
+        return " · will record when restarted"
+    return ""
 
 
 def health_tooltip(camera_id: str, health) -> str:
@@ -367,6 +402,10 @@ class CameraListPanel(QWidget):
     #: list was cleared.
     selected = Signal(object)
 
+    #: The operator ticked or unticked Record on a camera: ``(camera_id, on)``.
+    #: Emitted only for a person's tick, never for a rebuild.
+    record_toggled = Signal(str, bool)
+
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         #: True while the panel is changing its own highlight on somebody else's
@@ -377,18 +416,25 @@ class CameraListPanel(QWidget):
         title = QLabel("CAMERAS")
         title.setObjectName("PanelTitle")
 
+        #: Whether the Record boxes may be ticked. Follows the console's lock.
+        self._recording_editable = False
+
         self.tree = QTreeWidget()
-        self.tree.setColumnCount(4)
-        self.tree.setHeaderLabels(["Camera", "Source", "Placed", "Status"])
+        self.tree.setColumnCount(5)
+        self.tree.setHeaderLabels(["Camera", "Source", "Placed", "Status", "Record"])
         self.tree.setRootIsDecorated(False)
         self.tree.setAlternatingRowColors(True)
         self.tree.setSelectionMode(QTreeWidget.SelectionMode.SingleSelection)
         header = self.tree.header()
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        header.setStretchLastSection(True)
+        # Status stretches; the Record box needs one checkbox's width.
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(STATUS_COLUMN, QHeaderView.ResizeMode.Stretch)
         self.tree.setMinimumWidth(360)
         for index, width in enumerate((90, 170, 76)):
             self.tree.setColumnWidth(index, width)
+        self.tree.setColumnWidth(RECORD_COLUMN, 64)
+        self.tree.itemChanged.connect(self._item_changed)
         # A bound method, never a lambda closing over `self`: a lambda in this
         # connection is a reference cycle holding a QWidget, and the widget is
         # then destroyed at interpreter shutdown — after the QApplication has
@@ -443,8 +489,15 @@ class CameraListPanel(QWidget):
                     display_source(record),
                     "placed" if placed else "not placed",
                     f"{STATE_GLYPHS[state]}  {status_text(facts)}",
+                    "",
                 ])
                 item.setData(CAMERA_COLUMN, Qt.ItemDataRole.UserRole, camera_id)
+                asked = bool(getattr(record, "record", False))
+                item.setCheckState(
+                    RECORD_COLUMN,
+                    Qt.CheckState.Checked if asked else Qt.CheckState.Unchecked,
+                )
+                self._apply_record_flags(item)
                 colour = STATE_COLOURS[state]
                 item.setForeground(STATUS_COLUMN, QBrush(colour))
                 item.setToolTip(STATUS_COLUMN, health_tooltip(camera_id, facts))
@@ -491,6 +544,43 @@ class CameraListPanel(QWidget):
         if unplaced:
             parts.append(f"{unplaced} not placed")
         return " · ".join(parts)
+
+    # -------------------------------------------------------------- recording
+
+    def set_recording_editable(self, editable: bool) -> None:
+        """Whether Record may be ticked. The console's lock, worn by a column."""
+        self._recording_editable = bool(editable)
+        self._quiet = True
+        try:
+            for index in range(self.tree.topLevelItemCount()):
+                self._apply_record_flags(self.tree.topLevelItem(index))
+        finally:
+            self._quiet = False
+
+    def _apply_record_flags(self, item: QTreeWidgetItem) -> None:
+        flags = item.flags()
+        if self._recording_editable:
+            flags |= Qt.ItemFlag.ItemIsUserCheckable
+            item.setToolTip(RECORD_COLUMN, RECORD_TOOLTIP)
+        else:
+            flags &= ~Qt.ItemFlag.ItemIsUserCheckable
+            item.setToolTip(RECORD_COLUMN, RECORD_LOCKED_TOOLTIP)
+        item.setFlags(flags)
+
+    def _item_changed(self, item: QTreeWidgetItem, column: int) -> None:
+        """A Record box was ticked by a person. Nothing may raise out of here
+        — see `_row_selected`."""
+        if self._quiet or column != RECORD_COLUMN:
+            return
+        try:
+            camera_id = item.data(CAMERA_COLUMN, Qt.ItemDataRole.UserRole)
+            if camera_id is None:
+                return
+            self.record_toggled.emit(
+                str(camera_id), item.checkState(RECORD_COLUMN) == Qt.CheckState.Checked
+            )
+        except Exception:  # pragma: no cover - defensive, see the docstring
+            pass
 
     # -------------------------------------------------------------- selection
 

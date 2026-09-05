@@ -601,3 +601,64 @@ def test_the_panel_is_freed_when_its_last_reference_goes(qt_app):
         raise AssertionError(
             f"CameraListPanel outlived its last reference (held by {holders})."
         )
+
+
+# --------------------------------------------------------------- recording
+
+
+def _camera(camera_id: str, record: bool = False):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        camera_id=camera_id, source="device:0", display_source="device:0",
+        pose=None, record=record,
+    )
+
+
+def test_the_record_box_shows_the_flag_and_only_works_while_editable(qt_app):
+    from PySide6.QtCore import Qt
+
+    from sentinel_console.camera_list import RECORD_COLUMN, CameraListPanel
+
+    panel = CameraListPanel()
+    toggled = []
+    panel.record_toggled.connect(lambda camera_id, on: toggled.append((camera_id, on)))
+    panel.show_cameras([_camera("gate", record=True), _camera("yard")], {})
+
+    gate, yard = panel.tree.topLevelItem(0), panel.tree.topLevelItem(1)
+    assert gate.checkState(RECORD_COLUMN) == Qt.CheckState.Checked
+    assert yard.checkState(RECORD_COLUMN) == Qt.CheckState.Unchecked
+    assert not (gate.flags() & Qt.ItemFlag.ItemIsUserCheckable), "Record could be ticked while locked"
+    assert "Locked" in gate.toolTip(RECORD_COLUMN)
+
+    panel.set_recording_editable(True)
+    assert gate.flags() & Qt.ItemFlag.ItemIsUserCheckable, "unlocking did not reach the rows already shown"
+    assert "Locked" not in gate.toolTip(RECORD_COLUMN)
+
+    yard.setCheckState(RECORD_COLUMN, Qt.CheckState.Checked)
+    assert toggled == [("yard", True)]
+
+    # A rebuild by the console is not a person ticking.
+    toggled.clear()
+    panel.show_cameras([_camera("gate", record=True), _camera("yard", record=True)], {})
+    assert toggled == []
+    assert panel.tree.topLevelItem(1).flags() & Qt.ItemFlag.ItemIsUserCheckable
+
+    panel.set_recording_editable(False)
+    assert not (panel.tree.topLevelItem(0).flags() & Qt.ItemFlag.ItemIsUserCheckable)
+    panel.deleteLater()
+
+
+def test_a_recording_camera_says_so_in_its_status_and_a_stopped_recorder_says_why(qt_app):
+    from types import SimpleNamespace
+
+    from sentinel_console.camera_list import status_text
+
+    live = dict(state="LIVE", analysis_fps=15.0, seconds_since_frame=0.1)
+    assert "rec" not in status_text(SimpleNamespace(**live))
+    recording = status_text(SimpleNamespace(**live, recording=True, clips_written=3))
+    assert "rec" in recording and "3 clip" in recording
+    stopped = status_text(SimpleNamespace(**live, recording=False, recording_fault="disk full"))
+    assert "recording stopped: disk full" in stopped
+    pending = status_text(SimpleNamespace(**live, recording=False, asked_to_record=True))
+    assert "will record when restarted" in pending

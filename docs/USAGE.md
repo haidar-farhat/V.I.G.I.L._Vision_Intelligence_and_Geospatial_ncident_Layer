@@ -232,6 +232,7 @@ test**, and a test cannot click. They take the same syntax as `sentinel run`:
 | `--place SPEC` | `lat,lon,height,heading,pitch[,hfov,vfov,range]`, applied to every camera named by `--camera` in the same command — a camera restored unplaced is placed |
 | `--zone SPEC` | `name:lat,lon;lat,lon;lat,lon`, a restricted polygon, added unless a zone of that name is stored. Repeatable |
 | `--zone-classes NAME=label,label` | Which labels a `--zone` in this command acts on |
+| `--record` | Ask the cameras named by `--camera` to record whenever they run; stored with them like the Record box |
 | `--watch LABELS` | The classes tracked *this run* — `person,car` — instead of the machine's setting. Not remembered; refused before the window opens if the model does not name one |
 | `--confidence X` | The floor *this run*, 0.10–0.95. Not remembered |
 | `--settings FILE` | Keep the per-machine settings in this INI instead of the registry, so a test run leaves the operator's alone |
@@ -807,6 +808,26 @@ and evidence with three frames in four missing is not. For a **live camera**,
 a writer that falls behind drops frames rather than building the backlog that
 kills the process — and counts every drop, because a recorder silently
 discarding input is the worst failure a security system can have.
+
+### Recording from the console
+
+Tick **Record** in the camera list — Configure first, because it changes the
+site. The tick is stored with the camera, so it survives a restart, and it
+takes effect when the camera is next started: a camera already running keeps
+doing what it was started with, and its status says *will record when
+restarted* until then. A recording camera shows **● rec** and its clip count in
+the Status column; a recorder that stopped early says so there, with the
+reason. Clips go under the data directory's `recordings/` folder — `sentinel
+where` prints it — one folder per camera, and an incident exported from the
+console now carries the clips that cover it, preserved from retention.
+
+While the console or `sentinel node` runs, retention runs by itself every ten
+minutes with the defaults below (14 days, 5 GiB free), audited like the
+command; a sweep that cannot reach its target because everything left is
+preserved evidence is logged as an error. `sentinel node --record` still
+records every camera, as it always did; the console records the ones ticked,
+and `SentinelVision.exe --camera device:0 --record` ticks a camera from the
+command line.
 
 ### Retention — the disk is finite
 

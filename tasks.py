@@ -382,11 +382,12 @@ def package() -> None:
     from sentinel.version import build_info, write_build_file
 
     stamp = write_build_file(produced, commit=_commit())
-    build = build_info(stamp).describe()
+    # Not `build`: that name is the function called at the top of this one.
+    identity = build_info(stamp).describe()
 
     suffix = ".exe" if sys.platform == "win32" else ""
     (produced / "HOW TO RUN.txt").write_text(
-        RUN_NOTES.format(suffix=suffix) + BUILD_NOTES.format(build=build, suffix=suffix),
+        RUN_NOTES.format(suffix=suffix) + BUILD_NOTES.format(build=identity, suffix=suffix),
         encoding="utf-8",
     )
 
@@ -403,7 +404,7 @@ def package() -> None:
             shutil.copy2(model, target / model.name)
 
     print()
-    print(f"  {build}")
+    print(f"  {identity}")
     print()
     print("  Run it from here, and nowhere else:")
     print()

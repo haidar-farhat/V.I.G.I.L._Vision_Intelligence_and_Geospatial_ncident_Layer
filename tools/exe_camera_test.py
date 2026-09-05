@@ -123,6 +123,9 @@ def read_back(stdout: str) -> dict:
             (int(match.group(1)), match.group(2), int(match.group(3)), float(match.group(4)))
         )
     facts["screenshots"] = len(re.findall(r"^screenshot\s+", stdout, re.MULTILINE))
+    match = re.search(r"recording\s+(\d+) clip\(s\), ([\d.]+) MiB", stdout)
+    facts["clips"] = int(match.group(1)) if match else 0
+    facts["recorded_mib"] = float(match.group(2)) if match else 0.0
     return facts
 
 
@@ -161,6 +164,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--model", default=None, help="an ONNX model; default: the bundle's models/*-seg.onnx")
     parser.add_argument("--no-model", action="store_true", help="motion only")
     parser.add_argument("--keep", action="store_true", help="keep the temporary data directory")
+    parser.add_argument("--record", action="store_true",
+                        help="ask the camera to record this run; the summary must then show clips")
     args = parser.parse_args(argv)
 
     exe = executable()
@@ -194,6 +199,8 @@ def main(argv: list[str] | None = None) -> int:
         command += ["--model", args.model]
     if args.no_model:
         command += ["--no-model"]
+    if args.record:
+        command += ["--record"]
 
     env = {**os.environ, "SENTINEL_DATA_DIR": str(workspace)}
     print(f"binary      {exe}")
@@ -236,6 +243,8 @@ def main(argv: list[str] | None = None) -> int:
     for track_id, label, seen, span in facts["tracks"]:
         print(f"  track {track_id:<3} {label or 'unclassified':<12} {seen:>4} frames  {span:>5.1f}s")
     print(f"events      {facts['events']}")
+    if args.record:
+        print(f"recorded    {facts['clips']} clip(s), {facts['recorded_mib']:.1f} MiB")
     print(f"incidents   {facts['incidents']}")
     print(f"pictures    {len(pictures)}  in {shots}")
     if completed.stderr.strip():
@@ -257,6 +266,8 @@ def main(argv: list[str] | None = None) -> int:
     if raised:
         problems.append(f"{len(raised)} exception(s) reached the console's hook: "
                         + "; ".join(redacted(line)[:120] for line in raised[:4]))
+    if args.record and facts["clips"] == 0:
+        problems.append("--record was asked for and the summary shows no clip")
     if elapsed > args.seconds + 60.0:
         problems.append(f"the run took {elapsed:.0f}s for a {args.seconds:g}s --for; the window did not close itself")
 

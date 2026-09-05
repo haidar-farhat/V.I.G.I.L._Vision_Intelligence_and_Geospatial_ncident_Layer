@@ -2459,6 +2459,7 @@ def test_every_path_that_changes_the_site_goes_through_the_lock(qt_app, window):
         # process, not a stray click on a control room screen; every change
         # it makes goes through the node and is audited like a clicked one.
         "seed_site": "from run(): --camera, --place and --zone",
+        "_camera_record_toggled": "only while camera_list.set_recording_editable(True), which follows the lock",
     }
     mutators = (
         "self.node.add_camera", "self.node.remove_camera", "self.node.place_camera",
@@ -4554,3 +4555,75 @@ def test_about_names_the_build(qt_app, window, monkeypatch):
     )
     window._show_about()
     assert shown and shown[0].startswith(f"Sentinel Vision {version.__version__}")
+
+
+# --------------------------------------------------- recording from the console
+
+
+def test_the_record_box_goes_through_the_node_and_follows_the_lock(
+    qt_app, window, reference_video: Path
+):
+    from sentinel_console.camera_list import RECORD_COLUMN
+
+    window.add_camera(reference_video, "cam-07")
+    item = window.camera_list.tree.topLevelItem(0)
+    assert item is not None
+    assert not (item.flags() & Qt.ItemFlag.ItemIsUserCheckable), "recording could be changed in Monitor"
+
+    window.configure_button.setChecked(True)
+    item = window.camera_list.tree.topLevelItem(0)
+    assert item.flags() & Qt.ItemFlag.ItemIsUserCheckable
+    item.setCheckState(RECORD_COLUMN, Qt.CheckState.Checked)
+
+    assert window.node.camera("cam-07").record is True
+    assert window.store.camera_recording("cam-07") is True
+    actions = [row["action"] for row in window.store.audit_trail(limit=10)]
+    assert "camera.recording" in actions
+    assert "record" in window.status.currentMessage()
+
+    window.configure_button.setChecked(False)
+    item = window.camera_list.tree.topLevelItem(0)
+    assert not (item.flags() & Qt.ItemFlag.ItemIsUserCheckable)
+    assert item.checkState(RECORD_COLUMN) == Qt.CheckState.Checked, "relocking forgot the flag"
+
+
+def test_the_console_records_a_camera_that_asked_into_the_recordings_directory(
+    qt_app, tmp_path, monkeypatch, reference_video: Path
+):
+    """The console could not record at all until it handed the node a
+    recordings directory; nothing it exported carried footage."""
+    monkeypatch.setenv("SENTINEL_DATA_DIR", str(tmp_path))
+    win = ConsoleWindow(":memory:", settings=_isolated_settings(tmp_path))
+    try:
+        win.add_camera(reference_video, "cam-07")
+        win.node.set_recording("cam-07", True)
+        win._start()
+        pump(qt_app, win, 25.0)
+        assert not win._running, "the file did not finish"
+        clips = list((tmp_path / "recordings").rglob("*.mp4"))
+        assert clips, "the camera asked to record and nothing was written"
+        health = win.node.camera_health()["cam-07"]
+        assert health.asked_to_record is True
+    finally:
+        win.close()
+
+
+def test_a_camera_that_did_not_ask_records_nothing(qt_app, tmp_path, monkeypatch, reference_video: Path):
+    monkeypatch.setenv("SENTINEL_DATA_DIR", str(tmp_path))
+    win = ConsoleWindow(":memory:", settings=_isolated_settings(tmp_path))
+    try:
+        win.add_camera(reference_video, "cam-07")
+        win._start()
+        pump(qt_app, win, 25.0)
+        assert not list((tmp_path / "recordings").rglob("*.mp4"))
+    finally:
+        win.close()
+
+
+def test_the_record_flag_reaches_the_command_line(qt_app, window, reference_video: Path):
+    from sentinel_console.app import build_parser
+
+    assert build_parser().parse_args(["--record"]).record is True
+    assert build_parser().parse_args([]).record is False
+    named = window.seed_site(cameras=[reference_video], record=True)
+    assert named and window.node.camera(named[0]).record is True

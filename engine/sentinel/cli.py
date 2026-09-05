@@ -859,7 +859,7 @@ def _node(args: argparse.Namespace) -> int:
         record_to=record_to,
         # `--record` has always meant every camera this node runs, and the
         # per-camera flag the console sets does not narrow it.
-        record_every_camera=record_to is not None,
+        record_every_camera=True,
         segment_seconds=args.segment_seconds,
         detector_factory=lambda: _detector(args),
     )

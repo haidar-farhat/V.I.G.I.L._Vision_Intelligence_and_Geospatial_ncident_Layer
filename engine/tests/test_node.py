@@ -1771,7 +1771,10 @@ def test_a_second_run_of_the_same_track_id_is_a_second_encounter(
 def test_only_the_cameras_asked_to_record_do(tmp_path: Path, reference_video: Path, site: CameraPose):
     """Two cameras on one node with a recordings directory; one asked to
     record. Clips for that one, none for the other."""
-    with Node(tmp_path / "n.db", record_to=tmp_path / "rec", segment_seconds=2.0) as node:
+    with Node(
+        tmp_path / "n.db", record_to=tmp_path / "rec", segment_seconds=2.0,
+        record_every_camera=False,
+    ) as node:
         node.add_camera(reference_video, camera_id="gate", pose=site, recording=True)
         node.add_camera(reference_video, camera_id="yard", pose=site)
         node.run_forever()
@@ -1873,7 +1876,10 @@ def test_a_node_that_does_not_record_never_sweeps(tmp_path: Path):
 
 def test_the_sweep_waits_its_cadence_between_polls(tmp_path: Path, monkeypatch):
     swept = []
-    with Node(tmp_path / "n.db", record_to=tmp_path / "rec", retention_every_seconds=3600.0) as node:
+    with Node(
+        tmp_path / "n.db", record_to=tmp_path / "rec", retention_every_seconds=3600.0,
+        record_every_camera=False,
+    ) as node:
         from sentinel import recording
 
         real = recording.apply_retention

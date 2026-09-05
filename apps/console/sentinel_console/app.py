@@ -80,7 +80,7 @@ from sentinel.events import (
 from sentinel.evidence import ExportError
 from sentinel.coverage import sigma_bands, zone_report
 from sentinel.node import Node, NodeError, Update
-from sentinel.paths import default_model_path
+from sentinel.paths import default_model_path, recordings_directory
 from sentinel.store import default_database_path
 from sentinel import devices, logs, telemetry
 from sentinel.zones import Zone, ZoneKind, zone_warnings
@@ -324,6 +324,15 @@ class ConsoleWindow(QMainWindow):
             correlate_every_millis=CORRELATE_INTERVAL_MILLIS,
             # One detector per camera, never shared, built at start.
             detector_factory=self._detector_factory,
+            # Where a camera that asks to record writes its clips. Until this
+            # was passed the console could not record at all: the Recorder
+            # and retention were engine-and-CLI only, and nothing the console
+            # exported carried footage. Retention sweeps from the node's own
+            # poll while the console runs.
+            record_to=recordings_directory(),
+            # Per camera, by the Record box — never every camera, which is
+            # what `record_to` alone means and what the CLI's --record wants.
+            record_every_camera=False,
         )
 
         self._build()
@@ -439,6 +448,7 @@ class ConsoleWindow(QMainWindow):
         # the two are kept saying the same thing in `_selection_changed`.
         self.camera_list = CameraListPanel()
         self.camera_list.selected.connect(self._camera_row_selected)
+        self.camera_list.record_toggled.connect(self._camera_record_toggled)
 
         self.map = MapView()
         self.map.picked.connect(self._map_picked)
@@ -1064,6 +1074,9 @@ class ConsoleWindow(QMainWindow):
         # mid-gesture reverts the gesture: the lock coming back is not the
         # operator saying yes.
         self.map.set_editable(self._configuring)
+        # The Record boxes in the camera list are the same lock worn by a
+        # column: recording is a site decision with a disk behind it.
+        self.camera_list.set_recording_editable(self._configuring)
         if self.configure_button.isChecked() != self._configuring:
             self.configure_button.setChecked(self._configuring)
 
@@ -1426,6 +1439,29 @@ class ConsoleWindow(QMainWindow):
         if not self._running:
             self._teardown()
         self._set_status(f"Removed {session.camera_id}. {len(self._sessions)} camera(s).")
+
+    def _camera_record_toggled(self, camera_id: str, on: bool) -> None:
+        """A Record box was ticked. Through the node, so it is stored and audited.
+
+        Only reachable while the list's boxes are editable, which follows the
+        Configure lock — see `_set_configuring`.
+        """
+        self._touch()
+        if camera_id not in self._sessions:
+            return
+        self.node.set_recording(camera_id, on)
+        self._refresh_cameras()
+        session = self._sessions[camera_id]
+        if on:
+            self._set_status(
+                f"{camera_id} will record"
+                + (" when it is next started." if session.is_running else " when started.")
+            )
+        else:
+            self._set_status(
+                f"{camera_id} will stop recording"
+                + (" when it is next started." if session.is_running else ".")
+            )
 
     def _place_camera_on_map(self) -> None:
         """Move the selected camera to a point clicked on the plan view."""
@@ -2054,7 +2090,9 @@ class ConsoleWindow(QMainWindow):
             RapidMovementRule(speed_mps=6.0),
         ]
 
-    def seed_site(self, cameras=(), pose: CameraPose | None = None, zones=()) -> list[str]:
+    def seed_site(
+        self, cameras=(), pose: CameraPose | None = None, zones=(), record: bool = False
+    ) -> list[str]:
         """Cameras, a placement and zones given on the command line.
 
         The console is drivable from a terminal so that the packaged binary,
@@ -2099,6 +2137,9 @@ class ConsoleWindow(QMainWindow):
         if pose is not None:
             for camera_id in named:
                 self.node.place_camera(camera_id, pose)
+        if record:
+            for camera_id in named:
+                self.node.set_recording(camera_id, True)
 
         held = {zone.id for zone in self.node.zones}
         added = 0
@@ -2716,6 +2757,14 @@ def build_parser():
         ),
     )
     parser.add_argument(
+        "--record", action="store_true",
+        help=(
+            "ask the cameras named by --camera to record whenever they run. "
+            "Stored with them, like the console's Record box; clips go under "
+            "the data directory's recordings folder."
+        ),
+    )
+    parser.add_argument(
         "--place", type=cli._pose, default=None, metavar="SPEC",
         help=(
             "lat,lon,height,heading,pitch[,hfov,vfov,range] — applied to every "
@@ -2866,7 +2915,8 @@ def run(argv: list[str] | None = None) -> int:
         window.show()
 
         named = window.seed_site(
-            cameras=arguments.camera or (), pose=arguments.place, zones=zones
+            cameras=arguments.camera or (), pose=arguments.place, zones=zones,
+            record=arguments.record,
         )
         if arguments.place is not None and not named:
             log.warning("--place given but --camera named no camera; nothing was placed")

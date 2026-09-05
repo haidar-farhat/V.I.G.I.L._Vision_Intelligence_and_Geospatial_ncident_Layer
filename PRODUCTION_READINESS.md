@@ -28,14 +28,14 @@ It is not production-ready, and it cannot be called so until the P0 list is empt
 | Operator console | Native Qt, 374 tests, drivable from the command line since tonight; runs on the GUI thread with the node's persistence. **Until tonight, Place… → OK and Add zone… → OK raised on a deleted dialog and did nothing** — found by the packaged binary on the camera, never by a test | partly |
 | Authentication / authorization | **None.** Every action is attributed to the literal string `console` | **yes (P0)** |
 | Secrets | **Nothing is persisted**; RTSP passwords must be retyped after every restart and travel on the command line | **yes (P0)** |
-| Recording & retention | Engine + CLI only; the console cannot record; retention is a manual command | **yes (P0)** |
+| Recording & retention | **Closed 2026-09-05 (REL-02):** the console records per camera through a Record box behind the lock, the flag survives restarts (migration 11), and retention sweeps itself from the node's poll every ten minutes. Still open: an alert that leaves the process when the sweep cannot reach its target | partly (P1 remainder → OBS-01) |
 | Crash recovery / supervision | None. No service, no watchdog, no restart | **yes (P0)** |
 | Installer / signing | None. A folder, unsigned; SmartScreen warns, Gatekeeper refuses | **yes (P0)** |
 | CI | Written for three platforms; **has never executed remotely** (ROADMAP 0.4) | **yes (P0)** |
 | IP camera (RTSP) | Code path exists; **no physical IP camera has ever been contacted** | **yes (P1)** |
 | Backup / restore / DR | None | **yes (P1)** |
 | Observability & alerting | Log file + in-window status; no alert of any kind leaves the process | **yes (P1)** |
-| Documentation truth | Several documents describe a deleted TypeScript design; two claims contradict code | **yes (P1)** |
+| Documentation truth | Several documents describe a deleted TypeScript design; the egress-override contradiction is closed (SEC-03, 2026-09-05); DATABASE.md's claims remain (DATA-02) | **yes (P1)** |
 | Zero-WAN / credential redaction / audit chain | Enforced three ways, tested against deliberately bad input; the strongest part of the system | no |
 
 **What is genuinely good, and should not be re-litigated:** the C-ABI boundary
@@ -87,6 +87,7 @@ real camera is the test medium.
 | **The actual "buttons do nothing" defect, found by the first packaged camera run:** `PlacementDialog`, `ZoneDialog` (both routes) and `AddCameraDialog` carried `WA_DeleteOnClose`, so `QDialog.done()` deleted them the instant OK was pressed, before `exec()` returned; the slot then read a deleted spin box or line edit and raised, Qt swallowed it, and Place…/Add zone…/Draw→name did nothing. The operator's audit trail has no `camera.placed` and no `zone.created` for exactly this reason. Fixed: read, then `deleteLater()`; a structural test forbids the attribute on any dialog read after `exec()` | `app.py` `_place_camera`, `_add_zone_dialog`, `_zone_drawn`, `_choose_source` | 5 tests that press OK the way Qt does (`accept()` plus the deferred delete); the packaged run's traceback at 09:03:54 |
 | The timed run's report crashed printing `≥` to a cp1252 terminal and the window never closed; stdout/stderr now replace what they cannot encode and `_finish_timed_run` closes in a `finally`, dismissing any dialog left open | `app.py` `run()`, `_finish_timed_run` | 3 tests; the packaged run's traceback at 09:03:55 |
 | A camera id is not a file name: `camera-device:0.png` became an NTFS alternate data stream on an empty `camera-device` file (five pictures of six) | `app.py` `_file_safe` | 1 test |
+| **On `continue` (to-dos):** the console exports through the node with footage and preservation (REL-03); `sentinel.version` with a `build.json` stamp reaches About, `where`, the log, the report and the run notes (UI-01); the egress override is announced and logged and the docs stop denying it (SEC-03); `faulthandler` writes `crash.log` beside the log (OBS-03); **recording from the console**: a Record box per camera behind the lock, migration 11, `Node.set_recording`, the node records only asked cameras while `sentinel node --record` keeps recording all, retention sweeps from `poll` every ten minutes, recorder facts in the status strip, `--record` on the command line (REL-02) | `app.py`, `camera_list.py`, `store.py`, `node.py`, `cli.py`, `logs.py`, `decode.py`, `evidence.py`, `version.py`, `tasks.py`, docs | 33 tests across the engine and console suites; CI and a camera run recorded in §2.3 |
 | Standing rule 8 (camera + shipped binary, never a prerecorded file) | `HANDOFF.md` | — |
 
 ### 2.3 Verification record for tonight's build
@@ -123,10 +124,10 @@ The application must not be deployed to any site until every row is closed.
 | SEC-01 | Authentication and permission-based authorization for every site-changing and evidence-touching action | Local accounts exist; every mutating `Node` method and CLI command checks a permission; audit rows carry the user; denied attempts are audited; tests cover allowed, denied and escalation |
 | SEC-02 | Secret storage: camera credentials in the OS keychain; never on the command line; restarts do not lose them | `cameras.credentials_ref` populated by a keychain binding on Windows/macOS/Linux; a restored RTSP camera starts unattended; no argv path can carry a password without a warning; tests |
 | REL-01 | Process supervision: service wrappers and restart-on-crash for the node and the console | Killed process restarts within 10 s on each platform; restart audited; a 24 h run with three induced crashes loses no evidence |
-| REL-02 | Recording in the console, scheduled retention inside the node, disk watermark alert | A console toggle records; retention runs on a cadence without a human; a fake full disk produces an alert and never deletes preserved evidence; tests |
+| REL-02 | ✓ **closed 2026-09-05** (toggle, flag, sweep; 12 tests) — the watermark *alert* remains as OBS-01 | A console toggle records; retention runs on a cadence without a human; a fake full disk produces an alert and never deletes preserved evidence; tests |
 | OPS-01 | Signed installers per platform | MSI/`.deb`/AppImage/notarised `.dmg` produced by CI from a tag; a fresh VM installs, runs `exetest`, uninstalls cleanly |
 | TEST-01 | Run CI, remotely, on all three platforms including the offline job | Green on GitHub; branch protection requires it; the package job runs on tags |
-| DOC-01a | Remove or truthfully document `SENTINEL_ALLOW_PUBLIC_SOURCES` (docs promise "no override", code and its error message offer one) | Code and docs agree; a test pins the decision; if kept, use is logged at WARNING and audited |
+| DOC-01a | ✓ **closed 2026-09-05**: kept, announced at every start, logged with the address on every connection it allows, documented in USAGE, SECURITY and `.env.example`; 2 tests | Code and docs agree; a test pins the decision; if kept, use is logged at WARNING and audited |
 
 ---
 
@@ -140,7 +141,7 @@ Must be resolved before production unless explicitly risk-accepted in writing.
 | SEC-05 | Decide onnxruntime telemetry: source build with `--no_telemetry` for shipped bundles, or documented risk acceptance with a Linux runtime egress proof |
 | SEC-06 | Lock and hash-pin Python dependencies; `pip-audit` and `cargo audit` in CI; SBOM per release; wheelhouse procedure tested air-gapped |
 | SEC-14 | Document that the Monitor/Configure lock is not a security boundary; make it require a credential once SEC-01 exists |
-| REL-03 | Console export must go through `Node.export_incident` (footage + preservation); today it calls `evidence.export_incident` directly |
+| REL-03 | ✓ **closed 2026-09-05**: the console exports through the node; the package says how many clips it carries; 1 test |
 | REL-04 | Decode independent of analysis: a dead analytic must not stop recording (STATUS says it still can) |
 | REL-05 | Move persistence and correlation off the GUI thread, or bound them; measure UI stalls |
 | REL-06 | Process exit with a wedged decoder tested and bounded |
@@ -156,7 +157,7 @@ Must be resolved before production unless explicitly risk-accepted in writing.
 | AI-01 | Measure the false-object rate after the watch list and floor (TEST-04) |
 | AI-02 | Model licence: YOLOv8 weights are AGPL-3.0; legal review before any commercial deployment; permissive alternative evaluated |
 | NET-01 | One physical IP camera for one hour without a reconnect storm (ROADMAP 0.3b) |
-| UI-01 | Version, commit and build date in About, `sentinel where`, the log header, evidence reports and `HOW TO RUN.txt` |
+| UI-01 | ✓ **closed 2026-09-05**: `sentinel.version`, `build.json` stamped at package time, shown in About, `where`, the log's first line, the evidence report and `HOW TO RUN.txt`; 7 tests |
 | BE-01 | A clean stop channel for `sentinel node` on Windows (signals do not reach it) |
 | OPS-02 | Release process: semver tags, changelog, CI release job with checksums |
 | OPS-03 | CI hygiene: scheduled runs, dependency update bot, `cargo audit`, package job on tags |
@@ -212,7 +213,7 @@ Must be resolved before production unless explicitly risk-accepted in writing.
 | OPS-06 | One configuration story (today: registry, env vars, flags, database) |
 | OPS-08 / DOC-03 | Runbooks: camera dark, disk full, DB locked, restore, chain break |
 | OBS-02 | Structured logs with run/camera ids; per-camera counters exported |
-| OBS-03 | `faulthandler` to the log; minidumps for native crashes |
+| OBS-03 | ✓ **closed 2026-09-05** for the `faulthandler` half: `crash.log` beside the log, 2 tests. Minidumps remain |
 | DOC-02 | Operator manual for the packaged product |
 | DOC-06 | Consolidated known-limitations page |
 | DEBT-01 | One preprocessing module for both ONNX detectors |
