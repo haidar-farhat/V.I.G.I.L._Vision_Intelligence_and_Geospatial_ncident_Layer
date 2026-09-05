@@ -1937,3 +1937,15 @@ def test_a_recorder_that_cannot_start_does_not_stop_the_analysis(
 
     with Store(tmp_path / "n.db") as store:
         assert store.recording_count() == 0
+
+
+def test_the_egress_override_is_written_to_the_audit_trail_at_start(tmp_path: Path, monkeypatch):
+    """The log said it; the audit trail — which outlives log rotation — did not."""
+    monkeypatch.delenv("SENTINEL_ALLOW_PUBLIC_SOURCES", raising=False)
+    with Node(tmp_path / "quiet.db") as node:
+        assert "egress.override" not in [r["action"] for r in node.store.audit_trail(limit=20)]
+
+    monkeypatch.setenv("SENTINEL_ALLOW_PUBLIC_SOURCES", "1")
+    with Node(tmp_path / "loud.db") as node:
+        rows = [r for r in node.store.audit_trail(limit=20) if r["action"] == "egress.override"]
+        assert len(rows) == 1 and "SENTINEL_ALLOW_PUBLIC_SOURCES" in rows[0]["detail"]

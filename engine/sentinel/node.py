@@ -1228,6 +1228,19 @@ class Node:
         self._rebuild_identity()
 
         self.store.audit(self._actor, "node.started", node_id)
+        import os
+
+        if os.environ.get("SENTINEL_ALLOW_PUBLIC_SOURCES", "").strip().lower() not in ("", "0", "false", "no"):
+            # The egress guard's one override, on the record: the log says it
+            # at every start, and the audit trail — the one place a later
+            # reader looks for "was this machine allowed off the site" — must
+            # say it too. Written by every node, so no process reaches routable
+            # addresses without a row that survives log rotation.
+            self.store.audit(
+                self._actor, "egress.override", node_id,
+                "SENTINEL_ALLOW_PUBLIC_SOURCES is set: camera addresses outside "
+                "the local network are allowed for this process",
+            )
         _log.info(
             "node %s: %d zone(s), %d rule(s), recording %s, identity %s",
             node_id, len(self._zones), len(self._rules),

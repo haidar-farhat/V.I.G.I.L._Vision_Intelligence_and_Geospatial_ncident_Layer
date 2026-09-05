@@ -19,6 +19,57 @@ It is not production-ready, and it cannot be called so until the P0 list is empt
 
 ---
 
+## 0. Progress — verified against HEAD `2bf57e6`, 2026-09-06
+
+Sixteen independent verifiers read every item of this audit against the tree,
+one skeptic per item claimed closed or partial tried to refute it, and the
+refutations stood where the audit's own definition of done was only half met.
+The count is by the audit's rows (137 verifiable rows, some items span
+two rows). The shipped executables were rebuilt from this commit through the
+full local CI and run on the camera with recording.
+
+| Priority | Rows | Closed | Partial | Open |
+|---|---|---|---|---|
+| P0 | 7 | 0 | 2 | 5 |
+| P1 | 31 | 1 | 6 | 24 |
+| P2 | 58 | 0 | 6 | 52 |
+| P3 | 38 | 2 | 4 | 32 |
+| P4 | 3 | 0 | 0 | 3 |
+
+What the skeptics downgraded, and why: the console recording slice (REL-02)
+lacks the free-space *alert*; the egress override (SEC-03) is logged but not
+audited to the store; the console export (REL-03) has no test over an
+incident with a recorded segment; crash diagnostics (OBS-03) have no minidump;
+UI-01 stands, though the build line is the log's second line, not its first.
+
+Every closed or partial row, with what remains:
+
+| Id | P | State | Remaining |
+|---|---|---|---|
+| REL-02 | P0 | partial | Add a free-space watermark that raises a visible alert (console banner + audit row, wired to OBS-01), and a node-loop test that monkeypatches shutil.disk_usage to a full disk and asserts both the sweep and the alert fire while preserved evidence stays. |
+| SEC-03 | P0 | closed | closed 2026-09-06: the node now writes an `egress.override` audit row at start when the variable is set (test) |
+| DOC-01 | P1 | partial | Correct README (tests, diagrams, capability count), TESTING.md counts, DATABASE.md's four false claims (or label them PLAN), STATUS.md:135 and USAGE.md:1053; stamp a state on every H2 under docs/ (SECURITY Authorization/Audit/Privacy, DATABASE, DEPLOYMENT, PRO |
+| REL-03 | P1 | closed | closed 2026-09-06: a console export of a recorded incident carries its clips and preserves them (test); the console's Finished path now drains once more so the last clip and events are never lost |
+| REL-06 | P1 | partial | Add a test with a source whose read() blocks forever, asserting Node.close/closeEvent returns, the 'analysis.thread_stuck' row is written and the process exits within 15 s; optionally add a bounded hard-exit fallback. |
+| SEC-14 | P1 | partial | Once SEC-01 lands, require a credential to enter Configure and to use the mutating flags; add a sentence in SECURITY.md stating the lock's limits. |
+| TEST-02 | P1 | partial | Add a step to ci.yml's package job that runs the packaged console offscreen on the reference file with `--start --for 5 --screenshots` and asserts exit 0 and six PNGs, and write a release checklist that names `python tasks.py exetest` with pictures attached. |
+| UI-01 | P1 | closed | Behaviour is complete and demonstrated on the shipped 2bf57e6 bundle, but the closure's test and doc claims overstate: add tests for report.txt's "Application" line, for build_info's frozen path (monkeypatch sys.frozen/_MEIPASS and a build.json beside a fake s |
+| UX-12 | P1 | partial | Add a _press_ok test through _choose_watched, make the register's filled_in helper send DeferredDelete, and extend the structural test to every module defining a QDialog subclass. |
+| AI-08 | P2 | partial | Sweep the register from Node._sweep_retention_if_due on the same cadence as recordings; constrain the lawful basis to a site-configured list; add a per-subject export (identifiers' provenance + sightings, audited) for subject-access requests; and record a DPIA |
+| DR-02 | P2 | partial | A failure-injection test (TEST-07) that drives the writer and the store into ENOSPC (a small VHD/tmpfs or patched VideoWriter.write/open) and asserts a recorder fault, a loud store error and a still-painting console; an alert sink (OBS-01) fired by both the sh |
+| OBS-03 | P2 | partial | Add Windows minidump capture (e.g. an unhandled-exception filter calling MiniDumpWriteDump via ctypes, or a documented WER LocalDumps configuration applied by the installer/launcher) written beside crash.log, with a test and a USAGE/FEATURES line. |
+| TEST-06 | P2 | partial | Add an automated stress test that runs N file cameras through the segmenter and asserts a drop-rate bound, and record capacity per detector (motion, ONNX box, segmenter) in STATUS.md. |
+| TEST-08 | P2 | partial | Commit populated fixture databases at each schema version and add tests that migrate each one forward to current and back to its origin, asserting rows survive. |
+| UX-10 | P2 | partial | Have _report_uncaught (and the start-up except at app.py:2931) show a QMessageBox naming the actual log file path, and add a test that the dialog appears with that path. |
+| BE-04 | P3 | partial | Rename the four helpers to public names (e.g. `parse_pose`, `parse_zone`, `parse_zone_classes`, `apply_zone_classes`, ideally in a `sentinel.args`/`sentinel.parsing` module), switch app.py:2765-2878 and test_console.py:4195/4216 to them, and add a direct unit  |
+| BE-05 | P3 | closed | Nothing in git. Optionally drop the stale `infrastructure/` line at ARCHITECTURE.md:811 (point it at `packaging/`) and remove the empty/ignored directories from local checkouts. |
+| DATA-05 | P3 | closed | Nothing of substance. Optionally add a direct assertion that `incident_events` holds zero rows for the superseded incident ids so the cascade is checked explicitly rather than inferred from the per-event count. |
+| PERF-07 | P3 | partial | Evaluate at least one offline-capable H.264 encoder (bundled ffmpeg/PyAV or a platform hardware encoder) with measured size and CPU cost, then re-record the decision with those numbers. |
+| REL-14 | P3 | partial | Write the degradation matrix into docs (TESTING.md or DEPLOYMENT.md) and add tests for model-removed-mid-run and a read-only database. |
+| XP-04 | P3 | partial | Add tests that run the node and export_incident under a non-ASCII data-directory override and a >260-character Windows destination (applying the \\?\ prefix or a length check in export_incident if either fails), and decide UTF-8 output for the dev executable s |
+
+---
+
 ## 1. Executive Production Readiness Assessment
 
 | Dimension | State | Blocking? |
@@ -106,6 +157,8 @@ real camera is the test medium.
 | exetest run 5 (10:48, `--record`, exe 10:47) | **FAIL, and a real one**: `Recorder.start()` did `mkdir` on `recordings/device:0`, Windows refused the colon, the camera's pipeline died before a frame and no clip was written. Fixed: `recording.file_safe()` for folders, clips and pictures; the pipeline guards the recorder's start and reports `recording_fault` while the analysis continues (4 tests) | `dist/exetest/20260905-104755/stderr.txt` |
 | `python tasks.py ci --package` after the to-dos (11:02) | **green**, all 13 stages: engine 137.5 s, console 113.1 s, offline advisory passed, package 202 s, both launch checks | `scratchpad/ci5.log`, executables 11:02 |
 | exetest run 6 (11:02, `--record`, the CI-built exe) | **PASS with a caveat**: 32.9 s wall, 505 frames, **one clip, 3.4 MiB, `device-0_20260905-080245_00000000.mp4`, 17.5 fps measured**, six pictures, summary, no exception, closed itself; nobody in frame | `dist/exetest/20260905-110242/` |
+| `python tasks.py ci --package` on clean HEAD `2bf57e6` (23:44) | **green**, all 13 stages; the three executables rebuilt and stamped `0.1.0 (2bf57e6, built 2026-09-05 20:44 UTC)` — the first clean-commit stamp | `scratchpad/ci6.log`, `dist/SentinelVision/build.json` |
+| exetest run 7 (23:44, `--record`, the shipped exe) | **PASS with a caveat**: 32.2 s wall, 691 frames, one clip of 12.5 MiB at 23.7 fps measured, six pictures, no exception, closed itself; nobody in frame | `dist/exetest/20260905-234436/` |
 
 **Read together:** run 1 proves detection, tracking, the watch list and the
 floor on the shipped binary with a real person; runs 3 and 4 prove the timed

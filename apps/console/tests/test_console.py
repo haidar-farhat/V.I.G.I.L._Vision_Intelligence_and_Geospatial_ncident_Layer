@@ -4627,3 +4627,47 @@ def test_the_record_flag_reaches_the_command_line(qt_app, window, reference_vide
     assert build_parser().parse_args([]).record is False
     named = window.seed_site(cameras=[reference_video], record=True)
     assert named and window.node.camera(named[0]).record is True
+
+
+def test_a_console_export_of_a_recorded_incident_carries_its_clips_and_preserves_them(
+    qt_app, tmp_path, monkeypatch, reference_video: Path
+):
+    """The other half of the export test: an incident whose camera was
+    recording, exported from the console, must contain the clips and protect
+    the originals from retention — the two things the console never did."""
+    from PySide6.QtWidgets import QFileDialog, QMessageBox
+
+    monkeypatch.setenv("SENTINEL_DATA_DIR", str(tmp_path))
+    win = ConsoleWindow(":memory:", settings=_isolated_settings(tmp_path))
+    try:
+        _placed_window(win, reference_video)
+        win.node.set_recording("cam-07", True)
+        win.zone_radius.setValue(12.0)
+        win._add_zone()
+        win._start()
+        pump(qt_app, win, 25.0)
+        assert not win._running
+        # `pump` stops the moment the last thread dies, which can be before
+        # the repaint timer's next tick — the tick a real session would get.
+        win._collect()
+        assert win.store.recording_count() > 0, "the run finished and its clip was never indexed"
+        assert win.node.incidents, "the reference scene raised no incident"
+        incident = win.node.incidents[0]
+        monkeypatch.setattr(ConsoleWindow, "_selected_incident", lambda self: incident)
+        out = tmp_path / "out"
+        monkeypatch.setattr(QFileDialog, "getExistingDirectory", staticmethod(lambda *a, **k: str(out)))
+        shown = []
+        monkeypatch.setattr(QMessageBox, "information",
+                            staticmethod(lambda p, title, text, *a, **k: shown.append(text) or QMessageBox.StandardButton.Ok))
+
+        win._export_incident()
+
+        packages = [p for p in out.iterdir() if p.is_dir()]
+        assert len(packages) == 1
+        assert list(packages[0].glob("*.mp4")), "the package has no video in it"
+        assert "clip(s) of footage" in shown[0]
+        assert win.store.recorded_bytes(preserved=True) > 0
+        actions = [row["action"] for row in win.store.audit_trail(limit=500)]
+        assert "recording.preserved" in actions and "incident.exported" in actions
+    finally:
+        win.close()

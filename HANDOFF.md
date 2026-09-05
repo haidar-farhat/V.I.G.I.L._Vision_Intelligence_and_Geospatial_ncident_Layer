@@ -792,7 +792,13 @@ checks), executables 11:02, `build.json` stamped `0.1.0 (f98d754+dirty, …)`.
 caveat that nobody was in frame — 505 frames, **one clip of 3.4 MiB written as
 `device-0_20260905-080245_00000000.mp4` at 17.5 fps measured**, six pictures,
 no exception, closed itself. Suites now: 60 Rust, 1,138 engine, 382 console.
-Everything is uncommitted.
+
+**23:44 — the executables updated from clean HEAD `2bf57e6`** (the user
+committed the to-dos as `f98d754`, `45b591a`, `2bf57e6`): `ci --package`
+green on all thirteen stages, `build.json` stamped `0.1.0 (2bf57e6, built
+2026-09-05 20:44 UTC)`, and `exetest --record` on that binary passed with the
+usual caveat — 691 frames, one clip of 12.5 MiB, six pictures, no exception,
+nobody in frame.
 
 **Immediate:**
 

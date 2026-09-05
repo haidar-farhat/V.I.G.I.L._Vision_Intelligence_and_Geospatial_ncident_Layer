@@ -2427,6 +2427,13 @@ class ConsoleWindow(QMainWindow):
 
         if self._running and not any(s.is_running for s in self._sessions.values()):
             # Every camera has ended on its own. For files that is completion.
+            # One more poll first: the poll above ran while the last thread
+            # may still have been closing its recorder, so the final clip and
+            # the last events could be sitting in the runner, undrained — the
+            # Stop button collects once more after stopping for the same
+            # reason, and this path did not. Found by an export from the
+            # console that carried no video although the camera had recorded.
+            self.node.poll(force_correlate=True)
             self._teardown()
             self._set_status("Finished.")
 
