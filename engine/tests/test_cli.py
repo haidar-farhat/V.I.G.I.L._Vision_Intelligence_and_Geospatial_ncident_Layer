@@ -1123,3 +1123,88 @@ def test_feed_basemap_refuses_a_live_source_without_a_bound_before_opening_it(
 
     with pytest.raises(ValueError, match="--for"):
         cli._feed_basemap(object(), source, reference_pose, duration=None, per_second=4.0)
+
+
+def test_backup_and_restore_round_trip_from_the_command_line(tmp_path: Path, capsys):
+    database = tmp_path / "site.db"
+    with Store(database) as store:
+        store.save_camera("gate", "Gate", "device:0")
+
+    assert cli.main(["--database", str(database), "backup", "--to", str(tmp_path / "bk")]) == 0
+    out = capsys.readouterr().out
+    backups = list((tmp_path / "bk").glob("sentinel-*.db"))
+    assert len(backups) == 1 and str(backups[0]) in out and "sha256" in out
+
+    with Store(database) as store:
+        store.save_camera("yard", "Yard", "device:1")
+
+    assert cli.main(["--database", str(database), "restore", str(backups[0])]) == 1
+    assert "--replace" in capsys.readouterr().err
+    assert cli.main(["--database", str(database), "restore", str(backups[0]), "--replace"]) == 0
+    with Store(database, auto_migrate=False) as store:
+        assert [row["id"] for row in store.cameras()] == ["gate"]
+    assert list(tmp_path.glob("site.db.replaced-*")), "the replaced database was not kept aside"
+
+
+def test_a_node_with_no_source_runs_the_stored_cameras(tmp_path: Path, monkeypatch, capsys):
+    monkeypatch.setenv("SENTINEL_DATA_DIR", str(tmp_path))
+    from scene import write_scene
+
+    video = write_scene(tmp_path / "scene.mp4")
+    database = tmp_path / "site.db"
+    with Store(database) as store:
+        store.save_camera("gate", "Gate", str(video))
+
+    assert cli.main(["--database", str(database), "node", "--for", "1"]) == 0
+    out = capsys.readouterr().out
+    assert "running the 1 stored camera(s)" in out
+    assert "gate" in out
+
+
+def test_a_node_with_nothing_to_run_says_so(tmp_path: Path, monkeypatch, capsys):
+    monkeypatch.setenv("SENTINEL_DATA_DIR", str(tmp_path))
+    assert cli.main(["--database", str(tmp_path / "empty.db"), "node"]) == 2
+    assert "no source given" in capsys.readouterr().err
+
+
+def test_node_stop_writes_the_stop_file_and_a_running_node_honours_it(tmp_path: Path, monkeypatch, capsys):
+    monkeypatch.setenv("SENTINEL_DATA_DIR", str(tmp_path))
+    from sentinel import supervise as supervision
+
+    assert cli.main(["node", "--stop"]) == 0
+    assert supervision.stop_file().is_file()
+    assert "stop requested" in capsys.readouterr().out
+
+    # A stale request must not stop the next node before it starts; it is
+    # removed with a warning, and the node runs to its own end.
+    from scene import write_scene
+
+    video = write_scene(tmp_path / "scene.mp4")
+    assert cli.main(["--database", str(tmp_path / "n.db"), "node", str(video), "--for", "1"]) == 0
+    assert not supervision.stop_file().exists()
+
+
+def test_service_print_names_this_platforms_registration(capsys):
+    assert cli.main(["service", "print", "--", "--record"]) == 0
+    out = capsys.readouterr().out
+    assert "supervise" in out and "--record" in out and "install" in out
+
+
+def test_users_are_managed_from_the_command_line_with_the_password_on_stdin(tmp_path: Path, monkeypatch, capsys):
+    import io
+
+    database = tmp_path / "u.db"
+    monkeypatch.setattr("sys.stdin", io.StringIO("correct horse battery\n"))
+    assert cli.main(["--database", str(database), "users", "add", "alice", "--role", "ADMIN", "--stdin"]) == 0
+    assert cli.main(["--database", str(database), "users", "list"]) == 0
+    out = capsys.readouterr().out
+    assert "alice" in out and "ADMIN" in out and "active" in out
+    assert cli.main(["--database", str(database), "users", "disable", "alice"]) == 0
+    assert cli.main(["--database", str(database), "users", "list"]) == 0
+    assert "disabled" in capsys.readouterr().out
+    monkeypatch.setattr("sys.stdin", io.StringIO("another one\n"))
+    assert cli.main(["--database", str(database), "users", "passwd", "alice", "--stdin"]) == 0
+    with Store(database) as store:
+        actions = [r["action"] for r in store.audit_trail(limit=10)]
+        assert {"user.added", "user.disabled", "user.password_changed"} <= set(actions)
+        assert all(r["actor"].startswith("cli:") for r in store.audit_trail(limit=10) if r["action"].startswith("user."))

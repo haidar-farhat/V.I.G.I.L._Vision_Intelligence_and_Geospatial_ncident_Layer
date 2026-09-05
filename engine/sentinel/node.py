@@ -377,6 +377,10 @@ class CameraRecord:
     #: Records continuously when it runs. Stored with the camera (migration
     #: 11), read by `Node.start`, set by `Node.set_recording`.
     record: bool = False
+    #: The opaque handle the camera's password is filed under in the operating
+    #: system's keychain, or ``None`` when there is no password or no keychain.
+    #: Never the password. See `sentinel.secrets`.
+    credentials_ref: str | None = None
     #: How many runners this record has been given. Track ids and frame
     #: indices start again with each one, so anything the node keeps keyed on
     #: a track id — a refusal, an encounter already audited — is keyed on this
@@ -1622,11 +1626,31 @@ class Node:
             # was never persisted and must not be. A network camera therefore
             # comes back needing its password again, and says so rather than
             # failing at connect time with something unhelpful.
+            # The stored source is the redacted one. The password, if the
+            # keychain kept it, goes back in here — and nowhere else — so a
+            # site with network cameras comes back from a restart able to
+            # open them, which an unattended node has to.
+            ref = row["credentials_ref"] if "credentials_ref" in row.keys() else None
+            source_text = row["source"]
+            if ref:
+                from . import secrets as keychain
+                from .redact import with_password
+
+                password = keychain.load(ref)
+                if password:
+                    source_text = with_password(source_text, password)
+                else:
+                    _log.warning(
+                        "node %s: camera %s has a credential handle but the keychain "
+                        "holds nothing for it; the password must be given again",
+                        self._node_id, camera_id,
+                    )
             record = CameraRecord(
                 camera_id=camera_id,
-                source=row["source"],
+                source=source_text,
                 pose=self.store.camera_pose(camera_id),
                 record=bool(row["record"]) if "record" in row.keys() else False,
+                credentials_ref=ref,
             )
             # Rows written before one-source-one-camera was enforced. Kept, so
             # the operator can see them and nothing silently disappears from a
@@ -1748,12 +1772,19 @@ class Node:
         record = CameraRecord(
             camera_id=identifier, source=text, pose=pose, record=bool(recording)
         )
+        # A password travels to the operating system's keychain under a random
+        # handle, and the handle to the database. With no keychain on the
+        # machine, nothing is kept and the camera needs its password again
+        # after a restart — the behaviour before the keychain existed, and
+        # said so in the log rather than stored somewhere worse than nowhere.
+        record.credentials_ref = self._keep_password(identifier, text)
         self._cameras[identifier] = record
 
         # The redacted form, never the raw one: this row is read by anything
         # that lists cameras, and a password in it is a password on a screen.
         self.store.save_camera(
-            identifier, identifier, record.display_source, pose=pose, record=record.record
+            identifier, identifier, record.display_source, pose=pose,
+            record=record.record, credentials_ref=record.credentials_ref,
         )
         self.store.audit(
             self._actor, "camera.added", identifier,
@@ -1785,6 +1816,10 @@ class Node:
 
         del self._cameras[camera_id]
         self.store.delete_camera(camera_id)
+        if record.credentials_ref:
+            from . import secrets as keychain
+
+            keychain.forget(record.credentials_ref)
         # The redacted source and the placement, never the raw source: this row
         # outlives the camera, and it is the only surviving record of where the
         # thing that produced the evidence was pointing. A removal has no after.
@@ -1835,6 +1870,62 @@ class Node:
                 if pose else "unplaced"
             ),
         )
+
+    def _keep_password(self, camera_id: str, source: str) -> str | None:
+        """File a source's password in the keychain; return the handle, or None."""
+        from . import secrets as keychain
+        from .redact import split_password
+
+        _, password = split_password(source)
+        if not password:
+            return None
+        if not keychain.available():
+            _log.warning(
+                "node %s: camera %s has a password and this machine has no keychain "
+                "to keep it in; it must be given again after a restart",
+                self._node_id, camera_id,
+            )
+            return None
+        ref = keychain.new_ref()
+        if not keychain.store(ref, password):
+            return None
+        return ref
+
+    def set_password(self, camera_id: str, password: str) -> None:
+        """Give a stored camera its password, or a new one, without it ever
+        touching the command line or the database.
+
+        Rebuilds the in-memory source from the redacted form plus the secret,
+        files the secret in the keychain under a fresh handle (the old one is
+        forgotten), and audits that a credential changed — the handle, never
+        the value.
+        """
+        from . import secrets as keychain
+        from .redact import redact_url, with_password
+
+        if not password:
+            raise NodeError("a password cannot be empty")
+        record = self.camera(camera_id)
+        display = record.display_source
+        if "://" not in display:
+            raise NodeError(f"{camera_id} is not a network camera; it has no password")
+        placeholder = display if REDACTED in display else display.replace("@", f":{REDACTED}@", 1)
+        rebuilt = with_password(placeholder, password)
+        if rebuilt == placeholder:
+            raise NodeError(f"{camera_id}: could not place a password into {display}")
+        if not keychain.available():
+            raise NodeError("this machine has no keychain to keep the password in")
+        ref = keychain.new_ref()
+        if not keychain.store(ref, password):
+            raise NodeError("the keychain refused the password")
+        keychain.forget(record.credentials_ref)
+        record.credentials_ref = ref
+        record.source = rebuilt
+        self.store.save_camera(
+            camera_id, camera_id, redact_url(rebuilt), pose=record.pose,
+            record=record.record, credentials_ref=ref,
+        )
+        self.store.audit(self._actor, "camera.credential", camera_id, "password stored in the keychain")
 
     def set_recording(self, camera_id: str, on: bool) -> None:
         """Ask a camera to record whenever it runs, or stop asking.

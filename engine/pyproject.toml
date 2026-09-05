@@ -14,6 +14,11 @@ dependencies = [
     # files carrying no endpoint, checked with tools/binary_audit.py before it
     # was adopted.
     "shapely>=2.0",
+    # Camera passwords go to the operating system's keychain — Credential
+    # Manager, the macOS Keychain, Secret Service — never to the database.
+    # Pure Python, offline; its backends are the platform APIs. Where none is
+    # usable (a container with no D-Bus) it is detected and nothing is stored.
+    "keyring>=25",
 ]
 
 [project.scripts]

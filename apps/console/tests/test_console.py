@@ -4671,3 +4671,142 @@ def test_a_console_export_of_a_recorded_incident_carries_its_clips_and_preserves
         assert "recording.preserved" in actions and "incident.exported" in actions
     finally:
         win.close()
+
+
+# ------------------------------------------------------- accounts and permission
+
+
+def _operator(store):
+    from sentinel.accounts import Accounts, Role
+
+    return Accounts(store).add("alice", "correct horse battery", Role.OPERATOR)
+
+
+def test_with_no_account_nothing_is_gated_and_the_status_bar_says_so(qt_app, window):
+    assert window.user is None
+    assert window.actor == "console"
+    assert "nobody" in window.user_label.text()
+    window.configure_button.setChecked(True)
+    assert window._configuring
+
+
+def test_a_viewer_cannot_configure_and_the_refusal_is_audited(qt_app, tmp_path):
+    from sentinel.accounts import Accounts, Role, User
+
+    win = ConsoleWindow(":memory:", settings=_isolated_settings(tmp_path), user=User("vic", Role.VIEWER))
+    try:
+        Accounts(win.store).add("vic", "pw-pw-pw-pw", Role.VIEWER)
+        win.configure_button.setChecked(True)
+        assert not win._configuring
+        assert not win.configure_button.isChecked()
+        assert "vic" in win.status.currentMessage()
+        rows = [r for r in win.store.audit_trail(limit=10) if r["action"] == "console.configure.refused"]
+        assert rows and rows[0]["actor"] == "console:vic"
+        assert "vic · viewer" in win.user_label.text()
+    finally:
+        win.close()
+
+
+def test_an_operator_configures_and_every_change_is_audited_under_their_name(
+    qt_app, tmp_path, reference_video: Path
+):
+    from sentinel.accounts import Role, User
+
+    win = ConsoleWindow(":memory:", settings=_isolated_settings(tmp_path), user=User("alice", Role.OPERATOR))
+    try:
+        assert win.actor == "console:alice"
+        win.configure_button.setChecked(True)
+        assert win._configuring
+        win.add_camera(reference_video, "cam-07")
+        actors = {r["actor"] for r in win.store.audit_trail(limit=40) if r["action"] in ("camera.added", "console.configure.entered")}
+        assert actors == {"console:alice"}, actors
+    finally:
+        win.close()
+
+
+def test_a_viewer_cannot_export_evidence(qt_app, tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+    from sentinel.accounts import Role, User
+    from sentinel.incidents import Correlator
+    from test_store import make_event
+
+    win = ConsoleWindow(":memory:", settings=_isolated_settings(tmp_path), user=User("vic", Role.VIEWER))
+    try:
+        incident = Correlator().correlate([make_event(track=n) for n in (1, 2)])[0]
+        win.store.save_incident(incident)
+        monkeypatch.setattr(ConsoleWindow, "_selected_incident", lambda self: incident)
+        shown = []
+        monkeypatch.setattr(QMessageBox, "information",
+                            staticmethod(lambda p, title, text, *a, **k: shown.append(title) or QMessageBox.StandardButton.Ok))
+        win._export_incident()
+        assert shown == ["Not permitted"]
+        assert "incident.export.refused" in [r["action"] for r in win.store.audit_trail(limit=10)]
+    finally:
+        win.close()
+
+
+def test_the_login_dialog_signs_in_gives_up_after_the_attempts_and_never_keeps_the_password(qt_app, tmp_path):
+    from sentinel.accounts import Accounts, Role
+    from sentinel.store import Store
+    from sentinel_console.login import MAX_ATTEMPTS, LoginDialog
+
+    with Store(":memory:") as store:
+        Accounts(store).add("alice", "correct horse battery", Role.OPERATOR)
+        accounts = Accounts(store)
+
+        dialog = LoginDialog(accounts)
+        dialog.name.setText("alice")
+        dialog.password.setText("wrong")
+        dialog._try()
+        assert dialog.user is None and "attempt" in dialog.message.text()
+        assert dialog.password.text() == "", "a wrong password stayed in the box"
+        dialog.password.setText("correct horse battery")
+        dialog._try()
+        assert dialog.user is not None and dialog.user.name == "alice"
+        dialog.deleteLater()
+
+        given_up = LoginDialog(accounts)
+        outcomes = []
+        given_up.finished.connect(outcomes.append)
+        given_up.name.setText("alice")
+        for _ in range(MAX_ATTEMPTS):
+            given_up.password.setText("no")
+            given_up._try()
+        assert outcomes == [int(LoginDialog.DialogCode.Rejected)]
+        given_up.deleteLater()
+
+
+def test_the_first_administrator_dialog_creates_an_admin_or_is_declined(qt_app):
+    from sentinel.accounts import Accounts, Role
+    from sentinel.store import Store
+    from sentinel_console.login import FirstAdminDialog
+
+    with Store(":memory:") as store:
+        accounts = Accounts(store)
+        dialog = FirstAdminDialog(accounts)
+        dialog.name.setText("root")
+        dialog.password.setText("short")
+        dialog.confirm.setText("short")
+        dialog._create()
+        assert dialog.user is None and "eight" in dialog.message.text()
+        dialog.password.setText("long enough now")
+        dialog.confirm.setText("long enough noW")
+        dialog._create()
+        assert dialog.user is None and "differ" in dialog.message.text()
+        dialog.confirm.setText("long enough now")
+        dialog._create()
+        assert dialog.user is not None and dialog.user.role is Role.ADMIN
+        assert accounts.any()
+        dialog.deleteLater()
+
+
+def test_the_command_line_takes_a_user_and_refuses_seeding_to_a_viewer(qt_app):
+    import inspect
+
+    from sentinel_console import app as app_module
+    from sentinel_console.app import build_parser
+
+    assert build_parser().parse_args(["--user", "alice"]).user == "alice"
+    source = inspect.getsource(app_module.run)
+    assert "_sign_in(arguments)" in source
+    assert "SITE_CONFIGURE" in source, "seeding from the command line is not permission-checked"

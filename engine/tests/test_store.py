@@ -101,6 +101,11 @@ def test_no_column_in_the_schema_is_credential_shaped(store: Store):
             lowered = column.lower()
             if lowered == "credentials_ref":
                 continue
+            if table == "users" and lowered == "password_hash":
+                # The single audited exception, as DATABASE.md has always said:
+                # a one-way salted hash of a local operator's password, never
+                # a device credential and never reversible.
+                continue
             if any(word in lowered for word in FORBIDDEN):
                 offending.append(f"{table}.{column}")
 
@@ -1744,7 +1749,10 @@ def test_migration_eleven_carries_the_recording_flag_and_a_way_back():
         store.save_camera("cam-07", "North gate", "file:///media/north.mp4", record=True)
         before = store.applied_versions()
 
+        # Later migrations come off first; the recording flag is the one under test.
         undone = store.rollback()
+        while undone is not None and undone.name != "camera_recording":
+            undone = store.rollback()
         assert undone is not None and undone.name == "camera_recording"
         assert "record" not in store.column_names("cameras"), "the flag survived its own down"
         assert [row["id"] for row in store.cameras()] == ["cam-07"], "the camera went with it"
@@ -1753,3 +1761,89 @@ def test_migration_eleven_carries_the_recording_flag_and_a_way_back():
         assert store.applied_versions() == before
         # A row from before the flag records nothing — the safe direction.
         assert store.camera_recording("cam-07") is False
+
+
+# ----------------------------------------------------- backup and restore
+
+
+def test_a_backup_is_a_consistent_copy_with_its_digest_beside_it(tmp_path: Path):
+    from sentinel.store import _sha256_of
+
+    live = tmp_path / "live.db"
+    with Store(live) as store:
+        store.save_camera("cam-07", "North gate", "file:///media/north.mp4")
+        store.audit("test", "something.happened", "cam-07", "detail")
+        written = store.backup_to(tmp_path / "backups" / "one.db")
+        # Still usable after the backup, and the backup never overwrites.
+        store.save_camera("cam-08", "Yard", "file:///media/yard.mp4")
+        with pytest.raises(StoreError, match="never overwrites"):
+            store.backup_to(written)
+
+    sidecar = written.with_suffix(".db.sha256")
+    assert sidecar.read_text(encoding="utf-8").split()[0] == _sha256_of(written)
+    with Store(written, auto_migrate=False) as copy:
+        assert [row["id"] for row in copy.cameras()] == ["cam-07"], "the snapshot moved after it was taken"
+        assert copy.pending() == []
+
+
+def test_restore_refuses_a_live_database_unless_told_and_keeps_it_aside(tmp_path: Path):
+    from sentinel.store import restore_backup
+
+    live = tmp_path / "live.db"
+    with Store(live) as store:
+        store.save_camera("cam-07", "North gate", "file:///media/north.mp4")
+        backup = store.backup_to(tmp_path / "b.db")
+        store.save_camera("cam-08", "Yard", "file:///media/yard.mp4")
+
+    with pytest.raises(StoreError, match="--replace"):
+        restore_backup(backup, live)
+
+    restore_backup(backup, live, replace=True)
+    aside = list(tmp_path.glob("live.db.replaced-*"))
+    assert [p for p in aside if p.suffix == ""] or aside, "the replaced database was not kept"
+    with Store(live, auto_migrate=False) as restored:
+        assert [row["id"] for row in restored.cameras()] == ["cam-07"]
+
+
+def test_restore_refuses_a_backup_that_fails_its_own_checks(tmp_path: Path):
+    from sentinel.store import restore_backup, verify_backup
+
+    assert verify_backup(tmp_path / "absent.db") == [f"{tmp_path / 'absent.db'} does not exist"]
+
+    garbage = tmp_path / "garbage.db"
+    garbage.write_bytes(b"not a database at all" * 100)
+    assert any("not a database" in p or "quick_check" in p for p in verify_backup(garbage))
+
+    with Store(tmp_path / "live.db") as store:
+        good = store.backup_to(tmp_path / "good.db")
+    good.with_suffix(".db.sha256").write_text("0" * 64 + "  good.db\n", encoding="utf-8")
+    assert verify_backup(good) == ["the SHA-256 sidecar does not match the file"]
+    with pytest.raises(StoreError, match="cannot be restored"):
+        restore_backup(good, tmp_path / "elsewhere.db")
+
+
+def test_a_database_from_a_newer_build_is_refused_at_open(tmp_path: Path):
+    from sentinel.store import MIGRATIONS
+
+    path = tmp_path / "future.db"
+    with Store(path) as store:
+        store._connection.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)",
+            (MIGRATIONS[-1].version + 5, "from_the_future", 0),
+        )
+    with pytest.raises(StoreError, match="newer build"):
+        Store(path)
+
+
+def test_a_damaged_database_is_refused_with_the_way_out_named(tmp_path: Path):
+    path = tmp_path / "damaged.db"
+    path.write_bytes(b"SQLite format 3\x00" + b"\xff" * 4096)
+    with pytest.raises(StoreError, match="sentinel restore"):
+        Store(path)
+
+
+def test_a_file_database_runs_wal_with_normal_synchronous_as_documented(tmp_path: Path):
+    with Store(tmp_path / "w.db") as store:
+        assert store._connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+        # 1 is NORMAL. DATABASE.md claimed this for a long time before it was true.
+        assert store._connection.execute("PRAGMA synchronous").fetchone()[0] == 1

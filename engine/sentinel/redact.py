@@ -86,6 +86,63 @@ def redact_url(url: str) -> str:
     return _redact_query(rebuilt)
 
 
+def split_password(url: str) -> tuple[str, str | None]:
+    """The URL without its password, and the password — the keychain's halves.
+
+    The stripped form is exactly `redact_url`'s, so it is also the stored and
+    displayed form; `with_password` puts the secret back where the marker is.
+    The first credential found wins: the userinfo password if there is one,
+    else the first credential-shaped query value. A URL with no credential
+    comes back unchanged with ``None``.
+    """
+    if not isinstance(url, str) or "://" not in url:
+        return url, None
+    scheme, _, remainder = url.partition("://")
+    netloc, _, _ = remainder.partition("/")
+    if "@" in netloc:
+        userinfo = netloc.rpartition("@")[0]
+        _, has_password, password = userinfo.partition(":")
+        if has_password and password:
+            return redact_url(url), password
+    _, sep, query = url.partition("?")
+    if sep:
+        for pair in query.partition("#")[0].split("&"):
+            name, has_value, value = pair.partition("=")
+            if has_value and value and name.lower() in CREDENTIAL_QUERY_KEYS:
+                return redact_url(url), value
+    return url, None
+
+
+def with_password(stripped: str, password: str | None) -> str:
+    """Put a password back into a URL `redact_url` stripped.
+
+    The marker is replaced once, in the userinfo if the userinfo carries one,
+    else in the first credential-shaped query value — the same order
+    `split_password` takes it out in, so the two are exact inverses. A URL with
+    no marker, or no password to put back, is returned as it is.
+    """
+    if not password or not isinstance(stripped, str) or "://" not in stripped:
+        return stripped
+    scheme, _, remainder = stripped.partition("://")
+    netloc, slash, tail = remainder.partition("/")
+    if "@" in netloc:
+        userinfo, _, host = netloc.rpartition("@")
+        if userinfo.endswith(":" + REDACTED) or userinfo == REDACTED:
+            username = userinfo[: -len(REDACTED)].rstrip(":")
+            netloc = (f"{username}:{password}@" if username else f":{password}@") + host
+            return f"{scheme}://{netloc}" + ("/" + tail if slash else "")
+    head, sep, query = stripped.partition("?")
+    if sep:
+        query, hash_sep, fragment = query.partition("#")
+        pairs = query.split("&")
+        for index, pair in enumerate(pairs):
+            name, has_value, value = pair.partition("=")
+            if has_value and value == REDACTED and name.lower() in CREDENTIAL_QUERY_KEYS:
+                pairs[index] = f"{name}={password}"
+                return head + "?" + "&".join(pairs) + (hash_sep + fragment if hash_sep else "")
+    return stripped
+
+
 def _redact_query(url: str) -> str:
     """Replace credential-shaped query values, leaving the rest legible."""
     head, sep, query = url.partition("?")

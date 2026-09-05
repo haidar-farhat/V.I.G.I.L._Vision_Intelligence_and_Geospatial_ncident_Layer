@@ -332,7 +332,8 @@ def test_the_identity_switch_and_the_declared_flag_each_carry_a_way_back():
     assert by_version[9].name == "site_identity"
     assert by_version[10].name == "site_declared"
     assert by_version[11].name == "camera_recording"
-    assert MIGRATIONS[-1].version == 11, "a newer migration arrived; check it below too"
+    assert by_version[12].name == "users"
+    assert MIGRATIONS[-1].version == 12, "a newer migration arrived; check it below too"
     for migration in MIGRATIONS:
         assert migration.down.strip(), (
             f"migration {migration.version} ({migration.name}) has no way back — "
@@ -395,7 +396,7 @@ def test_the_site_row_survives_its_switch_and_flag_leaving_and_reads_as_off_and_
             undone_names.append(undone.name)
             if undone.name == "site_identity":
                 break
-        assert undone_names == ["camera_recording", "site_declared", "site_identity"]
+        assert undone_names == ["users", "camera_recording", "site_declared", "site_identity"]
         assert "declared" not in store.column_names("sites"), "the flag survived its own down"
         columns = store.column_names("sites")
         assert not any(c.startswith("identity_") for c in columns), (

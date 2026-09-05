@@ -847,6 +847,20 @@ def _node(args: argparse.Namespace) -> int:
         print("error: --for must be greater than zero", file=sys.stderr)
         return 2
 
+    from . import supervise as supervision
+
+    _warn_about_argv_passwords(args.source)
+    if args.stop:
+        # The one way to stop a node on every platform: a file it polls for.
+        # Windows delivers no Ctrl-C to a process without a console, and a
+        # scheduled task cannot send a signal.
+        written = supervision.request_stop()
+        print(f"stop requested: {written}")
+        print("The running node sees it on its next poll and exits; the supervisor does not restart it.")
+        return 0
+    if supervision.clear_stop():
+        _log.warning("a stale stop request was found and removed before starting")
+
     record_to = None
     if args.record is not None:
         record_to = Path(args.record) if args.record else paths.recordings_directory()
@@ -865,6 +879,17 @@ def _node(args: argparse.Namespace) -> int:
     )
 
     try:
+        if not args.source and not node.cameras:
+            print(
+                "error: no source given and the database holds no camera. Give a "
+                "source, or add cameras in the console first.", file=sys.stderr,
+            )
+            return 2
+        if not args.source:
+            # The service form: run what the database holds, as the console
+            # would. A node that needed its cameras retyped at every boot
+            # could not be started by a scheduler.
+            print(f"running the {len(node.cameras)} stored camera(s)")
         for index, source in enumerate(args.source):
             pose = None
             if args.place:
@@ -894,15 +919,24 @@ def _node(args: argparse.Namespace) -> int:
             print("Running until every camera ends or you press Ctrl-C. "
                   "For a scheduled job use --for SECONDS.", file=sys.stderr)
 
-        node.run_forever(
-            until=(lambda _: time.monotonic() >= deadline) if deadline else None
-        )
+        stop_path = supervision.stop_file()
+
+        def done(_node) -> bool:
+            if deadline is not None and time.monotonic() >= deadline:
+                return True
+            if stop_path.exists():
+                _log.info("node %s: stop requested by %s", args.node, stop_path)
+                return True
+            return False
+
+        node.run_forever(until=done)
 
         print()
         print(node.summary())
         return 0
     finally:
         node.close()
+        supervision.clear_stop()
 
 
 def _register_expiry(
@@ -1057,6 +1091,209 @@ def _devices(args: argparse.Namespace) -> int:
 
     print("Then: sentinel run device:0 --place lat,lon,height,heading,pitch")
     return 0
+
+
+def _backup(args: argparse.Namespace) -> int:
+    """`sentinel backup`: a consistent snapshot, named by the moment it was taken."""
+    from datetime import datetime, timezone
+
+    database = Path(args.database) if args.database else default_database_path()
+    if not database.exists():
+        print(f"error: {database} does not exist; nothing to back up", file=sys.stderr)
+        return 1
+    directory = Path(args.to) if args.to else paths.data_directory() / "backups"
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    target = directory / f"sentinel-{stamp}.db"
+    with Store(database, auto_migrate=False) as store:
+        written = store.backup_to(target)
+    digest = written.with_suffix(written.suffix + ".sha256").read_text(encoding="utf-8").split()[0]
+    print(f"backup      {written}")
+    print(f"sha256      {digest}")
+    print(f"size        {written.stat().st_size / 1024:.0f} KiB")
+    print("Keep the .sha256 beside it; `sentinel restore` checks the file against it.")
+    return 0
+
+
+def _restore(args: argparse.Namespace) -> int:
+    """`sentinel restore FILE [--replace]`: validated, never a silent overwrite."""
+    from .store import StoreError, restore_backup, verify_backup
+
+    database = Path(args.database) if args.database else default_database_path()
+    problems = verify_backup(args.backup)
+    if problems:
+        print(f"error: {args.backup} cannot be restored: " + "; ".join(problems), file=sys.stderr)
+        return 1
+    try:
+        landed = restore_backup(args.backup, database, replace=args.replace)
+    except StoreError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    print(f"restored    {landed}")
+    if args.replace:
+        print("the previous database was moved aside as <name>.replaced-<stamp>, not deleted")
+    return 0
+
+
+def _os_actor() -> str:
+    """The CLI runs as the operating-system account that launched it."""
+    import getpass as _getpass
+
+    try:
+        return f"cli:{_getpass.getuser()}"
+    except Exception:  # noqa: BLE001 - no account name available
+        return "cli"
+
+
+def _read_secret(prompt: str, from_stdin: bool) -> str:
+    import getpass as _getpass
+
+    if from_stdin:
+        return sys.stdin.readline().rstrip("\r\n")
+    return _getpass.getpass(prompt)
+
+
+def _users_add(args: argparse.Namespace) -> int:
+    from .accounts import AccountError, Accounts
+
+    secret = _read_secret(f"password for {args.name}: ", args.stdin)
+    if not args.stdin:
+        again = _read_secret("again: ", False)
+        if again != secret:
+            print("error: the two passwords differ", file=sys.stderr)
+            return 1
+    with Store(args.database or default_database_path()) as store:
+        try:
+            user = Accounts(store).add(args.name, secret, args.role, actor=_os_actor())
+        except AccountError as error:
+            print(f"error: {error}", file=sys.stderr)
+            return 1
+    print(f"added {user.name} ({user.role.value})")
+    return 0
+
+
+def _users_list(args: argparse.Namespace) -> int:
+    from .accounts import Accounts
+
+    with Store(args.database or default_database_path()) as store:
+        users = Accounts(store).users()
+    if not users:
+        print("no accounts. Until one exists the console gates nothing and names nobody.")
+        return 0
+    for user in users:
+        print(f"{user.name:<24} {user.role.value:<9} {'active' if user.active else 'disabled'}")
+    return 0
+
+
+def _users_passwd(args: argparse.Namespace) -> int:
+    from .accounts import AccountError, Accounts
+
+    secret = _read_secret(f"new password for {args.name}: ", args.stdin)
+    with Store(args.database or default_database_path()) as store:
+        try:
+            Accounts(store).set_password(args.name, secret, actor=_os_actor())
+        except AccountError as error:
+            print(f"error: {error}", file=sys.stderr)
+            return 1
+    print(f"changed {args.name}'s password")
+    return 0
+
+
+def _users_disable(args: argparse.Namespace) -> int:
+    return _users_active(args, False)
+
+
+def _users_enable(args: argparse.Namespace) -> int:
+    return _users_active(args, True)
+
+
+def _users_active(args: argparse.Namespace, active: bool) -> int:
+    from .accounts import AccountError, Accounts
+
+    with Store(args.database or default_database_path()) as store:
+        try:
+            Accounts(store).set_active(args.name, active, actor=_os_actor())
+        except AccountError as error:
+            print(f"error: {error}", file=sys.stderr)
+            return 1
+    print(f"{'enabled' if active else 'disabled'} {args.name}")
+    return 0
+
+
+def _password(args: argparse.Namespace) -> int:
+    """`sentinel password CAMERA`: prompted, never an argument."""
+    import getpass
+
+    from .node import NodeError
+    from . import secrets as keychain
+
+    if not keychain.available():
+        print("error: this machine has no keychain to keep a password in", file=sys.stderr)
+        return 1
+    if args.stdin:
+        secret = sys.stdin.readline().rstrip("\r\n")
+    else:
+        secret = getpass.getpass(f"password for {args.camera_id}: ")
+    with Node(args.database or default_database_path(), restore_cameras=True) as node:
+        try:
+            node.set_password(args.camera_id, secret)
+        except NodeError as error:
+            print(f"error: {error}", file=sys.stderr)
+            return 1
+    print(f"stored: {args.camera_id}'s password is in the keychain; the database holds a handle only")
+    return 0
+
+
+def _warn_about_argv_passwords(sources) -> None:
+    """A password in an argument is in every process listing on the machine."""
+    from .redact import split_password
+
+    for source in sources or ():
+        if split_password(str(source))[1]:
+            _log.warning(
+                "%s carries a password on the command line, which every process on "
+                "this machine can read; add the camera without it and use "
+                "`sentinel password CAMERA` instead",
+                split_password(str(source))[0],
+            )
+
+
+def _rest(arguments: list[str]) -> list[str]:
+    """argparse.REMAINDER keeps the `--`; the node must not see it."""
+    return [part for part in arguments if part != "--"] if arguments else []
+
+
+def _supervise(args: argparse.Namespace) -> int:
+    from . import supervise as supervision
+
+    rest = _rest(args.node_arguments)
+    command = supervision.child_command(rest)
+    print("supervising: " + " ".join(command), file=sys.stderr)
+    return supervision.supervise(command, max_restarts=args.max_restarts)
+
+
+def _service(args: argparse.Namespace) -> int:
+    from . import supervise as supervision
+
+    rest = _rest(args.node_arguments)
+    if args.action == "print":
+        definition = supervision.service_definition(sys.platform, rest)
+        print(f"kind      {definition['kind']}")
+        if definition["path"] is not None:
+            print(f"file      {definition['path']}")
+            print()
+            print(definition["content"])
+        print("install   " + " ".join(definition["install"]))
+        print("uninstall " + " ".join(definition["uninstall"]))
+        print(f"note      {definition['note']}")
+        return 0
+    if args.action == "install":
+        code, definition = supervision.install_service(rest)
+        print(f"{'registered' if code == 0 else 'FAILED to register'} the {definition['kind']}")
+        print(f"note      {definition['note']}")
+        return code
+    code, definition = supervision.uninstall_service()
+    print(f"{'removed' if code == 0 else 'FAILED to remove'} the {definition['kind']}")
+    return code
 
 
 def _where(args: argparse.Namespace) -> int:
@@ -1508,7 +1745,15 @@ def build_parser() -> argparse.ArgumentParser:
     node = commands.add_parser(
         "node", help="run cameras unattended, with no display — what a worker runs"
     )
-    node.add_argument("source", nargs="+", help="video files, rtsp:// URLs, or device:N")
+    node.add_argument(
+        "source", nargs="*",
+        help="video files, rtsp:// URLs, or device:N. With none, the cameras the "
+             "database holds are run — the form a service uses",
+    )
+    node.add_argument(
+        "--stop", action="store_true",
+        help="ask the node running against this data directory to stop, and exit",
+    )
     node.add_argument("--id", action="append", default=None,
                       help="camera id, once per source")
     node.add_argument("--place", action="append", type=_pose, default=None,
@@ -1581,6 +1826,88 @@ def build_parser() -> argparse.ArgumentParser:
 
     where = commands.add_parser("where", help="print every path this build uses")
     where.set_defaults(handler=_where)
+
+    users = commands.add_parser("users", help="local accounts: who may change the site")
+    user_commands = users.add_subparsers(dest="users_command", required=True)
+    add_user = user_commands.add_parser("add", help="create an account (the password is prompted for)")
+    add_user.add_argument("name", help="one word")
+    add_user.add_argument(
+        "--role", default="OPERATOR",
+        choices=["VIEWER", "OPERATOR", "ANALYST", "ADMIN"],
+        help="VIEWER watches; OPERATOR changes the site and exports; ANALYST exports and "
+             "reads the audit; ADMIN does everything including accounts (default OPERATOR)",
+    )
+    add_user.add_argument("--stdin", action="store_true", help="read the password from standard input")
+    add_user.set_defaults(handler=_users_add)
+    list_users = user_commands.add_parser("list", help="every account, its role and whether it is active")
+    list_users.set_defaults(handler=_users_list)
+    passwd = user_commands.add_parser("passwd", help="change an account's password (prompted)")
+    passwd.add_argument("name")
+    passwd.add_argument("--stdin", action="store_true")
+    passwd.set_defaults(handler=_users_passwd)
+    disable = user_commands.add_parser("disable", help="an inactive account holds no permission")
+    disable.add_argument("name")
+    disable.set_defaults(handler=_users_disable)
+    enable = user_commands.add_parser("enable", help="reactivate an account")
+    enable.add_argument("name")
+    enable.set_defaults(handler=_users_enable)
+
+    password = commands.add_parser(
+        "password",
+        help="give a stored network camera its password, kept in the OS keychain — "
+             "never on the command line",
+    )
+    password.add_argument("camera_id", help="the camera, as `sentinel incidents`/the console name it")
+    password.add_argument(
+        "--stdin", action="store_true",
+        help="read the password from standard input instead of prompting (for a script)",
+    )
+    password.set_defaults(handler=_password)
+
+    supervise = commands.add_parser(
+        "supervise",
+        help="run `node` as a child and restart it when it dies; stops when it exits cleanly",
+    )
+    supervise.add_argument(
+        "--max-restarts", type=int, default=None, metavar="N",
+        help="give up after N restarts (default: never)",
+    )
+    supervise.add_argument(
+        "node_arguments", nargs=argparse.REMAINDER,
+        help="everything after `--` is passed to `node` unchanged",
+    )
+    supervise.set_defaults(handler=_supervise)
+
+    service = commands.add_parser(
+        "service",
+        help="register the supervised node with the operating system, or remove it",
+    )
+    service.add_argument("action", choices=["install", "uninstall", "print"])
+    service.add_argument(
+        "node_arguments", nargs=argparse.REMAINDER,
+        help="everything after `--` is what `node` is run with, e.g. `-- --record`",
+    )
+    service.set_defaults(handler=_service)
+
+    backup = commands.add_parser(
+        "backup", help="copy the database to a dated file, with a SHA-256 sidecar"
+    )
+    backup.add_argument(
+        "--to", metavar="DIR", default=None,
+        help="where to write it (default: the data directory's backups/ folder)",
+    )
+    backup.set_defaults(handler=_backup)
+
+    restore = commands.add_parser(
+        "restore", help="put a backup in place as the live database, after checking it"
+    )
+    restore.add_argument("backup", help="a file written by `sentinel backup`")
+    restore.add_argument(
+        "--replace", action="store_true",
+        help="move the current database aside as <name>.replaced-<stamp> first; "
+             "without this an existing database is refused",
+    )
+    restore.set_defaults(handler=_restore)
 
     basemap = commands.add_parser(
         "basemap",

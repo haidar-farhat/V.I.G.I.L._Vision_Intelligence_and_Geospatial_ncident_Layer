@@ -124,15 +124,21 @@ Each awkward case in the table below was a real leak found by writing the test:
 | a credential in the query | `http://cam/stream?user=admin&password=…` |
 | no scheme at all | `admin:pw@10.0.0.5/s` |
 
-### Persistence — **PLANNED**
+### Persistence — **IMPLEMENTED / TESTED** (2026-09-06)
 
-Nothing persists a camera password today, so nothing can leak one from storage.
-When it does, the design is: the database stores `credentials_ref`, an opaque
-handle into the OS keychain (Windows Credential Manager, macOS Keychain, Linux
-Secret Service), and never the secret. The `cameras` table already carries the
-`credentials_ref` column and no password column, so the shape is in place ahead
-of the mechanism. A schema test walks every column looking for anything
-credential-shaped, which is what will keep it that way.
+The database stores `credentials_ref`, a random opaque handle; the secret goes
+to the operating system's keychain through `keyring` — Windows Credential
+Manager, the macOS Keychain, Secret Service on Linux — under that handle
+(`sentinel.secrets`). Adding a network camera files the password there and the
+stored source is the redacted form; a restarted node reads the handle, asks the
+keychain, and rebuilds the URL in memory (`redact.with_password`, the exact
+inverse of `redact_url`, tested on the awkward URLs above). Removing a camera
+forgets the entry. `sentinel password CAMERA` prompts for a password — it is
+never an argument, because an argument is in every process listing — and
+`run`/`node` warn when a source on the command line carries one. A machine
+with no usable keychain (a container without D-Bus) is detected: nothing is
+stored, the camera needs its password again after a restart, and the log says
+so. A backup of the database contains handles, not secrets.
 
 ## Zero WAN, enforced
 
@@ -354,7 +360,22 @@ dependencies with no route out — but only along the paths the tests reach.
 
 ---
 
-## Authorization
+## Authorization — **IMPLEMENTED / TESTED** (2026-09-06)
+
+Local accounts live in the `users` table (migration 12): a name, a salted
+scrypt hash, a role and an active flag. `sentinel users add|list|passwd|
+disable|enable` manage them, with the password prompted for or read from
+standard input, never an argument. The console asks who is there before it
+opens: with no account it offers to create the first administrator (and can be
+declined, in which case nothing is gated and the status bar says on every
+start that the audit trail names nobody); with accounts it shows the sign-in
+dialog, or takes `--user NAME` with the password on standard input for a
+script. Five failures in a sitting close the dialog; five failures on a name
+make every later attempt wait, longer each time, in that process. Every audit
+row the console writes carries `console:<name>`; the CLI writes `cli:<os
+account>`. What is **not** built: sessions and an application lock (the user
+is held for the life of the window), and permission on the control plane,
+which does not exist.
 
 Checks are always against a **permission**, never a role name, so adding or
 widening a role cannot accidentally open a door elsewhere.

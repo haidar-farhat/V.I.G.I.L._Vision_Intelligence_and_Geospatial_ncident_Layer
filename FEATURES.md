@@ -101,21 +101,21 @@ the engine already computes.
 | macOS support | `SKEL` | Never built or run |
 | Standalone completely local operation | `TESTED` | Three enforcement points; see Network |
 | LAN distributed operation | `PLAN` | |
-| Headless AI worker nodes | `PLAN` | `python -m sentinel` is headless but is not a node — it exits |
+| Headless AI worker nodes | `IMPL` | `sentinel node` with no source runs the stored cameras under `sentinel supervise`, registered with the OS by `sentinel service install` — a worker on one machine. Still `PLAN`: the control plane that makes it a worker of a control node |
 | Multi-monitor command-centre layouts | `PLAN` | First step: the map in a `QDockWidget` that floats to a second monitor and remembers its geometry; selection and modes keep working across windows. Video on one screen and the map on the other is how a control room is laid out. |
 | Fullscreen security-operations mode | `PLAN` | |
 | System tray operation | `PLAN` | |
 | Application lock | `PLAN` | Needs accounts first |
-| Local user accounts | `PLAN` | |
-| Role-based access control | `PLAN` | Design is permission-based, never role-name checks |
-| Administrator / operator / analyst / viewer roles | `PLAN` | |
+| Local user accounts | `TESTED` | `users` table (migration 12), salted scrypt hashes, `sentinel users add|list|passwd|disable|enable`; the console's first-administrator offer and sign-in dialog; `--user NAME` with the password on standard input for scripts; failures make the next attempt wait; logins and failures audited by name only |
+| Role-based access control | `TESTED` | Permission-based: `site.configure`, `incident.export`, `audit.read`, `users.manage`, `site.view`; code asks `user.may(permission)`, never a role name. Configure and Export are gated in the console and the refusals audited under the user's name; the command-line seeding flags are gated the same way |
+| Administrator / operator / analyst / viewer roles | `TESTED` | Sets of permissions in `sentinel.accounts.PERMISSIONS`; an inactive account holds none |
 | First-run setup wizard | `PLAN` | |
 | Professional security-operations UI | `TESTED` | Native Qt widgets, no webview — asserted by test |
 | Dark command-centre interface | `TESTED` | Distinct state colours, asserted distinguishable |
 | Arabic / English / French interface | `PLAN` | No string extraction yet |
 | RTL support | `PLAN` | |
 | Crash recovery | `SKEL` | An unhandled exception is logged with its traceback — including one raised inside a Qt slot, which Qt prints to a terminal the packaged console does not have and otherwise keeps on `sys.last_*`, pinning the widget it was raised in; the status bar names it; a hard crash — a segfault, an abort, a heap corruption — leaves every thread's Python stack in `crash.log` beside the log, written from C by `faulthandler`. Nothing restarts |
-| Automatic service recovery | `SKEL` | A camera reconnects with backoff — genuinely, since the pipeline began using it; the application does not |
+| Automatic service recovery | `TESTED` | `sentinel supervise` runs the node as a child and restarts it after a crash with a capped, growing pause; it stops only on a clean exit or a requested stop. `sentinel node --stop` is the stop channel on every platform (a file the node polls — Windows delivers no Ctrl-C to a process without a console); `node` with no source runs the stored cameras; `sentinel service install` registers the supervisor with Task Scheduler, systemd or launchd |
 | Health monitoring | `PLAN` | |
 | Diagnostics centre | `SKEL` | `sentinel where` and the log are the whole of it — and both, with the About dialog, every evidence report and `HOW TO RUN.txt`, now open with the build: version, commit and build date from `sentinel.version`, stamped into `build.json` beside the executables at package time |
 | The console drivable from the command line — the shipped binary as the test medium | `TESTED` | `--camera`, `--place`, `--zone`, `--zone-classes` seed a site through the node, audited like a click; `--watch` and `--confidence` set what this run tracks without touching the machine's settings; `--settings FILE` keeps a test run out of the registry; `--for SECONDS` closes the console and prints every camera's frames, tracks by class, events and incidents; `--screenshots DIR` photographs the window and every panel first. `python tasks.py exetest` runs `dist/SentinelVision/SentinelVision-dev.exe` that way on `device:0` in an isolated data directory and reads the summary back. The standing rule behind it: test through the camera and the binary, never a prerecorded file |
@@ -177,7 +177,7 @@ the engine already computes.
 | Codec detection | `PLAN` | |
 | Connection testing | `TESTED` | Socket probe before the decoder — OpenCV's own 30 s timeout cannot be changed |
 | Authentication testing | `PLAN` | |
-| Camera credential management | `SKEL` | Redaction is `TESTED`; **nothing persists a password**, so nothing can leak one from storage |
+| Camera credential management | `TESTED` | Redaction is `TESTED`; the password itself lives in the operating system's keychain under a random `credentials_ref` (`sentinel.secrets`, via `keyring`), the database and backups hold the handle only, a restarted node rebuilds the URL in memory, removing a camera forgets the entry, `sentinel password CAMERA` prompts rather than taking an argument, and a machine with no keychain is detected and stores nothing |
 | PTZ cameras · manual control · presets · home | `PLAN` | Permission-gated and audited by design |
 | Camera enable/disable | `PLAN` | |
 | Camera AI enable/disable | `PLAN` | |
@@ -765,7 +765,7 @@ both are `TESTED`.
 | Disk monitoring | `SKEL` | Free space is measured during a retention pass; nothing watches between passes |
 | Retention cleanup | `TESTED` | On invocation (`sentinel retention --apply`), not yet on a schedule |
 | Incident evidence protection | `TESTED` | Preservation beats every other rule, and a shortfall is reported rather than resolved by deleting evidence |
-| Backup · restore · backup validation | `PLAN` | Migrations each carry a reversal, which is the nearest thing today |
+| Backup · restore · backup validation | `TESTED` | `sentinel backup` snapshots the database through SQLite's backup API with a `.sha256` beside it; `sentinel restore` checks the digest, `quick_check` and the schema version, refuses to overwrite unless `--replace`, and then moves the current database aside rather than deleting it. A damaged file and a newer-schema file are refused at open with the way out named |
 
 ## 🗺️ Offline GIS
 
@@ -817,9 +817,9 @@ full acceptance criteria live there.
 
 | Capability | State | Note |
 |---|---|---|
-| Authentication and permission-based authorization (SEC-01) | `PLAN` | Every action is attributed to the literal string `console`; there is nobody to name in a chain of custody |
-| Camera credentials in the OS keychain, never on the command line (SEC-02) | `PLAN` | A restored RTSP camera needs its password retyped; `--camera rtsp://user:pw@…` puts it in a process listing |
-| Process supervision and restart (REL-01) | `PLAN` | No service, no watchdog; a crash at 03:00 ends monitoring silently |
+| Authentication and permission-based authorization (SEC-01) | `TESTED` | Built 2026-09-06 — see Local user accounts and Role-based access control. Every console audit row carries `console:<name>`; the CLI's carry `cli:<os account>`. Still `PLAN`: sessions, an application lock, and permission on a control plane that does not exist |
+| Camera credentials in the OS keychain, never on the command line (SEC-02) | `TESTED` | Built 2026-09-06 — see Camera credential management. A password on the command line still works and is warned about; `sentinel password` is the way that leaves no trace |
+| Process supervision and restart (REL-01) | `TESTED` | Built 2026-09-06: `supervise`, the stop file, stored-camera runs and `service install|uninstall|print` — see Automatic service recovery |
 | Recording from the console with self-running retention (REL-02) | `TESTED` | The Record box, `Node.set_recording`, the sweep from `poll` — above. Open: an alert that leaves the process |
 | Signed installers per platform (OPS-01) | `PLAN` | A folder, unsigned; SmartScreen warns, Gatekeeper refuses |
 | One remote CI run on three platforms (TEST-01) | `PLAN` | The workflow exists and has never executed remotely |
@@ -832,7 +832,7 @@ full acceptance criteria live there.
 | Locked, hash-pinned dependencies with vulnerability scanning (SEC-06) | `PLAN` | Floors only; no lock file; no `pip-audit`, no `cargo audit`, no SBOM |
 | Decode independent of analysis (REL-04) · persistence off the GUI thread (REL-05) · a wedged decoder cannot hold the process (REL-06) · a 72-hour soak (REL-07) | `PLAN` | Each is an audit item with its own definition of done |
 | Real-footage evaluation of the watch list and the floor (TEST-04) · an RTSP server in CI (TEST-03) · the packaged binary launched by CI (TEST-02) | `PLAN` | The camera runs recorded in the audit are the only evidence on real footage so far |
-| Backup and restore, tested by restoring (DATA-01) · DATABASE.md agrees with `store.py` (DATA-02) | `PLAN` | No backup tooling; the document claims checksummed migrations and `synchronous = NORMAL`, neither of which exists |
+| Backup and restore, tested by restoring (DATA-01) · DATABASE.md agrees with `store.py` (DATA-02) | `TESTED` | Built 2026-09-06: backup/restore, `synchronous = NORMAL` set on every open, `quick_check` and a newer-schema gate at open, DATABASE.md rewritten to say what exists and what is `PLAN` |
 | Alerting that leaves the process (OBS-01) · the documentation truth pass (DOC-01) · Linux and macOS run with a camera (XP-01) · one physical IP camera for an hour (NET-01) · the model licence reviewed (AI-02) | `PLAN` | See the audit |
 
 ## The ten that would make it feel like a platform

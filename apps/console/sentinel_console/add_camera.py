@@ -247,11 +247,11 @@ class AddCameraDialog(QDialog):
         )
         layout.addWidget(
             _hint(
-                "The password is used once, at the moment of connection, and is "
-                "held in memory only. It is never written to the database, the "
-                "log, an export or this screen — and it is not saved, so it has "
-                "to be entered again after a restart. Keychain storage is "
-                "designed and not built; see STATUS.md."
+                "The password is kept by the operating system's own keychain — "
+                "Credential Manager on Windows — under a random handle; the "
+                "database, the log, an export and this screen never carry it. "
+                "On a machine with no keychain it is held in memory for this "
+                "run only and asked for again after a restart."
             )
         )
         layout.addStretch(1)

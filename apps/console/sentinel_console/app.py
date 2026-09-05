@@ -97,6 +97,8 @@ from .selection import CAMERA as CAMERA_KIND, Selection, SelectionBus
 from .audit_view import AuditPanel
 from .investigation import InvestigationPanel
 from .watch_dialog import WatchedClassesDialog
+from .login import FirstAdminDialog, LoginDialog
+from sentinel.accounts import INCIDENT_EXPORT, SITE_CONFIGURE, Accounts, User
 from .zones_view import ZoneDialog, ZonePropertiesPanel, ZonesView
 
 _log = logs.get(__name__)
@@ -251,6 +253,7 @@ class ConsoleWindow(QMainWindow):
         settings: QSettings | None = None,
         watched=None,
         confidence: float | None = None,
+        user: User | None = None,
     ):
         """
         ``database`` is the path to persist to. ``":memory:"`` runs the console
@@ -271,6 +274,9 @@ class ConsoleWindow(QMainWindow):
         self.setStyleSheet(theme.STYLESHEET)
 
         self._sessions: dict[str, CameraSession] = {}
+        #: Who is at the console, or ``None`` when no account exists yet. The
+        #: audit trail names this user; the permission checks read it.
+        self._user = user
 
         # `None` means motion detection, and it means it *explicitly*. Finding a
         # model on disk and using it is a decision about what the system can
@@ -316,7 +322,7 @@ class ConsoleWindow(QMainWindow):
         # no display, which is the point: one analysis loop, not two that drift.
         self.node = Node(
             database if database is not None else default_database_path(),
-            actor="console",
+            actor=self.actor,
             # A viewer needs the frame the conclusions were drawn from, and
             # needs a file paced to its own timeline rather than flashing past.
             keep_images=True,
@@ -346,6 +352,23 @@ class ConsoleWindow(QMainWindow):
     def store(self):
         """The node's store. The console does not own one."""
         return self.node.store
+
+    @property
+    def user(self) -> User | None:
+        return self._user
+
+    @property
+    def actor(self) -> str:
+        """Who the audit trail names for this console's actions."""
+        return self._user.actor if self._user is not None else CONSOLE_ACTOR
+
+    def may(self, permission: str) -> bool:
+        """Permission, by name. With no accounts at all nothing is gated — a
+        deployment that has not created its first account must still work, and
+        the status bar says on every start that nobody is named."""
+        if self._user is None:
+            return not Accounts(self.store).any()
+        return self._user.may(permission)
 
     @property
     def _zones(self) -> list:
@@ -574,6 +597,12 @@ class ConsoleWindow(QMainWindow):
 
         self._set_status("Ready. Add a camera to begin.")
         self._build_menu()
+        # Who is here, beside the lock state. "nobody" is a warning, not a
+        # decoration: it means the audit trail names no person.
+        self.user_label = QLabel("")
+        self.user_label.setObjectName("Caption")
+        self.status.insertPermanentWidget(0, self.user_label)
+        self._show_user()
 
         # Locked to start with. Last, and both halves of that matter: after the
         # status bar, because this puts the map into Select, which reports its
@@ -1049,6 +1078,16 @@ class ConsoleWindow(QMainWindow):
         whatever state the last person walked away from, which is why this
         re-arms itself.
         """
+        if on and not self.may(SITE_CONFIGURE):
+            # Permission, not the lock: a viewer's Configure stays down and
+            # says why, and the refusal is audited under their name.
+            self.configure_button.setChecked(False)
+            who = self._user.name if self._user is not None else "nobody"
+            self._set_status(
+                f"Configure needs an operator or administrator account; {who} may only watch."
+            )
+            self.store.audit(self.actor, "console.configure.refused", self.node.node_id, "no permission")
+            return
         was, self._configuring = self._configuring, bool(on)
         for control in self._configure_only():
             control.setEnabled(self._configuring)
@@ -1091,7 +1130,7 @@ class ConsoleWindow(QMainWindow):
 
         if was != self._configuring:
             self.store.audit(
-                CONSOLE_ACTOR,
+                self.actor,
                 "console.configure.entered" if self._configuring else "console.configure.left",
                 self.node.node_id,
                 "unlocked the controls that change the site"
@@ -1100,6 +1139,18 @@ class ConsoleWindow(QMainWindow):
             )
             self._set_status("Configure: the site can be changed." if self._configuring
                              else "Monitor: the site is locked.")
+
+    def _show_user(self) -> None:
+        if self._user is not None:
+            self.user_label.setText(f"{self._user.name} · {self._user.role.value.lower()}")
+            self.user_label.setStyleSheet("")
+        else:
+            self.user_label.setText("no account — the audit trail names nobody")
+            self.user_label.setStyleSheet(f"color: {theme.STALE.name()};")
+            self.user_label.setToolTip(
+                "Create the first administrator with `sentinel users add NAME --role ADMIN`, "
+                "or accept the offer the console makes when it starts."
+            )
 
     def _relock(self) -> None:
         """The idle timeout fired."""
@@ -2022,6 +2073,13 @@ class ConsoleWindow(QMainWindow):
                 self, "No incident selected", "Select an incident to export."
             )
             return
+        if not self.may(INCIDENT_EXPORT):
+            self.store.audit(self.actor, "incident.export.refused", incident.id, "no permission")
+            QMessageBox.information(
+                self, "Not permitted",
+                "Exporting evidence needs an operator, analyst or administrator account.",
+            )
+            return
 
         destination = QFileDialog.getExistingDirectory(
             self, "Export evidence to", str(Path.home())
@@ -2809,7 +2867,52 @@ def build_parser():
         "--screenshots", default=None, metavar="DIR",
         help="with --for: photograph the window and every panel into DIR before closing",
     )
+    parser.add_argument(
+        "--user", default=None, metavar="NAME",
+        help="sign in as this account without the dialog; the password is read from "
+             "standard input (for a script or a test). Needed only when accounts exist.",
+    )
     return parser
+
+
+_REFUSED = object()
+
+
+def _sign_in(arguments):
+    """Who is opening the console, decided before the window exists.
+
+    No accounts: offer to create the first administrator (declinable). Some
+    accounts and ``--user``: the password comes from standard input, for a
+    script or a test. Some accounts and no flag: the sign-in dialog. Returns
+    the `User`, ``None`` for a console with no accounts, or `_REFUSED`.
+    """
+    from sentinel.accounts import AccountError
+
+    from sentinel.store import Store
+
+    with Store(arguments.database or default_database_path()) as store:
+        accounts = Accounts(store)
+        if not accounts.any():
+            if arguments.user:
+                print("--user given but no account exists; create one with `sentinel users add`", file=sys.stderr)
+                return _REFUSED
+            dialog = FirstAdminDialog(accounts)
+            accepted = dialog.exec() == QDialog.DialogCode.Accepted
+            user = dialog.user if accepted else None
+            dialog.deleteLater()
+            return user
+        if arguments.user:
+            secret = sys.stdin.readline().rstrip("\r\n") if sys.stdin is not None else ""
+            try:
+                return accounts.authenticate(arguments.user, secret)
+            except AccountError as error:
+                print(f"sign-in failed: {error}", file=sys.stderr)
+                return _REFUSED
+        dialog = LoginDialog(accounts)
+        accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        user = dialog.user if accepted else None
+        dialog.deleteLater()
+        return user if (accepted and user is not None) else _REFUSED
 
 
 def _refuse_unknown_labels(model: Path, labels) -> str | None:
@@ -2907,9 +3010,14 @@ def run(argv: list[str] | None = None) -> int:
         else:
             log.info("detection model: %s", model)
 
+        user = _sign_in(arguments)
+        if user is _REFUSED:
+            log.warning("console: sign-in cancelled or refused; not opening")
+            return 3
+
         window = ConsoleWindow(
             database=arguments.database, model=model, settings=settings,
-            watched=watched, confidence=arguments.confidence,
+            watched=watched, confidence=arguments.confidence, user=user,
         )
         # Installed before the window shows, so the first slot to raise is
         # already caught. See `_report_uncaught` for why this is not optional
@@ -2918,6 +3026,9 @@ def run(argv: list[str] | None = None) -> int:
         sys.excepthook = _report_uncaught
         window.show()
 
+        if (arguments.camera or zones or arguments.place) and not window.may(SITE_CONFIGURE):
+            log.warning("--camera/--place/--zone refused: %s may not change the site", window.actor)
+            return 3
         named = window.seed_site(
             cameras=arguments.camera or (), pose=arguments.place, zones=zones,
             record=arguments.record,

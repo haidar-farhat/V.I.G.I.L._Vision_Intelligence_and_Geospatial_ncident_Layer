@@ -66,7 +66,7 @@ _log = _get_logger(__name__)
 #: Schema version this build expects. A database at a different version is
 #: migrated forward, never opened as-is: opening a schema you do not understand
 #: and hoping the columns line up is how evidence is silently corrupted.
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 
 #: The audit column's zero, for rebuilding a millisecond timestamp exactly.
@@ -595,6 +595,30 @@ MIGRATIONS: tuple[Migration, ...] = (
         ALTER TABLE cameras DROP COLUMN record;
         """,
     ),
+    Migration(
+        version=12,
+        name="users",
+        up="""
+        -- Local accounts. `password_hash` is the one column in this schema
+        -- allowed to look like a secret: it is a salted scrypt hash of a local
+        -- operator's password, one-way, never a device credential — the
+        -- exception DATABASE.md has named since the first day. Roles are
+        -- stored as their name; code checks permissions, never role names.
+        CREATE TABLE users (
+            name          TEXT PRIMARY KEY,
+            password_hash TEXT NOT NULL,
+            role          TEXT NOT NULL CHECK (role IN ('VIEWER','OPERATOR','ANALYST','ADMIN')),
+            active        INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+            created_at    INTEGER NOT NULL,
+            updated_at    INTEGER NOT NULL
+        );
+        """,
+        down="""
+        -- A build without accounts attributes everything to "console" again.
+        -- The audit rows written under names survive, as they must.
+        DROP TABLE users;
+        """,
+    ),
 )
 
 
@@ -691,8 +715,17 @@ class Store:
         if self._path != ":memory:":
             Path(self._path).parent.mkdir(parents=True, exist_ok=True)
 
-        self._connection = sqlite3.connect(self._path, isolation_level=None)
-        self._connection.row_factory = sqlite3.Row
+        try:
+            self._connection = sqlite3.connect(self._path, isolation_level=None)
+            self._connection.row_factory = sqlite3.Row
+            if self._path != ":memory:":
+                self._require_intact()
+        except sqlite3.DatabaseError as error:
+            raise StoreError(
+                f"{self._path} is not a usable database ({error}). Restore the "
+                "most recent backup with `sentinel restore <backup> --replace`; "
+                "the damaged file is kept beside it."
+            ) from None
 
         # WAL lets a reader run while a writer commits, which matters when the
         # interface is querying incidents while a pipeline is inserting events.
@@ -729,15 +762,34 @@ class Store:
         secure it trades a real failure for a hypothetical one.
         """
         row = self._connection.execute("PRAGMA journal_mode").fetchone()
-        if row is not None and str(row[0]).lower() == "wal":
-            return
-        try:
-            self._connection.execute("PRAGMA journal_mode = WAL")
-        except sqlite3.OperationalError as refused:
-            _log.warning(
-                "%s: could not switch to WAL (%s); staying in %s",
-                self._path, refused, row[0] if row is not None else "the current mode",
-            )
+        if row is None or str(row[0]).lower() != "wal":
+            try:
+                self._connection.execute("PRAGMA journal_mode = WAL")
+            except sqlite3.OperationalError as refused:
+                _log.warning(
+                    "%s: could not switch to WAL (%s); staying in %s",
+                    self._path, refused, row[0] if row is not None else "the current mode",
+                )
+                return
+        # NORMAL with WAL: durable across a process crash, at risk only in a
+        # power loss between checkpoints — the trade DATABASE.md describes, and
+        # until this line it described a setting nobody had made (SQLite's
+        # default is FULL). Set every open, because it is per connection.
+        self._connection.execute("PRAGMA synchronous = NORMAL")
+
+    def _require_intact(self) -> None:
+        """Refuse a damaged file at open, with the way out named.
+
+        `quick_check` rather than `integrity_check`: it skips index-content
+        verification and runs in milliseconds on this database's size, which is
+        what an open can afford. A file that fails it is not repaired here —
+        repairing evidence is not a thing to do silently — and the message
+        says which command restores the last backup and that the file is kept.
+        """
+        row = self._connection.execute("PRAGMA quick_check").fetchone()
+        verdict = str(row[0]) if row is not None else "no answer"
+        if verdict.lower() != "ok":
+            raise sqlite3.DatabaseError(f"quick_check: {verdict}")
 
     @property
     def path(self) -> str:
@@ -853,6 +905,19 @@ class Store:
             "  applied_at INTEGER NOT NULL"
             ")"
         )
+        # A database written by a newer build carries migrations this build
+        # has never heard of. Opening it anyway — and auto-migrating nothing,
+        # because nothing is pending — would let an older console read rows
+        # whose meaning changed, and write rows the newer schema forbids.
+        # Refused, with both numbers, before a single row is touched.
+        newest_known = MIGRATIONS[-1].version
+        ahead = [v for v in self.applied_versions() if v > newest_known]
+        if ahead:
+            raise StoreError(
+                f"{self._path} was written by a newer build: it carries schema "
+                f"migration {max(ahead)}, and this build knows up to {newest_known}. "
+                "Run the newer build, or restore a backup taken by this one."
+            )
         if auto_migrate:
             self.migrate()
 
@@ -1897,6 +1962,66 @@ class Store:
 
     # ------------------------------------------------------------ introspection
 
+    # --------------------------------------------------------------- users
+
+    def save_user(self, name: str, password_hash: str, role: str, *, active: bool = True) -> None:
+        now = _now()
+        with self.transaction() as connection:
+            connection.execute(
+                "INSERT INTO users (name, password_hash, role, active, created_at, updated_at) "
+                "VALUES (?,?,?,?,?,?)",
+                (name, password_hash, role, 1 if active else 0, now, now),
+            )
+
+    def user(self, name: str):
+        return self._connection.execute(
+            "SELECT * FROM users WHERE name = ?", (name,)
+        ).fetchone()
+
+    def users(self) -> list[sqlite3.Row]:
+        return self._connection.execute("SELECT * FROM users ORDER BY name").fetchall()
+
+    def set_user_hash(self, name: str, password_hash: str) -> None:
+        with self.transaction() as connection:
+            connection.execute(
+                "UPDATE users SET password_hash = ?, updated_at = ? WHERE name = ?",
+                (password_hash, _now(), name),
+            )
+
+    def set_user_active(self, name: str, active: bool) -> None:
+        with self.transaction() as connection:
+            connection.execute(
+                "UPDATE users SET active = ?, updated_at = ? WHERE name = ?",
+                (1 if active else 0, _now(), name),
+            )
+
+    # ------------------------------------------------------------- backups
+
+    def backup_to(self, destination: "str | Path") -> Path:
+        """Copy this database to ``destination`` with SQLite's own backup API.
+
+        The backup API, never a file copy: a WAL database in use is two files
+        and a copy of one of them is a corrupt database that opens. The copy
+        is a consistent snapshot as of the call, taken page by page while
+        writers continue. A SHA-256 sidecar is written beside it so a restore
+        can prove the file is the one that was made.
+        """
+        target = Path(destination)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists():
+            raise StoreError(f"{target} already exists; a backup never overwrites one")
+        copy = sqlite3.connect(str(target))
+        try:
+            self._connection.backup(copy)
+        finally:
+            copy.close()
+        digest = _sha256_of(target)
+        target.with_suffix(target.suffix + ".sha256").write_text(
+            f"{digest}  {target.name}\n", encoding="utf-8"
+        )
+        _log.info("backed up %s to %s (%s)", self._path, target, digest[:12])
+        return target
+
     def table_names(self) -> list[str]:
         rows = self._connection.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
@@ -1911,6 +2036,103 @@ class Store:
 # ------------------------------------------------------------- reconstruction
 
 
+
+
+def _sha256_of(path: Path) -> str:
+    import hashlib
+
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def verify_backup(backup: "str | Path") -> list[str]:
+    """Why a backup file cannot be trusted, or an empty list.
+
+    Checks the sidecar digest when there is one, that SQLite accepts the file
+    and its quick_check passes, and that its schema is one this build knows.
+    """
+    path = Path(backup)
+    problems: list[str] = []
+    if not path.is_file():
+        return [f"{path} does not exist"]
+    sidecar = path.with_suffix(path.suffix + ".sha256")
+    if sidecar.is_file():
+        expected = sidecar.read_text(encoding="utf-8").split()[0]
+        if _sha256_of(path) != expected:
+            problems.append("the SHA-256 sidecar does not match the file")
+    try:
+        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            verdict = connection.execute("PRAGMA quick_check").fetchone()[0]
+            if str(verdict).lower() != "ok":
+                problems.append(f"quick_check: {verdict}")
+            versions = [
+                int(r[0]) for r in connection.execute(
+                    "SELECT version FROM schema_migrations"
+                ).fetchall()
+            ]
+            newest = MIGRATIONS[-1].version
+            if any(v > newest for v in versions):
+                problems.append(
+                    f"written by a newer build (schema {max(versions)}; this build knows {newest})"
+                )
+        finally:
+            connection.close()
+    except sqlite3.DatabaseError as error:
+        problems.append(f"not a database: {error}")
+    return problems
+
+
+def restore_backup(backup: "str | Path", database: "str | Path", *, replace: bool = False) -> Path:
+    """Put a backup in place as the live database.
+
+    Validates first (`verify_backup`), and never silently overwrites: a
+    database already at ``database`` is refused unless ``replace`` is given,
+    and even then it is moved aside — with its WAL and shared-memory files —
+    as ``<name>.replaced-<stamp>`` rather than deleted, because the file being
+    replaced may be the evidence somebody is trying to recover. The backup is
+    copied in through SQLite's backup API, so what lands is a clean,
+    checkpointed file. A database that is open elsewhere cannot be moved on
+    Windows, which is the refusal a live console gets.
+    """
+    source = Path(backup)
+    target = Path(database)
+    problems = verify_backup(source)
+    if problems:
+        raise StoreError(f"{source} cannot be restored: " + "; ".join(problems))
+    if target.exists():
+        if not replace:
+            raise StoreError(
+                f"{target} already exists. Pass --replace to move it aside as "
+                "<name>.replaced-<stamp> and put the backup in its place."
+            )
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        for suffix in ("", "-wal", "-shm"):
+            live = Path(str(target) + suffix)
+            if live.exists():
+                aside = Path(f"{target}.replaced-{stamp}{suffix}")
+                try:
+                    live.rename(aside)
+                except OSError as error:
+                    raise StoreError(
+                        f"{live} could not be moved aside ({error.strerror or error}); "
+                        "is the console or a `sentinel` command still using it?"
+                    ) from None
+    target.parent.mkdir(parents=True, exist_ok=True)
+    origin = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
+    try:
+        landed = sqlite3.connect(str(target))
+        try:
+            origin.backup(landed)
+        finally:
+            landed.close()
+    finally:
+        origin.close()
+    _log.info("restored %s from %s", target, source)
+    return target
 
 
 def _segment_from_row(row: sqlite3.Row) -> "Segment":

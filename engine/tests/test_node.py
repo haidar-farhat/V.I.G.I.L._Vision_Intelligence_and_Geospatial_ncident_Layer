@@ -537,7 +537,13 @@ def test_a_restarted_node_remembers_where_its_cameras_are(
         assert restarted.camera("yard").pose is None
 
 
-def test_a_restored_network_camera_says_it_needs_its_password_again(tmp_path: Path):
+def test_a_restored_network_camera_says_it_needs_its_password_again(tmp_path: Path, monkeypatch):
+    # Without a keychain — the case before one existed, and a container's case
+    # today. With one, `test_secrets.py` proves the password comes back.
+    from sentinel import secrets
+
+    secrets.use(None)
+    monkeypatch.setattr(secrets, "_platform_backend", lambda: None)
     # The raw URL was never persisted — that is the whole point of the
     # credential rule — so a restored network camera cannot connect. An
     # interface should be able to say so *before* the operator presses Start,

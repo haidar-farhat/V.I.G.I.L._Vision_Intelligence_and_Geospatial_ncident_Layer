@@ -347,6 +347,24 @@ minutes, abandoning anything half-drawn, or when you press the button again;
 both edges are written to the audit log. Escape abandons a drawing or clears a
 selection and does **not** relock.
 
+**Who is at the console.** The first start offers to create an administrator;
+after that the console asks you to sign in, and everything you change is
+written to the audit trail under your name. A viewer can watch, select, hover,
+measure — and cannot press Configure or export evidence; the status bar says
+so, and the refusal is audited. Accounts are managed from the command line:
+
+```bash
+sentinel users add alice --role OPERATOR   # prompts for the password, twice
+sentinel users list
+sentinel users passwd alice
+sentinel users disable alice
+```
+
+Roles: **viewer** watches; **operator** changes the site and exports;
+**analyst** exports and reads the audit; **admin** does everything including
+accounts. Skip the first-administrator offer and the console opens with nothing
+gated, and says on every start that the audit trail names nobody.
+
 **A greyed button still answers a click.** Clicking *Place…*, *Add zone…*,
 *Remove camera* or any other locked control while the site is locked says what
 that control does, that the site is locked, and offers to unlock it and carry
@@ -829,6 +847,28 @@ records every camera, as it always did; the console records the ones ticked,
 and `SentinelVision.exe --camera device:0 --record` ticks a camera from the
 command line.
 
+### Running unattended: the node as a service
+
+```bash
+sentinel node                       # run the cameras the database holds, until stopped
+sentinel node --stop                # ask the running node to stop (works on Windows too)
+sentinel supervise -- --record      # run the node and restart it when it dies
+sentinel service print -- --record  # show what `install` would register on this machine
+sentinel service install -- --record
+sentinel service uninstall
+```
+
+`node` with no source runs whatever the console has added — the form a
+scheduler needs. `--stop` writes a small file in the data directory that the
+running node sees on its next poll and exits cleanly; that is the stop channel
+on every platform, because a service has no terminal and Windows delivers no
+Ctrl-C to a process without one. `supervise` restarts the node after a crash
+with a growing pause (1, 2, 5, 10, 30, 60 s) and stops only when the node exits
+cleanly — a `--for` that ran out, or a stop that was asked for. `service
+install` registers the supervisor with the operating system's own starter: a
+scheduled task at logon on Windows, a user unit on systemd, a launch agent on
+macOS. Nothing else is installed, and `uninstall` removes exactly that.
+
 ### Retention — the disk is finite
 
 ```bash
@@ -935,6 +975,38 @@ python tasks.py db-rollback  # undo the most recent one
 `db` is read-only and deliberately so — applying a migration is something you do
 knowingly. Every migration carries a way back, because an upgrade that cannot be
 undone on a machine with no Internet and no spare hardware is a gamble.
+
+### Network camera passwords
+
+Add the camera with its password in the console, or on the command line once,
+and it is kept by the operating system's keychain under a random handle — the
+database, a backup, the log and every export hold the handle only, and the
+camera opens again after a restart. To give a stored camera its password
+without it ever appearing in a command line:
+
+```bash
+sentinel password gate          # prompts; nothing is echoed
+```
+
+`run` and `node` warn when a source on the command line carries a password,
+because an argument is readable by every process on the machine. A machine
+with no keychain — a container without D-Bus — stores nothing and says so; the
+password is then needed again after each restart, as before.
+
+### Backup and restore
+
+```bash
+sentinel backup                                # a consistent snapshot + .sha256, under backups/
+sentinel restore backups\\sentinel-<stamp>.db   # refuses if a database is already there
+sentinel restore backups\\sentinel-<stamp>.db --replace   # moves the current one aside first
+```
+
+Taken with SQLite's own backup API while the console runs, so it is consistent;
+checked against its digest, its own integrity and this build's schema before
+it is put in place; and a replaced database is kept as `<name>.replaced-<stamp>`,
+never deleted. Stop the console before restoring — a database it holds open
+cannot be moved. A database written by a newer build is refused at open with
+both schema numbers, and a damaged file is refused with this command named.
 
 ---
 
