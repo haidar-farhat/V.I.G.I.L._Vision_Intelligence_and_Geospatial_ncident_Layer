@@ -603,6 +603,118 @@ the basemap builder while this was done; add the flag (default
 the **site record** beside the identity switch, not in a per-machine INI;
 move it when the site screen exists.
 
+### 2026-09-05 — "hallucinations", "the buttons do nothing", and the exe as the test medium
+
+The operator's two complaints, read from their own machine rather than guessed:
+
+- **Every run on 2026-09-04 loaded the model with 80 classes** (`segmenter
+  ready … 80 class name(s)`, log lines 465–516). The watch-list commit
+  (`7a1b5df`, 23:10) post-dates the packaged build (22:00), so the binary they
+  ran still tracked couches and jars. Nothing in the tree was wrong; the exe
+  was stale — which is why rule 8 below exists.
+- **The audit trail for 22:51–23:00** shows unlock → start → stop → remove
+  camera → re-add → relock → start → stop, and never `camera.placed` or
+  `zone.created`. Place… and Add zone… were grey whenever the console was
+  locked, and a greyed button with a tooltip nobody hovers is "a button that
+  does nothing". The current database: one `device:0`, unplaced, no zones.
+
+What changed, each with tests that fail without it:
+
+- **A confidence floor for classifiers**: `DEFAULT_CONFIDENCE = 0.50`
+  (engine default stays 0.35; on the laptop camera the person held 0.86, the
+  couch 0.39, the jar 0.43–0.51), per machine in the Watched-classes dialog
+  (now "Watched classes and confidence…"), range 0.10–0.95, shown in the
+  status line as `≥ 0.50`, applied at the next Start. `detector_for` drops
+  `confidence_threshold` for motion the way it drops `classes`.
+- **A locked control answers a click.** The window installs itself as an event
+  filter on every control the lock disables (a disabled widget still runs its
+  filters — checked with a probe, not assumed), and `_offer_unlock` names the
+  control, says the site is locked, and offers to unlock and carry on; yes
+  is the audited Configure entry and then `control.click()`. Draw goes through
+  the same offer from `_mode_button_clicked`. `lock_label` in the status bar
+  reads MONITOR / CONFIGURE at all times.
+- **Escape never relocked.** The tooltip, USAGE and FEATURES said it did.
+  Corrected and pinned by a behavioural test.
+- **Exceptions inside Qt slots reach the log.** `_report_uncaught` is installed
+  as `sys.excepthook` before the window shows (PySide's `PyErr_Print` calls it
+  — probed), logs CRITICAL through the redacting filter, names the exception
+  in the status bar, and clears `sys.last_*` so the traceback cannot pin the
+  widget (§7's third route to the exit crash).
+- **The console has a command line** (`build_parser()`): `--camera --place
+  --zone --zone-classes` (the CLI's own parsers), `--watch --confidence`
+  (this run only, never persisted), `--settings FILE`, `--for SECONDS`
+  (prints the node summary plus every track with its class, then closes),
+  `--screenshots DIR` (window and every panel). `seed_site` goes through the
+  node and is audited; it is listed in the structural lock test as reachable
+  from `run()` only. A real process run on the reference file: six PNGs,
+  summary, exit 0.
+- **`python tasks.py exetest`** (`tools/exe_camera_test.py`) drives
+  `dist/SentinelVision/SentinelVision-dev.exe` on `device:0` in an isolated
+  data directory and settings file, seeds a placement and a person-only
+  `Room` zone 2 m ahead, runs `--start --for N --screenshots`, keeps stdout,
+  stderr and the log beside the pictures under `dist/exetest/<stamp>/`, and
+  reads the summary back into a PASS/FAIL table.
+- **`PRODUCTION_READINESS.md`** — the hostile audit: 106 TODOs (7 P0, 28 P1,
+  48 P2, 20 P3, 3 P4), each with evidence and a definition of done, plus the
+  release gate. Published as an artifact as well.
+
+**What the first packaged camera run found — the real "buttons do nothing".**
+`exetest` at 09:03 on the rebuilt binary: the pipeline ran (1,335 frames, a
+person at 0.86 for 28 s, no couch, no bottle, the floor and watch list in the
+status bar), and the operator, sitting at the machine, clicked Place… and Add
+zone… while it ran. Both raised `libshiboken: Internal C++ object … already
+deleted` — `PlacementDialog`, `ZoneDialog` and `AddCameraDialog` carried
+`WA_DeleteOnClose`, so `QDialog.done()` deleted them the instant OK was
+pressed, *before* `exec()` returned, and the slot read a spin box that no
+longer existed. Qt swallowed it; the excepthook added an hour earlier is what
+made it visible. No test had ever pressed OK on those dialogs — every test
+called the slot beneath them. Fixed (read, then `deleteLater()`), with five
+tests that press OK the way Qt does (`accept()` plus
+`sendPostedEvents(DeferredDelete)`) and a structural test forbidding the
+attribute on a dialog read after `exec()`. Two more from the same run: the
+report died printing `≥` to a cp1252 terminal and the timed run never closed
+(stdout/stderr now replace; `_finish_timed_run` closes in a `finally` and
+dismisses open dialogs), and `camera-device:0.png` became an NTFS alternate
+data stream (`_file_safe`). The tool now fails a run that logged an exception
+or outlived its `--for`.
+
+**Verification, honestly.** Console suite 374 passed (was 332). Engine
+`test_detect` green. Static guards green. **`tasks.py ci --package` is red at
+HEAD `d38c64e`** on three `test_identity.py` tests — `migration_nine_is_the_newest`,
+`migration_nine_arrives_and_leaves`, `plate_reader_is_built_…` — which
+belong to the `site_declared` migration 10 and `_SwitchedPlateReader` that
+arrived in the same commit from the other stream of work; reproduced in a
+clean worktree at HEAD, and none of those symbols appear in this session's
+patches. The package was therefore built directly (`tasks.py package`) and
+the camera run made against it; see the verification record at the end of
+this section. **Fix those three tests before calling CI green again.**
+
+Camera runs on the packaged binary (`dist/exetest/<stamp>/` holds the pictures,
+stdout, stderr and the log of each):
+
+| run | binary | what it showed |
+|---|---|---|
+| 09:03 | 09:02 build | 1,335 frames; one `person` at 0.86 for 28.2 s; no couch, no bottle; `≥ 0.50` and the watch list in the status bar. The operator clicked Place… and Add zone…: both raised on a deleted dialog (fixed since); the report died on `≥` in cp1252; `camera-device:0.png` became an alternate data stream |
+| 09:17 | 09:16 build | dialog fixes in; `6 class name(s)`; a person tracked; closed by hand at 12 s, before the timer — no picture, no summary (fixed since: a closed window still reports) |
+| 09:25 | 09:24 build | PASS with a caveat: 570 frames, six pictures, summary, no exception, closed itself at 30 s; nobody in frame |
+
+**Hard-won facts from this session:**
+
+- Two editors on one tree at once: files changed under the run twice
+  (`test_console.py` at 23:18, then a whole commit at 00:17 that folded this
+  session's files in with `basemap`, `cli`, `node`, `site`, `store`,
+  `register_view`). Patch by exact string with a count assertion; never
+  `Write` a file somebody else may hold open.
+- A background `cmd; echo EXIT $? >> log` reports the *echo's* exit code to
+  the harness. Read the log, not the task status.
+- `local_ci.py` adds `-q` to a `pytest.ini` that already has it: `-qq`, no
+  summary line. Count with `--collect-only -q | tail -1`.
+- Appending tests to `test_console.py` shadowed an existing `_say_yes(monkeypatch)`
+  helper and broke four unrelated tests; grep for helper names first (now
+  `_answer_the_key_yes` / `_answer_the_key_no`).
+- A full-page headless screenshot of a 26,000 px page tiles the masthead
+  twice; the DOM had one. Ask the DOM before believing a picture of it.
+
 **Immediate:**
 
 1. **1.3 appearance re-ID.** The tracker fragments (17 tracks over 15 s on one

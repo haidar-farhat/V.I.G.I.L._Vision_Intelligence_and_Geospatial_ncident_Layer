@@ -4254,6 +4254,23 @@ def test_a_timed_run_photographs_itself_reports_and_closes(
     assert "distinct tracks" in out, "the per-track summary is what a camera test reads"
 
 
+def test_a_camera_pane_picture_is_named_safely_for_a_file_system(qt_app, window, tmp_path):
+    """`device:0` — the id every local camera gets — is not a Windows file
+    name. The first packaged run wrote five pictures of six and a warning."""
+    from sentinel_console.app import _file_safe
+
+    assert _file_safe("device:0") == "device-0"
+    assert _file_safe("rtsp://admin@10.0.0.5/s") == "rtsp-admin-10.0.0.5-s"
+    assert _file_safe("gate") == "gate"
+    assert _file_safe("::") == "camera"
+
+    window.add_camera("device:0", camera_id="device:0")
+    written = window.photograph(tmp_path)
+    names = {path.name for path in written}
+    assert "camera-device-0.png" in names, names
+    assert all(":" not in path.name for path in written)
+
+
 def test_a_timed_run_with_no_pictures_still_reports(qt_app, window, capsys):
     window.end_after(0.0)
     deadline = time.perf_counter() + 5.0
@@ -4290,3 +4307,198 @@ def test_run_seeds_times_and_starts_in_that_order(qt_app):
         assert fragment in source, fragment
     assert source.index("window.seed_site(") < source.index("start_on_launch")
     assert source.index("sys.excepthook = _report_uncaught") < source.index("window.show()")
+
+
+# ---------------------------------------------- dialogs, with OK pressed
+#
+# Found by the packaged binary on the laptop camera, 2026-09-05 09:03: Place…
+# → OK raised "QDoubleSpinBox already deleted", Add zone… → OK raised the same
+# for its QLineEdit, three times. `WA_DeleteOnClose` had the dialog deleted
+# inside `done()`, before `exec()` returned and the slot read its fields. No
+# test had ever pressed OK: every test called the slot beneath the dialog.
+# These press OK the way Qt does, including the deferred delete that follows.
+
+
+def _press_ok(monkeypatch, cls, prepare=None):
+    """Make `cls.exec()` behave as a person pressing OK.
+
+    `accept()` is what `done()` runs, and it is what deletes a
+    `WA_DeleteOnClose` dialog; the deferred delete lands when the dialog's
+    event loop exits, which `sendPostedEvents` stands in for here.
+    """
+    from PySide6.QtCore import QCoreApplication, QEvent
+    from PySide6.QtWidgets import QDialog
+
+    def exec_(self):
+        if prepare is not None:
+            prepare(self)
+        self.accept()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(cls, "exec", exec_)
+
+
+def test_pressing_ok_in_the_placement_dialog_actually_places_the_camera(
+    qt_app, window, reference_video: Path, monkeypatch
+):
+    session = window.add_camera(reference_video, "cam-07")
+    window.configure_button.setChecked(True)
+    assert session.pose is None
+
+    def type_a_pose(dialog):
+        dialog.latitude.setValue(33.8938)
+        dialog.longitude.setValue(35.5018)
+        dialog.mount_height.setValue(6.0)
+        dialog.heading.setValue(180.0)
+        dialog.pitch.setValue(-22.0)
+
+    _press_ok(monkeypatch, PlacementDialog, type_a_pose)
+    window._place_camera()
+
+    assert session.pose is not None, "OK was pressed and the camera is still unplaced"
+    assert session.pose.mount_height == 6.0 and session.pose.heading == 180.0
+    actions = [row["action"] for row in window.store.audit_trail(limit=10)]
+    assert "camera.placed" in actions
+
+
+def test_pressing_ok_in_the_zone_dialog_actually_creates_a_zone(
+    qt_app, window, reference_video: Path, monkeypatch
+):
+    from sentinel_console.zones_view import ZoneDialog
+
+    _placed_window(window, reference_video)
+    window.configure_button.setChecked(True)
+    _press_ok(monkeypatch, ZoneDialog, lambda dialog: dialog._name.setText("Loading bay"))
+
+    window._add_zone_dialog()
+
+    assert [zone.name for zone in window._zones] == ["Loading bay"]
+    actions = [row["action"] for row in window.store.audit_trail(limit=10)]
+    assert "zone.created" in actions
+
+
+def test_naming_a_drawn_outline_on_ok_creates_the_zone(
+    qt_app, window, reference_video: Path, monkeypatch
+):
+    from sentinel.core import destination_point
+    from sentinel_console.zones_view import ZoneDialog
+
+    session = _placed_window(window, reference_video)
+    window.configure_button.setChecked(True)
+    anchor = destination_point(session.pose.position, session.pose.heading, 20.0)
+    ring = [destination_point(anchor, bearing, 5.0) for bearing in (0.0, 120.0, 240.0)]
+    _press_ok(monkeypatch, ZoneDialog, lambda dialog: dialog._name.setText("Drawn"))
+
+    window._zone_drawn(ring)
+
+    assert [zone.name for zone in window._zones] == ["Drawn"]
+    assert len(window._zones[0].ring) == 3
+
+
+def test_pressing_ok_in_the_add_camera_dialog_adds_the_camera(
+    qt_app, window, reference_video: Path, monkeypatch
+):
+    window.configure_button.setChecked(True)
+
+    def choose_the_file(dialog):
+        dialog._tabs.setCurrentIndex(2)
+        dialog._file.setText(str(reference_video))
+        dialog._accept()  # the OK handler, which records the choice
+
+    _press_ok(monkeypatch, AddCameraDialog, choose_the_file)
+    window._choose_source()
+
+    assert len(window._sessions) == 1
+    assert next(iter(window._sessions.values())).source == str(reference_video)
+
+
+def test_no_dialog_the_console_reads_after_exec_is_delete_on_close(qt_app):
+    """The structural half: the attribute must not come back on a dialog
+    whose fields are read after `exec()` returns."""
+    import inspect
+
+    from sentinel_console import app as app_module
+
+    source = inspect.getsource(app_module.ConsoleWindow)
+    # The call, not the word: the comments beside each dialog name the
+    # attribute to say why it is absent.
+    assert "setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)" not in source, (
+        "a dialog read after exec() is deleted by done() before exec() returns"
+    )
+
+
+# ------------------------------------------ the timed run ends, whatever
+
+
+def test_a_timed_run_closes_even_when_the_terminal_cannot_print_the_report(
+    qt_app, window, monkeypatch
+):
+    import builtins
+
+    def cannot_print(*args, **kwargs):
+        raise UnicodeEncodeError("charmap", "\u2265", 0, 1, "character maps to <undefined>")
+
+    monkeypatch.setattr(builtins, "print", cannot_print)
+    window.end_after(0.0)
+    deadline = time.perf_counter() + 5.0
+    while time.perf_counter() < deadline and window.isVisible():
+        qt_app.processEvents(QEventLoop.ProcessEventsFlag.AllEvents, 20)
+    assert not window.isVisible(), "the report could not be printed and the run never ended"
+
+
+def test_a_timed_run_dismisses_a_dialog_somebody_left_open(qt_app, window):
+    from PySide6.QtCore import QTimer
+
+    dialog = PlacementDialog(None, window)
+    dialog.show()
+    qt_app.processEvents()
+    assert dialog.isVisible()
+    outcomes = []
+    dialog.finished.connect(outcomes.append)
+
+    window.end_after(0.0)
+    deadline = time.perf_counter() + 5.0
+    while time.perf_counter() < deadline and window.isVisible():
+        qt_app.processEvents(QEventLoop.ProcessEventsFlag.AllEvents, 20)
+
+    assert not window.isVisible()
+    assert outcomes == [int(PlacementDialog.DialogCode.Rejected)], outcomes
+    dialog.deleteLater()
+
+
+def test_run_replaces_what_the_terminal_cannot_encode(qt_app):
+    import inspect
+
+    from sentinel_console import app as app_module
+
+    assert 'reconfigure(errors="replace")' in inspect.getsource(app_module.run)
+
+
+def test_a_timed_run_closed_early_by_a_person_still_reports(
+    qt_app, window, reference_video: Path, tmp_path, capsys
+):
+    """The second packaged camera run was closed by hand at twelve seconds and
+    left no picture and no summary; the tool read it as a run that never
+    started. Closing the window is not a reason to lose what it saw."""
+    _placed_window(window, reference_video)
+    window._start()
+    window.end_after(600.0, screenshots=tmp_path / "early")
+    deadline = time.perf_counter() + 3.0
+    while time.perf_counter() < deadline:
+        qt_app.processEvents(QEventLoop.ProcessEventsFlag.AllEvents, 20)
+
+    window.close()
+
+    assert not window._timed_pending
+    assert (tmp_path / "early" / "console.png").is_file()
+    out = capsys.readouterr().out
+    assert "node local" in out and "distinct tracks" in out
+    # And the timer, when it fires later, must not report a second time.
+    window._finish_timed_run()
+    assert "node local" not in capsys.readouterr().out
+
+
+def test_closing_a_window_that_was_never_timed_reports_nothing(qt_app, window, capsys):
+    window.close()
+    assert capsys.readouterr().out == ""

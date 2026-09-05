@@ -306,6 +306,9 @@ class ConsoleWindow(QMainWindow):
         )
         #: Where a timed run photographs itself before closing; see `end_after`.
         self._screenshots: Path | None = None
+        #: True from `end_after` until the run has reported, so a window a
+        #: person closes early still leaves its pictures and its summary.
+        self._timed_pending = False
 
         # The console is a *client* of this. It owns no store, no zones, no
         # rule set and no analysis thread; it owns widgets, and it calls
@@ -918,12 +921,15 @@ class ConsoleWindow(QMainWindow):
         """
         self._touch()
         dialog = AddCameraDialog(self)
-        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        # Read, then release — never `WA_DeleteOnClose`. See `_place_camera`.
+        accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        chosen = dialog.chosen if accepted else []
+        dialog.deleteLater()
+        if not accepted:
             return
 
         added = []
-        for choice in dialog.chosen:
+        for choice in chosen:
             try:
                 session = self.add_camera(choice.source, camera_id=choice.suggested_id)
             except NodeError as error:
@@ -1299,11 +1305,19 @@ class ConsoleWindow(QMainWindow):
             return
 
         dialog = PlacementDialog(session.pose, self)
-        # Parented to the window, so without this every placement leaves another
-        # dialog alive for the life of the console.
-        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        # Read before release, and never `WA_DeleteOnClose`. That attribute
+        # looked like the tidy way to keep a dialog from outliving its use,
+        # and it was the reason Place… did nothing: `QDialog.done()` deletes
+        # such a dialog before `exec()` returns, so `dialog.pose()` read a spin
+        # box that no longer existed and the slot raised — into a traceback Qt
+        # swallowed. The operator pressed OK, nothing happened, and the audit
+        # trail never gained a `camera.placed`. Found by the packaged binary on
+        # the camera, not by any test, because no test had ever pressed OK.
+        # The values are read first; the dialog is released afterwards on the
+        # event loop, the way the watch-list dialog always was.
         accepted = dialog.exec() == PlacementDialog.DialogCode.Accepted
         pose = dialog.pose() if accepted else None
+        dialog.deleteLater()
         if not accepted:
             return
 
@@ -1516,11 +1530,16 @@ class ConsoleWindow(QMainWindow):
             can_pick=any(s.pose is not None for s in self._sessions.values()),
             parent=self,
         )
-        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        # Read, then release — never `WA_DeleteOnClose`. See `_place_camera`:
+        # this dialog's OK raised the same way, three times in one run.
+        accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        if accepted:
+            name, kind, radius = dialog.name() or None, dialog.kind(), dialog.radius()
+            pick = dialog.pick_on_map()
+        dialog.deleteLater()
+        if not accepted:
             return
-        name, kind, radius = dialog.name() or None, dialog.kind(), dialog.radius()
-        if dialog.pick_on_map():
+        if pick:
             self._pick_action = ("zone", (name, kind, radius))
             self.map.begin_pick(f"Centre of {name or kind.value.title()}")
             self._set_status("Click the plan view where the zone's centre is.")
@@ -1552,11 +1571,15 @@ class ConsoleWindow(QMainWindow):
     def _zone_drawn(self, ring) -> None:
         """An outline was closed on the map; ask what it is, then create it."""
         dialog = ZoneDialog(ring_given=True, parent=self)
-        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        # Read, then release — never `WA_DeleteOnClose`. See `_place_camera`.
+        accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        if accepted:
+            name, kind = dialog.name() or None, dialog.kind()
+        dialog.deleteLater()
+        if not accepted:
             self._set_status("Zone abandoned.")
             return
-        self._create_zone(tuple(ring), name=dialog.name() or None, kind=dialog.kind())
+        self._create_zone(tuple(ring), name=name, kind=kind)
 
     def _edit_outline(self) -> None:
         self._touch()
@@ -2096,19 +2119,53 @@ class ConsoleWindow(QMainWindow):
         — see the freeing test.
         """
         self._screenshots = Path(screenshots) if screenshots else None
+        self._timed_pending = True
         QTimer.singleShot(int(max(0.0, float(seconds)) * 1000), self._finish_timed_run)
 
     def _finish_timed_run(self) -> None:
+        """The end of a `--for` run. Whatever else fails, the window closes.
+
+        The first packaged run on the camera got as far as the summary and
+        died printing "≥" to a cp1252 terminal; the window stayed open and the
+        run lasted until a person closed it. Every step is guarded and
+        `close()` is in a `finally`, because a timed run that does not end is
+        not a timed run.
+        """
+        try:
+            self._conclude_timed_run()
+        finally:
+            self.close()
+
+    def _conclude_timed_run(self) -> None:
+        """Photograph, stop, report — once, whichever way the run ends.
+
+        Called by the timer, and by `closeEvent` when a person closes the
+        window first: the second packaged run on the camera was closed by hand
+        at twelve seconds and left no picture and no summary, which to the
+        test tool was a run that never started. What was seen is reported
+        either way; only the moment differs.
+        """
+        if not self._timed_pending:
+            return
+        self._timed_pending = False
         if self._screenshots is not None:
             try:
                 for written in self.photograph(self._screenshots):
                     print(f"screenshot  {written}", flush=True)
             except Exception:  # noqa: BLE001 - a lost picture must not lose the summary
                 _log.exception("could not photograph the console")
+        # A dialog somebody opened meanwhile holds its own event loop, and
+        # closing the window underneath it is how a placement dialog came to
+        # be read after it was gone. Dismissed first, as a cancel.
+        for dialog in self.findChildren(QDialog):
+            if dialog.isVisible():
+                dialog.reject()
         if self._running:
             self._stop()
-        print(self.report(), flush=True)
-        self.close()
+        try:
+            print(self.report(), flush=True)
+        except Exception:  # noqa: BLE001 - the log has it either way
+            _log.exception("could not print the report")
 
     def report(self) -> str:
         """What this run concluded, for a terminal: the node's summary and,
@@ -2148,7 +2205,10 @@ class ConsoleWindow(QMainWindow):
             ("tracks", self.tracks),
         ]
         for camera_id, session in self._sessions.items():
-            subjects.append((f"camera-{camera_id}", session.view))
+            # A camera id is not a file name: `device:0` carries a colon, which
+            # Windows refuses, and the first camera run on the packaged binary
+            # came back with five pictures of six and a warning nobody read.
+            subjects.append((f"camera-{_file_safe(camera_id)}", session.view))
         written: list[Path] = []
         for name, widget in subjects:
             written.extend(self._shoot(directory, name, widget))
@@ -2159,6 +2219,8 @@ class ConsoleWindow(QMainWindow):
 
     @staticmethod
     def _shoot(directory: Path, name: str, widget: QWidget) -> list[Path]:
+        """One PNG, or none with a warning. Never an exception: a lost picture
+        must not lose the summary that follows it."""
         pixmap = widget.grab()
         if pixmap.isNull() or pixmap.width() < 8 or pixmap.height() < 8:
             _log.warning("%s: nothing usable to photograph (%dx%d)", name, pixmap.width(), pixmap.height())
@@ -2499,6 +2561,10 @@ class ConsoleWindow(QMainWindow):
         database.
         """
         self._timer.stop()
+        # A timed run that a person closes early still reports; see
+        # `_conclude_timed_run`. Before the node closes, while there is still
+        # something to photograph and a runner to read.
+        self._conclude_timed_run()
         self.node.close()
         event.accept()
 
@@ -2541,6 +2607,18 @@ def _report_uncaught(exc_type, exc_value, exc_traceback) -> None:
                 setattr(sys, name, None)
             except Exception:  # noqa: BLE001
                 pass
+
+
+def _file_safe(name: str) -> str:
+    """A camera id as a file name: letters, digits, dot, dash and underscore.
+
+    Everything else becomes a dash and runs collapse, so `device:0` is
+    `device-0` and `rtsp://…` can never carry a path separator into the
+    directory the pictures are written to.
+    """
+    cleaned = "".join(ch if (ch.isalnum() or ch in "._-") else "-" for ch in name)
+    cleaned = "-".join(part for part in cleaned.split("-") if part)
+    return cleaned or "camera"
 
 
 def _labels(text: str | None):
@@ -2701,6 +2779,18 @@ def run(argv: list[str] | None = None) -> int:
 
     parser = build_parser()
     arguments, unknown = parser.parse_known_args(sys.argv[1:] if argv is None else argv)
+
+    # The developer executable prints to a Windows console whose code page
+    # cannot spell "≥", and the first packaged camera run died on its own
+    # confidence floor with UnicodeEncodeError. A character the terminal
+    # cannot show is replaced, never fatal. `None` is the windowed build,
+    # which has no terminal at all.
+    for stream in (sys.stdout, sys.stderr):
+        if stream is not None and hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(errors="replace")
+            except (ValueError, OSError):
+                pass
 
     logs.configure(
         level="DEBUG" if arguments.verbose else None, developer=arguments.verbose

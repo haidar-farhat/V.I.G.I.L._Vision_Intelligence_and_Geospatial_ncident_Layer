@@ -126,6 +126,26 @@ def read_back(stdout: str) -> dict:
     return facts
 
 
+def exceptions_in(stderr: str) -> list[str]:
+    """The exceptions the console's own hook logged, one line each.
+
+    The first camera run logged four — two dialogs read after they were
+    deleted, a report the terminal could not print — and the tool called it a
+    pass with a caveat. A run that raised is not a pass.
+    """
+    lines = stderr.splitlines()
+    found = []
+    for index, line in enumerate(lines):
+        if "CRITICAL" in line and "unhandled exception" in line:
+            detail = next(
+                (later.strip() for later in lines[index + 1:index + 12]
+                 if later.strip() and not later.startswith(" ") and "Error" in later),
+                "",
+            )
+            found.append(detail or line.strip())
+    return found
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="exe-camera-test",
@@ -181,6 +201,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"evidence    {shots}")
     print("command     " + redacted(" ".join(command[1:])))
     print(f"running for {args.seconds:g}s — a real person in frame is what this is for")
+    print("a console window will appear on this desktop and close itself; leave it "
+          "alone — every click in it becomes part of the run")
     print()
 
     started = time.perf_counter()
@@ -231,6 +253,12 @@ def main(argv: list[str] | None = None) -> int:
         problems.append("no frame was analysed; the camera did not deliver or the run never started")
     if not pictures:
         problems.append("no picture was written; the run ended before it could photograph itself")
+    raised = exceptions_in(completed.stderr)
+    if raised:
+        problems.append(f"{len(raised)} exception(s) reached the console's hook: "
+                        + "; ".join(redacted(line)[:120] for line in raised[:4]))
+    if elapsed > args.seconds + 60.0:
+        problems.append(f"the run took {elapsed:.0f}s for a {args.seconds:g}s --for; the window did not close itself")
 
     if not args.keep:
         shutil.rmtree(workspace, ignore_errors=True)
