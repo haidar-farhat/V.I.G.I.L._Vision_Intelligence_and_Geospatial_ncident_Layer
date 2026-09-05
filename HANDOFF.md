@@ -872,6 +872,11 @@ packaging and the camera exetest on the rebuilt `SentinelVision-dev.exe`.
    space in the sweep and never reported a shortfall (`_free_bytes` now falls
    back to any segment).
 
+Suites after the six slices: 60 Rust, 1,192 engine, 393 console; the full
+local CI with packaging was green and the rebuilt `SentinelVision-dev.exe`
+ran on the laptop camera through `python tasks.py exetest --record` (see the
+verification record below this section).
+
 Two things worth knowing about slice 4. The schema test that fails on any
 credential-shaped column exempts exactly one, `users.password_hash`, by table
 and name — keep it that narrow. And the first-administrator offer is
