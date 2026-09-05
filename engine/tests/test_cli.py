@@ -1208,3 +1208,14 @@ def test_users_are_managed_from_the_command_line_with_the_password_on_stdin(tmp_
         actions = [r["action"] for r in store.audit_trail(limit=10)]
         assert {"user.added", "user.disabled", "user.password_changed"} <= set(actions)
         assert all(r["actor"].startswith("cli:") for r in store.audit_trail(limit=10) if r["action"].startswith("user."))
+
+
+def test_alerts_reports_its_sinks_and_sends_a_test_alert_through_them(tmp_path: Path, monkeypatch, capsys):
+    monkeypatch.setenv("SENTINEL_ALERT_FILE", str(tmp_path / "alerts.log"))
+    monkeypatch.delenv("SENTINEL_ALERT_COMMAND", raising=False)
+    monkeypatch.delenv("SENTINEL_ALERT_WEBHOOK", raising=False)
+    assert cli.main(["--database", str(tmp_path / "a.db"), "alerts", "--test"]) == 0
+    out = capsys.readouterr().out
+    assert "FileSink" in out and "test alert raised" in out
+    lines = (tmp_path / "alerts.log").read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 2 and " RAISED test operator " in lines[0] and " CLEARED " in lines[1]

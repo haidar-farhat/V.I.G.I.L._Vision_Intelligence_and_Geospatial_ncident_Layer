@@ -65,13 +65,14 @@ references.
 
 ## Entities
 
-| Group | Tables that exist (`store.py`, migrations 1–11) | Designed, `PLAN` |
+| Group | Tables that exist (`store.py`, migrations 1–12) | Designed, `PLAN` |
 |---|---|---|
 | Places | `zones`, `sites` | `locations`, `camera_zone_links` |
 | Cameras | `cameras` (with placement, `credentials_ref`, `record`) | `camera_profiles`, `camera_topology` |
 | Observation | — | `tracks`, `track_observations`, `track_associations` |
 | Analysis | `events` | `rules`, `event_zones`, `event_tracks` |
 | Workflow | `incidents`, `incident_events` | `incident_notes`, `alerts` |
+| Accounts | `users` (name, salted scrypt hash, role, active) | sessions |
 | Evidence | `recordings`, `plate_reads` | `evidence`, `incident_evidence` |
 | Identity register | `register_subjects`, `register_identifiers`, `register_sightings` | — |
 | Identity and AI | — | `users`, `nodes`, `ai_inferences`, `model_registry` |

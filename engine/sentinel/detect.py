@@ -23,6 +23,7 @@ and refuse to fire on a blob.
 
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -378,30 +379,93 @@ def detector_for(
     return OnnxDetector(path, **options)
 
 
-def _output_count(path: "str | Path") -> int:
-    """How many tensors the model produces, without loading it for inference.
+#: What has been read from each model file this process, keyed by the file's
+#: identity (path, size, mtime) so an operator replacing the file under a
+#: running console is noticed. Two caches: the structural answer `detector_for`
+#: needs to choose a class, and the full description an interface reads.
+_OUTPUT_COUNTS: dict[tuple[str, int, int], int] = {}
+_MODEL_INFO: dict[tuple[str, int, int], DetectorInfo] = {}
+_MODEL_LOCK = threading.Lock()
 
-    Reads the graph only. Building a full session to ask a structural question
-    would pay the optimisation cost twice.
-    """
-    from . import telemetry
 
-    telemetry.silence()
-    import onnxruntime as ort
-
+def _model_key(path: "str | Path") -> tuple[str, int, int]:
     resolved = Path(path).resolve()
     if not resolved.is_file():
         raise DetectionError(
             f"No model at {resolved}. Models are supplied by the operator; "
             "nothing is ever downloaded."
         )
+    stat = resolved.stat()
+    return (str(resolved), stat.st_size, stat.st_mtime_ns)
+
+
+def forget_models() -> None:
+    """Drop everything read from model files. For tests, and for nothing else."""
+    with _MODEL_LOCK:
+        _OUTPUT_COUNTS.clear()
+        _MODEL_INFO.clear()
+
+
+def model_info(model_path: "str | Path", *, classes: "Iterable[str] | None" = None) -> DetectorInfo:
+    """What a model can do, read once per process.
+
+    A console asks this question several times before a single camera starts
+    — the zone picker wants the labels, the watch-list dialog wants the whole
+    vocabulary, Start checks that the file loads — and each answer used to be
+    a full session build. The log showed `segmenter ready` four times for one
+    camera. The session built here is discarded; only its description is
+    kept, so the answer costs one load per process and per file.
+
+    ``classes`` narrows the reported names the way a detector built with the
+    same list would, and refuses an unknown name the same way, so a caller
+    validating a watch list gets the same answer without building anything.
+    """
+    key = _model_key(model_path)
+    with _MODEL_LOCK:
+        info = _MODEL_INFO.get(key)
+    if info is None:
+        info = detector_for(model_path).info
+        with _MODEL_LOCK:
+            _MODEL_INFO[key] = info
+    if classes is None:
+        return info
+    names, _ = _restrict_vocabulary(info.class_names, classes)
+    return DetectorInfo(
+        kind=info.kind, name=info.name, model_path=info.model_path,
+        model_sha256=info.model_sha256, input_size=info.input_size,
+        class_names=names, classifies=info.classifies,
+    )
+
+
+def _output_count(path: "str | Path") -> int:
+    """How many tensors the model produces, without loading it for inference.
+
+    Reads the graph only, and once per file per process: `detector_for` asks
+    this for every camera it builds a detector for, and the answer does not
+    change between cameras.
+    """
+    key = _model_key(path)
+    with _MODEL_LOCK:
+        cached = _OUTPUT_COUNTS.get(key)
+    if cached is not None:
+        return cached
+
+    from . import telemetry
+
+    telemetry.silence()
+    import onnxruntime as ort
+
+    resolved = Path(key[0])
     try:
         session = ort.InferenceSession(
             str(resolved), providers=["CPUExecutionProvider"]
         )
     except Exception as error:
         raise DetectionError(f"Could not load the model at {resolved}: {error}") from error
-    return len(session.get_outputs())
+    count = len(session.get_outputs())
+    with _MODEL_LOCK:
+        _OUTPUT_COUNTS[key] = count
+    return count
 
 
 def _sha256(path: Path) -> str:

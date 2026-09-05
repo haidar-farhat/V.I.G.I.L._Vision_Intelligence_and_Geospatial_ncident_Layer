@@ -380,6 +380,15 @@ which does not exist.
 Checks are always against a **permission**, never a role name, so adding or
 widening a role cannot accidentally open a door elsewhere.
 
+The console's Monitor/Configure lock is **not a security boundary** on its
+own: it exists so a hand on the mouse cannot move a camera by accident. It
+becomes one only when accounts exist, because entering Configure then needs
+the `site.configure` permission and the refusal is written to the audit
+trail under the viewer's name. The same permission gates the command-line
+flags that seed a site. Anyone with write access to the database file or the
+operating-system account can still do anything; that boundary is the
+operating system's, as it is for every desktop application.
+
 | Role | Can |
 |---|---|
 | `VIEWER` | See cameras, zones, events, incidents, recordings |

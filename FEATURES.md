@@ -820,7 +820,7 @@ full acceptance criteria live there.
 | Authentication and permission-based authorization (SEC-01) | `TESTED` | Built 2026-09-06 — see Local user accounts and Role-based access control. Every console audit row carries `console:<name>`; the CLI's carry `cli:<os account>`. Still `PLAN`: sessions, an application lock, and permission on a control plane that does not exist |
 | Camera credentials in the OS keychain, never on the command line (SEC-02) | `TESTED` | Built 2026-09-06 — see Camera credential management. A password on the command line still works and is warned about; `sentinel password` is the way that leaves no trace |
 | Process supervision and restart (REL-01) | `TESTED` | Built 2026-09-06: `supervise`, the stop file, stored-camera runs and `service install|uninstall|print` — see Automatic service recovery |
-| Recording from the console with self-running retention (REL-02) | `TESTED` | The Record box, `Node.set_recording`, the sweep from `poll` — above. Open: an alert that leaves the process |
+| Recording from the console with self-running retention and a low-disk alert (REL-02) | `TESTED` | The Record box, `Node.set_recording`, the sweep from `poll` — above. Open: an alert that leaves the process |
 | Signed installers per platform (OPS-01) | `PLAN` | A folder, unsigned; SmartScreen warns, Gatekeeper refuses |
 | One remote CI run on three platforms (TEST-01) | `PLAN` | The workflow exists and has never executed remotely |
 | The egress override documented and loud (SEC-03) | `TESTED` | `SENTINEL_ALLOW_PUBLIC_SOURCES` was in the code and in the refusal's own message while USAGE said there was no override; now announced at every start and logged with the address on every connection it allows |
@@ -833,7 +833,9 @@ full acceptance criteria live there.
 | Decode independent of analysis (REL-04) · persistence off the GUI thread (REL-05) · a wedged decoder cannot hold the process (REL-06) · a 72-hour soak (REL-07) | `PLAN` | Each is an audit item with its own definition of done |
 | Real-footage evaluation of the watch list and the floor (TEST-04) · an RTSP server in CI (TEST-03) · the packaged binary launched by CI (TEST-02) | `PLAN` | The camera runs recorded in the audit are the only evidence on real footage so far |
 | Backup and restore, tested by restoring (DATA-01) · DATABASE.md agrees with `store.py` (DATA-02) | `TESTED` | Built 2026-09-06: backup/restore, `synchronous = NORMAL` set on every open, `quick_check` and a newer-schema gate at open, DATABASE.md rewritten to say what exists and what is `PLAN` |
-| Alerting that leaves the process (OBS-01) · the documentation truth pass (DOC-01) · Linux and macOS run with a camera (XP-01) · one physical IP camera for an hour (NET-01) · the model licence reviewed (AI-02) | `PLAN` | See the audit |
+| Alerting that leaves the process (OBS-01) | `TESTED` | Built 2026-09-06: `sentinel.alerts` raises dark camera, recording stopped early, retention shortfall, stuck thread and low disk once each until cleared, audits them, and fans out to `alerts.log`, `SENTINEL_ALERT_COMMAND` and a local-network `SENTINEL_ALERT_WEBHOOK`; the console shows a banner and sounds once; `sentinel alerts --test` |
+| The model read once per process (PERF-01) | `TESTED` | Built 2026-09-06: `detect.model_info` and a cached output count; the console's four loads per Start became one per camera |
+| The documentation truth pass (DOC-01) · Linux and macOS run with a camera (XP-01) · one physical IP camera for an hour (NET-01) · the model licence reviewed (AI-02) | `PLAN` | See the audit |
 
 ## The ten that would make it feel like a platform
 

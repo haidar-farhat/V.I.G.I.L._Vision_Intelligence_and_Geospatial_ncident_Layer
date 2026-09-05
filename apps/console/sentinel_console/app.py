@@ -40,6 +40,7 @@ from PySide6.QtGui import QKeySequence, QShortcut, QAction, QCloseEvent, QFont
 from PySide6.QtWidgets import (
     QAbstractButton,
     QCheckBox,
+    QApplication,
     QComboBox,
     QDialog,
     QDoubleSpinBox,
@@ -69,7 +70,7 @@ from sentinel.core import (
     haversine_distance,
 )
 from sentinel.decode import DecodeError, VideoSource, redact_url
-from sentinel.detect import DetectionError, detector_for
+from sentinel.detect import DetectionError, detector_for, model_info
 from sentinel.detect import WATCHED_LABELS
 from sentinel.events import (
     AfterHoursRule,
@@ -688,6 +689,17 @@ class ConsoleWindow(QMainWindow):
         self.fault_label.setVisible(False)
         row.addSpacing(12)
         row.addWidget(self.fault_label)
+        # What the node is alerting about, on screen for as long as it is
+        # true, and sounded once when it becomes true. See `_show_alerts`.
+        self.alert_label = QLabel("")
+        self.alert_label.setObjectName("AlertBanner")
+        self.alert_label.setStyleSheet(
+            f"color: {theme.BACKGROUND.name()}; background: {theme.FAULT.name()}; "
+            "font-weight: 600; padding: 2px 8px; border-radius: 3px;"
+        )
+        self.alert_label.setVisible(False)
+        row.addSpacing(12)
+        row.addWidget(self.alert_label)
         row.addStretch(1)
 
         # The lock sits at the end of the camera row: it governs both rows.
@@ -1230,9 +1242,7 @@ class ConsoleWindow(QMainWindow):
         if self._model is None:
             return []
         try:
-            info = detector_for(
-                self._model, classes=self._watched, confidence_threshold=self._confidence
-            ).info
+            info = model_info(self._model, classes=self._watched)
         except DetectionError:
             return []
         return sorted(set(info.class_names.values())) if info.classifies else []
@@ -1242,7 +1252,7 @@ class ConsoleWindow(QMainWindow):
         if self._model is None:
             return []
         try:
-            info = detector_for(self._model).info
+            info = model_info(self._model)
         except DetectionError:
             return []
         return sorted(set(info.class_names.values())) if info.classifies else []
@@ -2376,16 +2386,16 @@ class ConsoleWindow(QMainWindow):
                 )
                 return
 
-        # The model is loaded once here for the same reason the cameras are
+        # The model is checked here for the same reason the cameras are
         # probed here: the factory runs inside each camera's own thread, so a
         # broken model file would otherwise fail sixteen times somewhere the
         # operator cannot see, leaving a window that started and shows nothing.
+        # Checked, not loaded: `model_info` answers from the one read this
+        # process has already made, so Start costs one session per camera and
+        # not, as the log once showed, four for a single camera.
         if self._model is not None:
             try:
-                detector_for(
-                    self._model, classes=self._watched,
-                    confidence_threshold=self._confidence,
-                )
+                model_info(self._model, classes=self._watched)
             except DetectionError as error:
                 QMessageBox.warning(self, "Cannot load the detection model", str(error))
                 return
@@ -2470,6 +2480,7 @@ class ConsoleWindow(QMainWindow):
             self.map.set_tracks(update.result.tracks, session.camera_id)
 
         self._show_faults()
+        self._show_alerts()
         # On the poll timer, because "is this camera still delivering frames"
         # is only true of the instant it was asked. A strip refreshed on
         # placement alone would have gone on reading "live" for a camera whose
@@ -2494,6 +2505,29 @@ class ConsoleWindow(QMainWindow):
             self.node.poll(force_correlate=True)
             self._teardown()
             self._set_status("Finished.")
+
+    def _show_alerts(self) -> None:
+        """What the node is alerting about, in the window and, once, aloud.
+
+        The banner stays for as long as the condition does; the sound is
+        made once per alert, because an alarm that repeats every poll is an
+        alarm somebody mutes. A console with nobody at it is the case the
+        file, command and webhook sinks exist for (`sentinel.alerts`).
+        """
+        fresh = self.node.alerts.take_new()
+        for alert in fresh:
+            self.store.audit(self.actor, "console.alert.shown", alert.subject, f"{alert.kind}: {alert.detail}")
+        if fresh:
+            QApplication.beep()
+        active = self.node.alerts.active()
+        if not active:
+            self.alert_label.setVisible(False)
+            return
+        newest = active[-1]
+        more = f" (+{len(active) - 1} more)" if len(active) > 1 else ""
+        self.alert_label.setText(f"ALERT · {newest.kind} · {newest.subject}: {newest.detail}{more}")
+        self.alert_label.setToolTip("\n".join(a.line() for a in active))
+        self.alert_label.setVisible(True)
 
     def _show_faults(self) -> None:
         """Report which camera is in trouble, in place and never modally.
@@ -2878,28 +2912,46 @@ def build_parser():
 _REFUSED = object()
 
 
-def _sign_in(arguments):
+#: Settings key remembering that the first-administrator offer was declined,
+#: so it is made once and not on every start; the status bar keeps saying
+#: that nobody is named until an account exists.
+FIRST_ADMIN_DECLINED = "accounts/first_admin_declined"
+
+
+def _sign_in(arguments, settings: QSettings | None = None):
     """Who is opening the console, decided before the window exists.
 
-    No accounts: offer to create the first administrator (declinable). Some
-    accounts and ``--user``: the password comes from standard input, for a
-    script or a test. Some accounts and no flag: the sign-in dialog. Returns
-    the `User`, ``None`` for a console with no accounts, or `_REFUSED`.
+    No accounts: offer to create the first administrator, once (declining is
+    remembered in the settings), and never on a timed ``--for`` run, which is
+    unattended and must not wait on a dialog. Some accounts and ``--user``:
+    the password comes from standard input, for a script or a test. Some
+    accounts and no flag: the sign-in dialog. Returns the `User`, ``None``
+    for a console with no accounts, or `_REFUSED`.
     """
     from sentinel.accounts import AccountError
 
     from sentinel.store import Store
 
+    settings = settings if settings is not None else QSettings()
     with Store(arguments.database or default_database_path()) as store:
         accounts = Accounts(store)
         if not accounts.any():
             if arguments.user:
                 print("--user given but no account exists; create one with `sentinel users add`", file=sys.stderr)
                 return _REFUSED
+            if arguments.duration is not None:
+                _log.info("no account exists; a timed run does not stop to offer one")
+                return None
+            if settings.value(FIRST_ADMIN_DECLINED, False, type=bool):
+                _log.warning("no account exists and the offer to create one was declined earlier; the audit trail names nobody")
+                return None
             dialog = FirstAdminDialog(accounts)
             accepted = dialog.exec() == QDialog.DialogCode.Accepted
             user = dialog.user if accepted else None
             dialog.deleteLater()
+            if not accepted:
+                settings.setValue(FIRST_ADMIN_DECLINED, True)
+                settings.sync()
             return user
         if arguments.user:
             secret = sys.stdin.readline().rstrip("\r\n") if sys.stdin is not None else ""
@@ -2920,7 +2972,7 @@ def _refuse_unknown_labels(model: Path, labels) -> str | None:
     every label. Checked before the window opens: a refusal inside a timed
     run would be a message box nobody is there to dismiss."""
     try:
-        detector_for(model, classes=labels)
+        model_info(model, classes=labels)
     except DetectionError as error:
         return f"--watch: {error}"
     return None
@@ -3010,7 +3062,7 @@ def run(argv: list[str] | None = None) -> int:
         else:
             log.info("detection model: %s", model)
 
-        user = _sign_in(arguments)
+        user = _sign_in(arguments, settings)
         if user is _REFUSED:
             log.warning("console: sign-in cancelled or refused; not opening")
             return 3

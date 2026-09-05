@@ -54,6 +54,7 @@ object for an API to be an API *of*.
 from __future__ import annotations
 
 import secrets
+import shutil
 import threading
 import time
 from collections import deque
@@ -66,6 +67,9 @@ from pathlib import Path
 from typing import Iterator, Sequence
 
 from . import paths
+from .alerts import (
+    CAMERA_DARK, DISK_LOW, RECORDING_STOPPED, RETENTION_SHORTFALL, THREAD_STUCK, Alerts,
+)
 from .auditing import MISSING, AuditRecord
 from .core import CameraPose, LatLon, Track
 from .decode import REDACTED, DecodeError, VideoSource, is_live_source
@@ -120,6 +124,12 @@ DARK_AFTER_SECONDS = 30.0
 #: nothing scheduled, with its own shortfall message reading "Recording will
 #: continue until the disk is full and then stop."
 RETENTION_EVERY_SECONDS = 600.0
+
+#: Free space on the recording volume below which the node alerts. Above the
+#: retention policy's own floor on purpose: retention deletes to stay above
+#: its floor, and the alert says that it can no longer, before the disk is
+#: full — which is when SQLite stops writing the events and the audit log.
+DISK_WATERMARK_BYTES = 2 * 1024**3
 
 #: Recorded in the audit log. There is no authentication yet, so there is nobody
 #: to name; recording the truth beats inventing an operator, because an audit
@@ -1072,6 +1082,7 @@ class Node:
         record_every_camera: bool = True,
         retention=None,
         retention_every_seconds: float = RETENTION_EVERY_SECONDS,
+        alerts: Alerts | None = None,
     ):
         """
         ``record_to`` is where clips go; without it nothing records, whatever
@@ -1149,6 +1160,13 @@ class Node:
         # chain of custody. Whoever owns this node names themselves.
         self._actor = actor
         self._site_tz = site_tz if site_tz is not None else datetime.now().astimezone().tzinfo
+        #: Where a dark camera, a stopped recording, a retention shortfall and
+        #: a stuck thread go *besides* the log. Built from the environment
+        #: unless the owner brought one. See `sentinel.alerts`.
+        self.alerts = alerts if alerts is not None else Alerts.from_environment(
+            store=self.store, actor=actor
+        )
+        self.alerts.bind(self.store, actor)
 
         self._cameras: dict[str, CameraRecord] = {}
         self._restored_cameras = 0
@@ -2166,6 +2184,10 @@ class Node:
                 self._actor, "analysis.thread_stuck", ", ".join(stubborn),
                 "left running rather than killed; it holds a decoder",
             )
+            self.alerts.raise_(
+                THREAD_STUCK, ", ".join(stubborn),
+                "analysis thread did not stop; left running rather than killed",
+            )
 
         self._running = False
         # No track is live once its camera has stopped, and the templates were
@@ -2245,6 +2267,7 @@ class Node:
             self.store.save_events(fresh)
 
         self._sweep_retention_if_due()
+        self._watch_for_alerts()
 
         due = (time.monotonic() - self._last_correlated) * 1000 >= self._correlate_every
         if fresh or force_correlate or due:
@@ -2837,6 +2860,67 @@ class Node:
         never delete; the disk then fills, and the interface must say so.
         """
         return self._retention_shortfall
+
+    def _watch_for_alerts(self) -> None:
+        """Raise and clear the conditions somebody must hear about. Every poll.
+
+        Reads what `_health_for` reads but tolerates a stand-in runner, so a
+        test can fake the clocks. A camera is dark when its thread is alive
+        and no frame has arrived for `DARK_AFTER_SECONDS`; the alert clears
+        the moment a frame does, or the camera is stopped on purpose.
+        """
+        alerts = self.alerts
+        for record in self._cameras.values():
+            runner = record.runner
+            camera_id = record.camera_id
+            running = record.is_running
+            if runner is None or not running:
+                alerts.clear(CAMERA_DARK, camera_id)
+                continue
+            since_frame = getattr(runner, "seconds_since_frame", None)
+            since_start = getattr(runner, "seconds_since_started", None)
+            silent_for = since_frame if since_frame is not None else since_start
+            faulted = getattr(runner, "fault", None) is not None
+            if not faulted and silent_for is not None and silent_for >= DARK_AFTER_SECONDS:
+                what = "no frame yet" if since_frame is None else "no frame"
+                alerts.raise_(CAMERA_DARK, camera_id, f"{what} for {silent_for:.0f} s; the thread is alive")
+            elif since_frame is not None and since_frame < DARK_AFTER_SECONDS:
+                alerts.clear(CAMERA_DARK, camera_id)
+
+            recorder = getattr(runner, "recorder_stats", None)
+            recording_fault = (
+                (getattr(recorder, "fault", None) if recorder is not None else None)
+                or getattr(runner, "recording_fault", None)
+            )
+            if record.record and recording_fault:
+                alerts.raise_(RECORDING_STOPPED, camera_id, str(recording_fault))
+
+        if self._retention_shortfall:
+            alerts.raise_(RETENTION_SHORTFALL, self._node_id, self._retention_shortfall)
+        else:
+            alerts.clear(RETENTION_SHORTFALL, self._node_id)
+
+        free = self._free_recording_bytes()
+        if free is not None and free < DISK_WATERMARK_BYTES:
+            alerts.raise_(
+                DISK_LOW, self._node_id,
+                f"{free / 1024**3:.1f} GiB free where recordings go, below the "
+                f"{DISK_WATERMARK_BYTES / 1024**3:.0f} GiB watermark; recording stops when it is full",
+            )
+        elif free is not None:
+            alerts.clear(DISK_LOW, self._node_id)
+
+    def _free_recording_bytes(self) -> float | None:
+        """Free space on the volume recordings go to; ``None`` without one."""
+        if self._record_to is None:
+            return None
+        probe = self._record_to
+        while not probe.exists() and probe.parent != probe:
+            probe = probe.parent
+        try:
+            return float(shutil.disk_usage(probe).free)
+        except OSError:
+            return None
 
     def _sweep_retention_if_due(self) -> None:
         """Retention, from the node's own loop, on a cadence.

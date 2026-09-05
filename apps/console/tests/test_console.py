@@ -3589,7 +3589,10 @@ def test_detector_labels_come_from_the_models_class_names(qt_app, window, monkey
         info = Info()
 
     window._model = Path("a-model.onnx")
-    monkeypatch.setattr(app_module, "detector_for", lambda _path, **_: Detector())
+    # The labels come through `model_info`, the once-per-process read; the
+    # window's watch list is widened so the restriction keeps all three.
+    window._watched = frozenset({"person", "car", "truck"})
+    monkeypatch.setattr(app_module, "model_info", lambda _path, classes=None: Detector().info)
 
     assert window._detector_labels() == ["car", "person", "truck"]
 
@@ -4288,7 +4291,7 @@ def test_an_unknown_watch_label_is_refused_before_any_window_exists(qt_app, monk
     def refuse(model, **options):
         raise DetectionError("asked to watch unicorn, which this model does not name")
 
-    monkeypatch.setattr(app_module, "detector_for", refuse)
+    monkeypatch.setattr(app_module, "model_info", refuse)
     problem = app_module._refuse_unknown_labels(Path("m.onnx"), frozenset({"unicorn"}))
     assert problem is not None and "unicorn" in problem
     assert app_module._labels(None) is None
@@ -4808,5 +4811,91 @@ def test_the_command_line_takes_a_user_and_refuses_seeding_to_a_viewer(qt_app):
 
     assert build_parser().parse_args(["--user", "alice"]).user == "alice"
     source = inspect.getsource(app_module.run)
-    assert "_sign_in(arguments)" in source
+    assert "_sign_in(arguments, settings)" in source
     assert "SITE_CONFIGURE" in source, "seeding from the command line is not permission-checked"
+
+
+def test_sign_in_never_stops_a_timed_run_and_offers_the_first_administrator_once(qt_app, tmp_path, monkeypatch):
+    from sentinel_console import app as app_module
+    from sentinel_console.app import FIRST_ADMIN_DECLINED, _sign_in, build_parser
+    from sentinel_console.login import FirstAdminDialog
+
+    database = str(tmp_path / "s.db")
+    settings = _isolated_settings(tmp_path)
+    opened = []
+    monkeypatch.setattr(FirstAdminDialog, "exec", lambda self: opened.append(1) or int(FirstAdminDialog.DialogCode.Rejected))
+
+    timed = build_parser().parse_args(["--database", database, "--for", "5"])
+    assert _sign_in(timed, settings) is None and opened == [], "a timed run waited on a dialog"
+
+    plain = build_parser().parse_args(["--database", database])
+    assert _sign_in(plain, settings) is None and opened == [1]
+    assert settings.value(FIRST_ADMIN_DECLINED, False, type=bool)
+    assert _sign_in(plain, settings) is None and opened == [1], "the declined offer came back"
+
+    with_user = build_parser().parse_args(["--database", database, "--user", "alice"])
+    assert _sign_in(with_user, settings) is app_module._REFUSED
+
+
+def test_the_console_asks_the_model_once_however_many_panels_want_its_labels(qt_app, window, tmp_path, monkeypatch):
+    """PERF-01: `_detector_labels`, `_vocabulary` and Start's check all read one description."""
+    import inspect
+
+    from sentinel import detect
+    from sentinel.detect import DetectorInfo, forget_models
+    from sentinel_console import app as app_module
+
+    model = tmp_path / "site.onnx"
+    model.write_bytes(b"stand-in")
+    loads = []
+
+    class _Stub:
+        info = DetectorInfo(
+            kind="onnx-segment", name="stub", model_path=str(model), model_sha256="cd" * 32,
+            input_size=(640, 640), class_names={0: "person", 1: "car"}, classifies=True,
+        )
+
+    monkeypatch.setattr(detect, "detector_for", lambda path, **options: loads.append(path) or _Stub())
+    forget_models()
+    try:
+        window._model = model
+        window._watched = frozenset({"person", "car"})
+        for _ in range(3):
+            assert window._detector_labels() == ["car", "person"]
+            assert window._vocabulary() == ["car", "person"]
+        assert app_module._refuse_unknown_labels(model, ["person"]) is None
+        assert "unicorn" in app_module._refuse_unknown_labels(model, ["unicorn"])
+        assert len(loads) == 1, f"the model was read {len(loads)} times for one description"
+    finally:
+        forget_models()
+
+    # And Start checks the model through the same cache, not by building it.
+    source = inspect.getsource(ConsoleWindow._start)
+    assert "model_info(self._model" in source and "detector_for(" not in source
+
+
+def test_an_alert_shows_a_banner_sounds_once_and_leaves_when_it_clears(qt_app, window, monkeypatch):
+    from PySide6.QtWidgets import QApplication
+    from sentinel.alerts import CAMERA_DARK
+
+    beeps = []
+    monkeypatch.setattr(QApplication, "beep", staticmethod(lambda: beeps.append(1)))
+    assert not window.alert_label.isVisible()
+
+    window.node.alerts.raise_(CAMERA_DARK, "gate", "no frame for 30 s; the thread is alive")
+    window._collect()
+    assert window.alert_label.isVisible()
+    assert "camera.dark" in window.alert_label.text() and "gate" in window.alert_label.text()
+    assert beeps == [1]
+    window._collect()
+    assert beeps == [1], "an alarm that repeats every poll is an alarm somebody mutes"
+
+    window.node.alerts.raise_(CAMERA_DARK, "yard", "no frame for 31 s; the thread is alive")
+    window._collect()
+    assert beeps == [1, 1] and "+1 more" in window.alert_label.text()
+    assert "console.alert.shown" in [r["action"] for r in window.store.audit_trail(limit=10)]
+
+    window.node.alerts.clear(CAMERA_DARK, "gate")
+    window.node.alerts.clear(CAMERA_DARK, "yard")
+    window._collect()
+    assert not window.alert_label.isVisible()

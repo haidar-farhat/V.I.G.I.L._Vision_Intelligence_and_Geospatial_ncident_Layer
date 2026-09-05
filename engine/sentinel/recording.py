@@ -741,7 +741,10 @@ def apply_retention(
     candidates.sort(key=lambda segment: segment.started_millis)
 
     total_bytes = store.recorded_bytes()
-    free_bytes = _free_bytes(shutil, candidates)
+    # Measured from any segment, preserved ones included: a store where every
+    # clip is preserved has no candidate, and a sweep that then reported
+    # infinite free space would never say the one thing it exists to say.
+    free_bytes = _free_bytes(shutil, candidates or everything)
 
     def over_budget() -> bool:
         if policy.max_bytes is not None and total_bytes > policy.max_bytes:

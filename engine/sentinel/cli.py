@@ -1134,6 +1134,24 @@ def _restore(args: argparse.Namespace) -> int:
     return 0
 
 
+def _alerts(args: argparse.Namespace) -> int:
+    """Where alerts go, and a test alert through every sink."""
+    from .alerts import Alerts
+
+    with Store(args.database or default_database_path()) as store:
+        alerts = Alerts.from_environment(store=store, actor=_os_actor())
+        print(alerts.describe())
+        for sink in alerts.sinks:
+            target = getattr(sink, "path", None) or getattr(sink, "url", None) or getattr(sink, "argv", None)
+            print(f"  {type(sink).__name__}: {target}")
+        if args.test:
+            alerts._synchronous = True
+            alerts.raise_("test", "operator", "a test alert from `sentinel alerts --test`")
+            alerts.clear("test", "operator")
+            print("test alert raised and cleared through every sink")
+    return 0
+
+
 def _os_actor() -> str:
     """The CLI runs as the operating-system account that launched it."""
     import getpass as _getpass
@@ -1826,6 +1844,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     where = commands.add_parser("where", help="print every path this build uses")
     where.set_defaults(handler=_where)
+
+    alerts = commands.add_parser("alerts", help="where alerts go (SENTINEL_ALERT_FILE, _COMMAND, _WEBHOOK)")
+    alerts.add_argument("--test", action="store_true", help="raise and clear a test alert through every sink")
+    alerts.set_defaults(handler=_alerts)
 
     users = commands.add_parser("users", help="local accounts: who may change the site")
     user_commands = users.add_subparsers(dest="users_command", required=True)

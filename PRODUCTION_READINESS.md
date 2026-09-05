@@ -30,8 +30,8 @@ full local CI and run on the camera with recording.
 
 | Priority | Rows | Closed | Partial | Open |
 |---|---|---|---|---|
-| P0 | 7 | 0 | 2 | 5 |
-| P1 | 31 | 1 | 6 | 24 |
+| P0 | 7 | 2 | 1 | 4 |
+| P1 | 31 | 4 | 5 | 22 |
 | P2 | 58 | 0 | 6 | 52 |
 | P3 | 38 | 2 | 4 | 32 |
 | P4 | 3 | 0 | 0 | 3 |
@@ -46,12 +46,15 @@ Every closed or partial row, with what remains:
 
 | Id | P | State | Remaining |
 |---|---|---|---|
-| REL-02 | P0 | partial | Add a free-space watermark that raises a visible alert (console banner + audit row, wired to OBS-01), and a node-loop test that monkeypatches shutil.disk_usage to a full disk and asserts both the sweep and the alert fire while preserved evidence stays. |
+| SEC-01 | P0 | partial | closed on 2026-09-06 for the console and the CLI: `users` table (migration 12, salted scrypt), `sentinel users add|list|passwd|disable|enable`, first-administrator offer and sign-in dialog, `--user` for scripts, Configure and Export gated by permission with the refusals audited, every audit row carrying `console:<name>` / `cli:<os account>`, lockout after five failures (tests: test_accounts.py, test_cli.py, test_console.py). Remaining: permission checks *inside* `Node` (today the UI and the command line check, the node trusts its caller), a session with a lock timeout and an application lock, and an escalation test (a viewer promoted mid-session) |
+| REL-02 | P0 | closed | closed 2026-09-06: `DISK_WATERMARK_BYTES` (2 GiB) raises a `disk.low` alert from the node's poll — console banner, sound, `alert.raised` row, the alert sinks — and clears when space returns; test monkeypatches `shutil.disk_usage` to a full disk and asserts the sweep's shortfall and the watermark both alert while a preserved clip stays. Found and fixed on the way: a store whose every clip is preserved measured *infinite* free space and never reported a shortfall |
+| OBS-01 | P1 | closed | closed 2026-09-06: `sentinel.alerts` — raised once per condition until cleared, audited, fanned out on its own thread to a file (`alerts.log` beside the log), an operator's command and a local-network webhook (public address refused); the node raises dark camera, recording stopped early, retention shortfall, stuck thread and low disk; the console shows a banner and sounds once per alert; `sentinel alerts --test`; tests for each condition and each sink |
+| PERF-01 | P1 | closed | closed 2026-09-06: `detect.model_info` reads a model once per process (keyed by path, size and mtime) and `_output_count` is cached the same way; the console's zone picker, watch-list dialog, Start check and `--watch` validation all read that one description, so Start costs one session per camera instead of four for one camera (tests count the loads). The capacity table per detector remains a measurement to take on the reference machine (PERF-02) |
 | SEC-03 | P0 | closed | closed 2026-09-06: the node now writes an `egress.override` audit row at start when the variable is set (test) |
 | DOC-01 | P1 | partial | Correct README (tests, diagrams, capability count), TESTING.md counts, DATABASE.md's four false claims (or label them PLAN), STATUS.md:135 and USAGE.md:1053; stamp a state on every H2 under docs/ (SECURITY Authorization/Audit/Privacy, DATABASE, DEPLOYMENT, PRO |
 | REL-03 | P1 | closed | closed 2026-09-06: a console export of a recorded incident carries its clips and preserves them (test); the console's Finished path now drains once more so the last clip and events are never lost |
 | REL-06 | P1 | partial | Add a test with a source whose read() blocks forever, asserting Node.close/closeEvent returns, the 'analysis.thread_stuck' row is written and the process exits within 15 s; optionally add a bounded hard-exit fallback. |
-| SEC-14 | P1 | partial | Once SEC-01 lands, require a credential to enter Configure and to use the mutating flags; add a sentence in SECURITY.md stating the lock's limits. |
+| SEC-14 | P1 | closed | closed 2026-09-06: with accounts present, Configure and the seeding flags need `site.configure` (tests); SECURITY.md's Authorization section states the lock's limits |
 | TEST-02 | P1 | partial | Add a step to ci.yml's package job that runs the packaged console offscreen on the reference file with `--start --for 5 --screenshots` and asserts exit 0 and six PNGs, and write a release checklist that names `python tasks.py exetest` with pictures attached. |
 | UI-01 | P1 | closed | Behaviour is complete and demonstrated on the shipped 2bf57e6 bundle, but the closure's test and doc claims overstate: add tests for report.txt's "Application" line, for build_info's frozen path (monkeypatch sys.frozen/_MEIPASS and a build.json beside a fake s |
 | UX-12 | P1 | partial | Add a _press_ok test through _choose_watched, make the register's filled_in helper send DeferredDelete, and extend the structural test to every module defining a QDialog subclass. |

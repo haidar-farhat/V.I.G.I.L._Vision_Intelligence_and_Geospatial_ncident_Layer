@@ -1955,3 +1955,116 @@ def test_the_egress_override_is_written_to_the_audit_trail_at_start(tmp_path: Pa
     with Node(tmp_path / "loud.db") as node:
         rows = [r for r in node.store.audit_trail(limit=20) if r["action"] == "egress.override"]
         assert len(rows) == 1 and "SENTINEL_ALLOW_PUBLIC_SOURCES" in rows[0]["detail"]
+
+
+# ------------------------------------------------------------------ alerts
+
+
+def test_a_dark_camera_raises_an_alert_that_clears_when_frames_return(tmp_path: Path, site: CameraPose):
+    from sentinel.alerts import CAMERA_DARK, Alerts
+
+    with Node(tmp_path / "n.db", alerts=Alerts(synchronous=True)) as node:
+        node.add_camera("rtsp://10.0.0.9:554/stream", camera_id="gate", pose=site)
+        record = node.camera("gate")
+        record.runner = _StalledRunner(DARK_AFTER_SECONDS * 2)
+        node._watch_for_alerts()
+        assert [a.key for a in node.alerts.active()] == [(CAMERA_DARK, "gate")]
+        node._watch_for_alerts()
+        assert node.alerts.raised_count == 1, "one dark camera, one alert"
+
+        record.runner = _StalledRunner(DARK_AFTER_SECONDS * 3, silent_since_frame=0.5)
+        node._watch_for_alerts()
+        assert node.alerts.active() == ()
+
+        record.runner = _StalledRunner(DARK_AFTER_SECONDS * 2)
+        node._watch_for_alerts()
+        assert len(node.alerts.active()) == 1
+        record.runner = None  # stopped on purpose is not dark
+        node._watch_for_alerts()
+        assert node.alerts.active() == ()
+
+
+def test_a_stopped_recording_a_retention_shortfall_and_a_stuck_thread_each_alert(tmp_path: Path, site: CameraPose):
+    from sentinel.alerts import RECORDING_STOPPED, RETENTION_SHORTFALL, THREAD_STUCK, Alerts
+
+    class _Stuck(_StalledRunner):
+        recording_fault = "disk full"
+
+        def ask_to_stop(self):
+            pass
+
+        def stop(self):
+            return False
+
+    with Node(tmp_path / "n.db", alerts=Alerts(synchronous=True), record_to=tmp_path / "rec") as node:
+        node.add_camera("rtsp://10.0.0.9:554/stream", camera_id="gate", pose=site, recording=True)
+        record = node.camera("gate")
+        record.runner = _Stuck(1.0, silent_since_frame=0.2)
+        node._watch_for_alerts()
+        assert [a.key for a in node.alerts.active()] == [(RECORDING_STOPPED, "gate")]
+
+        node._retention_shortfall = "everything left is preserved evidence"
+        node._watch_for_alerts()
+        assert (RETENTION_SHORTFALL, "local") in [a.key for a in node.alerts.active()]
+        node._retention_shortfall = None
+        node._watch_for_alerts()
+        assert (RETENTION_SHORTFALL, "local") not in [a.key for a in node.alerts.active()]
+
+        try:
+            node._running = True
+            assert node.stop() is False
+            assert (THREAD_STUCK, "gate") in [a.key for a in node.alerts.active()]
+            actions = [r["action"] for r in node.store.audit_trail(limit=30)]
+            assert "alert.raised" in actions and "analysis.thread_stuck" in actions
+        finally:
+            record.runner = None
+
+
+def test_the_poll_watches_for_alerts(tmp_path: Path):
+    import inspect
+
+    source = inspect.getsource(Node.poll)
+    assert "self._watch_for_alerts()" in source
+
+
+def test_a_full_disk_raises_the_watermark_alert_and_the_sweep_keeps_preserved_evidence(
+    tmp_path: Path, monkeypatch
+):
+    """REL-02: the sweep and the alert both fire on a full disk; evidence stays."""
+    from collections import namedtuple
+
+    import shutil
+
+    from sentinel.alerts import DISK_LOW, RETENTION_SHORTFALL, Alerts
+    from sentinel.recording import RetentionPolicy
+    from test_recording import segment_row
+
+    usage = namedtuple("usage", "total used free")
+    full = {"free": 100 * 1024**2}
+    # One patch covers both readers: the node and the sweep call `shutil.disk_usage`.
+    monkeypatch.setattr(shutil, "disk_usage", lambda path: usage(10**12, 10**12 - full["free"], full["free"]))
+
+    clips = tmp_path / "rec"
+    clips.mkdir()
+    keep = clips / "gate-keep.mp4"
+    keep.write_bytes(b"\0" * 1000)
+    policy = RetentionPolicy(max_age_days=None, max_bytes=None, min_free_bytes=1024**3)
+    with Node(
+        tmp_path / "n.db", record_to=clips, retention=policy, retention_every_seconds=0.0,
+        alerts=Alerts(synchronous=True),
+    ) as node:
+        node.store.save_segment(segment_row(keep, "gate", start=1_000, size=1000))
+        node.store.preserve_segments([keep])
+
+        node.poll()
+        keys = {a.key for a in node.alerts.active()}
+        assert (DISK_LOW, "local") in keys, "a nearly full disk raised nothing"
+        assert (RETENTION_SHORTFALL, "local") in keys, "the sweep could not reach its floor and said nothing"
+        assert keep.exists(), "preserved evidence was deleted to make room"
+        actions = [r["action"] for r in node.store.audit_trail(limit=40)]
+        assert "alert.raised" in actions and "recording.deleted" not in actions
+
+        full["free"] = 50 * 1024**3
+        node.poll()
+        keys = {a.key for a in node.alerts.active()}
+        assert (DISK_LOW, "local") not in keys and (RETENTION_SHORTFALL, "local") not in keys

@@ -365,6 +365,22 @@ Roles: **viewer** watches; **operator** changes the site and exports;
 accounts. Skip the first-administrator offer and the console opens with nothing
 gated, and says on every start that the audit trail names nobody.
 
+**When something goes wrong, something leaves the process.** A camera that
+is alive but has delivered no frame for thirty seconds, a recording that
+stopped early, a retention sweep that cannot reach its target because
+everything left is preserved evidence, and an analysis thread that would not
+stop each raise an *alert*: a red banner in the console, one sound, an
+`alert.raised` audit row, and a line in `alerts.log` beside the log. Each
+clears when the condition does. Three environment variables choose where else
+an alert goes; `sentinel alerts` prints the choice and `sentinel alerts
+--test` sends one through every sink:
+
+| Variable | What it does |
+|---|---|
+| `SENTINEL_ALERT_FILE` | The file a line is appended to (default `alerts.log` beside the log; empty disables) |
+| `SENTINEL_ALERT_COMMAND` | A command run per alert, with the kind, subject, detail and state as its last four arguments and as `SENTINEL_ALERT_*` in its environment |
+| `SENTINEL_ALERT_WEBHOOK` | An address on the local network that receives the alert as a JSON body; a public address is refused |
+
 **A greyed button still answers a click.** Clicking *Place…*, *Add zone…*,
 *Remove camera* or any other locked control while the site is locked says what
 that control does, that the site is locked, and offers to unlock it and carry
@@ -987,6 +1003,13 @@ without it ever appearing in a command line:
 ```bash
 sentinel password gate          # prompts; nothing is echoed
 ```
+
+Operator accounts — who may change the site and export evidence — are the
+same shape: `sentinel users add NAME --role ROLE` prompts for the password,
+`--stdin` reads it from standard input for a script, and `list`, `passwd`,
+`disable` and `enable` do what they say. The CLI itself runs as the
+operating-system account that launched it and writes `cli:<account>` to the
+audit trail.
 
 `run` and `node` warn when a source on the command line carries a password,
 because an argument is readable by every process on the machine. A machine

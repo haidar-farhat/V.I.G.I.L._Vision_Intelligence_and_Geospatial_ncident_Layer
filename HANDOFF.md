@@ -823,6 +823,62 @@ occlusion-aware coasting.
 
 ---
 
+### 2026-09-06 — "start doing all the unmade features": four slices, P0 first
+
+The directive was to build what the audit left unbuilt, in its priority
+order, one slice at a time with tests, and to say so after each slice rather
+than after all of them. Four landed; each ran the full local CI with
+packaging and the camera exetest on the rebuilt `SentinelVision-dev.exe`.
+
+1. **Backup and restore (REL-02's data half, DOC-01's DATABASE.md half).**
+   `Store.backup_to` uses SQLite's online backup and writes a sidecar
+   checksum; `verify_backup` and `restore_backup` check it; `_require_intact`
+   runs `quick_check` on open and a database from a newer schema is refused
+   rather than mangled; `sentinel backup` / `sentinel restore`. DATABASE.md
+   was rewritten to say what exists.
+2. **Supervision (REL-01).** `sentinel.supervise`: a stop file, a backoff
+   restart loop, and `service install|uninstall|print` that writes a Task
+   Scheduler, launchd or systemd definition. `sentinel node` with no sources
+   runs the stored cameras, so the service line has nothing to remember.
+3. **Camera passwords in the keychain (SEC-02).** `sentinel.secrets` over
+   `keyring`; `cameras.credentials_ref` is now populated; a restored RTSP
+   camera gets its password back from the keychain; `sentinel password
+   CAMERA`; `run`/`node` warn about a password in argv. Both test suites use
+   an in-memory keychain so they never touch the machine's.
+4. **Accounts and permissions (SEC-01, SEC-14).** `sentinel.accounts`:
+   `users` table (migration 12), salted scrypt hashes, roles as sets of
+   permissions, lockout after five failures; `sentinel users
+   add|list|passwd|disable|enable`; the console offers to create the first
+   administrator once (never on a timed `--for` run, which is unattended),
+   then asks for a sign-in, or takes `--user NAME` with the password on
+   standard input; Configure and Export need a permission and a refusal is
+   audited; every console audit row carries `console:<name>`, every CLI row
+   `cli:<os account>`. Not built, and said so in the audit: permission
+   checks inside `Node`, sessions and an application lock.
+
+5. **The model read once (PERF-01).** `detect.model_info` caches a model's
+   description per process, keyed by path, size and mtime; `_output_count`
+   is cached the same way. The console's zone picker, watch-list dialog,
+   Start check and `--watch` validation all read the one description. One
+   session per camera per Start, not four for one camera.
+6. **Alerts (OBS-01, and REL-02's last half).** `sentinel.alerts`: raised
+   once per (kind, subject) until cleared, audited, fanned out on a daemon
+   thread to `alerts.log`, an operator's command and a local-network webhook
+   (a public address is refused at construction). The node raises
+   `camera.dark`, `recording.stopped`, `retention.shortfall`,
+   `analysis.thread_stuck` and `disk.low` (2 GiB watermark) from `poll` and
+   `stop`; the console shows a red banner and beeps once per alert. Found on
+   the way: a store whose every clip is preserved measured *infinite* free
+   space in the sweep and never reported a shortfall (`_free_bytes` now falls
+   back to any segment).
+
+Two things worth knowing about slice 4. The schema test that fails on any
+credential-shaped column exempts exactly one, `users.password_hash`, by table
+and name — keep it that narrow. And the first-administrator offer is
+remembered when declined (`accounts/first_admin_declined` in the settings),
+so a deployment that has not decided on accounts is told once, and the
+status bar keeps saying "the audit trail names nobody" until one exists.
+
 ## 7. Hard-won facts worth not rediscovering
 
 - **The recurring defect in this repository is correct, tested code that nothing
