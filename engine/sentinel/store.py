@@ -66,7 +66,7 @@ _log = _get_logger(__name__)
 #: Schema version this build expects. A database at a different version is
 #: migrated forward, never opened as-is: opening a schema you do not understand
 #: and hoping the columns line up is how evidence is silently corrupted.
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 
 #: The audit column's zero, for rebuilding a millisecond timestamp exactly.
@@ -574,6 +574,27 @@ MIGRATIONS: tuple[Migration, ...] = (
         ALTER TABLE sites DROP COLUMN declared;
         """,
     ),
+    Migration(
+        version=11,
+        name="camera_recording",
+        up="""
+        -- Whether this camera records continuously when it runs. Off by
+        -- default: writing video is the most expensive thing this system can
+        -- do to a disk — roughly 17.5 GB per camera per day at 640x480/15fps
+        -- — so it happens because somebody asked for it, per camera, and the
+        -- asking survives a restart. The console's Record checkbox and
+        -- `Node.set_recording` write it; `Node.start` reads it. Recording
+        -- was engine-and-CLI only until this column existed: the console had
+        -- no way to switch it on, so nothing it exported carried footage.
+        ALTER TABLE cameras ADD COLUMN record INTEGER NOT NULL DEFAULT 0
+            CHECK (record IN (0, 1));
+        """,
+        down="""
+        -- A build without the flag records nothing from the console, which
+        -- is what it did before the flag existed. The camera survives.
+        ALTER TABLE cameras DROP COLUMN record;
+        """,
+    ),
 )
 
 
@@ -920,6 +941,7 @@ class Store:
         source: str,
         pose=None,
         credentials_ref: str | None = None,
+        record: bool | None = None,
     ) -> None:
         """Record a camera.
 
@@ -927,17 +949,31 @@ class Store:
         never the raw URL. ``credentials_ref`` is an opaque handle into the
         operating system's keychain; a password must never reach this function,
         and a test asserts that nothing stored here looks like one.
+
+        ``record`` is whether the camera records when it runs. ``None`` keeps
+        whatever is stored — a placement is not a decision about recording,
+        and an upsert that reset the flag on every placement would switch a
+        camera's recording off the moment somebody nudged it on the map. A
+        new camera with ``None`` does not record: the expensive thing is opted
+        into, never acquired by omission.
         """
         now = _now()
         with self.transaction() as connection:
+            if record is None:
+                stored = connection.execute(
+                    "SELECT record FROM cameras WHERE id = ?", (camera_id,)
+                ).fetchone()
+                flag = int(stored["record"]) if stored is not None else 0
+            else:
+                flag = 1 if record else 0
             connection.execute(
                 """
                 INSERT INTO cameras (
                     id, name, source, credentials_ref,
                     latitude, longitude, mount_height, heading, pitch, roll,
-                    horizontal_fov, vertical_fov, range_meters,
+                    horizontal_fov, vertical_fov, range_meters, record,
                     created_at, updated_at
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(id) DO UPDATE SET
                     name = excluded.name,
                     source = excluded.source,
@@ -951,6 +987,7 @@ class Store:
                     horizontal_fov = excluded.horizontal_fov,
                     vertical_fov = excluded.vertical_fov,
                     range_meters = excluded.range_meters,
+                    record = excluded.record,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -964,9 +1001,17 @@ class Store:
                     pose.horizontal_fov if pose else None,
                     pose.vertical_fov if pose else None,
                     pose.range_meters if pose else None,
+                    flag,
                     now, now,
                 ),
             )
+
+    def camera_recording(self, camera_id: str) -> bool:
+        """Whether a camera is asked to record. ``False`` for one that is not stored."""
+        row = self._connection.execute(
+            "SELECT record FROM cameras WHERE id = ?", (camera_id,)
+        ).fetchone()
+        return bool(row["record"]) if row is not None else False
 
     def cameras(self) -> list[sqlite3.Row]:
         return self._connection.execute(

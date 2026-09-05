@@ -77,7 +77,7 @@ from sentinel.events import (
     RapidMovementRule,
     ZoneEntryRule,
 )
-from sentinel.evidence import ExportError, export_incident
+from sentinel.evidence import ExportError
 from sentinel.coverage import sigma_bands, zone_report
 from sentinel.node import Node, NodeError, Update
 from sentinel.paths import default_model_path
@@ -1993,21 +1993,26 @@ class ConsoleWindow(QMainWindow):
         if not destination:
             return
 
+        # Through the node, which is the one implementation: it finds the
+        # incident, works out which recorded segments cover it, preserves them
+        # from retention, audits that, and exports with the footage. This
+        # method used to call the exporter directly and produced a package
+        # with no video in it and no preservation behind it — for as long as
+        # the node's own docstring said the console "used to". The actor is
+        # the node's, "console": there is no authentication yet, so there is
+        # nobody to name, and inventing an operator would be a false entry in
+        # a chain of custody.
         try:
-            export = export_incident(
-                incident,
-                Path(destination),
-                # No authentication yet, so there is nobody to name. Recording
-                # "console" is the truth; inventing an operator name would be a
-                # false entry in a chain of custody.
-                exported_by="console (unauthenticated)",
-            )
-        except ExportError as error:
+            export, coverage = self.node.export_incident(incident.id, Path(destination))
+        except (ExportError, NodeError) as error:
             QMessageBox.warning(self, "Export failed", str(error))
             return
 
-        self.store.audit(
-            "console", "incident.exported", incident.id, str(export.directory)
+        clips = sum(len(cover.segments) for cover in coverage)
+        footage = (
+            f"{clips} clip(s) of footage, preserved from retention"
+            if clips
+            else "no footage: nothing was recording when this happened"
         )
         QMessageBox.information(
             self,
@@ -2017,6 +2022,7 @@ class ConsoleWindow(QMainWindow):
                 "",
                 f"{len(export.files)} files written to",
                 str(export.directory),
+                footage,
                 "",
                 "Manifest SHA-256:",
                 export.manifest_sha256,
@@ -2517,10 +2523,12 @@ class ConsoleWindow(QMainWindow):
         self.status.showMessage(text)
 
     def _show_about(self) -> None:
+        from sentinel.version import describe
+
         QMessageBox.information(
             self,
             "About this build",
-            "Sentinel Vision console.\n\n"
+            f"{describe()}\n\n"
             "Native Qt widgets — no embedded browser.\n"
             "No Internet access at any point: no tiles, no telemetry, no model "
             "downloads.\n\n"
@@ -2613,7 +2621,7 @@ def _file_safe(name: str) -> str:
     """A camera id as a file name: letters, digits, dot, dash and underscore.
 
     Everything else becomes a dash and runs collapse, so `device:0` is
-    `device-0` and `rtsp://…` can never carry a path separator into the
+    `device-0` and a network URL can never carry a path separator into the
     directory the pictures are written to.
     """
     cleaned = "".join(ch if (ch.isalnum() or ch in "._-") else "-" for ch in name)

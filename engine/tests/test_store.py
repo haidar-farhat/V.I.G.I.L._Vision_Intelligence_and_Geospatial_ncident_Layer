@@ -1711,3 +1711,45 @@ def test_a_record_stamped_to_the_microsecond_still_verifies_from_its_row(tmp_pat
             before_json=row["before_json"], after_json=row["after_json"],
         )
         assert verify_chain([rebuilt], [row["chain_hash"]]) is None, "the row does not re-hash to its own chain hash"
+
+
+# ------------------------------------------------------ recording, per camera
+
+
+def test_a_camera_remembers_whether_it_records_and_a_placement_does_not_forget_it(store: Store):
+    store.save_camera("cam-07", "North gate", "file:///media/north.mp4", record=True)
+    assert store.camera_recording("cam-07") is True
+
+    pose = CameraPose(
+        position=SITE, mount_height=6.5, heading=145.0, pitch=-24.0,
+        horizontal_fov=58.0, vertical_fov=33.0, range_meters=110.0,
+    )
+    # A placement says nothing about recording, so it must keep the flag.
+    store.save_camera("cam-07", "North gate", "file:///media/north.mp4", pose)
+    assert store.camera_recording("cam-07") is True
+    assert store.camera_pose("cam-07") is not None
+
+    store.save_camera("cam-07", "North gate", "file:///media/north.mp4", pose, record=False)
+    assert store.camera_recording("cam-07") is False
+    assert store.camera_recording("absent") is False
+
+    # A new camera saved without a decision does not record: the expensive
+    # thing is opted into, never acquired by omission.
+    store.save_camera("cam-08", "Yard", "file:///media/yard.mp4")
+    assert store.camera_recording("cam-08") is False
+
+
+def test_migration_eleven_carries_the_recording_flag_and_a_way_back():
+    with Store(":memory:") as store:
+        store.save_camera("cam-07", "North gate", "file:///media/north.mp4", record=True)
+        before = store.applied_versions()
+
+        undone = store.rollback()
+        assert undone is not None and undone.name == "camera_recording"
+        assert "record" not in store.column_names("cameras"), "the flag survived its own down"
+        assert [row["id"] for row in store.cameras()] == ["cam-07"], "the camera went with it"
+
+        store.migrate()
+        assert store.applied_versions() == before
+        # A row from before the flag records nothing — the safe direction.
+        assert store.camera_recording("cam-07") is False

@@ -396,6 +396,16 @@ class VideoSource:
                 "Internet; if that address is genuinely a camera on a routed "
                 "network, set SENTINEL_ALLOW_PUBLIC_SOURCES=1."
             )
+        if public:
+            # The one override, and it is loud: every connection it allows is
+            # named in the log at WARNING, with the address, so a machine that
+            # reaches routable addresses never does so quietly. The variable
+            # is announced once more at start-up by `logs.configure`.
+            _log.warning(
+                "%s resolves to %s, outside the local network; connecting anyway "
+                "because SENTINEL_ALLOW_PUBLIC_SOURCES is set",
+                self._display, ", ".join(sorted(public)),
+            )
 
     def _open_capture(self) -> cv2.VideoCapture:
         """Hand the URL to OpenCV.

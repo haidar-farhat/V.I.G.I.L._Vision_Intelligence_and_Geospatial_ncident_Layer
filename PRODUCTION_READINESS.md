@@ -99,13 +99,18 @@ real camera is the test medium.
 | exetest run 2 (09:17, exe 09:16) | Dialog fixes in; watch list active (`6 class name(s)`); a person tracked; the window was closed by hand at 12 s, before the timer, so no picture and no summary were left. Tool verdict FAIL — which led to `_conclude_timed_run` on close | `dist/exetest/20260905-091709/` |
 | exetest run 3 (09:25, exe 09:24) | **PASS with a caveat**: 32.9 s wall for `--for 30`, 570 frames analysed, six pictures including `camera-device-0.png`, summary printed, no exception logged, closed itself; nobody was in front of the camera, so 0 detections | `dist/exetest/20260905-092516/` |
 | Console suite after all fixes | 374 passed | offscreen, 2026-09-05 |
+| `test_identity.py` brought up to date with migration 10 and the switched reader, plus 4 tests for what they promise | 40 passed | 2026-09-05, after `continue` |
+| `python tasks.py ci --package` on the green tree | **green**, all 13 stages: source audit (after it caught an `rtsp://…` in a new docstring, reworded), binary audit, docs lint, rustfmt, clippy, `cargo test` (60), release build, engine (162.9 s), console (91.9 s), engine with the network poisoned (advisory, passed), package (265.7 s), `sentinel.exe where` and `coverage` launch checks | `scratchpad/ci3.log`, executables 10:05 |
+| exetest run 4 (10:06, the CI-built exe) | **PASS with a caveat**: 34.3 s wall, 427 frames, six pictures, summary, no exception, closed itself; nobody in frame | `dist/exetest/20260905-100625/` |
 
 **Read together:** run 1 proves detection, tracking, the watch list and the
-floor on the shipped binary with a real person; run 3 proves the timed run,
-the pictures and the summary; the defects between them were found only
+floor on the shipped binary with a real person; runs 3 and 4 prove the timed
+run, the pictures and the summary; the defects between them were found only
 because a person was at the keyboard while the binary ran — which is the whole
-argument for rule 8 in HANDOFF.md. CI is still red at HEAD for reasons outside
-this session's work, and must be green before any of this is called done.
+argument for rule 8 in HANDOFF.md. Local CI is green on the working tree
+(uncommitted). Remote CI has still never run (TEST-01), and no run with a
+person in frame has yet been made on the final binary — the next `exetest`
+with somebody in the chair is the first thing to do.
 
 ---
 

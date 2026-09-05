@@ -4502,3 +4502,55 @@ def test_a_timed_run_closed_early_by_a_person_still_reports(
 def test_closing_a_window_that_was_never_timed_reports_nothing(qt_app, window, capsys):
     window.close()
     assert capsys.readouterr().out == ""
+
+
+# ------------------------------------ export through the node, and the build
+
+
+def test_the_console_exports_through_the_node_with_footage_and_preservation(
+    qt_app, window, tmp_path, monkeypatch
+):
+    """`_export_incident` called the exporter directly, so a package made from
+    the console carried no footage and preserved nothing — for as long as the
+    node's own docstring said the console "used to". Now it goes through the
+    node, like the test above it always did."""
+    from PySide6.QtWidgets import QFileDialog, QMessageBox
+    from sentinel.evidence import verify_export
+    from sentinel.incidents import Correlator
+    from test_store import make_event
+
+    incident = Correlator().correlate([make_event(track=n) for n in (1, 2)])[0]
+    window.store.save_incident(incident)
+    monkeypatch.setattr(ConsoleWindow, "_selected_incident", lambda self: incident)
+    monkeypatch.setattr(
+        QFileDialog, "getExistingDirectory", staticmethod(lambda *a, **k: str(tmp_path))
+    )
+    shown = []
+    monkeypatch.setattr(
+        QMessageBox, "information",
+        staticmethod(lambda parent, title, text, *a, **k: shown.append((title, text)) or QMessageBox.StandardButton.Ok),
+    )
+
+    window._export_incident()
+
+    assert shown and shown[0][0] == "Evidence exported", shown
+    packages = [path for path in tmp_path.iterdir() if path.is_dir()]
+    assert len(packages) == 1
+    assert (packages[0] / "footage.json").is_file(), "the package has no footage record"
+    assert verify_export(packages[0]) == []
+    assert "footage" in shown[0][1]
+    actions = [row["action"] for row in window.store.audit_trail(limit=10)]
+    assert actions.count("incident.exported") == 1, "audited twice, or not at all"
+
+
+def test_about_names_the_build(qt_app, window, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+    from sentinel import version
+
+    shown = []
+    monkeypatch.setattr(
+        QMessageBox, "information",
+        staticmethod(lambda parent, title, text, *a, **k: shown.append(text) or QMessageBox.StandardButton.Ok),
+    )
+    window._show_about()
+    assert shown and shown[0].startswith(f"Sentinel Vision {version.__version__}")

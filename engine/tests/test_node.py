@@ -1763,3 +1763,127 @@ def test_a_second_run_of_the_same_track_id_is_a_second_encounter(
     assert first_run == 1
     assert len(audits) == 2, "the second run's encounter was taken for the first's"
     assert all(row["subject"] == "veh-1" for row in audits)
+
+
+# ------------------------------------------------- recording, asked per camera
+
+
+def test_only_the_cameras_asked_to_record_do(tmp_path: Path, reference_video: Path, site: CameraPose):
+    """Two cameras on one node with a recordings directory; one asked to
+    record. Clips for that one, none for the other."""
+    with Node(tmp_path / "n.db", record_to=tmp_path / "rec", segment_seconds=2.0) as node:
+        node.add_camera(reference_video, camera_id="gate", pose=site, recording=True)
+        node.add_camera(reference_video, camera_id="yard", pose=site)
+        node.run_forever()
+        assert node.camera_health()["gate"].asked_to_record is True
+        assert node.camera_health()["yard"].asked_to_record is False
+
+    with Store(tmp_path / "n.db") as store:
+        recorded = {segment.camera_id for segment in store.segments()}
+        assert recorded == {"gate"}, recorded
+
+
+def test_the_cli_style_node_still_records_every_camera(tmp_path: Path, reference_video: Path, site: CameraPose):
+    # `sentinel node --record` has always meant every camera; the per-camera
+    # flag the console sets must not narrow it.
+    with Node(
+        tmp_path / "n.db", record_to=tmp_path / "rec", segment_seconds=2.0,
+        record_every_camera=True,
+    ) as node:
+        node.add_camera(reference_video, camera_id="gate", pose=site)
+        node.run_forever()
+        assert "recording" in node.summary()
+
+    with Store(tmp_path / "n.db") as store:
+        assert {segment.camera_id for segment in store.segments()} == {"gate"}
+
+
+def test_a_node_with_nowhere_to_write_records_nothing_whatever_was_asked(
+    tmp_path: Path, reference_video: Path, site: CameraPose
+):
+    with Node(tmp_path / "n.db") as node:
+        node.add_camera(reference_video, camera_id="gate", pose=site, recording=True)
+        node.run_forever()
+    with Store(tmp_path / "n.db") as store:
+        assert store.recording_count() == 0
+
+
+def test_asking_a_camera_to_record_is_persisted_audited_and_survives_a_placement(
+    tmp_path: Path, reference_video: Path, site: CameraPose
+):
+    with Node(tmp_path / "n.db") as node:
+        node.add_camera(reference_video, camera_id="gate")
+        assert node.camera("gate").record is False
+        node.set_recording("gate", True)
+        assert node.camera("gate").record is True
+        assert node.store.camera_recording("gate") is True
+        rows = [row for row in node.store.audit_trail(limit=5) if row["action"] == "camera.recording"]
+        assert rows and rows[0]["detail"] == "recording on"
+        assert rows[0]["chain_hash"], "the switch is a structured, chained record"
+        node.set_recording("gate", True)   # already on: nothing written twice
+        assert len([r for r in node.store.audit_trail(limit=10) if r["action"] == "camera.recording"]) == 1
+
+    with Node(tmp_path / "n.db") as node:
+        assert node.camera("gate").record is True, "the flag did not survive a restart"
+        node.place_camera("gate", site)
+        assert node.camera("gate").record is True, "placing the camera forgot that it records"
+        assert node.store.camera_recording("gate") is True
+
+
+def test_retention_sweeps_from_the_nodes_own_poll_on_a_cadence(tmp_path: Path):
+    import time as clock
+
+    from sentinel.recording import RetentionPolicy, Segment
+
+    old = tmp_path / "rec" / "gate_old.mp4"
+    old.parent.mkdir(parents=True)
+    old.write_bytes(b"x" * 1024)
+    kept = tmp_path / "rec" / "gate_evidence.mp4"
+    kept.write_bytes(b"y" * 1024)
+
+    with Node(
+        tmp_path / "n.db", record_to=tmp_path / "rec",
+        retention=RetentionPolicy(max_age_days=1.0, min_free_bytes=None),
+        retention_every_seconds=0.0,
+    ) as node:
+        long_ago = int(clock.time() * 1000) - 3 * 86_400_000
+        for path in (old, kept):
+            node.store.save_segment(Segment(
+                "gate", path, long_ago, long_ago + 60_000, 900, 640, 480,
+                15.0, 15.0, "mp4v", 1024, "0" * 64,
+            ))
+        node.store.preserve_segments([kept])
+
+        node.poll()
+
+        assert not old.exists(), "the sweep did not run from poll"
+        assert kept.exists(), "preserved evidence was deleted"
+        assert node.store.recording_count() == 1
+        actions = [row["action"] for row in node.store.audit_trail(limit=10)]
+        assert "recording.deleted" in actions
+        assert node.retention_shortfall is None
+
+
+def test_a_node_that_does_not_record_never_sweeps(tmp_path: Path):
+    with Node(tmp_path / "n.db", retention_every_seconds=0.0) as node:
+        assert node._retention is None
+        node.poll()
+        assert node.retention_shortfall is None
+
+
+def test_the_sweep_waits_its_cadence_between_polls(tmp_path: Path, monkeypatch):
+    swept = []
+    with Node(tmp_path / "n.db", record_to=tmp_path / "rec", retention_every_seconds=3600.0) as node:
+        from sentinel import recording
+
+        real = recording.apply_retention
+
+        def counting(*args, **kwargs):
+            swept.append(1)
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(recording, "apply_retention", counting)
+        node.poll()
+        node.poll()
+        node.poll()
+    assert swept == [1], "the first poll sweeps, and the next ones wait the cadence"

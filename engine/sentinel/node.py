@@ -113,6 +113,14 @@ STOP_TIMEOUT_SECONDS = 10.0
 #: short enough that an operator finds out while it still matters.
 DARK_AFTER_SECONDS = 30.0
 
+#: How often a node that records sweeps its own recordings. Ten minutes is
+#: far more often than a disk fills and far less often than a poll, and it is
+#: the difference between retention that happens and retention that somebody
+#: was supposed to run: `apply_retention` existed for three days as a command
+#: nothing scheduled, with its own shortfall message reading "Recording will
+#: continue until the disk is full and then stop."
+RETENTION_EVERY_SECONDS = 600.0
+
 #: Recorded in the audit log. There is no authentication yet, so there is nobody
 #: to name; recording the truth beats inventing an operator, because an audit
 #: trail with a false entry is worse than no audit trail.
@@ -265,6 +273,18 @@ class CameraHealth:
     #: Since its thread was started, or ``None`` if it never was. This is what
     #: makes DARK defensible for a camera that has produced nothing at all.
     seconds_since_started: float | None
+    #: The stored flag: this camera records when it runs. Distinct from
+    #: `recording`, which is whether a recorder is open right now — the flag
+    #: can be on for a camera that has not been restarted since it was set.
+    asked_to_record: bool = False
+    #: A recorder is attached to the running pipeline.
+    recording: bool = False
+    clips_written: int = 0
+    bytes_recorded: int = 0
+    #: Why the recorder stopped early, or ``None``. A camera whose writer died
+    #: in the first minute must not report the same line as one recording all
+    #: night.
+    recording_fault: str | None = None
 
     @property
     def is_dark(self) -> bool:
@@ -333,6 +353,15 @@ class CameraHealth:
             parts.append(f"{self.reconnects} reconnect(s)")
         if not self.is_placed:
             parts.append("not placed")
+        if self.recording_fault:
+            parts.append(f"recording stopped: {self.recording_fault}")
+        elif self.recording:
+            parts.append(f"recording · {self.clips_written} clip(s)")
+        elif self.asked_to_record and self.is_running:
+            # Set after the camera started: the flag reaches a pipeline when it
+            # is built, and saying "recording" here would be the one lie a
+            # status line about evidence must not tell.
+            parts.append("will record when restarted")
         return " — ".join(parts)
 
 
@@ -345,6 +374,9 @@ class CameraRecord:
     #: it is never logged, displayed or stored — `display_source` is.
     source: str
     pose: CameraPose | None = None
+    #: Records continuously when it runs. Stored with the camera (migration
+    #: 11), read by `Node.start`, set by `Node.set_recording`.
+    record: bool = False
     #: How many runners this record has been given. Track ids and frame
     #: indices start again with each one, so anything the node keeps keyed on
     #: a track id — a refusal, an encounter already audited — is keyed on this
@@ -506,6 +538,13 @@ class CameraRunner:
     @property
     def stats(self) -> PipelineStats | None:
         return self._pipeline.stats if self._pipeline is not None else None
+
+    @property
+    def recorder_stats(self):
+        """What the recorder did, or ``None`` when this run has no recorder."""
+        pipeline = self._pipeline
+        recorder = pipeline.recorder if pipeline is not None else None
+        return recorder.stats if recorder is not None else None
 
     @property
     def skipped(self) -> int:
@@ -835,6 +874,7 @@ def _health_for(record: CameraRecord) -> CameraHealth:
         fps = runner.analysis_fps
 
     stats = runner.stats if runner is not None else None
+    recorder = runner.recorder_stats if runner is not None else None
     return CameraHealth(
         camera_id=record.camera_id,
         state=state,
@@ -848,6 +888,11 @@ def _health_for(record: CameraRecord) -> CameraHealth:
         fault=fault,
         seconds_since_frame=since_frame,
         seconds_since_started=since_start,
+        asked_to_record=record.record,
+        recording=recorder is not None and running and recorder.fault is None,
+        clips_written=recorder.segments_written if recorder is not None else 0,
+        bytes_recorded=recorder.bytes_written if recorder is not None else 0,
+        recording_fault=recorder.fault if recorder is not None else None,
     )
 
 
@@ -1011,8 +1056,22 @@ class Node:
         site_tz=None,
         face_backend: FaceBackend | None = None,
         plate_reader: PlateReader | None = None,
+        record_every_camera: bool = False,
+        retention=None,
+        retention_every_seconds: float = RETENTION_EVERY_SECONDS,
     ):
         """
+        ``record_to`` is where clips go; without it nothing records, whatever
+        the cameras ask. With it, a camera records when its stored flag says so
+        (`CameraRecord.record`, the console's checkbox) — or every camera does,
+        with ``record_every_camera``, which is what `sentinel node --record`
+        has always meant and still does.
+
+        ``retention`` is the policy swept every ``retention_every_seconds``
+        from :meth:`poll`, by this node, while it runs. It defaults to
+        `RetentionPolicy()` when the node records and to nothing when it does
+        not; a node that never writes video has nothing of its own to sweep.
+
         ``detector_factory`` is called once per camera. One detector per camera,
         never shared: MOG2 carries a per-pixel model of *its* scene, and feeding
         it two cameras corrupts both models and every detection that comes out
@@ -1054,6 +1113,18 @@ class Node:
         self._detector_factory = detector_factory or (lambda: MotionDetector())
         self._record_to = Path(record_to) if record_to else None
         self._segment_seconds = segment_seconds
+        self._record_every_camera = bool(record_every_camera)
+        from .recording import RetentionPolicy
+
+        self._retention = (
+            retention if retention is not None
+            else (RetentionPolicy() if self._record_to else None)
+        )
+        self._retention_every = float(retention_every_seconds)
+        #: Monotonic time of the last sweep; ``None`` until the first, so a
+        #: node restarted after a month sweeps on its first poll.
+        self._last_retention: float | None = None
+        self._retention_shortfall: str | None = None
         self._keep_images = keep_images
         self._realtime = realtime
         self._correlate_every = correlate_every_millis
@@ -1531,6 +1602,7 @@ class Node:
                 camera_id=camera_id,
                 source=row["source"],
                 pose=self.store.camera_pose(camera_id),
+                record=bool(row["record"]) if "record" in row.keys() else False,
             )
             # Rows written before one-source-one-camera was enforced. Kept, so
             # the operator can see them and nothing silently disappears from a
@@ -1621,9 +1693,12 @@ class Node:
 
     def add_camera(
         self, source: str | Path, *, camera_id: str | None = None,
-        pose: CameraPose | None = None,
+        pose: CameraPose | None = None, recording: bool = False,
     ) -> CameraRecord:
-        """Register a camera. Does not start it, and opens nothing."""
+        """Register a camera. Does not start it, and opens nothing.
+
+        ``recording`` asks it to record whenever it runs; stored with it.
+        """
         text = str(source)
         identifier = camera_id or f"cam-{len(self._cameras) + 1:02d}"
         if identifier in self._cameras:
@@ -1646,13 +1721,20 @@ class Node:
                         "this node. One camera per device; start that one."
                     )
 
-        record = CameraRecord(camera_id=identifier, source=text, pose=pose)
+        record = CameraRecord(
+            camera_id=identifier, source=text, pose=pose, record=bool(recording)
+        )
         self._cameras[identifier] = record
 
         # The redacted form, never the raw one: this row is read by anything
         # that lists cameras, and a password in it is a password on a screen.
-        self.store.save_camera(identifier, identifier, record.display_source, pose=pose)
-        self.store.audit(self._actor, "camera.added", identifier, record.display_source)
+        self.store.save_camera(
+            identifier, identifier, record.display_source, pose=pose, record=record.record
+        )
+        self.store.audit(
+            self._actor, "camera.added", identifier,
+            record.display_source + (" (recording)" if record.record else ""),
+        )
         _log.info("node %s: added camera %s (%s)", self._node_id, identifier,
                   record.display_source)
         return record
@@ -1710,8 +1792,9 @@ class Node:
         if record.runner is not None:
             record.runner.set_pose(pose)
 
+        # `record=record.record`, or a placement would switch recording off.
         self.store.save_camera(
-            camera_id, camera_id, record.display_source, pose=pose
+            camera_id, camera_id, record.display_source, pose=pose, record=record.record
         )
         # The line is the one this log has always carried: a coordinate to six
         # places and the angles, which is what a person checking a placement
@@ -1728,6 +1811,41 @@ class Node:
                 if pose else "unplaced"
             ),
         )
+
+    def set_recording(self, camera_id: str, on: bool) -> None:
+        """Ask a camera to record whenever it runs, or stop asking.
+
+        Stored with the camera, so it survives a restart, and audited with
+        both states: whether a camera was recording on the night is the first
+        question asked of any footage that is missing. Takes effect when the
+        camera is next started — a recorder is handed to a pipeline when it is
+        built — and the health line says "will record when restarted" until
+        then, so the flag is never mistaken for the fact.
+        """
+        record = self.camera(camera_id)
+        was, record.record = record.record, bool(on)
+        if was == record.record:
+            return
+        self.store.save_camera(
+            camera_id, camera_id, record.display_source, pose=record.pose, record=record.record
+        )
+        self._audit(
+            "camera.recording", camera_id,
+            before={"record": was}, after={"record": record.record},
+            detail="recording on" if record.record else "recording off",
+        )
+        if record.is_running:
+            _log.warning(
+                "node %s: camera %s will %s when it is next started; the run in "
+                "progress keeps what it was started with",
+                self._node_id, camera_id, "record" if record.record else "stop recording",
+            )
+        if record.record and self._record_to is None:
+            _log.warning(
+                "node %s: camera %s asks to record, but this node has no "
+                "recordings directory; nothing will be written",
+                self._node_id, camera_id,
+            )
 
     def add_zone(self, zone: Zone) -> None:
         """Add a zone, and rebuild the rule set if it was the first one.
@@ -1869,7 +1987,16 @@ class Node:
                 keep_images=self._keep_images
                 or (record.identity.faces and self._faces is not None),
                 realtime=self._realtime,
-                record_to=self._record_to,
+                # The flag reaches the pipeline here and nowhere else: a
+                # camera records when it asked to, or when the whole node was
+                # told to (the CLI's --record), and a node with nowhere to
+                # write records nothing whatever was asked.
+                record_to=(
+                    self._record_to
+                    if self._record_to is not None
+                    and (self._record_every_camera or record.record)
+                    else None
+                ),
                 segment_seconds=self._segment_seconds,
                 site_tz=self._site_tz,
                 plate_reader=self._plate_reader_for(record),
@@ -2001,6 +2128,8 @@ class Node:
 
         if fresh:
             self.store.save_events(fresh)
+
+        self._sweep_retention_if_due()
 
         due = (time.monotonic() - self._last_correlated) * 1000 >= self._correlate_every
         if fresh or force_correlate or due:
@@ -2585,6 +2714,43 @@ class Node:
                 return identifier.id
         return None
 
+    @property
+    def retention_shortfall(self) -> str | None:
+        """Why the last sweep could not reach its target, or ``None``.
+
+        Set when everything left is preserved evidence, which the sweep will
+        never delete; the disk then fills, and the interface must say so.
+        """
+        return self._retention_shortfall
+
+    def _sweep_retention_if_due(self) -> None:
+        """Retention, from the node's own loop, on a cadence.
+
+        On this thread, which is the store's. A sweep is a query and a few
+        unlinks; hundreds of them on a GUI thread are felt, and moving the
+        node's persistence off that thread is a separate item — but a sweep
+        that nobody runs is a disk that fills, and that is the worse trade.
+        """
+        if self._retention is None:
+            return
+        now = time.monotonic()
+        if self._last_retention is not None and now - self._last_retention < self._retention_every:
+            return
+        self._last_retention = now
+        from .recording import apply_retention
+
+        try:
+            result = apply_retention(self.store, self._retention, actor=self._actor)
+        except Exception:  # noqa: BLE001 - a failed sweep must not stop the poll
+            _log.exception("node %s: retention sweep failed", self._node_id)
+            return
+        self._retention_shortfall = result.shortfall
+        if result.deleted:
+            _log.info(
+                "node %s: retention removed %d clip(s), %.2f GiB",
+                self._node_id, len(result.deleted), result.freed_gib,
+            )
+
     def correlate(self) -> tuple[Incident, ...]:
         """Group every camera's events into incidents, across the whole node.
 
@@ -2747,6 +2913,15 @@ class Node:
                     f"{stats.distinct_objects} track(s)"
                 )
             lines.append(f"    events        {len(record.events)}")
+            recorder = record.runner.recorder_stats if record.runner is not None else None
+            if recorder is not None:
+                lines.append(
+                    f"    recording     {recorder.segments_written} clip(s), "
+                    f"{recorder.bytes_written / 1024 / 1024:.1f} MiB"
+                    + (f", STOPPED EARLY: {recorder.fault}" if recorder.fault else "")
+                )
+            elif record.record:
+                lines.append("    recording     asked for; begins when the camera starts")
         lines.append(f"  incidents       {len(self._incidents)}")
         # What the switch is doing, in the run's own summary: a site that turned
         # faces on and has no models must read it here, not discover it.

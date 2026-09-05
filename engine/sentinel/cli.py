@@ -857,6 +857,9 @@ def _node(args: argparse.Namespace) -> int:
         node_id=args.node,
         zones=zones,
         record_to=record_to,
+        # `--record` has always meant every camera this node runs, and the
+        # per-camera flag the console sets does not narrow it.
+        record_every_camera=record_to is not None,
         segment_seconds=args.segment_seconds,
         detector_factory=lambda: _detector(args),
     )
@@ -1058,6 +1061,11 @@ def _devices(args: argparse.Namespace) -> int:
 
 def _where(args: argparse.Namespace) -> int:
     """Answer "where does this thing keep my files", which is asked constantly."""
+    from .version import describe
+
+    # First, because "which build is this" is the other question every bug
+    # report needs answered and until now nothing printed it.
+    print(f"build            {describe()}")
     print(f"data directory   {paths.data_directory()}")
     print(f"models directory {paths.models_directory()}")
     print(f"database         {args.database or default_database_path()}")

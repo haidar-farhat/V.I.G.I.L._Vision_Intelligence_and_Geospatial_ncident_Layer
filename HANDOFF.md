@@ -687,7 +687,23 @@ arrived in the same commit from the other stream of work; reproduced in a
 clean worktree at HEAD, and none of those symbols appear in this session's
 patches. The package was therefore built directly (`tasks.py package`) and
 the camera run made against it; see the verification record at the end of
-this section. **Fix those three tests before calling CI green again.**
+this section. **Then fixed, on `continue`:** the three tests were stale
+against deliberate work — migration 10 `site_declared` (the node's own
+placeholder site row must not freeze an origin nobody chose) and
+`_SwitchedPlateReader` (plates *off* reaches a running camera at its next
+read). They now assert what the code promises, and four tests were added for
+the promises themselves, which nothing had tested: the switched reader
+returns nothing once the site says no; `set_identity` clears the event every
+running reader watches; a switch written before any camera is placed leaves
+the origin following the cameras (`declared=False`); a declared site is
+returned as it is whatever the cameras say. `test_identity.py`: 40 passed.
+`python tasks.py ci --package` was then run on the whole tree: **green**,
+all thirteen stages (the source audit first caught an `rtsp://…` in a new
+docstring — §7's rule, again — reworded), executables rebuilt at 10:05, and a
+fourth camera run on that exact binary passed (34.3 s, 427 frames, six
+pictures, no exception; nobody in frame). Everything is uncommitted; the
+change set is `app.py`, `test_console.py`, `test_identity.py`,
+`exe_camera_test.py`, HANDOFF, STATUS and the new `PRODUCTION_READINESS.md`.
 
 Camera runs on the packaged binary (`dist/exetest/<stamp>/` holds the pictures,
 stdout, stderr and the log of each):
@@ -697,6 +713,7 @@ stdout, stderr and the log of each):
 | 09:03 | 09:02 build | 1,335 frames; one `person` at 0.86 for 28.2 s; no couch, no bottle; `≥ 0.50` and the watch list in the status bar. The operator clicked Place… and Add zone…: both raised on a deleted dialog (fixed since); the report died on `≥` in cp1252; `camera-device:0.png` became an alternate data stream |
 | 09:17 | 09:16 build | dialog fixes in; `6 class name(s)`; a person tracked; closed by hand at 12 s, before the timer — no picture, no summary (fixed since: a closed window still reports) |
 | 09:25 | 09:24 build | PASS with a caveat: 570 frames, six pictures, summary, no exception, closed itself at 30 s; nobody in frame |
+| 10:06 | 10:05 build (CI) | PASS with a caveat: 427 frames, six pictures, summary, no exception, closed itself; nobody in frame |
 
 **Hard-won facts from this session:**
 

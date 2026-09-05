@@ -923,6 +923,7 @@ undone on a machine with no Internet and no spare hardware is a gamble.
 |---|---|
 | `SENTINEL_LOG_LEVEL` | `DEBUG`, `INFO` (default), `WARNING`, `ERROR`. Turns a packaged build up in the field without a rebuild |
 | `SENTINEL_LOG_FILE` | a specific path, or `""` to write nothing to disk — which is what a container wants, since its log is stdout |
+| `crash.log` beside `sentinel.log` | not a setting: where a *hard* crash — a segfault, an abort, a heap corruption — leaves the Python stack of every thread at the moment it happened, written from C by `faulthandler`. The ordinary log cannot record its own process dying; this can. Empty is the normal state |
 
 The file rotates at 5 MB and keeps five, so it cannot become the thing that
 fills the disk.
@@ -1003,7 +1004,7 @@ modules or open a socket.
 | **`The Rust engine core was not found`** | The core is not built, or you moved the library | `python tasks.py build`, or set `SENTINEL_CORE_LIB` |
 | **`reports ABI version N; this build expects M`** | A stale core beside a newer engine | `cargo build --release` in `core/`. The refusal is deliberate: calling a function whose signature moved produces plausible, wrong geometry |
 | **`does not export sentinel_abi_version`** | That library is not the engine core, or is far older | Same fix |
-| **`Refused to contact "…"`** | The egress guard: that address is not on a private network | Intended. Use a LAN address. There is no override, and there will not be one |
+| **`Refused to contact "…"`** | The egress guard: that address is not on a private network | Intended. Use a LAN address. The one override is `SENTINEL_ALLOW_PUBLIC_SOURCES=1` in the environment of the process — for a camera on a routed private WAN, never for the Internet. It is an environment variable so it cannot be ticked by accident, the product never sets it, and every start and every connection it allows is logged at WARNING with the address |
 | **`Failed to load Python DLL '…\_internal\python3xx.dll'`** | An executable was run away from the `_internal` folder beside it — most often one out of `build/`, which is PyInstaller's scratch directory and not the product | Run from `dist/SentinelVision/`. `python tasks.py package` now deletes those stubs |
 | **The console exits immediately, packaged** | An exception before the window appeared | Run `SentinelVision-dev.exe` — that is what it is for |
 | **A camera is listed but will not open** | In use by another application, blocked by a privacy setting, or not a capture device at all — a Windows Hello IR sensor lists as a camera and opens on nothing | `sentinel devices --probe` shows which ones actually open |

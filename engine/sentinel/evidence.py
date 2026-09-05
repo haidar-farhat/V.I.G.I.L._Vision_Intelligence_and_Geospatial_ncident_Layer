@@ -52,7 +52,9 @@ EXPORT_FORMAT_VERSION = 1
 #: Bumped when the *system* changes in a way that affects what it concludes.
 #: Recorded in every export, because "which build said this" is a question that
 #: gets asked long after the build has been replaced.
-APPLICATION_VERSION = "0.1.0"
+# One source for the version: `sentinel.version`. Kept under this name because
+# it is what the manifest and the report have always been written from.
+from .version import __version__ as APPLICATION_VERSION, describe as _describe_build
 
 
 class ExportError(RuntimeError):
@@ -340,7 +342,7 @@ def _readable_report(incident: Incident, exported_by: str, at: datetime) -> str:
         "-" * 70,
         f"  Exported by   {exported_by}",
         f"  Exported at   {at:%Y-%m-%d %H:%M:%S} UTC",
-        f"  Application   Sentinel Vision {APPLICATION_VERSION}",
+        f"  Application   {_describe_build()}",
         f"  Format        {EXPORT_FORMAT_VERSION}",
         f"  Platform      {platform.platform()}",
         f"  Python        {sys.version.split()[0]}",

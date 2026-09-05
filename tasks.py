@@ -200,6 +200,17 @@ def cli() -> None:
 #: the notes written into the folder must not be able to disagree.
 EXECUTABLES = ("SentinelVision", "SentinelVision-dev", "sentinel")
 
+#: Appended to the run notes at package time, when the build is known. Kept
+#: apart from RUN_NOTES so the notes can be rendered without a build — which
+#: is what the test of them does.
+BUILD_NOTES = """
+Build
+=====
+
+This is {build}. `build.json` beside the executables says the same, and
+`sentinel{suffix} where` prints it — quote it in any bug report.
+"""
+
 RUN_NOTES = """Sentinel Vision
 ===============
 
@@ -229,6 +240,28 @@ console detects motion only, and says so in its toolbar.
 
 Documentation: docs/USAGE.md in the source repository.
 """
+
+
+def _commit() -> str | None:
+    """The short commit the bundle is built from, ``+dirty`` if the tree has
+    uncommitted changes, ``None`` when git cannot say."""
+    try:
+        head = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"], cwd=ROOT,
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        if head.returncode != 0:
+            return None
+        dirty = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=no"], cwd=ROOT,
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    commit = head.stdout.strip() or None
+    if commit and dirty.stdout.strip():
+        commit += "+dirty"
+    return commit
 
 
 def bundle_in_use() -> list[str]:
@@ -343,8 +376,17 @@ def package() -> None:
     # fallback if something went wrong, right up until there is a real bundle.
     stripped = strip_work_executables(work)
 
+    # Stamp the bundle. A frozen build cannot ask git, so the answer to
+    # "which build is this" is written down beside the executables now.
+    sys.path.insert(0, str(ENGINE))
+    from sentinel.version import build_info, write_build_file
+
+    stamp = write_build_file(produced, commit=_commit())
+    build = build_info(stamp).describe()
+
+    suffix = ".exe" if sys.platform == "win32" else ""
     (produced / "HOW TO RUN.txt").write_text(
-        RUN_NOTES.format(suffix=".exe" if sys.platform == "win32" else ""),
+        RUN_NOTES.format(suffix=suffix) + BUILD_NOTES.format(build=build, suffix=suffix),
         encoding="utf-8",
     )
 
@@ -360,6 +402,8 @@ def package() -> None:
         for model in models:
             shutil.copy2(model, target / model.name)
 
+    print()
+    print(f"  {build}")
     print()
     print("  Run it from here, and nowhere else:")
     print()

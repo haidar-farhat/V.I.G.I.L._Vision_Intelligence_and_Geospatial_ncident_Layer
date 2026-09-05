@@ -247,3 +247,49 @@ def test_no_handler_can_reach_the_network():
 
     assert not leaked, f"logging must not be able to reach {sorted(leaked)}"
     assert "logging.config" not in used
+
+
+# ------------------------------------------------------ crash diagnostics
+
+
+def test_a_hard_crash_would_leave_its_trace_beside_the_log(tmp_path: Path):
+    """A segfault or an abort never reaches the Python log; `faulthandler`
+    writes every thread's stack to crash.log from C at the moment it happens."""
+    import faulthandler
+
+    logs.configure(file=tmp_path / "sentinel.log", console=False)
+
+    assert faulthandler.is_enabled()
+    crash = logs.crash_log_path()
+    assert crash is not None and crash.parent == tmp_path and crash.name == "crash.log"
+    assert crash.is_file()
+
+    # A dump on demand proves the handler really writes there.
+    faulthandler.dump_traceback(file=logs._crash_handle, all_threads=False)
+    logs._crash_handle.flush()
+    assert "test_a_hard_crash_would_leave_its_trace_beside_the_log" in crash.read_text(encoding="utf-8")
+
+
+def test_no_file_log_means_no_crash_file_and_no_error(tmp_path: Path):
+    logs.configure(file="", console=False)
+    assert logs.crash_log_path() is None
+
+
+def test_the_log_opens_with_the_build_it_was_written_by(tmp_path: Path):
+    from sentinel import version
+
+    target = tmp_path / "sentinel.log"
+    logs.configure(file=target, console=False)
+    for handler in logging.getLogger("sentinel").handlers:
+        handler.flush()
+    assert f"Sentinel Vision {version.__version__}" in target.read_text(encoding="utf-8")
+
+
+def test_the_egress_override_is_announced_at_start_up(tmp_path: Path, monkeypatch, caplog):
+    monkeypatch.setenv("SENTINEL_ALLOW_PUBLIC_SOURCES", "1")
+    target = tmp_path / "sentinel.log"
+    logs.configure(file=target, console=False)
+    for handler in logging.getLogger("sentinel").handlers:
+        handler.flush()
+    text = target.read_text(encoding="utf-8")
+    assert "WARNING" in text and "SENTINEL_ALLOW_PUBLIC_SOURCES is set" in text

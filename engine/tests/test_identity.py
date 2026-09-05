@@ -324,10 +324,19 @@ def make_site(**overrides) -> Site:
     return Site(**fields)
 
 
-def test_migration_nine_is_the_newest_and_carries_a_way_back():
-    newest = MIGRATIONS[-1]
-    assert newest.version == 9 and newest.name == "site_identity"
-    assert newest.down.strip(), "an upgrade with no way back is a gamble on an air-gapped machine"
+def test_the_identity_switch_and_the_declared_flag_each_carry_a_way_back():
+    """Migration 9 put the switch on the site row; migration 10 added the
+    `declared` flag that keeps the node's own placeholder row from freezing an
+    origin nobody chose. Both must be undoable on an air-gapped machine."""
+    by_version = {migration.version: migration for migration in MIGRATIONS}
+    assert by_version[9].name == "site_identity"
+    assert by_version[10].name == "site_declared"
+    assert MIGRATIONS[-1].version == 10, "a newer migration arrived; check it below too"
+    for migration in MIGRATIONS:
+        assert migration.down.strip(), (
+            f"migration {migration.version} ({migration.name}) has no way back — "
+            "an upgrade with no way back is a gamble on an air-gapped machine"
+        )
 
 
 def test_a_site_saved_with_plates_on_reads_back_so():
@@ -360,20 +369,25 @@ def test_the_identity_columns_refuse_a_third_value():
             store._connection.execute("UPDATE sites SET identity_faces = 2")
 
 
-def test_migration_nine_arrives_and_leaves_and_an_old_site_row_reads_as_off():
-    """Up, down and up again on a database with a site in it.
+def test_the_site_row_survives_its_switch_and_flag_leaving_and_reads_as_off_and_declared():
+    """Down twice, then up again, on a database with a site in it.
 
-    The down must take the flags and leave the site: a build that predates the
-    switch cannot honour it, and losing the site's origin along with it would
+    The downs must take the flags and leave the site: a build that predates
+    them cannot honour them, and losing the site's origin along with them would
     re-anchor every zone on the plan view. Coming back up, a row written before
     the columns existed — which is what the rolled-back row now is — must read
-    as everything off. Off is the only honest reading of "nobody asked", and a
-    reader that guessed on would run a face model on a site that never agreed.
+    as everything off, and as *declared*. Off is the only honest reading of
+    "nobody asked" for a switch that starts biometric processing; declared is
+    the safe reading for the flag, because a placeholder read as declared
+    freezes an origin while a declared row read as a placeholder moves one.
     """
     with Store(":memory:") as store:
         store.save_site(make_site(identity=Identity(plates=True, faces=True)))
         before = store.applied_versions()
 
+        undone = store.rollback()
+        assert undone is not None and undone.name == "site_declared"
+        assert "declared" not in store.column_names("sites"), "the flag survived its own down"
         undone = store.rollback()
         assert undone is not None and undone.name == "site_identity"
         columns = store.column_names("sites")
@@ -394,6 +408,10 @@ def test_migration_nine_arrives_and_leaves_and_an_old_site_row_reads_as_off():
         assert restored.origin.lat == pytest.approx(SITE.lat)
         assert restored.identity == Identity(), (
             "a row written before the switch existed came back with something on"
+        )
+        assert restored.declared is True, (
+            "a row written before the flag existed must read as declared: the "
+            "other reading moves an origin somebody chose"
         )
 
 
@@ -1084,7 +1102,10 @@ def test_the_plate_reader_is_built_from_the_models_directory_only_when_plates_ar
     assert built[0].detector_path == empty_models / "plate-detector.onnx"
     assert built[0].recogniser_path == empty_models / "plate-recogniser.onnx"
     assert built[0].charset_path == empty_models / "plate-charset.txt"
-    assert isinstance(handed, _RecordingPlateReader)
+    # Behind the switch, so that plates *off* stops it at its next read rather
+    # than at the camera's next restart; the reader itself is the one built.
+    assert isinstance(handed, node_module._SwitchedPlateReader), type(handed)
+    assert isinstance(handed.reader, _RecordingPlateReader)
     assert "plates: on" in status and "no models" not in status
 
 
@@ -1177,3 +1198,84 @@ def test_the_whole_engine_still_imports_no_qt_with_identity_wired():
     )
 
     assert result.returncode == 0, f"the engine dragged in Qt: {result.stdout.strip()}"
+
+
+# --------------------------------------------- the switch reaches a running reader
+
+_A_POSE = CameraPose(
+    position=SITE, mount_height=6.0, heading=180.0, pitch=-22.0,
+    horizontal_fov=62.0, vertical_fov=36.0, range_meters=90.0,
+)
+
+
+
+def test_the_switched_reader_reads_only_while_the_site_says_plates_are_on():
+    """`_SwitchedPlateReader` is what a pipeline is handed, so that plates
+    *off* reaches a running camera at its next read. The pipeline's own
+    bookkeeping carries on over an empty answer."""
+    import threading
+
+    from sentinel import node as node_module
+
+    inner = _RecordingPlateReader()
+    switch = threading.Event()
+    switch.set()
+    wrapped = node_module._SwitchedPlateReader(inner, switch)
+    assert wrapped.country == inner.country
+    assert wrapped.reader is inner
+
+    wrapped.read(None, None, frame_index=1)
+    assert inner.calls == 1
+
+    switch.clear()
+    assert wrapped.read(None, None, frame_index=2) == ()
+    assert inner.calls == 1, "the site said no and the reader was still asked"
+
+    switch.set()
+    wrapped.read(None, None, frame_index=3)
+    assert inner.calls == 2
+
+
+def test_turning_plates_off_clears_the_switch_every_running_reader_watches(tmp_path: Path):
+    with Node(tmp_path / "n.db", plate_reader=_RecordingPlateReader()) as node:
+        node.set_identity(Identity(plates=True), reason="gate access list")
+        assert node._plates_on.is_set()
+        node.set_identity(Identity(plates=False), reason="no longer needed")
+        assert not node._plates_on.is_set()
+
+
+# ------------------------------------------------ the node's placeholder site row
+
+
+def test_the_switch_written_before_any_camera_is_placed_does_not_freeze_the_origin(
+    tmp_path: Path, reference_video: Path
+):
+    """A node that turned plates on before its first camera was placed once
+    kept the site at (0, 0) for good, with every camera placed afterwards
+    anchored on the Gulf of Guinea. The row `set_identity` writes carries the
+    switch and is marked undeclared; the origin keeps following the cameras."""
+    with Node(tmp_path / "n.db", plate_reader=_RecordingPlateReader()) as node:
+        node.set_identity(Identity(plates=True), reason="gate access list")
+        assert node.store.site().declared is False, "the node's own row claimed to be declared"
+        assert node.site().origin == LatLon(0.0, 0.0), "nothing is placed, so there is nowhere"
+
+        node.add_camera(reference_video, camera_id="gate")
+        node.place_camera("gate", _A_POSE)
+
+        derived = node.site()
+        assert derived.identity.plates is True, "the switch was lost with the origin"
+        assert derived.origin == _A_POSE.position, "the origin froze on the placeholder"
+        assert derived.declared is False
+
+
+def test_a_declared_site_is_returned_as_it_is_whatever_the_cameras_say(
+    tmp_path: Path, reference_video: Path
+):
+    elsewhere = LatLon(SITE.lat + 0.01, SITE.lon + 0.01)
+    with Node(tmp_path / "n.db") as node:
+        node.store.save_site(make_site(origin=elsewhere))
+        node.add_camera(reference_video, camera_id="gate")
+        node.place_camera("gate", _A_POSE)
+        site = node.site()
+        assert site.declared is True
+        assert site.origin == elsewhere, "a declared origin was second-guessed from the cameras"

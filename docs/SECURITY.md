@@ -195,6 +195,17 @@ routable host needs to know exactly what stopped them and that it was deliberate
 > Refused to contact "…". Sentinel Vision operates without Internet access by
 > design and never falls back to an online service.
 
+**There is one override, and it is loud.** `SENTINEL_ALLOW_PUBLIC_SOURCES=1`
+in the environment of the process lets a camera that resolves to a routable
+address through — for a camera on a routed private WAN, not for the Internet.
+It is an environment variable rather than a setting so that it cannot be
+ticked by accident; the product never sets it; `logs.configure` says at
+WARNING on every start that it is set; and `VideoSource._require_private` logs
+every connection it allows, with the address. An earlier version of this
+document and of USAGE said there was no override. There was, in the code and
+in the refusal's own message, and a control described wrongly is worse than one
+described not at all.
+
 **Scope, stated honestly.** The guard is on the decode path, which is the only
 place this build opens an outbound socket. It is *not* a process-wide socket
 filter: when the control plane and node pairing are built, each will need the

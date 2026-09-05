@@ -55,6 +55,19 @@ LEVEL_VARIABLE = "SENTINEL_LOG_LEVEL"
 #: file handler entirely, which is what a container wants — its log is stdout.
 FILE_VARIABLE = "SENTINEL_LOG_FILE"
 
+#: The egress guard's one override (see `decode.py`). Read here only to say,
+#: at start-up, that it is set.
+PUBLIC_SOURCES_VARIABLE = "SENTINEL_ALLOW_PUBLIC_SOURCES"
+
+#: Where a hard crash leaves its trace. A segfault, an abort, a heap corruption
+#: — the 0xC0000374 that once ended a green test run with nothing but an exit
+#: code — never reaches the Python log, because the interpreter is not there
+#: to write it. `faulthandler` writes every thread's Python stack to this file
+#: at the moment of the crash, from C, with no allocation.
+CRASH_FILE = "crash.log"
+_crash_handle = None
+_faulthandler_was_enabled = False
+
 OPERATOR_FORMAT = "%(asctime)s  %(levelname)-7s  %(name)-22s  %(message)s"
 DEVELOPER_FORMAT = (
     "%(asctime)s.%(msecs)03d  %(levelname)-7s  %(name)-26s  "
@@ -213,7 +226,52 @@ def configure(
         target or "disabled",
         logging.getLevelName(recorded),
     )
+    # The build, on the first line of every log. A log that cannot say which
+    # build wrote it is a log that has to be matched to one by its dates.
+    from .version import describe
+
+    logger.info("%s", describe())
+    if os.environ.get(PUBLIC_SOURCES_VARIABLE, "").strip().lower() not in ("", "0", "false", "no"):
+        # The one override of the egress guard, said out loud once per process
+        # so that a machine reaching routable addresses never does so quietly.
+        logger.warning(
+            "%s is set: the egress guard will let camera addresses outside the "
+            "local network through. Every connection it allows is logged.",
+            PUBLIC_SOURCES_VARIABLE,
+        )
+    if target is not None:
+        _enable_crash_log(target.parent)
     return logger
+
+
+def _enable_crash_log(directory: Path) -> Path | None:
+    """Point `faulthandler` at ``crash.log`` beside the log. Never fails."""
+    global _crash_handle, _faulthandler_was_enabled
+
+    import faulthandler
+
+    _faulthandler_was_enabled = faulthandler.is_enabled()
+    path = directory / CRASH_FILE
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        handle = open(path, "a", encoding="utf-8")  # noqa: SIM115 - held for the process's life
+    except OSError:
+        return None
+    # `enable` again replaces the file. Held open on purpose: at the moment it
+    # is needed there is no later in which to open one.
+    faulthandler.enable(file=handle, all_threads=True)
+    if _crash_handle is not None and _crash_handle is not handle:
+        try:
+            _crash_handle.close()
+        except OSError:
+            pass
+    _crash_handle = handle
+    return path
+
+
+def crash_log_path() -> Path | None:
+    """Where the crash trace goes, or ``None`` when no file log is configured."""
+    return Path(_crash_handle.name) if _crash_handle is not None else None
 
 
 def _log_file(file: Path | str | None) -> Path | None:
@@ -244,7 +302,7 @@ def reset() -> None:
     A test that configures logging must not leave handlers attached to a
     process-wide logger for every test that follows.
     """
-    global _configured
+    global _configured, _crash_handle
 
     logger = logging.getLogger(ROOT)
     for handler in list(logger.handlers):
@@ -252,3 +310,18 @@ def reset() -> None:
         handler.close()
     logger.setLevel(logging.NOTSET)
     _configured = False
+    if _crash_handle is not None:
+        import faulthandler
+
+        # Back to whatever was there before — pytest's own handler on stderr,
+        # usually — rather than off, so a native crash in the rest of a test
+        # session still says where it happened.
+        if _faulthandler_was_enabled:
+            faulthandler.enable()
+        else:
+            faulthandler.disable()
+        try:
+            _crash_handle.close()
+        except OSError:
+            pass
+        _crash_handle = None
