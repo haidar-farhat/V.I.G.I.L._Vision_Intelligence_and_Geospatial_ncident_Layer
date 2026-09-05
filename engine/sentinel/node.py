@@ -547,6 +547,12 @@ class CameraRunner:
         return recorder.stats if recorder is not None else None
 
     @property
+    def recording_fault(self) -> str | None:
+        """Why a recorder that was asked for never started, or ``None``."""
+        pipeline = self._pipeline
+        return pipeline.recording_fault if pipeline is not None else None
+
+    @property
     def skipped(self) -> int:
         """Results published that nobody ever collected.
 
@@ -892,7 +898,10 @@ def _health_for(record: CameraRecord) -> CameraHealth:
         recording=recorder is not None and running and recorder.fault is None,
         clips_written=recorder.segments_written if recorder is not None else 0,
         bytes_recorded=recorder.bytes_written if recorder is not None else 0,
-        recording_fault=recorder.fault if recorder is not None else None,
+        recording_fault=(
+            (recorder.fault if recorder is not None else None)
+            or (getattr(runner, "recording_fault", None) if runner is not None else None)
+        ),
     )
 
 
@@ -2922,6 +2931,8 @@ class Node:
                     f"{recorder.bytes_written / 1024 / 1024:.1f} MiB"
                     + (f", STOPPED EARLY: {recorder.fault}" if recorder.fault else "")
                 )
+            elif record.runner is not None and getattr(record.runner, "recording_fault", None):
+                lines.append(f"    recording     UNAVAILABLE: {record.runner.recording_fault}")
             elif record.record:
                 lines.append("    recording     asked for; begins when the camera starts")
         lines.append(f"  incidents       {len(self._incidents)}")

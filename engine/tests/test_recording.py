@@ -834,3 +834,35 @@ def test_preserving_evidence_is_audited(recorded_incident):
 
     assert "recording.preserved" in actions
     assert "incident.exported" in actions
+
+
+# --------------------------------------------------- a camera id on a disk
+
+
+def test_a_camera_id_is_made_safe_for_a_file_system():
+    from sentinel.recording import file_safe
+
+    assert file_safe("device:0") == "device-0"
+    assert file_safe("gate") == "gate"
+    assert file_safe("rtsp://admin@10.0.0.5/s") == "rtsp-admin-10.0.0.5-s"
+    assert file_safe("a/../b") == "a-..-b"
+    assert file_safe("::") == "camera"
+    assert file_safe("") == "camera"
+
+
+def test_a_camera_called_device_colon_zero_records_a_clip_with_no_colon_in_its_name(tmp_path: Path):
+    """The first packaged run to ask for recording died in `mkdir` on
+    `recordings/device:0`. The id stays the id — the index and the evidence
+    name the camera as the operator does — and the disk gets a safe name."""
+    recorder = Recorder("device:0", tmp_path / "rec", live=False, fps=15.0)
+    recorder.start()
+    for frame in frames(12):
+        recorder.offer(frame)
+    segments = recorder.close()
+
+    assert segments, "nothing was recorded"
+    for segment in segments:
+        assert segment.camera_id == "device:0"
+        assert ":" not in segment.path.name
+        assert segment.path.name.startswith("device-0_")
+        assert segment.path.is_file()

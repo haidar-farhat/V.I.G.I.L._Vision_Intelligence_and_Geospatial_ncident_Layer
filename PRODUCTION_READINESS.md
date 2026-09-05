@@ -99,10 +99,13 @@ real camera is the test medium.
 | `python tasks.py exetest` run 1 (09:03, exe 09:02) | Pipeline real: 1,335 frames, 1,259 detections, one `person` at 0.86 held 28.2 s, **no couch, no bottle**, status line `watching bicycle, bus, car, motorcycle, person, truck with masks · ≥ 0.50`. The operator clicked Place… and Add zone… during the run: **both raised on a deleted dialog** (the defect since fixed); the report died printing `≥` to a cp1252 console; the camera picture went into an NTFS alternate stream. Tool verdict FAIL | `dist/exetest/20260905-090322/` — `console.png`, `stderr.txt` |
 | exetest run 2 (09:17, exe 09:16) | Dialog fixes in; watch list active (`6 class name(s)`); a person tracked; the window was closed by hand at 12 s, before the timer, so no picture and no summary were left. Tool verdict FAIL — which led to `_conclude_timed_run` on close | `dist/exetest/20260905-091709/` |
 | exetest run 3 (09:25, exe 09:24) | **PASS with a caveat**: 32.9 s wall for `--for 30`, 570 frames analysed, six pictures including `camera-device-0.png`, summary printed, no exception logged, closed itself; nobody was in front of the camera, so 0 detections | `dist/exetest/20260905-092516/` |
-| Console suite after all fixes | 374 passed | offscreen, 2026-09-05 |
+| Console suite after all fixes | 382 passed (374 before the to-dos) | offscreen, 2026-09-05 |
 | `test_identity.py` brought up to date with migration 10 and the switched reader, plus 4 tests for what they promise | 40 passed | 2026-09-05, after `continue` |
 | `python tasks.py ci --package` on the green tree | **green**, all 13 stages: source audit (after it caught an `rtsp://…` in a new docstring, reworded), binary audit, docs lint, rustfmt, clippy, `cargo test` (60), release build, engine (162.9 s), console (91.9 s), engine with the network poisoned (advisory, passed), package (265.7 s), `sentinel.exe where` and `coverage` launch checks | `scratchpad/ci3.log`, executables 10:05 |
 | exetest run 4 (10:06, the CI-built exe) | **PASS with a caveat**: 34.3 s wall, 427 frames, six pictures, summary, no exception, closed itself; nobody in frame | `dist/exetest/20260905-100625/` |
+| exetest run 5 (10:48, `--record`, exe 10:47) | **FAIL, and a real one**: `Recorder.start()` did `mkdir` on `recordings/device:0`, Windows refused the colon, the camera's pipeline died before a frame and no clip was written. Fixed: `recording.file_safe()` for folders, clips and pictures; the pipeline guards the recorder's start and reports `recording_fault` while the analysis continues (4 tests) | `dist/exetest/20260905-104755/stderr.txt` |
+| `python tasks.py ci --package` after the to-dos (11:02) | **green**, all 13 stages: engine 137.5 s, console 113.1 s, offline advisory passed, package 202 s, both launch checks | `scratchpad/ci5.log`, executables 11:02 |
+| exetest run 6 (11:02, `--record`, the CI-built exe) | **PASS with a caveat**: 32.9 s wall, 505 frames, **one clip, 3.4 MiB, `device-0_20260905-080245_00000000.mp4`, 17.5 fps measured**, six pictures, summary, no exception, closed itself; nobody in frame | `dist/exetest/20260905-110242/` |
 
 **Read together:** run 1 proves detection, tracking, the watch list and the
 floor on the shipped binary with a real person; runs 3 and 4 prove the timed
@@ -249,6 +252,7 @@ Must be resolved before production unless explicitly risk-accepted in writing.
 | XP-04 | Non-ASCII data directories; long paths; cp1252 |
 | DR-04 | Evidence-tampering response procedure |
 | UX-13 | The status bar's transient message is clipped by its permanent labels |
+| UX-16 | The camera list clips Status and hides the Record box behind a scrollbar at the default split |
 
 ---
 
@@ -557,6 +561,13 @@ transient message fully visible at 1280 px. **UX-14 · P4** the zone label
 `Room · restricted` sits on the camera marker at the default fit; offset labels
 away from markers. **UX-15 · P4** the dev executable's stdout is cp1252, so
 `≥` prints as `?` in `stdout.txt`; emit UTF-8 once the terminal story is decided.
+
+**UX-16 · P3 · The camera list clips its Status and Record columns at the
+default split.** In the sixth camera run's picture the CAMERAS panel is 640 px
+wide: Status is cut at "Stat", the `● rec 1 clip(s)` text is off to the right,
+and the Record box is behind a horizontal scrollbar. *Done when:* the panel's
+default share of the top splitter is wide enough for all five columns at
+1280 px, or Source elides first, and a test measures it.
 
 **UX-12 · P1 · Every dialog's OK path must be exercised by a test that presses
 OK the way Qt does.** *Why:* four dialogs were read after `exec()` with

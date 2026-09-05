@@ -2659,15 +2659,12 @@ def _report_uncaught(exc_type, exc_value, exc_traceback) -> None:
 
 
 def _file_safe(name: str) -> str:
-    """A camera id as a file name: letters, digits, dot, dash and underscore.
+    """A camera id as a file name. One rule, the recorder's: see
+    `sentinel.recording.file_safe` — the same colon that put a picture into an
+    alternate data stream stopped a recording from starting."""
+    from sentinel.recording import file_safe
 
-    Everything else becomes a dash and runs collapse, so `device:0` is
-    `device-0` and a network URL can never carry a path separator into the
-    directory the pictures are written to.
-    """
-    cleaned = "".join(ch if (ch.isalnum() or ch in "._-") else "-" for ch in name)
-    cleaned = "-".join(part for part in cleaned.split("-") if part)
-    return cleaned or "camera"
+    return file_safe(name)
 
 
 def _labels(text: str | None):

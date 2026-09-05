@@ -769,6 +769,31 @@ in the console) — REL-05 is the item that moves it; a flag set on a running
 camera applies at its next start and the status line says so; there is still
 no alert that leaves the process (OBS-01).
 
+**What the first camera run with `--record` found.** The camera's pipeline
+died before a frame: `Recorder.start()` does `mkdir` on
+`recordings/<camera_id>`, the id was `device:0`, and Windows refused the
+colon — `NotADirectoryError`, "device:0 stopped unexpectedly", no frames, no
+clips, and the exe test's new `--record` check called it FAIL. Two fixes:
+`recording.file_safe()` (one rule for the folder, the clip names and the
+console's pictures — `device:0` → `device-0`, the id itself unchanged in the
+index and the evidence), and the pipeline guards `Recorder(...).start()` so a
+recorder that cannot begin becomes `Pipeline.recording_fault`, reported in
+`CameraHealth.recording_fault`, the status cell and `summary()` as
+UNAVAILABLE while the analysis continues. The recorder is fed before analysis
+precisely so the two cannot take each other down; the guard is what makes
+that true at start-up too. Tests: a `device:0` camera records under
+`device-0/`; a recordings path that is a *file* leaves the camera analysing
+with the fault named.
+
+**Verification of the to-dos.** `python tasks.py ci --package`: green, all
+thirteen stages (engine 137.5 s, console 113.1 s, package 202 s, both launch
+checks), executables 11:02, `build.json` stamped `0.1.0 (f98d754+dirty, …)`.
+`python tasks.py exetest --seconds 30 --record` on that binary: PASS with the
+caveat that nobody was in frame — 505 frames, **one clip of 3.4 MiB written as
+`device-0_20260905-080245_00000000.mp4` at 17.5 fps measured**, six pictures,
+no exception, closed itself. Suites now: 60 Rust, 1,138 engine, 382 console.
+Everything is uncommitted.
+
 **Immediate:**
 
 1. **1.3 appearance re-ID.** The tracker fragments (17 tracks over 15 s on one

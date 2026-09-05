@@ -1893,3 +1893,47 @@ def test_the_sweep_waits_its_cadence_between_polls(tmp_path: Path, monkeypatch):
         node.poll()
         node.poll()
     assert swept == [1], "the first poll sweeps, and the next ones wait the cadence"
+
+
+def test_a_local_camera_id_records_into_a_directory_windows_can_make(
+    tmp_path: Path, reference_video: Path, site: CameraPose
+):
+    """`device:0` is the id every local camera gets, and `recordings/device:0`
+    is not a directory Windows will make. The packaged binary found out."""
+    with Node(tmp_path / "n.db", record_to=tmp_path / "rec", segment_seconds=2.0) as node:
+        node.add_camera(reference_video, camera_id="device:0", pose=site)
+        node.run_forever()
+        assert node.camera("device:0").runner.stats.frames > 0
+        assert node.camera("device:0").runner.fault is None
+        assert node.camera_health()["device:0"].recording_fault is None
+
+    with Store(tmp_path / "n.db") as store:
+        segments = list(store.segments())
+        assert segments, "nothing was recorded"
+        assert all(segment.camera_id == "device:0" for segment in segments)
+        assert all(":" not in segment.path.name for segment in segments)
+        assert (tmp_path / "rec" / "device-0").is_dir()
+
+
+def test_a_recorder_that_cannot_start_does_not_stop_the_analysis(
+    tmp_path: Path, reference_video: Path, site: CameraPose
+):
+    """Recording that cannot begin is a fault to report, not a reason to stop
+    watching. The recordings directory here is a *file*, so the recorder's
+    `mkdir` fails the way it did on the packaged binary."""
+    blocker = tmp_path / "blocker"
+    blocker.write_bytes(b"not a directory")
+
+    with Node(tmp_path / "n.db", record_to=blocker, segment_seconds=2.0) as node:
+        node.add_camera(reference_video, camera_id="gate", pose=site)
+        node.run_forever()
+        runner = node.camera("gate").runner
+        assert runner.stats.frames > 0, "the analysis stopped with the recorder"
+        assert runner.fault is None, "the recorder's failure was reported as the camera's"
+        health = node.camera_health()["gate"]
+        assert health.recording is False
+        assert health.recording_fault and "Error" in health.recording_fault
+        assert "UNAVAILABLE" in node.summary()
+
+    with Store(tmp_path / "n.db") as store:
+        assert store.recording_count() == 0

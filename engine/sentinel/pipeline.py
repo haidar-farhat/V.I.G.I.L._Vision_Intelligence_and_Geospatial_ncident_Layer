@@ -59,7 +59,7 @@ from .plates import (
 from .zones import Zone, ZoneEvaluator
 
 from .logs import get as _get_logger
-from .recording import Recorder
+from .recording import Recorder, file_safe
 
 _log = _get_logger(__name__)
 
@@ -294,6 +294,7 @@ class Pipeline:
                  "_correlator", "_recent_events", "_event_retention",
                  "_resolved_epoch", "_epoch_basis",
                  "_record_to", "_segment_seconds", "_on_segment", "_recorder",
+                 "_recording_fault",
                  "_stopping", "_stream",
                  "_plate_reader", "_plate_settings", "_plates", "_vehicle_class_ids",
                  "_plate_last", "_plate_next_read", "_plate_stride", "_plate_fault")
@@ -367,6 +368,7 @@ class Pipeline:
         self._segment_seconds = segment_seconds
         self._on_segment = on_segment
         self._recorder: Recorder | None = None
+        self._recording_fault: str | None = None
 
         # Plate reading is opt-in for the same reason recording is: it costs a
         # crop and two model calls per vehicle per frame, and a camera watching
@@ -492,6 +494,19 @@ class Pipeline:
         """The recorder, once :meth:`run` has started one."""
         return self._recorder
 
+    @property
+    def recording_fault(self) -> str | None:
+        """Why no recorder is running although one was asked for, or ``None``.
+
+        Distinct from `RecorderStats.fault`, which is a recorder that started
+        and then died. This is one that never started — a directory that
+        could not be made, a codec the build lacks — and the analysis went on
+        without it. Read the way `plate_fault` is read: a camera that was
+        asked to record and is not must never report the same line as one
+        that is.
+        """
+        return self._recording_fault
+
     def ask_to_stop(self) -> None:
         """End a live run. Safe from any thread, and returns immediately."""
         self._stopping.set()
@@ -516,20 +531,38 @@ class Pipeline:
         )
 
         if self._record_to is not None:
-            self._recorder = Recorder(
-                self._source.source_id,
-                self._record_to / self._source.source_id,
-                fps=info.fps,
-                # A file must not lose frames; a camera must not build a
-                # backlog. The whole difference is this argument.
-                live=info.is_live,
-                # A file's frames are stamped from the start of the recording,
-                # and retention works in days.
-                epoch_millis=self._wall_clock_epoch(),
-                segment_seconds=self._segment_seconds,
-                on_segment=self._on_segment,
-            )
-            self._recorder.start()
+            # Guarded, because the first packaged camera run died here: the
+            # camera id was `device:0`, the directory `recordings/device:0`
+            # cannot exist on Windows, `start()` raised in `mkdir`, and the
+            # whole camera stopped before a frame was analysed. Recording that
+            # cannot begin is a fault to report, not a reason to stop watching
+            # — the recorder is fed *before* analysis precisely so that the two
+            # cannot take each other down.
+            try:
+                recorder = Recorder(
+                    self._source.source_id,
+                    # A camera id is not a directory name: see `file_safe`.
+                    self._record_to / file_safe(self._source.source_id),
+                    fps=info.fps,
+                    # A file must not lose frames; a camera must not build a
+                    # backlog. The whole difference is this argument.
+                    live=info.is_live,
+                    # A file's frames are stamped from the start of the
+                    # recording, and retention works in days.
+                    epoch_millis=self._wall_clock_epoch(),
+                    segment_seconds=self._segment_seconds,
+                    on_segment=self._on_segment,
+                )
+                recorder.start()
+            except Exception as error:  # noqa: BLE001 - the disk is not the analysis
+                self._recording_fault = f"{type(error).__name__}: {error}"
+                _log.error(
+                    "%s: RECORDING UNAVAILABLE — %s. Analysis continues without it; "
+                    "nothing from this run will be on disk.",
+                    self._source.source_id, self._recording_fault,
+                )
+            else:
+                self._recorder = recorder
 
         _log.info(
             "%s: analysis started (detector %s, %s, %d zone(s), %d rule(s)%s)",

@@ -155,6 +155,21 @@ class RecorderStats:
         return self.frames_dropped / total if total else 0.0
 
 
+def file_safe(name: str) -> str:
+    """A camera id as a file or directory name.
+
+    Letters, digits, dot, dash and underscore survive; everything else becomes
+    a dash and runs collapse, so ``device:0`` — the id every local camera gets
+    — is ``device-0``. Windows reads the colon as a drive or an alternate
+    data stream: the first packaged camera run asked to record and its
+    pipeline died in ``mkdir`` on ``recordings/device:0`` before a frame was
+    analysed. A URL-shaped id can never carry a path separator either.
+    """
+    cleaned = "".join(ch if (ch.isalnum() or ch in "._-") else "-" for ch in str(name))
+    cleaned = "-".join(part for part in cleaned.split("-") if part)
+    return cleaned or "camera"
+
+
 def _unique_path(path: Path) -> Path:
     """A path nothing is already using.
 
@@ -524,7 +539,8 @@ class Recorder:
         wall = self._epoch_millis + frame.timestamp_millis
         stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime(wall / 1000))
         path = _unique_path(
-            self._directory / f"{self._camera_id}_{stamp}_{frame.index:08d}{CONTAINER}"
+            self._directory
+            / f"{file_safe(self._camera_id)}_{stamp}_{frame.index:08d}{CONTAINER}"
         )
 
         writer = cv2.VideoWriter(
