@@ -15,7 +15,7 @@ from enum import StrEnum
 from typing import Sequence
 
 from .events import Event, Severity, severity_rank
-from .geo import LatLon, haversine_distance
+from .geo import LatLon, distance_meters
 from .zones import ZoneKind
 
 DEFAULT_WINDOW_MILLIS = 120_000
@@ -86,7 +86,7 @@ def associate(events: Sequence[Event], *, window_millis: int = DEFAULT_WINDOW_MI
             pa, pb = _position_of(first), _position_of(second)
             if pa is None or pb is None:
                 continue
-            separation = haversine_distance(pa, pb)
+            separation = distance_meters(pa, pb)
             slack = min(MAX_UNCERTAINTY_ALLOWANCE_METERS,
                         (first.evidence.position_uncertainty_meters or 0.0) + (second.evidence.position_uncertainty_meters or 0.0))
             allowance = radius_meters + slack
@@ -151,7 +151,7 @@ def link_same_camera_fragments(events: Sequence[Event], *, radius_meters: float 
             point_a, point_b = _position_of(last), _position_of(first)
             if point_a is None or point_b is None:
                 continue
-            separation = haversine_distance(point_a, point_b)
+            separation = distance_meters(point_a, point_b)
             slack = min(MAX_UNCERTAINTY_ALLOWANCE_METERS,
                         (last.evidence.position_uncertainty_meters or 0.0) + (first.evidence.position_uncertainty_meters or 0.0))
             allowance = (radius_meters + slack) * FRAGMENT_ALLOWANCE_FRACTION
@@ -329,7 +329,7 @@ class Correlator:
                 continue
             slack = min(MAX_UNCERTAINTY_ALLOWANCE_METERS,
                         (event.evidence.position_uncertainty_meters or 0.0) + (other.evidence.position_uncertainty_meters or 0.0))
-            if haversine_distance(position, other_position) <= self._radius + slack:
+            if distance_meters(position, other_position) <= self._radius + slack:
                 return True
         return False
 

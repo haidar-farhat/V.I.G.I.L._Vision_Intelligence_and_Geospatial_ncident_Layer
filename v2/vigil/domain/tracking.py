@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from typing import Protocol, Sequence
 
 from .detection import BoundingBox, Detection
-from .geo import CameraPose, LatLon, PositionEstimate, Vec2, bearing_degrees, haversine_distance, project_point
+from .geo import CameraPose, LatLon, PositionEstimate, Vec2, bearing_degrees, distance_meters, project_point
 
 #: The most the distance gate widens for a track that has been missed.
 MAX_GATE_WIDENING = 3.0
@@ -206,6 +206,6 @@ class Tracker:
             track.speed_mps = None
             track.heading_degrees = None
             return
-        distance = haversine_distance(first_p, track.position.point)
+        distance = distance_meters(first_p, track.position.point)
         track.speed_mps = distance / (span / 1000.0)
         track.heading_degrees = bearing_degrees(first_p, track.position.point) if distance > 0.25 else None

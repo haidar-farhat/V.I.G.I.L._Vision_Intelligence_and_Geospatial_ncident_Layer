@@ -4,14 +4,14 @@ import pytest
 
 from vigil.domain.geo import (
     CameraPose, LatLon, PositionSource, Vec2, bearing_degrees, camera_sees, destination_point, field_of_view,
-    haversine_distance, image_coordinates, point_in_ring, project_point, project_to_ground, ray_angles,
+    distance_meters, image_coordinates, point_in_ring, project_point, project_to_ground, ray_angles,
 )
 
 
 def test_geodesy_round_trips_across_a_site():
     origin = LatLon(33.8938, 35.5018)
     there = destination_point(origin, 45.0, 100.0)
-    assert abs(haversine_distance(origin, there) - 100.0) < 0.01
+    assert abs(distance_meters(origin, there) - 100.0) < 0.01
     assert abs(bearing_degrees(origin, there) - 45.0) < 0.01
 
 
@@ -28,7 +28,7 @@ def test_a_point_projects_to_the_ground_with_a_stated_uncertainty(pose):
     expected = pose.mount_height / math.tan(math.radians(-ray_angles(pose, 0.5, 0.8)[1]))
     assert abs(projection.ground_distance_meters - expected) < 1e-6
     assert projection.uncertainty_meters > 0
-    assert abs(haversine_distance(pose.position, projection.position) - expected) < 0.01
+    assert abs(distance_meters(pose.position, projection.position) - expected) < 0.01
 
 
 def test_a_ray_at_the_horizon_projects_nowhere_and_falls_back_to_the_camera():
@@ -48,7 +48,7 @@ def test_beyond_range_is_refused_not_clamped():
 def test_the_field_of_view_is_an_annular_sector_and_empty_when_the_camera_sees_no_ground(pose):
     ring = field_of_view(pose, 8)
     assert len(ring) == 18, "far arc, then near arc back"
-    distances = [haversine_distance(pose.position, p) for p in ring]
+    distances = [distance_meters(pose.position, p) for p in ring]
     assert min(distances) > 1.0, "a tilted camera does not see its own feet"
     sky = CameraPose(LatLon(0, 0), 4.0, 0.0, 20.0)
     assert field_of_view(sky) == []
