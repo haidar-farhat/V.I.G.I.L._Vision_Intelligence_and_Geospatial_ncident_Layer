@@ -40,6 +40,7 @@ use crate::camera::{
 use crate::geodesy::{self, LatLon};
 use crate::ortho::{self, CellStats, GroundGrid, GroundSample, MedianAccumulator};
 use crate::track::KalmanBox;
+use crate::detect_post;
 use crate::triangulate::{self, Ray};
 
 /// Version of this ABI. Python checks it on load and refuses a mismatch
@@ -60,7 +61,10 @@ use crate::triangulate::{self, Ray};
 /// kind: a binding sending fourteen values where sixteen are read would have
 /// a ground plane tilted by whatever was next in memory, and every position
 /// from that camera would be quietly, plausibly wrong.
-pub const ABI_VERSION: u32 = 4;
+///
+/// **5** adds detection suppression. A new symbol again, so the hazard is the
+/// same as 3's: a new binding against an old library resolves it to nothing.
+pub const ABI_VERSION: u32 = 5;
 
 /// `[lat, lon, mount_height, heading, pitch, roll, hfov, vfov, range,
 /// k1, k2, p1, p2, k3, ground_tilt_east, ground_tilt_north]`.
@@ -859,6 +863,52 @@ pub unsafe extern "C" fn vigil_fit_plane(
     0
 }
 
+// ------------------------------------------------------ detection post-work
+
+/// Class-aware suppression over `count` boxes.
+///
+/// `xyxy` is `4 * count` readable `f64`; `scores` and `classes` are `count`
+/// each. Writes the kept indices into `out` (which must hold `count`) and
+/// returns how many, or -1 on a null or undersized buffer.
+///
+/// # Safety
+/// Every pointer must be readable for the length stated above; `out` must be
+/// writable for `count` `i64`.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn vigil_suppress(
+    xyxy: *const f64,
+    scores: *const f64,
+    classes: *const i64,
+    count: u32,
+    iou_threshold: f64,
+    soft: u32,
+    sigma: f64,
+    floor: f64,
+    out: *mut i64,
+) -> i32 {
+    if xyxy.is_null() || scores.is_null() || classes.is_null() || out.is_null() {
+        return -1;
+    }
+    if count == 0 {
+        return 0;
+    }
+    let n = count as usize;
+    let boxes = detect_post::Boxes {
+        xyxy: core::slice::from_raw_parts(xyxy, n * 4),
+        scores: core::slice::from_raw_parts(scores, n),
+        classes: core::slice::from_raw_parts(classes, n),
+    };
+    if boxes.xyxy.iter().any(|v| !v.is_finite()) || boxes.scores.iter().any(|v| !v.is_finite()) {
+        return -1;
+    }
+    let kept = detect_post::suppress_per_class(&boxes, iou_threshold, soft != 0, sigma, floor);
+    for (i, &index) in kept.iter().enumerate() {
+        *out.add(i) = index as i64;
+    }
+    kept.len() as i32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1039,6 +1089,6 @@ mod tests {
         }
         assert_eq!(out, [16, 5, 6, 5, 72, 8, 8]);
         assert_eq!(vigil_abi_version(), ABI_VERSION);
-        assert_eq!(ABI_VERSION, 4, "the pose grew its ground tilt");
+        assert_eq!(ABI_VERSION, 5, "detection suppression arrived");
     }
 }

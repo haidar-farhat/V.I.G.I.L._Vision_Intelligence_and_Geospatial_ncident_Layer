@@ -337,3 +337,32 @@ def _health(ctx: _Context) -> int:
         print(f"{cid:<16} {h.describe()}")
     print(json.dumps(build_info()))
     return 0
+
+
+def _evaluate(ctx: _Context) -> int:
+    """Score the detector against corrected labels.
+
+    Prints nothing but what was measured. There is no fallback that scores
+    something else when the corpus is unusable -- the refusals in
+    `service.evaluation` are the feature, and turning one into a warning
+    above a number would defeat the whole module.
+    """
+    from ..adapters.detectors import detector_for
+    from ..service.evaluation import EvaluationError, evaluate
+
+    model = Path(ctx.args.model) if ctx.args.model else ctx.settings.default_model()
+    if model is None:
+        print("error: no model to score. Supply one with --model, or put one where "
+              "`vigil where` says models live.", file=sys.stderr)
+        return 1
+    try:
+        detector = detector_for(model, confidence=ctx.args.confidence)
+        result = evaluate(Path(ctx.args.corpus), detector, detector.info.class_names,
+                          limit=ctx.args.limit)
+    except (EvaluationError, OSError, ValueError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    print(f"scored {Path(model).name} at confidence "
+          f"{ctx.args.confidence if ctx.args.confidence is not None else 'the built-in floor'}")
+    print(result.describe())
+    return 0

@@ -26,10 +26,12 @@ from ..service.runtime import RetentionPolicy, apply_retention
 from ..version import build_info, describe
 
 from .map_commands import add_arguments as _add_map_arguments
-from .site_commands import _cameras, _pose, _read_secret, _site, _users, _where, _zones
+from .site_commands import (
+    _cameras, _identity, _pose, _read_secret, _site, _users, _where, _zones,
+)
 from .work_commands import (
-    _alerts, _audit, _backup, _doctor, _events, _export, _health, _incidents, _restore, _retention,
-    _review, _run, _service, _supervise, _verify,
+    _alerts, _audit, _backup, _doctor, _evaluate, _events, _export, _health, _incidents,
+    _restore, _retention, _review, _run, _service, _supervise, _verify,
 )
 
 _log = logs.get(__name__)
@@ -175,6 +177,48 @@ def build_parser() -> argparse.ArgumentParser:
     cren = cc.add_parser("rename"); cren.add_argument("id"); cren.add_argument("name")
     cc.add_parser("remove").add_argument("id")
     cameras.set_defaults(handler=_cameras)
+
+    evaluate = commands.add_parser(
+        "eval", help="score the detector against labels a person corrected")
+    evaluate.add_argument("corpus", help="a folder written by `vigil dataset export`, with its "
+                                         "labels corrected")
+    evaluate.add_argument("--model", help="the ONNX model to score (default: the site's)")
+    evaluate.add_argument("--confidence", type=float,
+                          help="floor for this run. Lower than the running one to see what recall "
+                               "is available; the shipped default is what the site actually uses")
+    evaluate.add_argument("--limit", type=int, help="score at most this many frames")
+    evaluate.set_defaults(handler=_evaluate)
+
+    identity = commands.add_parser(
+        "identity",
+        help="faces, plates and the subject register — OFF by default (DECISIONS.md D-08)")
+    ic = identity.add_subparsers(dest="identity_command", required=True)
+    ic.add_parser("show", help="whether this site processes biometrics, and for how long it keeps them")
+    ion = ic.add_parser("enable", help="turn face and plate processing on")
+    ion.add_argument("--retention-days", type=int, required=True, dest="retention_days",
+                     help="days after which face and plate observations are deleted. Required: "
+                          "there is no 'keep for ever' option and `vigil doctor` fails on a site "
+                          "that reaches that state")
+    ion.add_argument("--reason", required=True,
+                     help="why this site processes biometrics, recorded against your name. No "
+                          "default, because this is the setting somebody will be asked about")
+    ioff = ic.add_parser("disable", help="turn it off")
+    ioff.add_argument("--reason", default="")
+    ioff.add_argument("--erase", action="store_true",
+                      help="also destroy every enrolled subject and observation. Irreversible, "
+                           "and deliberately not implied by turning the feature off")
+    ien = ic.add_parser("enrol", help="enrol a subject from an embedding file")
+    ien.add_argument("label")
+    ien.add_argument("--embedding", required=True, help="a JSON array of floats from your model")
+    ien.add_argument("--model", required=True, help="sha256 of the model that produced it")
+    ien.add_argument("--basis", required=True,
+                     help="why this person is enrolled — a case number, an instruction, a contract")
+    ien.add_argument("--note")
+    ic.add_parser("list", help="the enrolled subjects")
+    ifor = ic.add_parser("forget", help="erase a subject and every observation of them")
+    ifor.add_argument("id")
+    ic.add_parser("sweep", help="delete observations past the retention limit now")
+    identity.set_defaults(handler=_identity)
 
     zones = commands.add_parser("zones", help="named areas on the ground")
     zc = zones.add_subparsers(dest="zones_command", required=True)

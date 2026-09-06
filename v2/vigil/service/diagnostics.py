@@ -134,6 +134,34 @@ def _accounts(store) -> Check:
     return Check("accounts", State.OK, f"{len(active)} active of {len(store.users())}")
 
 
+def _identity(store) -> Check:
+    """Whether this site processes biometrics, and whether it says for how long.
+
+    **A FAIL, not a warning, when it is on with no retention limit.** An
+    unbounded biometric store is the worst thing this feature can become, and
+    the check has to be loud because the failure is entirely silent: nothing
+    looks wrong about a `face_observations` table with four million rows in
+    it, and nobody goes looking.
+
+    OK when it is off, which is where every site starts and most stay.
+    """
+    from .identity import IdentityService
+
+    state = IdentityService(store).state()
+    if not state.enabled:
+        return Check("identity", State.OK, "faces and plates are off")
+    if state.retention_days is None:
+        return Check("identity", State.FAIL,
+                     "faces and plates are ON with no retention limit, so biometric data is being "
+                     "kept for ever",
+                     "Set one now: `vigil identity enable --retention-days N --reason ...`, or "
+                     "turn it off with `vigil identity disable`.")
+    counted = store.biometric_counts()
+    return Check("identity", State.OK,
+                 f"faces and plates are on; {counted['subjects']} subject(s), observations "
+                 f"deleted after {state.retention_days} day(s)")
+
+
 def _site(store) -> Check:
     cameras = store.cameras()
     if not cameras:
@@ -296,6 +324,7 @@ def run_checks(settings, store, keychain, *, probe: bool = False) -> list[Check]
         lambda: _disk(settings),
         lambda: _accounts(store),
         lambda: _site(store),
+        lambda: _identity(store),
         lambda: _zones(store),
         lambda: _detection(settings, store),
         lambda: _threats(settings, store),

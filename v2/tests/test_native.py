@@ -218,7 +218,7 @@ def test_the_binding_refuses_a_core_that_is_not_the_right_core():
     # not export at all. ABI 4 grew the pose by the two ground tilts, and that
     # one is the dangerous kind: a short pose gives the core a ground plane
     # tilted by whatever was next in memory.
-    assert native.ABI_VERSION == 4
+    assert native.ABI_VERSION == 5
     assert native.EXPECTED_LAYOUT == (16, 5, 6, 5, 72, 8, 8)
     assert native.loaded_from() is not None and native.loaded_from().is_file()
 
@@ -397,3 +397,53 @@ def test_zero_tilt_reproduces_the_level_plane_exactly_on_both_sides():
             if a is not None:
                 assert a.position.lat == b.position.lat and a.position.lon == b.position.lon
                 assert a.ground_distance_meters == b.ground_distance_meters
+
+
+def test_the_two_suppressors_keep_exactly_the_same_boxes():
+    """Including which of two equal scores survives.
+
+    A quantised model emits equal scores constantly, and `argsort` is not
+    stable by default — so without a defined tie-break the Rust and the NumPy
+    would disagree now and then for a reason neither could be blamed for, on
+    a frame nobody could reproduce.
+    """
+    rng = np.random.default_rng(31)
+    for trial in range(30):
+        count = int(rng.integers(1, 120))
+        xyxy = np.empty((count, 4))
+        xyxy[:, 0] = rng.uniform(0, 0.9, count)
+        xyxy[:, 1] = rng.uniform(0, 0.9, count)
+        xyxy[:, 2] = xyxy[:, 0] + rng.uniform(0.01, 0.15, count)
+        xyxy[:, 3] = xyxy[:, 1] + rng.uniform(0.01, 0.15, count)
+        # Quantised to two decimals on purpose, so ties are common.
+        scores = np.round(rng.uniform(0.2, 0.99, count), 2)
+        classes = rng.integers(0, 4, count)
+        for soft in (False, True):
+            rust = native.suppress(xyxy, scores, classes, 0.45, soft=soft)
+            numpy_result = native._suppress_numpy(xyxy, scores, classes, 0.45, soft, 0.5, 0.2)
+            assert list(rust) == list(numpy_result), (
+                f"trial {trial}, soft={soft}: {list(rust)} vs {list(numpy_result)}")
+
+
+def test_suppression_is_fast_enough_that_tiling_can_afford_it():
+    """The measurement the kernel exists for. NumPy took 4.9 ms on 300
+    proposals and tiling runs suppression once per tile, so a five-pass frame
+    was spending most of its budget deciding what to throw away."""
+    import time
+
+    rng = np.random.default_rng(5)
+    count = 300
+    xyxy = np.empty((count, 4))
+    xyxy[:, 0] = rng.uniform(0, 0.9, count)
+    xyxy[:, 1] = rng.uniform(0, 0.9, count)
+    xyxy[:, 2] = xyxy[:, 0] + rng.uniform(0.02, 0.1, count)
+    xyxy[:, 3] = xyxy[:, 1] + rng.uniform(0.02, 0.1, count)
+    scores = rng.uniform(0.25, 0.99, count)
+    classes = rng.integers(0, 8, count)
+
+    native.suppress(xyxy, scores, classes, 0.45, soft=True)
+    started = time.perf_counter()
+    for _ in range(50):
+        native.suppress(xyxy, scores, classes, 0.45, soft=True)
+    each = (time.perf_counter() - started) * 1000 / 50
+    assert each < 1.0, f"soft suppression took {each:.3f} ms; NumPy did it in 4.9"

@@ -203,6 +203,57 @@ def _cameras(ctx: _Context) -> int:
         return 1
     return 0
 
+def _identity(ctx: _Context) -> int:
+    """Faces, plates and the subject register.
+
+    Every branch that changes anything goes through `IdentityService`, which
+    is where the switch, the audit and the refusals live. This function does
+    argument shuffling and printing and nothing else — the rules must not be
+    reachable from a second place with a different set of them.
+    """
+    import json
+
+    from ..domain.identity import IdentityError
+    from ..service.identity import IdentityService
+
+    service = IdentityService(ctx.store)
+    args, by = ctx.args, ctx.principal
+    try:
+        if args.identity_command == "show":
+            print(service.describe())
+        elif args.identity_command == "enable":
+            print(service.enable(args.retention_days, reason=args.reason, by=by).describe())
+        elif args.identity_command == "disable":
+            state = service.disable(reason=args.reason, by=by, erase=args.erase)
+            print(state.describe())
+        elif args.identity_command == "enrol":
+            try:
+                embedding = json.loads(Path(args.embedding).read_text(encoding="utf-8")
+                                       if Path(args.embedding).is_file() else args.embedding)
+            except (OSError, ValueError) as error:
+                print(f"error: --embedding is a JSON array of floats, or a file holding one: "
+                      f"{error}", file=sys.stderr)
+                return 1
+            subject = service.enrol(args.label, embedding, args.model, basis=args.basis,
+                                    by=by, note=args.note)
+            print(f"enrolled {args.label} as {subject}")
+        elif args.identity_command == "list":
+            register = service.register()
+            print(register.describe())
+            for subject in register.subjects:
+                print(f"{subject.id:<26} {subject.label:<24} {subject.model_sha256[:12]}")
+        elif args.identity_command == "forget":
+            print(f"erased: {service.forget(args.id, by=by)}")
+        elif args.identity_command == "sweep":
+            removed = service.sweep()
+            print(f"deleted {removed}" if removed else
+                  "nothing to sweep: no retention limit is set, so nothing expires")
+    except (IdentityError, AuthError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def _zones(ctx: _Context) -> int:
     site, args, by = ctx.site, ctx.args, ctx.principal
     try:

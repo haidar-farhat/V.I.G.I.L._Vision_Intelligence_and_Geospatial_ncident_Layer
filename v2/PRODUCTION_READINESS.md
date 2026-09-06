@@ -258,16 +258,23 @@ error with range.
 
 ### Blocking
 
-1. **There is no data pipeline, no dataset, and no evaluation.** The model is
-   an ONNX file the operator supplies; the one in this repository is stock
+1. **There is no labelled dataset.** Narrowed, not closed. The model is an
+   ONNX file the operator supplies; the one in this repository is stock
    `yolov8n-seg` COCO weights that have never seen this site, in this light,
-   at this mounting height. Nothing here measures precision, recall, or the
-   false-positive rate on the site it will run at, because there is nothing
-   to measure them against. **This is the single largest gap and no amount of
-   pipeline engineering closes it.** What would: a few thousand labelled
-   frames from the actual cameras, at the actual hours, split by *day* rather
-   than at random — a random split over consecutive frames leaks almost
-   perfectly and would produce a meaningless number.
+   at this mounting height. Nothing here has measured precision, recall or
+   the false-positive rate on the site it will run at.
+
+   What now exists on both sides of the gap: `vigil dataset export` writes the
+   corpus — frames, detector pre-labels to correct, and a split by **whole
+   days** — and `vigil eval` scores a detector against corrected labels and
+   **refuses a validation set sharing a day with training**, because a random
+   split over consecutive frames leaks almost perfectly and would produce a
+   flattering meaningless number.
+
+   **What is still missing is the labels themselves**, and no amount of
+   pipeline engineering closes that: it is a few hundred corrected frames per
+   camera, at the actual hours, and it needs a person. Every accuracy claim in
+   this document stays unmade until then.
 2. **Every appearance threshold is calibrated on synthetic scenes.** Solid
    colour blocks separate at a cosine distance of 0.56. Real clothing under
    real light will not, and the honest expectation is that

@@ -57,6 +57,8 @@ python tools/detector_options.py --clip CLIP.mp4   # how to make detection affor
 And the corpus running the product has already written:
 
 ```bash
+python -m vigil identity show                  # faces and plates: OFF, and why
+python -m vigil eval ./corpus                  # score the detector — refuses a leaking split
 python -m vigil dataset export --to ./corpus   # frames, pre-labels, split BY DAY
 python -m vigil site detection --detect-every 3  # 3x less detection, measured
 ```
@@ -191,9 +193,9 @@ not contain — which has already happened here once, quietly.
 
 | | |
 |---|---|
-| Product code | 18,946 lines of Python, 4,997 lines of Rust behind a C ABI |
-| Tests | 392 Python + 70 Rust, all green through `python tasks.py check` |
-| Capabilities | 39 tested, 2 implemented, 1 planned ([CAPABILITIES.md](CAPABILITIES.md)) |
+| Product code | 21,442 lines of Python, 5,351 lines of Rust behind a C ABI |
+| Tests | 436 Python + 77 Rust, all green through `python tasks.py check` |
+| Capabilities | 42 tested, 2 implemented, **0 planned** ([CAPABILITIES.md](CAPABILITIES.md)) |
 | Packaged | `vigil.exe` for the command line and `vigil-console.exe` for the window, sharing one `_internal` |
 
 **Two executables, one tree.** `vigil.exe` is console-subsystem so every
@@ -211,12 +213,17 @@ algorithms and `tests/test_native.py` holds them to the same answers — but
 `vigil map` is unavailable and association runs an order of magnitude slower.
 `vigil doctor` says which you have.
 
-Not built, and not pretended: faces, plates and a subject register
-(DECISIONS.md D-08); **any training or labelling pipeline** — the model is an
+Not built, and not pretended: **any training or labelling pipeline** — the model is an
 ONNX file the operator supplies and the shipped one is stock COCO weights,
 which have never seen this site; installers and code signing, which need a
 certificate; and **a model that can name a weapon**, which is the operator's
 to supply — the mechanism is here and tested, the weights are not.
+
+Faces, plates and the subject register **are** built, off by default behind one
+switch (`vigil identity show`), and every threshold in them is an assumption
+that says so: no face or plate model ships and none has been run. DECISIONS.md
+D-08 records that the gate for building them — an hour on a physical IP camera
+— was waived rather than met, by whom, and what is therefore unproven.
 [PRODUCTION_READINESS.md](PRODUCTION_READINESS.md) is the honest account of
 what is measured and what is not; [ROADMAP.md](ROADMAP.md) says what each of
 those needs.
@@ -225,6 +232,8 @@ those needs.
 
 | When (UTC) | What ran | Result |
 |---|---|---|
+| 2026-09-06 21:20 | packaged `vigil.exe`, `exetest --seconds 20 --record --console`, after the identity, suppression-kernel and evaluation work | **PASS in 24 s**, with migrations 6 to 9 applied inside the packaged build. Faces and plates ship **off**: `vigil identity show` reads "faces and plates are OFF: no face is embedded, no plate is read, and no biometric row is written". |
+| 2026-09-06 21:05 | the four Phase 8 candidates, measured before any was rewritten | The measurement decided what to write **and what not to**. NumPy soft-NMS on 300 proposals: **4.92 ms**, against about 12.5 ms for the detection itself — and tiling runs it once per tile. In Rust: **0.044 ms, 138x**, returning identical indices including ties. Two candidates on the same list were left alone after measuring: the assignment cost matrix at **5 microseconds** and mask decode at 0.9 ms. The appearance descriptor got neither — `cv2.calcHist` with a mask is 3.5x faster than indexing the pixels out and counting them in NumPy, with identical results over 300 randomised crops, so 12 detections went **3.61 ms to 1.49 ms** with no new implementation of a colour space to keep in step. |
 | 2026-09-06 20:19 | packaged `vigil.exe`, `exetest --seconds 20 --record --console`, after the pose calibration, triangulation, cross-camera, live-map and detection work | **PASS in 23 s.** The window carries the new *Measure pose…* control, and the status bar reads **watching 80 classes** rather than six. It detected and tracked a **cell phone** — a class the old frozen watch list made invisible to the detector, the tracker, the plan and the map — drew it, inferred `carried` between it and the person, and raised **no event** for it, which is the whole point of splitting what is detected from what is alerted on. Migrations 6, 7 and 8 applied inside the packaged build. |
 | 2026-09-06 20:18 | packaged `vigil.exe`, `exetest --seconds 25 --record` on `device:0` | **PASS in 29 s** at a sustained **20 fps** with the lowered 0.25 floor, soft-NMS and the full COCO vocabulary, on DirectML. |
 | 2026-09-06 20:28 | `tools/camera_check.py --seconds 75 --map` on `device:0` — the rebuilt detection path end to end | 1,491 frames in 75.3 s = **19.8 fps**, against 14.1 fps on the CPU path earlier the same day. **2.3 detections per frame** where the shipped 0.50 threshold and six classes produced 0.00 on the same view; 3 distinct track ids for 3 objects, so no fragmentation came with them. Detection 12.45 ms median. Map: **123 m² usable of 163 m² seen (75%)**. Tiling correctly did nothing — a 640x480 webcam is already below the model's 640x640 input, and cropping an image the model sees whole buys nothing. |

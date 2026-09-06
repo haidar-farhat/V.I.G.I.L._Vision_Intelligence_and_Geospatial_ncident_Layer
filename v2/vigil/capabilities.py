@@ -132,6 +132,26 @@ MANIFEST: tuple[Capability, ...] = (
                "re-identification across a gap — on the exponential-average tracker it replaced "
                "this would have been reckless. A per-site setting rather than a flag, because a "
                "service started at boot has nobody to type a flag at it"),
+    Capability("suppression", "Deciding which boxes to throw away, which was a third of detection",
+               State.TESTED,
+               ("vigil.kernel.native.suppress", "vigil.kernel.fallbacks._suppress_numpy"),
+               ("tests/test_native.py", "tests/test_tiling.py"),
+               "Measured before it was written, which is this repository's rule for a Rust kernel — and the "
+               "measurement also said what *not* to write. NumPy: hard NMS 3.14 ms and soft-NMS 4.92 ms on "
+               "300 proposals over 8 classes, against about 12.5 ms for the detection itself, so suppression "
+               "was a quarter to a third of detection and tiling runs it once per tile. In Rust: **0.044 ms, "
+               "138x**, with both implementations returning identical indices over randomised inputs "
+               "including ties — the ordering is defined as descending score then ascending index, because "
+               "`argsort` is not stable and a quantised model emits equal scores constantly. Two candidates "
+               "on the same list were measured and **left in Python**: the assignment cost matrix at 5 "
+               "microseconds and mask decode at 0.9 ms per frame, where a second implementation would cost "
+               "more to keep in step than it saves. The appearance descriptor was the third, and the answer "
+               "there was neither: `cv2.calcHist` with a mask does the same arithmetic 3.5x faster than "
+               "indexing the pixels out and counting them in NumPy — identical results over 300 randomised "
+               "crops — so 12 detections went from 3.61 ms to 1.49 ms with no new implementation of a colour "
+               "space to maintain. The honest limit: none of this shows up on a near-empty frame, because "
+               "suppression of one proposal is free. It bites on the busy frame, which is the frame you "
+               "cannot afford to drop"),
     Capability("engine-core", "The arithmetic that runs per pixel, in Rust behind a C ABI", State.TESTED,
                ("vigil.kernel.native.load", "vigil.kernel.native.ortho_sample",
                 "vigil.kernel.native.assign", "vigil.kernel.native.kalman_predict"),
@@ -314,7 +334,53 @@ MANIFEST: tuple[Capability, ...] = (
                "`vigil console`. No domain state in the view; every change through Commands with the principal. "
                "Structural tests hold the three v1 Qt rules: no lambda over self in a connection, no WA_DeleteOnClose, "
                "a greyed control answers a click"),
-    Capability("faces-plates", "Faces, plates and a subject register behind an identity switch", State.PLAN, (), (), "DECISIONS.md D-08"),
+    Capability("identity", "Faces, plates and a subject register behind one identity switch",
+               State.TESTED,
+               ("vigil.domain.identity.Register", "vigil.domain.identity.Verdict",
+                "vigil.perception.faces.FaceReader", "vigil.perception.plates.Accumulator",
+                "vigil.service.identity.IdentityService"),
+               ("tests/test_identity.py",),
+               "DECISIONS.md D-08, whose gate -- an hour on a physical IP camera -- was **waived**, not met; "
+               "that entry records who waived it and what is therefore unproven. **No face or plate model "
+               "ships and none has been run, so every threshold here is a stated assumption and says so in "
+               "its own docstring.** What is built and tested is the discipline. OFF by default: one switch, "
+               "not two, and `enable` refuses without both a retention limit and a written reason, while "
+               "`vigil doctor` FAILS on a database found on with no limit -- an unbounded biometric store is "
+               "the worst thing this can become and the failure is otherwise entirely silent. A single frame "
+               "is **structurally incapable** of asserting a name: `compare` has no path to MATCH and "
+               "`Match.label` raises unless it earned one, where v1 stated the same rule in its headline and "
+               "left a public method that broke it. Two encoders' embeddings are never compared -- the check "
+               "v1 asserted at length and never wrote. A plate has **no text at all** while any character is "
+               "unresolved, so a half-read plate cannot be logged, exported or searched; a character needs "
+               "three votes *and* more than the runner-up, because the count alone resolves a position four "
+               "frames called 8 and four called B. Four v1 bugs are fixed here with tests naming them: the "
+               "unconditional softmax that silently flattened every confidence under the threshold so no "
+               "plate ever resolved; a CTC blank index off by one for any blank not at the end; a read with "
+               "no per-character confidence getting a free vote, which is exactly what the fabricated 1.0 it "
+               "claimed to avoid would have done; and a person-box check on x and y but not width, so a box "
+               "of width 200.0 clamped to the whole frame and pointed the face pipeline at the street. "
+               "Erasure vacuums with `secure_delete`, because a DELETE alone leaves the template readable in "
+               "freed pages -- v1 promised 'a delete that really deletes' and did not. The audit trail holds "
+               "identifiers and never names, since it is append-only and a name in it outlives the erasure "
+               "it records"),
+    Capability("evaluation", "Precision and recall against corrected labels, and the split it refuses",
+               State.TESTED,
+               ("vigil.service.evaluation.evaluate", "vigil.service.evaluation.check_split",
+                "vigil.service.evaluation.average_precision"),
+               ("tests/test_evaluation.py",),
+               "The harness, built before there is data to put in it, so that on the day labels appear there "
+               "is no temptation to write a quick script that scores the training set. Precision, recall and "
+               "all-points average precision per class at IoU 0.5, greedy matching by descending confidence "
+               "with each label claimed once. **It refuses a validation set that shares a day with training** "
+               "-- and stops rather than warning, because a warning printed above a 0.98 is read as a 0.98. "
+               "Consecutive frames of security footage are near-duplicates, so a random split tests the model "
+               "on the frame after the one it trained on. Classes the validation set never contained are "
+               "excluded from mAP rather than scored zero, since averaging in a zero for each of COCO's "
+               "eighty would bury every real figure. Frames missing an image or a label are counted and "
+               "reported, because a corpus quietly missing half its labels scores beautifully on recall. "
+               "**Nothing has been scored: no labelled dataset exists for this site**, and this module says "
+               "so rather than producing a number",
+               ),
     Capability("packaging", "One executable, built and camera-tested by the task runner", State.IMPL,
                (), (), "`tasks.py package` builds dist/vigil/vigil.exe; `exetest` ran it on device:0 with recording and passed on 2026-09-05 (README.md); no installer, no signing"),
     Capability("observability", "An unattended run is watchable: metrics in the log, JSON on demand, a crash file", State.TESTED,

@@ -25,6 +25,7 @@
 
 pub mod assign;
 pub mod camera;
+pub mod detect_post;
 pub mod ffi;
 pub mod geodesy;
 pub mod lens;
