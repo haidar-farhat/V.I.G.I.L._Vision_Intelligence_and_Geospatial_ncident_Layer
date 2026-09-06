@@ -31,18 +31,14 @@ from .site_commands import _adhoc_id, _pose, _read_secret
 _log = _get_logger(__name__)
 
 
-def _detector_factory(model: Path | None, watch: str | None, confidence: float | None):
-    from ..adapters.detectors import WATCHED_LABELS, detector_for, model_info
+def _detector_factory(site, model: Path | None, watch: str | None, confidence: float | None):
+    """The site's stored settings, with this run's flags on top of them."""
+    from ..service.detection import detector_factory
 
-    classes = frozenset(w.strip().lower() for w in watch.split(",") if w.strip()) if watch else WATCHED_LABELS
-    if model is not None:
-        model_info(model, classes=classes)  # validates the watch list once, before any thread
+    chosen = site.detection().override(None if watch is None else [w for w in watch.split(",") if w.strip()],
+                                       confidence)
+    return detector_factory(model, chosen)
 
-    class _Factory:
-        def __call__(self):
-            return detector_for(model, classes=classes if model is not None else None, confidence=confidence)
-
-    return _Factory()
 
 def _query(args) -> "Query":
     from ..service.search import Query
@@ -55,6 +51,7 @@ def _run(ctx: _Context) -> int:
     """Analyse the stored cameras (or ad-hoc sources) for a while; print what was concluded."""
     args, by = ctx.args, ctx.principal
     from ..adapters.detectors import DetectionError
+    from ..service.detection import DetectionError as BadDetectionSetting
 
     if args.stop:
         path = request_stop(ctx.settings.data_dir)
@@ -67,8 +64,9 @@ def _run(ctx: _Context) -> int:
 
     model = Path(args.model) if args.model else (None if args.no_model else ctx.settings.default_model())
     try:
-        factory = _detector_factory(model, args.watch, args.confidence)
-    except DetectionError as error:
+        factory = _detector_factory(ctx.site, model, args.watch, args.confidence)
+        print(f"detection: {factory.describe()}")
+    except (DetectionError, BadDetectionSetting) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
     chosen: list[str] | None = None

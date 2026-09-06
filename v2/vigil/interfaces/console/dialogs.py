@@ -212,6 +212,47 @@ class AddCameraDialog(_Dialog):
                 "password": self.password.text() or None, "record": self.record.isChecked()}
 
 
+class EditCameraDialog(_Dialog):
+    """Rename a camera, or move it to a new address.
+
+    Both existed only on the command line, so an operator whose camera moved
+    to a new IP had to remove and re-add it from the window — which threw
+    away its placement, and with it every zone that acted on what it saw.
+    """
+
+    def __init__(self, camera, parent: QWidget | None = None):
+        super().__init__(f"Edit {camera.id}", parent)
+        caption = QLabel("The identifier stays as it is: events, clips and incidents already refer to it. "
+                         "Changing the address keeps the placement and everything the camera has seen.")
+        caption.setWordWrap(True)
+        self._outer.addWidget(caption)
+        form = QFormLayout()
+        self.identifier = QLabel(camera.id)
+        self.display_name = QLineEdit(camera.name)
+        self.source = QLineEdit(camera.source)
+        self.source.setPlaceholderText("a file, device:0, or an address on the local network")
+        form.addRow("Identifier", self.identifier)
+        form.addRow("Name", self.display_name)
+        form.addRow("Source", self.source)
+        self._outer.addLayout(form)
+        hint = QLabel("A password typed into the address is taken out of it and kept in the keychain, "
+                      "and never shown here again.")
+        hint.setObjectName("Caption")
+        hint.setWordWrap(True)
+        self._outer.addWidget(hint)
+        self._finish("Save")
+
+    def check(self) -> str | None:
+        if not self.display_name.text().strip():
+            return "A camera needs a name."
+        if not self.source.text().strip():
+            return "A camera needs a source: a file, device:0, or an address."
+        return None
+
+    def value(self) -> dict:
+        return {"name": self.display_name.text().strip(), "source": self.source.text().strip()}
+
+
 class PlaceCameraDialog(_Dialog):
     """Where a camera is and where it looks. Without this nothing can be located."""
 

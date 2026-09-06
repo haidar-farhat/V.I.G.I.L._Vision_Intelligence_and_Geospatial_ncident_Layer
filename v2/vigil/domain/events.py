@@ -104,6 +104,19 @@ class RuleContext:
 
         return tuple(r for r in self.relations if r.kind is RelationKind.CARRIED and r.subject == self._track_id)
 
+    def occupants(self) -> tuple:
+        """The tracks that appear to be inside this one — the people in the car."""
+        from .relations import occupants_of
+
+        return occupants_of(self.relations, self._track_id)
+
+    def group(self) -> str:
+        """What is apparently inside this track, counted: "3 people", or empty."""
+        from .relations import describe_group
+
+        occupants = self.occupants()
+        return describe_group([self._labels.get(i) for i in occupants]) if occupants else ""
+
     @property
     def _track_id(self) -> int:
         return self.track.id if self.track is not None else -1
@@ -205,8 +218,18 @@ class ZoneEntryRule(Rule):
         if carrying:
             carried = " " + " and ".join(r.describe(context.name_of).split("appears to be ")[-1] for r in carrying)
             conditions.extend(c for relation in carrying for c in relation.conditions)
+        # Who is in it. A vehicle entering a yard is one event whether it
+        # holds a driver or five people, and the difference is the whole
+        # reason somebody is watching. Hedged: one camera infers "inside".
+        occupants = context.occupants()
+        inside = ""
+        if occupants:
+            inside = f", apparently with {context.group()} inside"
+            conditions.append(f"{len(occupants)} track(s) overlapped it enough to look like occupants")
+            conditions.extend(c for relation in context.relations
+                              for c in relation.conditions if relation.subject in occupants)
         return [self._build(
-            context, summary=f"{_subject(context)} entered {zone.name}{carried}",
+            context, summary=f"{_subject(context)} entered {zone.name}{carried}{inside}",
             conditions=tuple(conditions),
             confidence=change.presence.confidence, observations=change.presence.observations, severity=severity,
         )]

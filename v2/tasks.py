@@ -75,6 +75,10 @@ def package() -> int:
         return 1
     if DIST.exists():
         shutil.rmtree(DIST)
+    # Taken before the build, because that is the tree PyInstaller is about
+    # to read. Anything edited while it runs will differ from this, which is
+    # exactly the state `exetest` must refuse.
+    sources = source_digests()
     code = _run([sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "--name", "vigil", "--distpath", str(ROOT / "dist"),
                  "--workpath", str(ROOT / "build"), "--specpath", str(ROOT / "build"), "--collect-all", "onnxruntime", "--collect-data", "tzdata",
                  "--hidden-import", "keyring.backends.Windows", "--hidden-import", "keyring.backends.macOS",
@@ -88,12 +92,55 @@ def package() -> int:
                  str(ROOT / "packaging" / "entry.py")])
     if code != 0:
         return code
-    (DIST / "build.json").write_text(json.dumps({"commit": _commit(), "built_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}), encoding="utf-8")
+    (DIST / "build.json").write_text(json.dumps({"commit": _commit(), "sources": sources,
+                                                 "built_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}),
+                                     encoding="utf-8")
     models = ROOT / "models"
     if models.is_dir():
         shutil.copytree(models, DIST / "models", dirs_exist_ok=True)
     print(f"packaged to {DIST}")
     return 0
+
+
+def source_digests() -> dict[str, str]:
+    """A digest for every source file, so a bundle can be compared with the tree."""
+    import hashlib
+
+    out = {}
+    for folder in ("vigil", "packaging"):
+        for path in sorted((ROOT / folder).rglob("*.py")):
+            if "__pycache__" in path.parts:
+                continue
+            out[path.relative_to(ROOT).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return out
+
+
+def stale_sources(exe: Path) -> list[str]:
+    """Source files that differ from the ones this bundle was built from.
+
+    Digests, not timestamps. PyInstaller reads each source at its own moment
+    during a build, so an edit made while it runs produces a bundle that
+    mixes two versions — and the executable, written at the end, still looks
+    newer than every source. That happened here: the packaged window
+    imported a function the packaged domain module did not have, and a
+    timestamp check called the bundle current.
+
+    `exetest` is the only check that runs the packaged product, so it is the
+    only one a wrong bundle can fool: an old executable runs perfectly.
+    """
+    if not exe.is_file():
+        return []
+    stamp = exe.parent / "build.json"
+    try:
+        packaged = json.loads(stamp.read_text(encoding="utf-8")).get("sources") or {}
+    except (OSError, ValueError):
+        packaged = {}
+    if not packaged:
+        return ["build.json: this bundle records no source digests"]
+    current = source_digests()
+    differ = set(current) ^ set(packaged)
+    differ |= {name for name in set(current) & set(packaged) if current[name] != packaged[name]}
+    return sorted(differ)
 
 
 def exetest() -> int:
@@ -106,10 +153,20 @@ def exetest() -> int:
     parser.add_argument("--no-model", action="store_true")
     parser.add_argument("--record", action="store_true")
     parser.add_argument("--console", action="store_true", help="drive the window, and photograph it before it closes")
+    parser.add_argument("--allow-stale", action="store_true", help="test the built executable even if the source is newer")
     args = parser.parse_args(sys.argv[2:])
     exe = DIST / ("vigil.exe" if os.name == "nt" else "vigil")
     if not exe.is_file():
         print(f"no executable at {exe}; run `python tasks.py package` first")
+        return 1
+    stale = stale_sources(exe)
+    if stale and not args.allow_stale:
+        # A pass against yesterday's binary is worse than no test: it is
+        # evidence for a change the executable does not contain. This has
+        # already happened once, quietly, and the run still said PASS.
+        print(f"the bundle was built from different sources: {len(stale)} file(s) differ, "
+              f"starting with {stale[0]}; run `python tasks.py package` "
+              f"(or --allow-stale to test this bundle on purpose)")
         return 1
     workspace = ROOT / "dist" / "exetest" / time.strftime("%Y%m%d-%H%M%S")
     workspace.mkdir(parents=True)

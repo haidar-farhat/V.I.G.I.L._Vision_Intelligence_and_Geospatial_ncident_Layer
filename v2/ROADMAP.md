@@ -68,6 +68,14 @@ and each way it should *not* fire (a person passing in front of a car; a bag
 on the ground beside somebody; two people who happen to be four metres
 apart). Then a camera run with a real car and real people.
 
+**Where it stands (2026-09-06).** Built and tested: all four relations, the
+approach *warning* before the breach, the dotted link on the plan, a zone
+entry that says what was carried, and a vehicle entry that counts who is
+apparently inside it. Still owed: a camera run with a real car and real
+people — a laptop webcam cannot produce one, so the count is proven by
+synthetic box sequences and by the live chain around it, and this line says so
+rather than letting the table imply otherwise.
+
 ## 3 · Naming what a thing is, including a dangerous one
 
 **What it adds.** A threat vocabulary: labels the site treats as dangerous,

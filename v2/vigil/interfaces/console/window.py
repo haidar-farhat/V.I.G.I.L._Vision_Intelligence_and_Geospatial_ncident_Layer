@@ -166,6 +166,9 @@ class ConsoleWindow(QMainWindow):
         self.add_button.clicked.connect(self._add_camera)
         self.place_button = QPushButton("Place…")
         self.place_button.clicked.connect(self._place_camera)
+        self.edit_camera_button = QPushButton("Edit…")
+        self.edit_camera_button.setToolTip("Rename this camera, or point it at a new address.")
+        self.edit_camera_button.clicked.connect(self._edit_camera)
         self.password_button = QPushButton("Password…")
         self.password_button.clicked.connect(self._set_password)
         self.remove_button = QPushButton("Remove")
@@ -191,8 +194,8 @@ class ConsoleWindow(QMainWindow):
         self.dismissed_box.toggled.connect(self._show_dismissed)
         self.export_button = QPushButton("Export evidence…")
         self.export_button.clicked.connect(self._export)
-        for button in (self.add_button, self.place_button, self.password_button, self.remove_button,
-                       self.zone_button, self.edit_zone_button, self.drop_zone_button):
+        for button in (self.add_button, self.place_button, self.edit_camera_button, self.password_button,
+                       self.remove_button, self.zone_button, self.edit_zone_button, self.drop_zone_button):
             row.addWidget(button)
         row.addSpacing(10)
         for button in (self.start_button, self.stop_button):
@@ -207,8 +210,8 @@ class ConsoleWindow(QMainWindow):
         return row
 
     def _configure_only(self) -> Sequence[QWidget]:
-        return (self.add_button, self.place_button, self.password_button, self.remove_button,
-                self.zone_button, self.edit_zone_button, self.drop_zone_button)
+        return (self.add_button, self.place_button, self.edit_camera_button, self.password_button,
+                self.remove_button, self.zone_button, self.edit_zone_button, self.drop_zone_button)
 
     # ----------------------------------------------------------- the lock
 
@@ -277,6 +280,25 @@ class ConsoleWindow(QMainWindow):
         if not ok or pose is None:
             return
         self._say(self.commands.place_camera(camera.id, pose).message)
+        self.refresh_site()
+
+    def _edit_camera(self) -> None:
+        camera = self._current_camera()
+        if camera is None:
+            self._say("Select a camera to edit.")
+            return
+        ok, value = dialogs.ask(dialogs.EditCameraDialog(camera, self))
+        if not ok or value is None:
+            return
+        said = []
+        # Two service calls, each audited on its own, and neither attempted
+        # when the field was left alone: an audit row for a change nobody
+        # made is a row somebody has to explain later.
+        if value["name"] != camera.name:
+            said.append(self.commands.rename_camera(camera.id, value["name"]).message)
+        if value["source"] != camera.source:
+            said.append(self.commands.set_source(camera.id, value["source"]).message)
+        self._say(" ".join(said) if said else f"{camera.id} is unchanged.")
         self.refresh_site()
 
     def _set_password(self) -> None:
@@ -476,7 +498,8 @@ class ConsoleWindow(QMainWindow):
                 view.set_detector_info(info)
             pose = poses.get(result.camera_id)
             rows.extend((result.camera_id, track, info, pose,
-                         tuple(r for r in result.relations if r.subject == track.id))
+                         tuple(r for r in result.relations
+                               if r.subject == track.id or r.object == track.id))
                         for track in result.tracks)
         if rows or results:
             self.tracks.show_tracks(rows)

@@ -43,7 +43,8 @@ runs the analysis and exports; analyst exports and reads the audit trail;
 admin does all of it and manages accounts.
 
 **Changing what exists.** A camera that moved to a new address keeps its
-placement and its zones (`vigil cameras source gate rtsp://…`), and a zone's
+placement and its zones (`vigil cameras source gate rtsp://…`, or *Edit…* in
+the console, which also renames it), and a zone's
 name, kind, watch list or hours change without touching the ring somebody
 drew (`vigil zones edit yard --watch person --closed 22-6`, or *Edit zone…*
 in the console). Both are audited with what the value was before.
@@ -63,6 +64,23 @@ cannot tell being inside a car from walking in front of it — so each carries
 the overlap, the distance and the frames it held, and a zone entry that quotes
 one repeats those conditions in its evidence. Distances are always given with
 their error: `11.2 ± 2.4 m`, never a bare eleven.
+
+**How many are in it.** A vehicle entering a zone is one event whether it
+holds a driver or five people, and the difference is the whole reason somebody
+is watching, so the entry says *apparently with 3 people inside* and quotes
+the overlap each count was drawn from. The track table says the same on the
+vehicle's row. Hedged, like every relation: from one camera, somebody standing
+in front of a van overlaps it exactly as somebody sitting in it does.
+
+**What a site watches for.** The watch list and the confidence threshold are
+kept with the site (`vigil site detection --watch person,car --confidence
+0.6`), not typed at each run: a service started at boot has nobody to type at
+it, and until now it analysed with the built-in list while the operator
+believed the choice they made once still applied. `--watch` and `--confidence`
+still override it for one run. A label the installed model cannot produce is
+refused where it is typed — the run prints the model's own vocabulary — and
+`vigil doctor` fails on a stored one, because a site watching for nothing
+looks exactly like a quiet night.
 
 **Dangerous things, and what this refuses to claim.** A site names the labels
 it treats as dangerous: `vigil site threats --set knife --suggest`. Nothing is
@@ -124,15 +142,18 @@ agent, redacted the same way the prose is.
 
 **Packaging.** `python tasks.py package` builds `dist/vigil/vigil.exe`.
 `python tasks.py exetest --seconds 20 --record` runs it on `device:0` and
-judges the run; `--console` drives the window instead and photographs it.
+judges the run; `--console` drives the window instead and photographs it. It
+refuses to run against an executable older than the source, because an old
+binary runs perfectly and a pass against one is evidence for a change it does
+not contain — which has already happened here once, quietly.
 
 ## The state of it
 
 | | |
 |---|---|
-| Product code | 9,592 lines of Python, no compiled core |
-| Tests | 190, all green through `python tasks.py check` |
-| Capabilities | 26 tested, 2 implemented, 1 planned ([CAPABILITIES.md](CAPABILITIES.md)) |
+| Product code | 9,960 lines of Python, no compiled core |
+| Tests | 202, all green through `python tasks.py check` |
+| Capabilities | 27 tested, 2 implemented, 1 planned ([CAPABILITIES.md](CAPABILITIES.md)) |
 | Packaged | 751 MB bundle: one `vigil.exe` that is both the command line and the console |
 
 Not built, and not pretended: faces, plates and a subject register
@@ -152,6 +173,8 @@ operator's to supply — the mechanism is here and tested, the weights are not.
 | 2026-09-06 06:13 | the console with **two** cameras, the laptop and a file, both placed | Two workers, two wedges on the plan, per-camera health (one LIVE, one STOPPED when its file ended), and an incident from the live one. |
 | 2026-09-06 06:16 | **ten-minute unattended soak**, `run --for 600 --record` | **Stable.** 602 s for a 600 s request, exit 0, no traceback. 8,565 frames — 14.3 fps average, 16 fps at the end — with the segmentation model on one CPU camera. Ten one-minute clips. Memory started at 45 MiB, peaked at 221 MiB while the model loaded, settled at 64 MiB and stayed flat for the last four minutes. |
 
+| 2026-09-06 15:16 | packaged `vigil.exe`, `exetest --console` — **FAIL**, and worth keeping | The bundle was built while the source was being edited, so it shipped a window importing `describe_group` from a packaged domain module that did not have it. An earlier run had already passed against a thirty-minute-old binary. `package` now stamps a digest per source file and `exetest` refuses a tree that differs. |
+| 2026-09-06 15:27 | packaged `vigil.exe`, `exetest --seconds 20 --record --console`, against a bundle proven to match the tree | **PASS** in 23 s. `site detection --watch person,car --confidence 0.55` survived a restart, `doctor` read it back as OK, and `run` printed `watching car, person; confidence at least 0.55` before any thread started. The window drew the new *Edit…* button greyed under the lock, and the track table read **3.1 ± 0.1 m** for a person at 0.88. |
 | 2026-09-06 11:20 | the whole chain on a generated walk, through the real pipeline | A block walking towards the camera produced **"An object is approaching the Doorstep, 0.5 ± 0.2 m away"** at `MEDIUM`, then **"An object entered the Doorstep"** at `HIGH`, correlated into one incident. Warning first, breach second — which is the point. (Camera runs remain the product check; this one needed a known path.) |
 | 2026-09-06 10:44 | the console on `device:0` with the new columns | The track table read **3.1 ± 0.1 m** for a bottle in front of the camera — the distance and its error, measured live. "Doing" was empty because a relation needs two tracks and only one was in view. |
 | 2026-09-06 09:25 | packaged `vigil.exe`, `exetest --console` after the CLI split | **PASS** in 23 s. The shipped console carries the incident filter bar, and the split into parser, site commands and work commands changed nothing an operator can see. |

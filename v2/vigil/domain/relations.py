@@ -97,6 +97,44 @@ class Relation:
         return f"{who} is moving towards {target}"
 
 
+#: How a label reads when there is more than one of it. Only the words this
+#: product actually says; anything else takes an `s` and is usually right.
+_PLURALS = {"person": "people", "man": "men", "woman": "women", "child": "children", "bus": "buses"}
+
+
+def describe_group(labels: Sequence[str]) -> str:
+    """"3 people", "2 people and a dog", "4 objects" — what an operator would say.
+
+    A count is the one thing a single camera can state plainly: it is not an
+    inference about what the group *is*, only about how many boxes held.
+    """
+    from collections import Counter
+
+    counted = Counter(l if l else "object" for l in labels)
+    parts = []
+    for label, n in sorted(counted.items(), key=lambda kv: (-kv[1], kv[0])):
+        if n == 1:
+            parts.append(("an " if label[:1] in "aeiou" else "a ") + label)
+        else:
+            parts.append(f"{n} {_PLURALS.get(label, label + 's')}")
+    if len(parts) <= 2:
+        return " and ".join(parts)
+    return ", ".join(parts[:-1]) + " and " + parts[-1]
+
+
+def occupants_of(relations: Iterable["Relation"], track_id: int) -> tuple[int, ...]:
+    """The tracks that appear to be inside this one, each counted once.
+
+    Inferred, like every relation here: from one camera, a person standing in
+    front of a van overlaps it exactly as a person sitting in it does.
+    """
+    seen = []
+    for relation in relations:
+        if relation.kind is RelationKind.INSIDE and relation.object == track_id and relation.subject not in seen:
+            seen.append(relation.subject)
+    return tuple(seen)
+
+
 def overlap_fraction(inner: BoundingBox, outer: BoundingBox) -> float:
     """How much of ``inner`` lies within ``outer``, by area. 0 when it does not."""
     if inner.area <= 0:

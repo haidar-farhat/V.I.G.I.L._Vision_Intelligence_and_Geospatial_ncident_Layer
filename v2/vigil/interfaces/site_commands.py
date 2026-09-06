@@ -182,6 +182,25 @@ def _zones(ctx: _Context) -> int:
     return 0
 
 def _site(ctx: _Context) -> int:
+    if ctx.args.site_command == "detection":
+        from ..service.detection import DetectionError
+
+        try:
+            if ctx.args.clear:
+                chosen = ctx.site.set_detection([], None, by=ctx.principal)
+            elif ctx.args.watch is not None or ctx.args.confidence is not None:
+                current = ctx.site.detection()
+                labels = (current.labels if ctx.args.watch is None
+                          else [l for l in ctx.args.watch.split(",") if l.strip()])
+                confidence = current.confidence if ctx.args.confidence is None else ctx.args.confidence
+                chosen = ctx.site.set_detection(labels, confidence, by=ctx.principal)
+            else:
+                chosen = ctx.site.detection()
+        except (DetectionError, AuthError) as error:
+            print(f"error: {error}", file=sys.stderr)
+            return 1
+        print(chosen.describe())
+        return 0
     if ctx.args.site_command == "threats":
         from ..domain.threats import ThreatVocabulary
 

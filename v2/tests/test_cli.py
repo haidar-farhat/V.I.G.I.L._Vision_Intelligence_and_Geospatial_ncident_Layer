@@ -258,3 +258,17 @@ def test_the_threat_vocabulary_is_read_set_and_cleared_from_the_command_line(dat
     assert "a knife (HIGH)" in capsys.readouterr().out
     assert main(["site", "threats", "--clear"]) == 0
     assert "no label is treated as a threat" in capsys.readouterr().out
+
+
+def test_the_command_line_reads_sets_and_clears_it(data, capsys):
+    assert main(["site", "detection"]) == 0
+    assert "built-in" in capsys.readouterr().out
+    assert main(["site", "detection", "--watch", "person,car", "--confidence", "0.65"]) == 0
+    assert "person" in capsys.readouterr().out
+    assert main(["site", "detection", "--confidence", "0.7"]) == 0
+    kept = capsys.readouterr().out
+    assert "person" in kept and "0.70" in kept, "changing one value must not drop the other"
+    assert main(["site", "detection", "--confidence", "1.5"]) == 1
+    assert "outside" in capsys.readouterr().err
+    assert main(["site", "detection", "--clear"]) == 0
+    assert "built-in" in capsys.readouterr().out

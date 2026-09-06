@@ -180,6 +180,32 @@ def _threats(settings, store) -> Check:
     return Check("threat labels", State.OK, vocabulary.describe())
 
 
+def _detection(settings, store) -> Check:
+    """Whether this site's watch list is one the installed model can satisfy."""
+    from .detection import DetectionSettings
+
+    chosen = DetectionSettings.from_site(store.site())
+    if chosen.labels is None and chosen.confidence is None:
+        return Check("detection", State.OK, "built-in watch list, the detector's own threshold",
+                     "To change it for every run: `vigil site detection --watch person,car`.")
+    model = settings.default_model()
+    if model is None:
+        return Check("detection", State.WARN, f"{chosen.describe()}, but motion detection cannot watch a class",
+                     "Install a model, or the watch list has no effect.")
+    try:
+        from ..adapters.detectors import model_info
+
+        names = list(model_info(model).class_names.values())
+    except Exception as error:  # noqa: BLE001
+        return Check("detection", State.WARN, f"cannot be checked: {error}")
+    missing = sorted(l for l in (chosen.labels or ()) if l not in names)
+    if missing:
+        return Check("detection", State.FAIL,
+                     f"{', '.join(missing)} cannot be produced by {model.name}, so this site watches for nothing",
+                     "Use a model trained on those classes, or `vigil site detection --clear`.")
+    return Check("detection", State.OK, chosen.describe())
+
+
 def _alerts(settings) -> Check:
     from .alerts import Alerts
 
@@ -223,6 +249,7 @@ def run_checks(settings, store, keychain, *, probe: bool = False) -> list[Check]
         lambda: _accounts(store),
         lambda: _site(store),
         lambda: _zones(store),
+        lambda: _detection(settings, store),
         lambda: _threats(settings, store),
         lambda: _alerts(settings),
         lambda: _sources(store, probe),

@@ -267,6 +267,25 @@ class SiteService:
                           before={"labels": list(before.labels)}, after={"labels": list(after.labels)})
         return after
 
+    def detection(self):
+        """What this site watches for and how sure it must be."""
+        from .detection import DetectionSettings
+
+        return DetectionSettings.from_site(self._store.site())
+
+    def set_detection(self, labels, confidence: float | None, *, by: Principal):
+        """Store the watch list and the threshold, after checking they make sense."""
+        from .detection import DetectionSettings
+
+        by.require(SITE_CONFIGURE)
+        before = self.detection()
+        after = DetectionSettings.checked(labels, confidence)
+        self._store.set_detection(sorted(after.labels or ()), after.confidence)
+        self._store.audit(by.actor, "site.detection_changed", None, after.describe(),
+                          before={"labels": sorted(before.labels or ()), "confidence": before.confidence},
+                          after={"labels": sorted(after.labels or ()), "confidence": after.confidence})
+        return after
+
     def name_site(self, name: str, timezone_name: str, *, by: Principal) -> None:
         by.require(SITE_CONFIGURE)
         self.known_timezone(timezone_name)

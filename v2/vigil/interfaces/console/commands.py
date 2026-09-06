@@ -159,6 +159,15 @@ class Commands:
         outcome = self._guard(SITE_CONFIGURE, self._site.set_password, camera_id, password, by=self._principal)
         return Outcome(True, f"Stored {camera_id}'s password in the keychain.", outcome.value) if outcome else outcome
 
+    def rename_camera(self, camera_id: str, name: str) -> Outcome:
+        outcome = self._guard(SITE_CONFIGURE, self._site.rename_camera, camera_id, name, by=self._principal)
+        return Outcome(True, f"{camera_id} is now {name}.", outcome.value) if outcome else outcome
+
+    def set_source(self, camera_id: str, source: str) -> Outcome:
+        """The camera moved. Its placement, its zones and its history stay."""
+        outcome = self._guard(SITE_CONFIGURE, self._site.set_source, camera_id, source, by=self._principal)
+        return Outcome(True, f"{camera_id} now reads from its new address.", outcome.value) if outcome else outcome
+
     def remove_camera(self, camera_id: str) -> Outcome:
         outcome = self._guard(SITE_CONFIGURE, self._site.remove_camera, camera_id, by=self._principal)
         return Outcome(True, f"Removed {camera_id}.") if outcome else outcome

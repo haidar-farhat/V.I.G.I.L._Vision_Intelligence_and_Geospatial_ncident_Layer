@@ -129,7 +129,7 @@ def run(argv: list[str] | None = None) -> int:
 
     model = Path(arguments.model) if arguments.model else (None if arguments.no_model else settings.default_model())
     try:
-        factory = _detector_factory(model, arguments.watch, arguments.confidence)
+        factory = _detector_factory(site, model, arguments.watch, arguments.confidence)
     except Exception as error:  # noqa: BLE001 - a bad watch list must not open a window
         print(f"error: {error}", file=sys.stderr)
         store.close()
@@ -196,18 +196,13 @@ class _Photographer:
         _log.info("console: photographed into %s", self._directory)
 
 
-def _detector_factory(model, watch, confidence):
-    from ...adapters.detectors import WATCHED_LABELS, detector_for, model_info
+def _detector_factory(site, model, watch, confidence):
+    """The site's stored settings, with this run's flags on top of them."""
+    from ...service.detection import detector_factory
 
-    classes = frozenset(w.strip().lower() for w in watch.split(",") if w.strip()) if watch else WATCHED_LABELS
-    if model is not None:
-        model_info(model, classes=classes)
-
-    class _Factory:
-        def __call__(self):
-            return detector_for(model, classes=classes if model is not None else None, confidence=confidence)
-
-    return _Factory()
+    chosen = site.detection().override(None if watch is None else [w for w in watch.split(",") if w.strip()],
+                                       confidence)
+    return detector_factory(model, chosen)
 
 
 def main(argv: list[str] | None = None) -> int:

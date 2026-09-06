@@ -178,6 +178,25 @@ MIGRATIONS: tuple[Migration, ...] = (
         ALTER TABLE site DROP COLUMN threat_labels;
         """,
     ),
+    Migration(
+        version=4,
+        name="site_detection",
+        up="""
+        -- What this site watches for, and how sure the detector must be.
+        -- Settings rather than flags: a service started at boot has nobody
+        -- to type `--watch` at it, and until now it silently analysed with
+        -- the defaults while the operator believed the console's choices
+        -- applied everywhere.
+        ALTER TABLE site ADD COLUMN watch_labels TEXT NOT NULL DEFAULT '[]';
+        ALTER TABLE site ADD COLUMN min_confidence REAL;
+        """,
+        down="""
+        -- A build without them uses the built-in watch list, which is what
+        -- every run did before this migration.
+        ALTER TABLE site DROP COLUMN min_confidence;
+        ALTER TABLE site DROP COLUMN watch_labels;
+        """,
+    ),
 )
 
 SCHEMA_VERSION = MIGRATIONS[-1].version

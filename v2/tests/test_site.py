@@ -17,7 +17,7 @@ def test_every_mutating_method_takes_a_principal_and_writes_an_audit_row(keychai
         site = SiteService(store, keychain)
         for name, method in inspect.getmembers(SiteService, inspect.isfunction):
             # `known_timezone` is a pure validator that changes nothing.
-            if name.startswith("_") or name in ("cameras", "camera", "zones", "threats", "source_with_credentials",
+            if name.startswith("_") or name in ("cameras", "camera", "zones", "threats", "detection", "source_with_credentials",
                                                 "store", "known_timezone"):
                 continue
             assert "by" in inspect.signature(method).parameters, f"{name} takes no principal"

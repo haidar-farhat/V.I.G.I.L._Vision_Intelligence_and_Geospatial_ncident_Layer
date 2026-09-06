@@ -468,9 +468,11 @@ class Store:
         self._check_thread()
         row = self._connection.execute("SELECT * FROM site WHERE id = 'site'").fetchone()
         if row is None:
-            return {"id": "site", "name": "Unnamed site", "timezone": "UTC", "threat_labels": [], "updated_at": 0}
+            return {"id": "site", "name": "Unnamed site", "timezone": "UTC", "threat_labels": [],
+                    "watch_labels": [], "min_confidence": None, "updated_at": 0}
         site = dict(row)
         site["threat_labels"] = json.loads(site.get("threat_labels") or "[]")
+        site["watch_labels"] = json.loads(site.get("watch_labels") or "[]")
         return site
 
     def set_threat_labels(self, labels: Sequence[str]) -> None:
@@ -479,6 +481,16 @@ class Store:
                       "VALUES ('site', 'Unnamed site', 'UTC', ?, ?) "
                       "ON CONFLICT(id) DO UPDATE SET threat_labels=excluded.threat_labels, updated_at=excluded.updated_at",
                       (json.dumps(sorted({str(l).strip().lower() for l in labels if str(l).strip()})), _now()))
+
+    def set_detection(self, labels: Sequence[str], confidence: float | None) -> None:
+        """What to watch for and how sure to be. An empty list means the built-in one."""
+        with self.transaction() as c:
+            c.execute("INSERT INTO site (id, name, timezone, watch_labels, min_confidence, updated_at) "
+                      "VALUES ('site', 'Unnamed site', 'UTC', ?, ?, ?) "
+                      "ON CONFLICT(id) DO UPDATE SET watch_labels=excluded.watch_labels, "
+                      "min_confidence=excluded.min_confidence, updated_at=excluded.updated_at",
+                      (json.dumps(sorted({str(l).strip().lower() for l in labels if str(l).strip()})),
+                       None if confidence is None else float(confidence), _now()))
 
     def save_site(self, name: str, timezone_name: str) -> None:
         with self.transaction() as c:

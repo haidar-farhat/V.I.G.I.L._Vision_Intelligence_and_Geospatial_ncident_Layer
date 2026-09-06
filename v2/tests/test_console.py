@@ -206,6 +206,42 @@ def test_the_place_dialog_validates_and_places(console, qt_app, reference_video,
     assert console.plan._cameras, "the plan did not learn about the placement"
 
 
+def test_a_camera_can_be_renamed_and_moved_to_a_new_address_from_the_window(console, qt_app, reference_video,
+                                                                            monkeypatch):
+    """Both existed only on the command line, so the two interfaces disagreed."""
+    console.configure_button.setChecked(True)
+    console.commands.add_camera("gate", str(reference_video), pose=CameraPose(LatLon(33.8938, 35.5018), 4.0, 0.0, -25.0))
+    console.refresh_site()
+    console.camera_list.tree.topLevelItem(0).setSelected(True)
+
+    dialog = dialogs.EditCameraDialog(console.commands.cameras()[0])
+    assert dialog.identifier.text() == "gate", "the identifier is shown, not editable"
+    dialog.display_name.setText("  ")
+    assert "needs a name" in dialog.check()
+    dialog.display_name.setText("North gate")
+    dialog.source.setText("device:1")
+    assert dialog.check() is None
+    value = dialog.value()
+    dialog.deleteLater()
+
+    monkeypatch.setattr(dialogs, "ask", lambda d: (d.deleteLater(), (True, value))[1])
+    console._edit_camera()
+    camera = console.commands.cameras()[0]
+    assert camera.id == "gate" and camera.name == "North gate" and camera.source == "device:1"
+    assert camera.placed, "moving a camera must keep its placement, not throw it away"
+    actions = [r["action"] for r in console.commands.audit_rows()]
+    assert "camera.renamed" in actions and "camera.source_changed" in actions
+
+    # Saving the dialog unchanged writes nothing: an audit row for a change
+    # nobody made is a row somebody has to explain later.
+    before = len(console.commands.audit_rows())
+    monkeypatch.setattr(dialogs, "ask", lambda d: (d.deleteLater(), (True, {"name": "North gate",
+                                                                            "source": "device:1"}))[1])
+    console._edit_camera()
+    assert len(console.commands.audit_rows()) == before
+    assert "unchanged" in console.status.currentMessage()
+
+
 def test_drawing_a_zone_on_the_plan_creates_it(console, qt_app, monkeypatch):
     console.configure_button.setChecked(True)
     console.commands.add_camera("gate", "clip.mp4", pose=CameraPose(LatLon(33.8938, 35.5018), 4.0, 0.0, -25.0))
@@ -668,6 +704,39 @@ def test_the_track_table_says_how_far_away_and_what_the_track_is_doing(console, 
     console.tracks.show_tracks([("gate", nowhere, info, pose, ())])
     assert console.tracks.tree.topLevelItem(0).text(5) == "—"
     assert "not placed on the ground" in console.tracks.tree.topLevelItem(0).toolTip(5)
+
+
+def test_the_track_table_counts_who_is_apparently_in_the_car(qt_app, pose):
+    """The car does not know it is occupied; the count comes from the people."""
+    from vigil.adapters.detectors import DetectorInfo
+    from vigil.domain.detection import BoundingBox
+    from vigil.domain.geo import PositionEstimate, PositionSource, Vec2, destination_point
+    from vigil.domain.relations import Relation, RelationKind
+    from vigil.domain.tracking import Track
+    from vigil.interfaces.console.widgets import TrackTable
+
+    info = DetectorInfo("onnx-detect", "w", class_names={0: "person", 2: "car"}, classifies=True)
+    where = destination_point(pose.position, 0.0, 12.0)
+
+    def made(track_id, class_id):
+        return Track(track_id, class_id, 0, 0, 0, BoundingBox(0.4, 0.5, 0.1, 0.2), Vec2(0.45, 0.7),
+                     confidence=0.8, confirmed=True,
+                     position=PositionEstimate(where, 1.5, PositionSource.GROUND_PROJECTION))
+
+    inside = tuple(Relation(RelationKind.INSIDE, subject, 9, confidence=0.6,
+                            conditions=("72% of the person's box lay within the car's",))
+                   for subject in (1, 2, 3))
+    table = TrackTable()
+    rows = [("gate", made(9, 2), info, pose, inside)]
+    rows.extend(("gate", made(subject, 0), info, pose, (inside[subject - 1],)) for subject in (1, 2, 3))
+    table.show_tracks(rows)
+
+    car = table.tree.topLevelItem(0)
+    assert car.text(2) == "car"
+    assert car.text(6) == "3 people apparently inside it", car.text(6)
+    assert "72% of the person's box" in car.toolTip(6), "an inference must show its working"
+    person = table.tree.topLevelItem(1)
+    assert "probably in" in person.text(6), "the person's side of the same relation stays hedged"
 
 
 def test_the_plan_links_two_tracks_a_relation_joins(qt_app, pose):

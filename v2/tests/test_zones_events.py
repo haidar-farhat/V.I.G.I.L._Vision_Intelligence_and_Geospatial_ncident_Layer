@@ -121,6 +121,42 @@ def test_a_zone_entry_says_what_they_were_carrying_and_shows_its_working():
     assert plain.carrying() == () and plain.name_of(4) == "track 4"
 
 
+def test_a_vehicle_entering_a_zone_says_how_many_people_appear_to_be_in_it():
+    """One event whether it holds a driver or five, and the difference is the point."""
+    from vigil.domain.relations import Relation, RelationKind, describe_group, occupants_of
+
+    centre = LatLon(33.8938, 35.5018)
+    zone = Zone("z", "Yard", ZoneKind.RESTRICTED, square(centre), enter_after_millis=0)
+    presence = PresenceTracker([zone])
+    presence.update([track(7, centre)], 0)
+    change = presence.update([track(7, centre)], 100)[0]
+    # Three people inside the car, and the car itself carrying nothing.
+    inside = tuple(Relation(RelationKind.INSIDE, subject, 7, confidence=0.6,
+                            conditions=(f"{70 + subject}% of the person's box lay within the car's",))
+                   for subject in (1, 2, 3))
+    labels = {7: "car", 1: "person", 2: "person", 3: "person"}
+    vehicles = DetectorInfo("onnx-detect", "test", class_names={0: "person", 2: "car"}, classifies=True)
+    context = RuleContext("node", "cam", zone, track(7, centre, class_id=2), change.presence, 100,
+                          datetime.now(timezone.utc), vehicles, 3, None, inside, labels)
+    assert occupants_of(inside, 7) == (1, 2, 3)
+    assert context.group() == "3 people"
+    event = ZoneEntryRule().on_presence_change(change, context)[0]
+    assert event.summary == "A car entered Yard, apparently with 3 people inside"
+    assert "apparently" in event.summary, "one camera cannot see inside a car; the wording must hedge"
+    assert any("box lay within the car's" in c for c in event.evidence.conditions), "the count must show its working"
+
+    # Counted once each, however many frames repeated the relation, and the
+    # phrase is the one an operator would use.
+    assert occupants_of((*inside, inside[0]), 7) == (1, 2, 3)
+    assert describe_group(["person"]) == "a person" and describe_group(["person", "dog"]) == "a dog and a person"
+
+    # Nobody inside: the sentence is the one it always was.
+    alone = RuleContext("node", "cam", zone, track(7, centre, class_id=2), change.presence, 100,
+                        datetime.now(timezone.utc), vehicles, 3, None, (), labels)
+    assert alone.occupants() == () and alone.group() == ""
+    assert ZoneEntryRule().on_presence_change(change, alone)[0].summary == "A car entered Yard"
+
+
 def _approaching(distance_m: float, zone: Zone, *, class_id: int = 0, confidence: float = 0.8):
     """A track that far outside the zone, and the relation saying it is closing."""
     from vigil.domain.relations import Relation, RelationKind

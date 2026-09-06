@@ -301,6 +301,7 @@ class TrackTable(QWidget):
     def show_tracks(self, rows: Sequence[tuple]) -> None:
         """``rows`` is (camera_id, track, detector_info, pose, relations)."""
         from ...domain.geo import distance_from_camera
+        from ...domain.relations import describe_group, occupants_of
 
         self.tree.clear()
         for camera_id, track, info, pose, relations in rows:
@@ -318,7 +319,14 @@ class TrackTable(QWidget):
                     # Never a number pretending to be a fix: the camera's own
                     # position with the whole field of view as its error.
                     position = f"at the camera (not projected, ±{track.position.radius_meters:.0f} m)"
-            doing = "; ".join(r.describe(_namer(rows, info)) for r in relations)
+            name_of = _namer(rows, info)
+            said = [r.describe(name_of) for r in relations if r.subject == track.id]
+            # The other end of the same relation: the car does not know it is
+            # occupied, so the count is assembled from the people who overlap it.
+            inside = occupants_of(relations, track.id)
+            if inside:
+                said.append(f"{describe_group([name_of(i) for i in inside])} apparently inside it")
+            doing = "; ".join(said)
             item = QTreeWidgetItem([
                 camera_id, str(track.id), label or "unclassified" if info and info.classifies else label or "—",
                 f"{track.confidence:.2f}", "—" if track.speed_mps is None else f"{track.speed_mps:.1f} m/s",

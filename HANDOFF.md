@@ -986,6 +986,41 @@ person the detector blinked on was counted as "2 persons", so same-camera
 fragment linking was ported. Every one of them now has a test. **Photograph
 the interface — it is still the highest-yield check in this repository.**
 
+**A site now owns what it watches for.** `--watch` and `--confidence` were
+flags, which meant they existed only while somebody stood at a keyboard: a
+service started at boot, or a console opened by double-click, analysed with
+the built-in list while the operator believed the choice they typed once still
+applied. Both are site settings (`vigil site detection --watch person,car
+--confidence 0.6`), a flag overrides them for one run, and the two copies of
+the detector factory — one in the console, one in the command line — became
+one in `vigil/service/detection.py`. A label the model cannot produce is
+refused where it is typed, with the model's own vocabulary printed, and
+`vigil doctor` fails on a stored one: a site watching for nothing looks
+exactly like a quiet night.
+
+**Three people in the car.** The `INSIDE` relation was measured and shown
+nowhere a person reads. A vehicle entering a zone now says *apparently with
+3 people inside* and quotes the overlap each count came from, and the track
+table says the same on the vehicle's row — assembled from the people, since
+the car does not know it is occupied. The console also gained *Edit…*, which
+renames a camera and moves it to a new address without throwing away its
+placement; both existed only on the command line, so the two interfaces had
+quietly disagreed.
+
+**The build check that proved a pass meaningless.** `python tasks.py build`
+is not a task — the runner exits 2 and prints its menu — but the command was
+piped into `tail`, and Git Bash returns the exit of the last command in a
+pipe, so it looked like a build. `exetest` then passed against a
+thirty-minute-old executable. The guard added for it compared **timestamps**,
+and was wrong too: PyInstaller reads each source at its own moment, so a
+bundle built across an edit mixes two versions while its executable, written
+last, still looks newer than every source. That exact bundle shipped a window
+importing `describe_group` from a packaged domain module that did not have
+it. `package` now records a digest per source file in `build.json` and
+`exetest` refuses to run when the tree differs — `--allow-stale` to test an
+old bundle on purpose. **A green result from the wrong binary is worse than a
+red one.**
+
 ## 7. Hard-won facts worth not rediscovering
 
 - **The recurring defect in this repository is correct, tested code that nothing
@@ -1003,7 +1038,9 @@ the interface — it is still the highest-yield check in this repository.**
 - **Git Bash does not split a colon-separated `PYTHONPATH` for Windows
   Python.** Use PowerShell with `;`, or rely on `pytest.ini`'s `pythonpath`.
 - **Heredocs are mangled here.** Write patch scripts with the Write tool and run
-  them; a `<<'EOF'` with `\n` inside failed to parse.
+  them; a `<<'EOF'` with `\n` inside failed to parse. A patch script that *writes* an escaped newline into a
+  file needs it escaped twice, and one silently wrote a real newline into a
+  Python string literal instead — the file then would not parse.
 - `core.py` already had an `ImagePoint` (field-of-view). Grep before naming.
 - **Verify the premise, not just the result.** `strings` does not exist on this
   machine; OpenCV 5 substitutes codecs; offscreen Qt has 0 font families and
