@@ -29,7 +29,7 @@ from . import dialogs, theme
 from .commands import Commands
 from .plan import PlanView
 from .video import VideoView
-from .widgets import AuditView, CameraList, ElidingLabel, IncidentDetail, IncidentList, TrackTable
+from .widgets import AuditView, CameraList, ElidingLabel, FlowLayout, IncidentDetail, IncidentList, TrackTable
 
 _log = _get_logger(__name__)
 
@@ -153,14 +153,18 @@ class ConsoleWindow(QMainWindow):
 
     # ------------------------------------------------------------- building
 
-    def _build_toolbar(self) -> QHBoxLayout:
-        row = QHBoxLayout()
+    #: The narrowest window this toolbar is designed to stay readable in. A
+    #: 1366-wide laptop is the machine this runs on in the places it runs.
+    NARROWEST_WINDOW = 1280
+
+    def _build_toolbar(self) -> "FlowLayout":
+        row = FlowLayout(spacing=6)
         self.configure_button = QPushButton("Configure")
         self.configure_button.setCheckable(True)
         self.configure_button.setToolTip("Unlock the controls that change the site.")
         self.configure_button.toggled.connect(self._set_configuring)
         row.addWidget(self.configure_button)
-        row.addSpacing(10)
+        self.toolbar = row
 
         self.add_button = QPushButton("Add camera…")
         self.add_button.clicked.connect(self._add_camera)
@@ -173,6 +177,9 @@ class ConsoleWindow(QMainWindow):
         self.password_button.clicked.connect(self._set_password)
         self.remove_button = QPushButton("Remove")
         self.remove_button.clicked.connect(self._remove_camera)
+        self.detection_button = QPushButton("Watch for…")
+        self.detection_button.setToolTip("What this site looks for, and how sure the detector must be.")
+        self.detection_button.clicked.connect(self._set_detection)
         self.zone_button = QPushButton("Draw zone")
         self.zone_button.setCheckable(True)
         self.zone_button.toggled.connect(self._draw_zone)
@@ -192,26 +199,29 @@ class ConsoleWindow(QMainWindow):
         self.dismiss_button.clicked.connect(self._dismiss)
         self.dismissed_box = QCheckBox("Show dismissed")
         self.dismissed_box.toggled.connect(self._show_dismissed)
-        self.export_button = QPushButton("Export evidence…")
+        self.export_button = QPushButton("Export…")
+        self.export_button.setToolTip("Write the evidence package for this incident: report, clips and a "
+                                      "manifest that verifies.")
         self.export_button.clicked.connect(self._export)
-        for button in (self.add_button, self.place_button, self.edit_camera_button, self.password_button,
-                       self.remove_button, self.zone_button, self.edit_zone_button, self.drop_zone_button):
-            row.addWidget(button)
-        row.addSpacing(10)
-        for button in (self.start_button, self.stop_button):
-            row.addWidget(button)
-        row.addSpacing(10)
-        for widget in (self.acknowledge_button, self.dismiss_button, self.export_button, self.dismissed_box):
+        self.about_button = QPushButton("About")
+        self.about_button.clicked.connect(self._about)
+        # A wrapping layout, not a row. Qt's answer to buttons that do not
+        # fit is to shrink them and elide the labels, and the shipped window
+        # read "dd camera.", "elete zone", "ort evidenc" on a 1280-wide
+        # screen — nothing failed, nothing was logged, and only a photograph
+        # showed it. This gives every control the width it asked for and
+        # takes another line when it has to.
+        for widget in (self.add_button, self.place_button, self.edit_camera_button, self.password_button,
+                       self.remove_button, self.detection_button, self.zone_button, self.edit_zone_button,
+                       self.drop_zone_button, self.start_button, self.stop_button, self.acknowledge_button,
+                       self.dismiss_button, self.export_button, self.dismissed_box, self.about_button):
             row.addWidget(widget)
-        row.addStretch(1)
-        about = QPushButton("About")
-        about.clicked.connect(self._about)
-        row.addWidget(about)
         return row
 
     def _configure_only(self) -> Sequence[QWidget]:
         return (self.add_button, self.place_button, self.edit_camera_button, self.password_button,
-                self.remove_button, self.zone_button, self.edit_zone_button, self.drop_zone_button)
+                self.remove_button, self.detection_button, self.zone_button, self.edit_zone_button,
+                self.drop_zone_button)
 
     # ----------------------------------------------------------- the lock
 
@@ -322,6 +332,16 @@ class ConsoleWindow(QMainWindow):
             return
         self._say(self.commands.remove_camera(camera.id).message)
         self.refresh_site()
+
+    def _set_detection(self) -> None:
+        info = next((self.commands.detector_info(c.id) for c in self.commands.cameras()
+                     if self.commands.detector_info(c.id) is not None), None)
+        names = tuple(info.class_names.values()) if info is not None and info.classifies else ()
+        ok, value = dialogs.ask(dialogs.DetectionDialog(self.commands.detection(), names, self))
+        if not ok or value is None:
+            return
+        self._say(self.commands.set_detection(value["labels"], value["confidence"]).message)
+        self._show_detector()
 
     def _draw_zone(self, on: bool) -> None:
         if on:
@@ -593,7 +613,7 @@ class ConsoleWindow(QMainWindow):
         may_review = chosen and self.commands.may(INCIDENT_REVIEW)
         self.acknowledge_button.setEnabled(may_review)
         self.dismiss_button.setEnabled(may_review)
-        self.detail.show_incident(incident)
+        self.detail.show_incident(incident, {c.id: c.pose for c in self.commands.cameras()})
         if chosen:
             self.tabs.setCurrentWidget(self.detail)
 

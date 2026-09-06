@@ -9,9 +9,9 @@ from __future__ import annotations
 import time
 from typing import Sequence
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QPoint, QRect, Qt, Signal
 from PySide6.QtWidgets import (
-    QAbstractItemView, QHeaderView, QLabel, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
+    QAbstractItemView, QHeaderView, QLabel, QLayout, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from . import theme
@@ -388,6 +388,87 @@ class AuditView(QWidget):
             self.tree.addTopLevelItem(item)
 
 
+class FlowLayout(QLayout):
+    """Lays widgets left to right and wraps to a new line when they run out.
+
+    Qt's answer to a row of buttons that does not fit is to shrink them and
+    elide the labels — the shipped window read "dd camera.", "elete zone",
+    "ort evidenc" on a 1280-wide screen, and nothing failed or was logged.
+    Every widget here is given at least the width it asked for, so a label
+    is never cut; the toolbar grows a line instead, which the operator can
+    see. Qt ships this as an example, not as a class.
+    """
+
+    def __init__(self, parent=None, spacing: int = 6):
+        super().__init__(parent)
+        self._items: list = []
+        self.setSpacing(spacing)
+
+    def addItem(self, item) -> None:  # noqa: N802 - Qt's name
+        self._items.append(item)
+
+    def count(self) -> int:
+        return len(self._items)
+
+    def itemAt(self, index: int):  # noqa: N802 - Qt's name
+        return self._items[index] if 0 <= index < len(self._items) else None
+
+    def takeAt(self, index: int):  # noqa: N802 - Qt's name
+        return self._items.pop(index) if 0 <= index < len(self._items) else None
+
+    def expandingDirections(self):  # noqa: N802 - Qt's name
+        return Qt.Orientations(0)
+
+    def hasHeightForWidth(self) -> bool:  # noqa: N802 - Qt's name
+        return True
+
+    def heightForWidth(self, width: int) -> int:  # noqa: N802 - Qt's name
+        return self._lay(QRect(0, 0, width, 0), place=False)
+
+    def setGeometry(self, rect) -> None:  # noqa: N802 - Qt's name
+        super().setGeometry(rect)
+        self._lay(rect, place=True)
+
+    def sizeHint(self):  # noqa: N802 - Qt's name
+        return self.minimumSize()
+
+    def minimumSize(self):  # noqa: N802 - Qt's name
+        from PySide6.QtCore import QSize
+
+        size = QSize(0, 0)
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        margins = self.contentsMargins()
+        return size + QSize(margins.left() + margins.right(), margins.top() + margins.bottom())
+
+    def rows(self) -> int:
+        """How many lines the toolbar currently takes. One is the happy case."""
+        return self._rows
+
+    _rows = 1
+
+    def _lay(self, rect, *, place: bool) -> int:
+        margins = self.contentsMargins()
+        left, top = rect.x() + margins.left(), rect.y() + margins.top()
+        right = rect.right() - margins.right()
+        x, y, line_height, rows = left, top, 0, 1
+        for item in self._items:
+            wanted = item.sizeHint()
+            if x > left and x + wanted.width() > right:
+                x, y = left, y + line_height + self.spacing()
+                line_height, rows = 0, rows + 1
+            if place:
+                item.setGeometry(QRect(QPoint(x, y), wanted))
+            x += wanted.width() + self.spacing()
+            line_height = max(line_height, wanted.height())
+        if place:
+            # Only a real placement counts: Qt probes `heightForWidth` with
+            # widths it is merely considering, and recording those made the
+            # toolbar report three lines while showing one.
+            self._rows = rows
+        return y + line_height - rect.y() + margins.bottom()
+
+
 class IncidentDetail(QWidget):
     """Why the system said what it said, for the incident that is selected.
 
@@ -409,7 +490,8 @@ class IncidentDetail(QWidget):
         layout.addWidget(self.text)
         self.show_incident(None)
 
-    def show_incident(self, incident) -> None:
+    def show_incident(self, incident, poses: dict | None = None) -> None:
+        poses = poses or {}
         if incident is None:
             self.text.setHtml(f"<p style='color:{theme.TEXT_FAINT.name()}'>Select an incident to see why it was raised.</p>")
             return
@@ -438,6 +520,12 @@ class IncidentDetail(QWidget):
             if event.evidence.latitude is not None:
                 place = (f"{event.evidence.latitude:.6f}, {event.evidence.longitude:.6f} "
                          f"±{event.evidence.position_uncertainty_meters:.1f} m")
+            # How far from the camera, in the panel that answers "why" —
+            # the exported report has said it for months, and the person
+            # reading the screen is the one who has to act on it.
+            away = event.evidence.distance_from(poses.get(event.evidence.camera_id))
+            if away is not None:
+                place += f", {away.describe()} from {event.evidence.camera_id}"
             detector = event.evidence.detector
             what = detector.name if detector.classifies else f"{detector.name} (does not classify)"
             rows.append(

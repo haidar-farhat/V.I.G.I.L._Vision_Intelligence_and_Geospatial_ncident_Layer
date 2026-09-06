@@ -172,6 +172,35 @@ class Commands:
         outcome = self._guard(SITE_CONFIGURE, self._site.remove_camera, camera_id, by=self._principal)
         return Outcome(True, f"Removed {camera_id}.") if outcome else outcome
 
+    def detection(self):
+        """What this site watches for and how sure it must be."""
+        return self._site.detection()
+
+    def set_detection(self, labels, confidence) -> Outcome:
+        """Store it, after proving this model can actually satisfy it.
+
+        Built before it is stored, on purpose: a watch list the model cannot
+        produce would otherwise be saved, take effect at the next start, and
+        show as a site that sees nothing — which reads exactly like a quiet
+        night.
+        """
+        from ...adapters.detectors import DetectionError as ModelCannot
+        from ...service.detection import DetectionError, DetectionSettings, detector_factory
+
+        try:
+            wanted = DetectionSettings.checked(labels, confidence)
+            factory = detector_factory(self.model, wanted)
+        except (DetectionError, ModelCannot) as error:
+            # The model's own complaint names every label it does know, which
+            # is the only useful thing to put in front of the operator here.
+            return Outcome(False, str(error))
+        outcome = self._guard(SITE_CONFIGURE, self._site.set_detection, labels, confidence, by=self._principal)
+        if not outcome:
+            return outcome
+        self._runtime.use_detector(factory, by=self._principal)
+        running = " It applies when the analysis is next started." if self._runtime.running else ""
+        return Outcome(True, f"Now {wanted.describe()}.{running}", wanted)
+
     def add_zone(self, zone_id: str, name: str, kind: ZoneKind | str, ring: Sequence[LatLon], *,
                  watch: Sequence[str] = (), schedule: Schedule | None = None) -> Outcome:
         outcome = self._guard(SITE_CONFIGURE, self._site.add_zone, zone_id, name, kind, ring, watch=watch,

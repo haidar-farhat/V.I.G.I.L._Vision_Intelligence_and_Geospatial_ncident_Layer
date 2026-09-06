@@ -53,11 +53,13 @@ MANIFEST: tuple[Capability, ...] = (
                "with a dotted line, because a solid one would read as a fact about the ground"),
     Capability("detection-settings", "What a site watches for and how sure it must be, kept with the site", State.TESTED,
                ("vigil.service.detection.DetectionSettings", "vigil.service.detection.detector_factory"),
-               ("tests/test_detection.py", "tests/test_cli.py"),
+               ("tests/test_detection.py", "tests/test_cli.py", "tests/test_console.py"),
                "They were flags, so a service started at boot analysed with the built-in list while the operator "
                "believed what they had typed once still applied. A flag now overrides the setting for that one run, "
                "the model is opened before any thread exists so an impossible watch list fails at start-up, and "
-               "`vigil doctor` fails when a watched label is one the model cannot produce"),
+               "`vigil doctor` fails when a watched label is one the model cannot produce. The console's "
+               "*Watch for…* edits the same setting and says a change lands at the next start, because a "
+               "detector is made once per camera thread and lives as long as it does"),
     Capability("threats", "Labels a site treats as dangerous, and what it refuses to claim", State.TESTED,
                ("vigil.domain.threats.ThreatVocabulary", "vigil.domain.threats.ThreatRule"),
                ("tests/test_threats.py", "tests/test_site.py", "tests/test_diagnostics.py", "tests/test_cli.py"),

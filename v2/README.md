@@ -74,13 +74,16 @@ in front of a van overlaps it exactly as somebody sitting in it does.
 
 **What a site watches for.** The watch list and the confidence threshold are
 kept with the site (`vigil site detection --watch person,car --confidence
-0.6`), not typed at each run: a service started at boot has nobody to type at
+0.6`, or *Watch for…* in the console), not typed at each run: a service started at boot has nobody to type at
 it, and until now it analysed with the built-in list while the operator
 believed the choice they made once still applied. `--watch` and `--confidence`
 still override it for one run. A label the installed model cannot produce is
 refused where it is typed — the run prints the model's own vocabulary — and
 `vigil doctor` fails on a stored one, because a site watching for nothing
-looks exactly like a quiet night.
+looks exactly like a quiet night. A change made in the window lands at the
+next start and says so: a detector is made once per camera thread and lives as
+long as it does, so swapping one mid-run would mean two cameras drawing
+conclusions from different settings inside one incident.
 
 **Dangerous things, and what this refuses to claim.** A site names the labels
 it treats as dangerous: `vigil site threats --set knife --suggest`. Nothing is
@@ -101,9 +104,12 @@ hear about something that has not arrived yet.
 
 **Seen on screen and in the evidence.** The track table says how far each
 object is from its camera, always with the error — `12.0 ± 1.5 m` — and what
-it is doing, with the reasons one hover away. The exported report carries the
-same distance for every event, because "eleven metres from the gate" is the
-kind of thing somebody asks months later. A track the geometry could not place
+it is doing, with the reasons one hover away. The *Why* panel says the same
+for every event in an incident, beside the rule, the conditions it checked and
+the risk weights. The exported report carries that distance too, because
+"eleven metres from the gate" is the kind of thing somebody asks months later.
+One measurement, computed in one place (`Evidence.distance_from`), so the
+screen and the evidence cannot disagree. A track the geometry could not place
 says so instead of printing a number.
 
 **Working the queue.** `vigil incidents` shows what is still waiting on a

@@ -1021,6 +1021,17 @@ it. `package` now records a digest per source file in `build.json` and
 old bundle on purpose. **A green result from the wrong binary is worse than a
 red one.**
 
+**The reachability test could not see the console.** It scanned
+`vigil/interfaces/*.py` with `glob`, not `rglob`, so every module under
+`interfaces/console/` was invisible to it: a service method only the window
+reached read as *called by no interface*. Widened. It caught `use_detector`
+immediately, which is the first method in this repository that the console
+calls and the command line does not.
+
+**Distance now has one implementation.** `Evidence.distance_from(pose)` in the
+domain; the export, the track table and the *Why* panel all call it. It was
+about to be written a third time.
+
 ## 7. Hard-won facts worth not rediscovering
 
 - **The recurring defect in this repository is correct, tested code that nothing

@@ -53,6 +53,32 @@ class Evidence:
     def detector_classifies(self) -> bool:
         return self.detector.classifies
 
+    def position(self):
+        """Where this happened, or `None` when the geometry could not say.
+
+        An event stores three loose numbers because that is what a row of a
+        database holds; every reader wants the estimate they add up to.
+        """
+        from .geo import LatLon, PositionEstimate, PositionSource
+
+        if self.latitude is None or self.longitude is None:
+            return None
+        return PositionEstimate(LatLon(self.latitude, self.longitude),
+                                self.position_uncertainty_meters or 0.0, PositionSource.GROUND_PROJECTION)
+
+    def distance_from(self, pose):
+        """How far from the camera that saw it, with its error, or `None`.
+
+        Here rather than in each reader: the export, the operator window and
+        anything after them must not be able to disagree about a distance.
+        """
+        from .geo import distance_from_camera
+
+        estimate = self.position()
+        if pose is None or estimate is None:
+            return None
+        return distance_from_camera(pose, estimate)
+
 
 @dataclass(frozen=True, slots=True)
 class Event:

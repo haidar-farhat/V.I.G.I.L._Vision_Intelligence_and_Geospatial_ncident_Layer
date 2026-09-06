@@ -113,14 +113,8 @@ def _sha256(path: Path) -> str:
 
 def _from_camera(pose, event) -> str | None:
     """The distance with its error, or ``None`` when it cannot be measured."""
-    from ..domain.geo import LatLon, PositionEstimate, PositionSource, distance_from_camera
-
-    if pose is None or event.evidence.latitude is None:
-        return None
-    estimate = PositionEstimate(LatLon(event.evidence.latitude, event.evidence.longitude),
-                                event.evidence.position_uncertainty_meters or 0.0,
-                                PositionSource.GROUND_PROJECTION)
-    return distance_from_camera(pose, estimate).describe()
+    away = event.evidence.distance_from(pose)
+    return None if away is None else away.describe()
 
 
 def _event_dict(e) -> dict:

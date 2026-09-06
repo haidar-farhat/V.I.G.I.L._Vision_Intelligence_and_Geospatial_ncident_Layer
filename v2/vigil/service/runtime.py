@@ -454,6 +454,18 @@ class Runtime:
             _log.info("threat labels for this site: %s", vocabulary.describe())
         return [*default_rules(), ThreatRule(vocabulary)]
 
+    def use_detector(self, factory: Callable[[], Detector], *, by: Principal) -> None:
+        """Analyse with this from the next start. Running workers keep theirs.
+
+        A detector is made once per analysis thread and lives as long as it
+        does, so swapping one mid-run would mean two cameras drawing
+        conclusions from different settings within one incident. The change
+        is deliberately visible only at the next start, and the caller says
+        so where it is typed.
+        """
+        by.require(ANALYSIS_CONTROL)
+        self._detector_factory = factory
+
     def _factory(self) -> Callable[[], Detector]:
         if self._detector_factory is not None:
             return self._detector_factory

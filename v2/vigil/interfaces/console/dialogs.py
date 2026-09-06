@@ -253,6 +253,47 @@ class EditCameraDialog(_Dialog):
         return {"name": self.display_name.text().strip(), "source": self.source.text().strip()}
 
 
+class DetectionDialog(_Dialog):
+    """What this site watches for, and how sure the detector has to be."""
+
+    def __init__(self, settings, model_names: Sequence[str] = (), parent: QWidget | None = None):
+        from PySide6.QtWidgets import QDoubleSpinBox
+
+        super().__init__("What this site watches for", parent)
+        caption = QLabel("Kept with the site, so an unattended run uses it too. Leave the list empty for the "
+                         "built-in one. A label this model cannot name is refused rather than stored.")
+        caption.setWordWrap(True)
+        self._outer.addWidget(caption)
+        form = QFormLayout()
+        self.watch = QLineEdit(", ".join(sorted(settings.labels)) if settings.labels else "")
+        self.watch.setPlaceholderText("person, car — empty for the built-in list")
+        self.confidence = QDoubleSpinBox()
+        self.confidence.setRange(0.0, 0.95)
+        self.confidence.setSingleStep(0.05)
+        self.confidence.setDecimals(2)
+        self.confidence.setSpecialValueText("the detector's own")
+        self.confidence.setValue(settings.confidence or 0.0)
+        form.addRow("Watch", self.watch)
+        form.addRow("Confidence at least", self.confidence)
+        self._outer.addLayout(form)
+        if model_names:
+            names = QLabel("This model can name: " + ", ".join(sorted(model_names)))
+            names.setObjectName("Caption")
+            names.setWordWrap(True)
+            self._outer.addWidget(names)
+        timing = QLabel("A change takes effect when the analysis is next started: a detector is made once per "
+                        "camera thread and lives as long as it does.")
+        timing.setObjectName("Caption")
+        timing.setWordWrap(True)
+        self._outer.addWidget(timing)
+        self._finish("Save")
+
+    def value(self) -> dict:
+        labels = [l.strip() for l in self.watch.text().split(",") if l.strip()]
+        confidence = self.confidence.value()
+        return {"labels": labels, "confidence": None if confidence <= 0 else round(confidence, 2)}
+
+
 class PlaceCameraDialog(_Dialog):
     """Where a camera is and where it looks. Without this nothing can be located."""
 

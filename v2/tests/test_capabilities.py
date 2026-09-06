@@ -75,7 +75,9 @@ def test_every_public_service_method_is_called_by_an_interface():
                 public.add(name)
     public |= {"export_incident", "verify_package", "apply_retention"}
     called = set()
-    for path in (ROOT / "vigil" / "interfaces").glob("*.py"):
+    # `rglob`, not `glob`: the console is an interface too, and a method only
+    # it reached read as unreachable until this was widened.
+    for path in (ROOT / "vigil" / "interfaces").rglob("*.py"):
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
             if isinstance(node, ast.Attribute):

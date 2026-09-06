@@ -478,6 +478,29 @@ def test_selecting_an_incident_shows_why_it_was_raised(console, qt_app):
     assert "same object" in shown or "No association" in shown
 
 
+def test_the_why_panel_says_how_far_each_event_was_from_its_camera(console, qt_app, pose):
+    """The exported report has said it for months; the person acting on it reads the screen."""
+    from test_incidents import event
+    from vigil.domain.incidents import Correlator
+    from vigil.interfaces.console.widgets import IncidentDetail
+
+    incident = Correlator().correlate([event("a", 1, 10_000), event("a", 2, 11_000)])[0]
+    placed = incident.events[0]
+    assert placed.evidence.distance_from(None) is None, "no pose, no distance — not a bare number"
+    away = placed.evidence.distance_from(pose)
+
+    detail = IncidentDetail()
+    detail.show_incident(incident, {"a": pose})
+    shown = detail.text.toPlainText()
+    assert away is not None and away.describe() in shown and "±" in shown
+    assert f"from {placed.evidence.camera_id}" in shown
+
+    # A camera nobody placed reports no distance rather than inventing one.
+    detail.show_incident(incident, {})
+    assert away.describe() not in detail.text.toPlainText()
+    detail.deleteLater()
+
+
 def test_a_track_the_geometry_could_not_place_is_shown_as_unplaced_never_as_a_fix(qt_app, pose):
     """`CameraFallback` exists so an operator still learns "something is at this camera"."""
     from vigil.domain.geo import PositionEstimate, PositionSource
@@ -737,6 +760,67 @@ def test_the_track_table_counts_who_is_apparently_in_the_car(qt_app, pose):
     assert "72% of the person's box" in car.toolTip(6), "an inference must show its working"
     person = table.tree.topLevelItem(1)
     assert "probably in" in person.text(6), "the person's side of the same relation stays hedged"
+
+
+def test_the_window_changes_what_the_site_watches_for(console, qt_app, monkeypatch):
+    """The setting existed only on the command line, so the two interfaces disagreed."""
+    from vigil.service.detection import DetectionSettings
+
+    console.configure_button.setChecked(True)
+    assert console.commands.detection() == DetectionSettings(), "a fresh site watches the built-in list"
+
+    dialog = dialogs.DetectionDialog(DetectionSettings(frozenset({"person"}), 0.6), ("person", "car"))
+    assert dialog.watch.text() == "person" and dialog.confidence.value() == 0.6
+    dialog.watch.setText("person, car")
+    dialog.confidence.setValue(0.75)
+    value = dialog.value()
+    dialog.deleteLater()
+
+    monkeypatch.setattr(dialogs, "ask", lambda d: (d.deleteLater(), (True, value))[1])
+    console._set_detection()
+    stored = console.commands.detection()
+    assert stored.labels == frozenset({"person", "car"}) and stored.confidence == 0.75
+    assert "watching car, person" in console.status.currentMessage()
+    assert "site.detection_changed" in [r["action"] for r in console.commands.audit_rows()]
+
+    # Nothing chosen means the built-in list, and the spin box says so rather
+    # than showing a zero somebody would read as a threshold.
+    cleared = dialogs.DetectionDialog(DetectionSettings())
+    assert cleared.value() == {"labels": [], "confidence": None}
+    assert cleared.confidence.specialValueText()
+    cleared.deleteLater()
+
+    # A setting the detector cannot satisfy is refused, and nothing is stored.
+    refused = console.commands.set_detection(["person"], 1.5)
+    assert not refused and "outside" in refused.message
+    assert console.commands.detection() == stored, "a refused setting must not be half-applied"
+
+
+def test_the_toolbar_stays_readable_on_the_narrowest_window_it_claims(console, qt_app):
+    """Qt answers a toolbar that will not fit by cutting the words in half.
+
+    The shipped window read "dd camera.", "elete zone" and "ort evidenc"
+    after one more button was added to a row that had just fitted. Nothing
+    failed, nothing was logged, and only a photograph showed it.
+    """
+    from PySide6.QtWidgets import QPushButton
+
+    console.resize(console.NARROWEST_WINDOW, 800)
+    console.show()
+    qt_app.processEvents()
+    toolbar = console.toolbar
+    for index in range(toolbar.count()):
+        widget = toolbar.itemAt(index).widget()
+        assert widget.width() >= widget.sizeHint().width(),             f"{widget.text()!r} is narrower than its own label and would be cut"
+        assert widget.x() + widget.width() <= console.NARROWEST_WINDOW, f"{widget.text()!r} is off the window"
+    assert toolbar.rows() >= 1
+
+    # Every button an operator can press is in the toolbar: a control that
+    # exists but sits in no layout is worse than one that is missing.
+    placed = {toolbar.itemAt(i).widget() for i in range(toolbar.count())}
+    buttons = [w for w in console.findChildren(QPushButton) if w.parent() is console]
+    assert set(buttons) <= placed, "a button was built and never added to the toolbar"
+    assert set(console._configure_only()) <= placed
 
 
 def test_the_plan_links_two_tracks_a_relation_joins(qt_app, pose):
