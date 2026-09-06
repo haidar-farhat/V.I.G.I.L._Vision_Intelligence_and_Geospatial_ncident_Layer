@@ -15,18 +15,15 @@ v1 are structural here and are asserted by tests:
 
 from __future__ import annotations
 
-import weakref
-from pathlib import Path
 from typing import Sequence
 
 from PySide6.QtCore import QEvent, QTimer, Qt
 from PySide6.QtWidgets import (
-    QFrame, QGridLayout, QHBoxLayout, QLabel, QMainWindow, QMessageBox, QPushButton, QSplitter, QTabWidget,
-    QVBoxLayout, QWidget,
+    QCheckBox, QFrame, QGridLayout, QHBoxLayout, QLabel, QMainWindow, QMessageBox, QPushButton, QSplitter,
+    QTabWidget, QVBoxLayout, QWidget,
 )
 
-from ...domain.geo import CameraPose
-from ...service.auth import ANALYSIS_CONTROL, INCIDENT_EXPORT, SITE_CONFIGURE
+from ...service.auth import INCIDENT_EXPORT, INCIDENT_REVIEW, SITE_CONFIGURE
 from ...logs import get as _get_logger
 from . import dialogs, theme
 from .commands import Commands
@@ -43,7 +40,7 @@ IDLE_RELOCK_MILLIS = 10 * 60 * 1000
 LOCKED_REASON = "Locked. Press Configure to change the site — cameras, placement and zones."
 #: The share of the status bar one permanent label may take, so the message
 #: it sits beside keeps at least a third of the bar.
-STATUS_LABEL_SHARE = 0.13
+STATUS_LABEL_SHARE = 0.11
 
 
 def _panel(title: str, body: QWidget) -> QFrame:
@@ -102,6 +99,7 @@ class ConsoleWindow(QMainWindow):
 
         self.incidents = IncidentList()
         self.incidents.selected.connect(self._incident_selected)
+        self.incidents.filtered.connect(self._filter_incidents)
         self.tracks = TrackTable()
         self.detail = IncidentDetail()
         self.audit = AuditView()
@@ -129,6 +127,7 @@ class ConsoleWindow(QMainWindow):
         self.setCentralWidget(central)
 
         self.status = self.statusBar()
+        self.site_label = ElidingLabel("")
         self.user_label = ElidingLabel("")
         self.lock_label = ElidingLabel("")
         self.placement_label = ElidingLabel("")
@@ -146,6 +145,7 @@ class ConsoleWindow(QMainWindow):
         self._idle.setInterval(IDLE_RELOCK_MILLIS)
         self._idle.timeout.connect(self._relock)
 
+        self._show_site()
         self._show_principal()
         self._set_configuring(False)
         self.refresh_site()
@@ -173,20 +173,33 @@ class ConsoleWindow(QMainWindow):
         self.zone_button = QPushButton("Draw zone")
         self.zone_button.setCheckable(True)
         self.zone_button.toggled.connect(self._draw_zone)
+        self.edit_zone_button = QPushButton("Edit zone…")
+        self.edit_zone_button.clicked.connect(self._edit_zone)
         self.drop_zone_button = QPushButton("Delete zone")
         self.drop_zone_button.clicked.connect(self._remove_zone)
         self.start_button = QPushButton("Start")
         self.start_button.clicked.connect(self._start)
         self.stop_button = QPushButton("Stop")
         self.stop_button.clicked.connect(self._stop)
+        self.acknowledge_button = QPushButton("Acknowledge")
+        self.acknowledge_button.setToolTip("Somebody has seen this and it is real.")
+        self.acknowledge_button.clicked.connect(self._acknowledge)
+        self.dismiss_button = QPushButton("Dismiss…")
+        self.dismiss_button.setToolTip("Seen, and not worth acting on. A reason is required.")
+        self.dismiss_button.clicked.connect(self._dismiss)
+        self.dismissed_box = QCheckBox("Show dismissed")
+        self.dismissed_box.toggled.connect(self._show_dismissed)
         self.export_button = QPushButton("Export evidence…")
         self.export_button.clicked.connect(self._export)
         for button in (self.add_button, self.place_button, self.password_button, self.remove_button,
-                       self.zone_button, self.drop_zone_button):
+                       self.zone_button, self.edit_zone_button, self.drop_zone_button):
             row.addWidget(button)
         row.addSpacing(10)
-        for button in (self.start_button, self.stop_button, self.export_button):
+        for button in (self.start_button, self.stop_button):
             row.addWidget(button)
+        row.addSpacing(10)
+        for widget in (self.acknowledge_button, self.dismiss_button, self.export_button, self.dismissed_box):
+            row.addWidget(widget)
         row.addStretch(1)
         about = QPushButton("About")
         about.clicked.connect(self._about)
@@ -195,7 +208,7 @@ class ConsoleWindow(QMainWindow):
 
     def _configure_only(self) -> Sequence[QWidget]:
         return (self.add_button, self.place_button, self.password_button, self.remove_button,
-                self.zone_button, self.drop_zone_button)
+                self.zone_button, self.edit_zone_button, self.drop_zone_button)
 
     # ----------------------------------------------------------- the lock
 
@@ -309,18 +322,35 @@ class ConsoleWindow(QMainWindow):
         self._say(outcome.message)
         self.refresh_site()
 
-    def _remove_zone(self) -> None:
+    def _edit_zone(self) -> None:
+        zone = self._pick_zone("Edit a zone")
+        if zone is None:
+            return
+        ok, value = dialogs.ask(dialogs.ZoneDialog((), self._detector_labels(), self, existing=zone))
+        if not ok or value is None:
+            return
+        self._say(self.commands.edit_zone(zone.id, name=value["name"], kind=value["kind"],
+                                          watch=value["watch"], schedule=value["schedule"]).message)
+        self.refresh_site()
+
+    def _pick_zone(self, title: str):
         zones = self.commands.zones()
         if not zones:
-            self._say("There is no zone to delete.")
-            return
+            self._say("There is no zone yet. Draw one first.")
+            return None
         from PySide6.QtWidgets import QInputDialog
 
         names = [f"{z.id} — {z.name}" for z in zones]
-        chosen, ok = QInputDialog.getItem(self, "Delete a zone", "Zone", names, 0, False)
+        chosen, ok = QInputDialog.getItem(self, title, "Zone", names, 0, False)
         if not ok or not chosen:
+            return None
+        return next((z for z in zones if z.id == chosen.split(" — ")[0]), None)
+
+    def _remove_zone(self) -> None:
+        zone = self._pick_zone("Delete a zone")
+        if zone is None:
             return
-        self._say(self.commands.remove_zone(chosen.split(" — ")[0]).message)
+        self._say(self.commands.remove_zone(zone.id).message)
         self.refresh_site()
 
     def _start(self) -> None:
@@ -345,6 +375,41 @@ class ConsoleWindow(QMainWindow):
         for view in self._views.values():
             view.set_caption("stopped")
 
+    def _acknowledge(self) -> None:
+        incident = self.incidents.selected_incident()
+        if incident is None:
+            self._say("Select an incident to acknowledge.")
+            return
+        self._say(self.commands.acknowledge(incident).message)
+        self._refresh_incidents()
+
+    def _dismiss(self) -> None:
+        incident = self.incidents.selected_incident()
+        if incident is None:
+            self._say("Select an incident to dismiss.")
+            return
+        ok, note = dialogs.ask(dialogs.NoteDialog(
+            "Dismiss this incident", "Why is it not worth acting on? Without a reason a dismissal cannot be "
+            "told from nobody having looked.", self))
+        if not ok or not note:
+            return
+        self._say(self.commands.dismiss(incident, note).message)
+        self._refresh_incidents()
+
+    def _show_dismissed(self, on: bool) -> None:
+        self.commands.show_dismissed = bool(on)
+        self._refresh_incidents()
+
+    def _filter_incidents(self, camera: str, severity: str, contains: str) -> None:
+        self.commands.set_filter(camera, severity, contains)
+        self._refresh_incidents()
+        found = self.incidents.tree.topLevelItemCount()
+        self._say(f"{found} incident(s) matching {self.commands.query.describe()}.")
+
+    def _refresh_incidents(self) -> None:
+        self.incidents.show_incidents(self.commands.incidents())
+        self._incident_selected(self.incidents.selected_incident())
+
     def _export(self) -> None:
         incident = self.incidents.selected_incident()
         if incident is None:
@@ -368,6 +433,7 @@ class ConsoleWindow(QMainWindow):
     def refresh_site(self) -> None:
         cameras = self.commands.cameras()
         self.camera_list.show_cameras(cameras, self.commands.health())
+        self.incidents.set_cameras([c.id for c in cameras])
         self.plan.set_cameras({c.id: c.pose for c in cameras if c.pose is not None})
         self.plan.set_zones(self.commands.zones())
         placed = [c for c in cameras if c.placed]
@@ -414,8 +480,8 @@ class ConsoleWindow(QMainWindow):
             self._show_detector()
         self.camera_list.show_cameras(self.commands.cameras(), health)
         self.incidents.show_incidents(self.commands.incidents())
+        self._incident_selected(self.incidents.selected_incident())
         self._show_alerts()
-        self.export_button.setEnabled(bool(self.incidents.selected_incident()) and self.commands.may(INCIDENT_EXPORT))
         if self.tabs.currentWidget() is self.audit:
             self.audit.show_rows(self.commands.audit_rows(limit=200))
         if not final and self._timer.isActive() and not self.commands.runtime.running:
@@ -495,9 +561,13 @@ class ConsoleWindow(QMainWindow):
         self.plan.select(camera_id)
 
     def _incident_selected(self, incident) -> None:
-        self.export_button.setEnabled(incident is not None and self.commands.may(INCIDENT_EXPORT))
+        chosen = incident is not None
+        self.export_button.setEnabled(chosen and self.commands.may(INCIDENT_EXPORT))
+        may_review = chosen and self.commands.may(INCIDENT_REVIEW)
+        self.acknowledge_button.setEnabled(may_review)
+        self.dismiss_button.setEnabled(may_review)
         self.detail.show_incident(incident)
-        if incident is not None:
+        if chosen:
             self.tabs.setCurrentWidget(self.detail)
 
     def _tab_changed(self, index: int) -> None:
@@ -507,6 +577,17 @@ class ConsoleWindow(QMainWindow):
     def _record_toggled(self, camera_id: str, on: bool) -> None:
         self._say(self.commands.set_recording(camera_id, on).message)
         self._idle.start()
+
+    def _show_site(self) -> None:
+        """The site's name and the clock its schedules are read in.
+
+        On screen because a zone that closes at 22:00 closes in *this* clock,
+        and an operator reading a wall clock has to be able to check that.
+        """
+        name, zone = self.commands.site()
+        self.setWindowTitle(f"Sentinel Vision — {name}")
+        self.site_label.setText(f"{name} · {zone}")
+        self.site_label.setToolTip("Schedules on zones are read in this clock. Change it with `vigil site name`.")
 
     def _show_principal(self) -> None:
         principal = self.commands.principal
@@ -523,7 +604,8 @@ class ConsoleWindow(QMainWindow):
             self.status.showMessage(text, 12_000)
 
     def _permanent_labels(self):
-        return (self.user_label, self.lock_label, self.placement_label, self.detector_label, self.alert_label)
+        return (self.site_label, self.user_label, self.lock_label, self.placement_label, self.detector_label,
+                self.alert_label)
 
     def _fit_labels(self) -> None:
         cap = int((self.status.width() or self.width()) * STATUS_LABEL_SHARE)

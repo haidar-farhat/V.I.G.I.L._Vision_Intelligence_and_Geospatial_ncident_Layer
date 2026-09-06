@@ -16,7 +16,9 @@ def test_every_mutating_method_takes_a_principal_and_writes_an_audit_row(keychai
     with Store(":memory:") as store:
         site = SiteService(store, keychain)
         for name, method in inspect.getmembers(SiteService, inspect.isfunction):
-            if name.startswith("_") or name in ("cameras", "camera", "zones", "source_with_credentials", "store"):
+            # `known_timezone` is a pure validator that changes nothing.
+            if name.startswith("_") or name in ("cameras", "camera", "zones", "source_with_credentials", "store",
+                                                "known_timezone"):
                 continue
             assert "by" in inspect.signature(method).parameters, f"{name} takes no principal"
         camera = site.add_camera("gate", "rtsp" + "://admin:s3cret@10.0.0.9/s", pose=pose, by=OPERATOR)
@@ -72,3 +74,66 @@ def test_without_a_keychain_the_password_is_not_kept_and_that_is_said(pose, capl
         assert camera.credentials_ref is None and "not kept" in caplog.text
         with pytest.raises(SiteError, match="no keychain"):
             site.set_password("gate", "x", by=Principal.open_site())
+
+
+def test_an_unknown_time_zone_is_refused_where_it_is_typed(keychain):
+    """A site that learns at 03:00 that its clock was invalid has already been told the wrong thing all night."""
+    from datetime import timezone
+    from zoneinfo import ZoneInfo
+
+    with Store(":memory:") as store:
+        site = SiteService(store, keychain)
+        assert site.known_timezone("UTC") is timezone.utc
+        assert site.known_timezone("  utc  ") is timezone.utc
+        assert site.known_timezone("Asia/Beirut") == ZoneInfo("Asia/Beirut")
+        with pytest.raises(SiteError, match="does not know the time zone"):
+            site.known_timezone("Mars/Olympus")
+        with pytest.raises(SiteError):
+            site.name_site("Depot", "Mars/Olympus", by=OPERATOR)
+        assert store.site()["name"] != "Depot", "a refused clock must not half-save the site"
+        site.name_site("Depot", "Asia/Beirut", by=OPERATOR)
+        assert store.site()["timezone"] == "Asia/Beirut"
+
+
+def test_a_camera_that_moved_keeps_its_placement_and_its_password_follows(keychain, pose):
+    """Removing and re-adding was the only way, and it threw away the placement."""
+    with Store(":memory:") as store:
+        site = SiteService(store, keychain)
+        site.add_camera("gate", "rtsp" + "://admin:oldpass@10.0.0.9/s", pose=pose, record=True, by=OPERATOR)
+        moved = site.set_source("gate", "rtsp" + "://admin:newpass@10.0.0.44/s", by=OPERATOR)
+        assert moved.source.endswith("10.0.0.44/s") and moved.pose == pose and moved.record
+        opened = site.source_with_credentials(moved)
+        assert "newpass" in opened and "oldpass" not in opened
+        renamed = site.rename_camera("gate", "North gate", by=OPERATOR)
+        assert renamed.name == "North gate" and renamed.id == "gate"
+        with pytest.raises(SiteError):
+            site.rename_camera("gate", "   ", by=OPERATOR)
+        actions = {r["action"] for r in store.audit_trail()}
+        assert {"camera.source_changed", "camera.renamed"} <= actions
+        trail = " ".join(str(dict(r)) for r in store.audit_trail())
+        assert "oldpass" not in trail and "newpass" not in trail
+
+
+def test_a_zone_can_be_changed_without_losing_the_ring_somebody_drew(keychain):
+    from vigil.domain.zones import Schedule, ZoneKind
+
+    with Store(":memory:") as store:
+        site = SiteService(store, keychain)
+        ring = [LatLon(0, 0), LatLon(0, 0.001), LatLon(0.001, 0.001), LatLon(0.001, 0)]
+        site.add_zone("yard", "Yrad", "interest", ring, watch=["person"], by=OPERATOR)
+        fixed = site.edit_zone("yard", name="Yard", kind=ZoneKind.RESTRICTED, watch=["Person", "car"],
+                               schedule=Schedule(22, 6), by=OPERATOR)
+        assert fixed.name == "Yard" and fixed.kind is ZoneKind.RESTRICTED
+        assert fixed.watch == frozenset({"person", "car"}) and fixed.ring == tuple(ring)
+        assert fixed.schedule == Schedule(22, 6)
+        # Absent means keep; None means clear. They are different requests.
+        kept = site.edit_zone("yard", enter_after_millis=1200, by=OPERATOR)
+        assert kept.schedule == Schedule(22, 6) and kept.enter_after_millis == 1200 and kept.name == "Yard"
+        cleared = site.edit_zone("yard", schedule=None, by=OPERATOR)
+        assert cleared.schedule is None
+        row = [r for r in store.audit_trail() if r["action"] == "zone.changed"][-1]
+        assert "Yrad" in row["before"] and "Yard" in row["after"]
+        with pytest.raises(SiteError, match="no zone"):
+            site.edit_zone("nothing", name="x", by=OPERATOR)
+        with pytest.raises(Forbidden):
+            site.edit_zone("yard", name="x", by=VIEWER)

@@ -76,7 +76,7 @@ def package() -> int:
     if DIST.exists():
         shutil.rmtree(DIST)
     code = _run([sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "--name", "vigil", "--distpath", str(ROOT / "dist"),
-                 "--workpath", str(ROOT / "build"), "--specpath", str(ROOT / "build"), "--collect-all", "onnxruntime",
+                 "--workpath", str(ROOT / "build"), "--specpath", str(ROOT / "build"), "--collect-all", "onnxruntime", "--collect-data", "tzdata",
                  "--hidden-import", "keyring.backends.Windows", "--hidden-import", "keyring.backends.macOS",
                  "--hidden-import", "keyring.backends.SecretService",
                  "--hidden-import", "PySide6.QtWidgets", "--hidden-import", "PySide6.QtGui",

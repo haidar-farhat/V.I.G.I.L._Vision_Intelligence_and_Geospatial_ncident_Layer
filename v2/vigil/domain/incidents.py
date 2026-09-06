@@ -9,8 +9,9 @@ the strength of a motion blob.
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
+from enum import StrEnum
 from typing import Sequence
 
 from .events import Event, Severity, severity_rank
@@ -208,6 +209,30 @@ def score_risk(events: Sequence[Event], distinct: int, cameras: Sequence[str], d
     return Risk(round(score, 3), tuple(factors))
 
 
+class ReviewState(StrEnum):
+    """Where an incident stands with the people who have to act on it."""
+
+    NEW = "NEW"
+    ACKNOWLEDGED = "ACKNOWLEDGED"
+    DISMISSED = "DISMISSED"
+
+
+@dataclass(frozen=True, slots=True)
+class Review:
+    """Somebody's judgement, and who made it. Never anonymous."""
+
+    state: ReviewState = ReviewState.NEW
+    by: str | None = None
+    at_millis: int | None = None
+    note: str | None = None
+
+    def describe(self) -> str:
+        if self.state is ReviewState.NEW:
+            return "not yet reviewed"
+        note = f" — {self.note}" if self.note else ""
+        return f"{str(self.state).lower()} by {self.by}{note}"
+
+
 @dataclass(frozen=True, slots=True)
 class Incident:
     id: str
@@ -222,6 +247,7 @@ class Incident:
     events: tuple[Event, ...]
     associations: tuple[Association, ...]
     risk: Risk
+    review: Review = Review()
 
     @property
     def duration_millis(self) -> int:

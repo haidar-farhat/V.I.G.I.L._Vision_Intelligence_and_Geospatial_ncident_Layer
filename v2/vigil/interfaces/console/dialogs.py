@@ -265,12 +265,19 @@ class PlaceCameraDialog(_Dialog):
 
 
 class ZoneDialog(_Dialog):
-    """What a drawn ring means: its name, kind, watch list and closed hours."""
+    """What a drawn ring means: its name, kind, watch list and closed hours.
 
-    def __init__(self, ring: Sequence[LatLon], labels: Sequence[str] = (), parent: QWidget | None = None):
-        super().__init__("Add a zone", parent)
-        self._ring = list(ring)
-        self._outer.addWidget(QLabel(f"{len(self._ring)} point(s) on the ground."))
+    The same dialog edits one, because the questions are the same; only the
+    ring is untouchable there, since it is the part that took care to draw.
+    """
+
+    def __init__(self, ring: Sequence[LatLon], labels: Sequence[str] = (), parent: QWidget | None = None,
+                 existing=None):
+        super().__init__("Edit a zone" if existing is not None else "Add a zone", parent)
+        self._ring = list(existing.ring) if existing is not None else list(ring)
+        self._existing = existing
+        self._outer.addWidget(QLabel(f"{len(self._ring)} point(s) on the ground."
+                                     + (" The ring itself is not changed here." if existing is not None else "")))
         form = QFormLayout()
         self.identifier = QLineEdit()
         self.identifier.setPlaceholderText("yard")
@@ -311,7 +318,20 @@ class ZoneDialog(_Dialog):
         row.addWidget(self.closed_until)
         row.addStretch(1)
         self._outer.addWidget(hours)
-        self._finish("Add zone")
+        if existing is not None:
+            self.identifier.setText(existing.id)
+            self.identifier.setReadOnly(True)
+            self.name.setText(existing.name)
+            self.kind.setCurrentIndex(max(0, self.kind.findData(existing.kind.value)))
+            for index in range(self.watch.count()):
+                item = self.watch.item(index)
+                if item.text().lower() in existing.watch:
+                    item.setCheckState(Qt.CheckState.Checked)
+            if existing.schedule is not None:
+                self.closed.setChecked(True)
+                self.closed_from.setValue(existing.schedule.closed_from)
+                self.closed_until.setValue(existing.schedule.closed_until)
+        self._finish("Save" if existing is not None else "Add zone")
 
     def check(self) -> str | None:
         if len(self._ring) < 3:
@@ -346,3 +366,24 @@ class PasswordDialog(_Dialog):
 
     def value(self) -> str:
         return self.password.text()
+
+
+class NoteDialog(_Dialog):
+    """One line of why. Required where a judgement without a reason means nothing."""
+
+    def __init__(self, title: str, prompt: str, parent: QWidget | None = None):
+        super().__init__(title, parent)
+        caption = QLabel(prompt)
+        caption.setWordWrap(True)
+        self._outer.addWidget(caption)
+        self.note = QLineEdit()
+        self.note.setMaxLength(500)
+        self._outer.addWidget(self.note)
+        self._finish("Save")
+        self.note.setFocus()
+
+    def check(self) -> str | None:
+        return None if self.note.text().strip() else "A reason is required."
+
+    def value(self) -> str:
+        return self.note.text().strip()

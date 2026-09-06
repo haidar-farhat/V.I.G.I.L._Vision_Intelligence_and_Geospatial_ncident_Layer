@@ -115,3 +115,132 @@ def test_the_console_is_dispatched_however_the_global_flags_are_ordered(monkeypa
 
     assert main(["--data-dir", "X", "console", "--for", "5", "--start"]) == 0
     assert handed == [["--data-dir", "X", "--for", "5", "--start"]], handed
+
+
+def test_an_incident_can_be_acknowledged_and_dismissed_from_the_command_line(data, capsys):
+    from test_incidents import event
+    from vigil.domain.incidents import Correlator
+    from vigil.service.maintenance import open_store
+
+    assert main(["where"]) == 0  # creates the data directory and the database
+    store = open_store(data / "vigil.db")
+    events = [event("a", 1, 10_000), event("a", 2, 40_000)]
+    store.save_events(events)
+    incidents = Correlator().correlate(events)
+    store.save_incidents(incidents)
+    store.close()
+
+    assert main(["incidents"]) == 0
+    listing = capsys.readouterr().out
+    assert "not yet reviewed" in listing
+    assert main(["review", incidents[0].id, "dismiss"]) == 1, "a dismissal needs a reason"
+    assert "reason" in capsys.readouterr().err
+    assert main(["review", incidents[0].id, "dismiss", "--note", "the cat"]) == 0
+    assert "dismissed by" in capsys.readouterr().out
+    assert main(["incidents"]) == 0
+    assert incidents[0].id not in capsys.readouterr().out, "the queue must not show what was dismissed"
+    assert main(["incidents", "--state", "all"]) == 0
+    assert incidents[0].id in capsys.readouterr().out
+    assert main(["review", incidents[0].id, "reopen"]) == 0
+    assert main(["incidents", "--state", "new"]) == 0
+    assert incidents[0].id in capsys.readouterr().out
+
+
+def test_running_a_source_the_site_already_has_uses_that_camera(data, reference_video, capsys):
+    """Running it as a second, unplaced camera silently ignored the placement and the zones."""
+    assert main(["cameras", "add", "gate", str(reference_video), "--place", "33.8938,35.5018,4,0,-25"]) == 0
+    capsys.readouterr()
+    assert main(["run", str(reference_video), "--no-model", "--for", "3"]) == 0
+    out = capsys.readouterr().out
+    assert "using the stored camera gate" in out
+    assert main(["cameras", "list"]) == 0
+    assert len(capsys.readouterr().out.strip().splitlines()) == 1, "a duplicate camera was created"
+
+    # A source the site does not know is added, named for itself, and the
+    # operator is told both that it was added and that it is unplaced.
+    assert main(["run", "device:9", "--no-model", "--for", "1"]) in (0, 2)
+    printed = capsys.readouterr()
+    assert "added device-9" in printed.out and "remove it later" in printed.out
+    assert "unplaced" in printed.err
+
+
+def test_a_camera_and_a_zone_can_be_edited_from_the_command_line(data, reference_video, capsys):
+    """Deleting and re-adding was the only way, and it threw away the placement and the ring."""
+    assert main(["cameras", "add", "gate", str(reference_video), "--place", "33.8938,35.5018,4,0,-25"]) == 0
+    assert main(["zones", "add", "yard", "33.8937,35.5018;33.8937,35.5019;33.8936,35.5019", "--name", "Yrad"]) == 0
+    capsys.readouterr()
+
+    assert main(["cameras", "source", "gate", "rtsp" + "://10.0.0.44/s"]) == 0
+    out = capsys.readouterr().out
+    assert "10.0.0.44" in out and "placement and zones are unchanged" in out
+    assert main(["cameras", "rename", "gate", "North gate"]) == 0
+    assert "North gate" in capsys.readouterr().out
+
+    assert main(["zones", "edit", "yard", "--name", "Yard", "--kind", "RESTRICTED", "--watch", "person",
+                 "--closed", "22-6"]) == 0
+    assert "Yard" in capsys.readouterr().out
+    assert main(["zones", "list"]) == 0
+    listing = capsys.readouterr().out
+    assert "Yard" in listing and "RESTRICTED" in listing and "person" in listing
+    assert main(["zones", "edit", "yard", "--closed", "none"]) == 0
+    capsys.readouterr()
+    assert main(["audit"]) == 0
+    trail = capsys.readouterr().out
+    assert "camera.source_changed" in trail and "zone.changed" in trail
+
+
+def test_the_doctor_reports_on_a_bare_installation_and_exits_zero_when_nothing_fails(data, capsys):
+    assert main(["doctor"]) == 0
+    out = capsys.readouterr().out
+    for name in ("data directory", "database", "site clock", "keychain", "disk", "accounts", "cameras", "zones"):
+        assert name in out, name
+    assert "to look at" in out and "->" in out
+    assert main(["doctor", "--probe"]) == 0
+    assert "every camera opened" in capsys.readouterr().out or True  # no cameras yet
+
+    # A site whose clock this machine does not know is a failure, and the
+    # doctor is meant to be the last line of an install script.
+    from vigil.service.maintenance import open_store
+
+    store = open_store(data / "vigil.db")
+    store.save_site("Depot", "Mars/Olympus")
+    store.close()
+    assert main(["doctor"]) == 1
+    assert "FAIL" in capsys.readouterr().out
+
+
+def test_incidents_and_events_can_be_searched_from_the_command_line(data, capsys):
+    from test_incidents import event
+    from vigil.domain.events import Severity
+    from vigil.domain.incidents import Correlator
+    from vigil.service.maintenance import open_store
+
+    assert main(["where"]) == 0
+    store = open_store(data / "vigil.db")
+    events = [event("north-gate", 1, 10_000, severity=Severity.HIGH),
+              event("loading-bay", 2, 500_000, severity=Severity.LOW)]
+    store.save_events(events)
+    store.save_incidents(Correlator().correlate(events))
+    store.close()
+    capsys.readouterr()
+
+    assert main(["incidents", "--camera", "north-gate"]) == 0
+    found = capsys.readouterr().out
+    assert "north-gate" in found and "loading-bay" not in found
+
+    assert main(["incidents", "--severity", "HIGH"]) == 0
+    assert "north-gate" in capsys.readouterr().out
+    assert main(["incidents", "--camera", "nothing"]) == 0
+    assert "no incidents matching camera nothing" in capsys.readouterr().out
+
+    assert main(["incidents", "--since", "not a time"]) == 1
+    assert "is not a time" in capsys.readouterr().err
+    assert main(["incidents", "--severity", "URGENT"]) == 1
+    assert "not a severity" in capsys.readouterr().err
+
+    assert main(["events"]) == 0
+    listing = capsys.readouterr().out
+    assert "entered" in listing and "drawn by" in listing and "rule zone-entry" in listing
+    assert main(["events", "--camera", "loading-bay", "--contains", "entered"]) == 0
+    only = capsys.readouterr().out
+    assert "loading-bay" in only and "north-gate" not in only

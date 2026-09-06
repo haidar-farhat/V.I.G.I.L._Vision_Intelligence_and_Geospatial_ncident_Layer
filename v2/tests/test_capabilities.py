@@ -11,8 +11,25 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 def _resolve(dotted: str):
-    module_name, _, attribute = dotted.rpartition(".")
-    return getattr(importlib.import_module(module_name), attribute)
+    """Import the longest module prefix, then walk the attributes.
+
+    A manifest entry may name a method (`...Runtime.metrics`), so splitting
+    at the last dot and importing the rest is not enough.
+    """
+    parts = dotted.split(".")
+    module, index = None, 0
+    for size in range(len(parts), 0, -1):
+        try:
+            module = importlib.import_module(".".join(parts[:size]))
+            index = size
+            break
+        except ModuleNotFoundError:
+            continue
+    assert module is not None, f"no module in {dotted}"
+    thing = module
+    for name in parts[index:]:
+        thing = getattr(thing, name)
+    return thing
 
 
 def test_every_symbol_in_the_manifest_exists_and_its_tests_reference_it():

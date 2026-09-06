@@ -23,7 +23,7 @@ from ..adapters.recorder import Segment
 from ..domain.detection import DetectorInfo
 from ..domain.events import Event, EventType, Evidence, Severity
 from ..domain.geo import CameraPose, LatLon
-from ..domain.incidents import Association, Incident, Risk, RiskFactor
+from ..domain.incidents import Association, Incident, Review, ReviewState, Risk, RiskFactor
 from ..domain.zones import Membership, Schedule, Zone, ZoneKind
 from ..logs import get as _get_logger
 from .schema import MIGRATIONS, SCHEMA_VERSION, Migration
@@ -268,13 +268,34 @@ class Store:
             )
             return c.total_changes - before
 
-    def events(self, *, since: int | None = None, limit: int = 10_000) -> list[Event]:
+    def events(self, *, since: int | None = None, until: int | None = None, camera_id: str | None = None,
+               zone_id: str | None = None, severities: Sequence[str] | None = None, contains: str | None = None,
+               limit: int = 10_000) -> list[Event]:
+        """Events, filtered in SQL. A search must not read the history into memory."""
         self._check_thread()
+        clauses, args = [], []
         if since is not None:
-            rows = self._connection.execute("SELECT * FROM events WHERE occurred_at >= ? ORDER BY occurred_at LIMIT ?", (since, limit))
-        else:
-            rows = self._connection.execute("SELECT * FROM events ORDER BY occurred_at LIMIT ?", (limit,))
-        return [_event_of(r) for r in rows]
+            clauses.append("occurred_at >= ?"); args.append(since)
+        if until is not None:
+            clauses.append("occurred_at <= ?"); args.append(until)
+        if camera_id:
+            clauses.append("camera_id = ?"); args.append(camera_id)
+        if zone_id:
+            clauses.append("zone_id = ?"); args.append(zone_id)
+        if severities:
+            clauses.append(f"severity IN ({','.join('?' * len(severities))})")
+            args.extend(str(s) for s in severities)
+        if contains:
+            # The summary and the evidence, because "person" is in one and
+            # "north-gate" may only be in the other.
+            clauses.append("(summary LIKE ? OR evidence LIKE ?)")
+            args.extend([f"%{contains}%", f"%{contains}%"])
+        sql = "SELECT * FROM events"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY occurred_at LIMIT ?"
+        args.append(limit)
+        return [_event_of(r) for r in self._connection.execute(sql, args)]
 
     def event_count(self) -> int:
         self._check_thread()
@@ -291,7 +312,10 @@ class Store:
                        risk, associations, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)
                        ON CONFLICT(id) DO UPDATE SET severity=excluded.severity, summary=excluded.summary,
                        closed_at=excluded.closed_at, distinct_objects=excluded.distinct_objects, cameras=excluded.cameras,
-                       zones=excluded.zones, risk=excluded.risk, associations=excluded.associations, updated_at=excluded.updated_at""",
+                       zones=excluded.zones, risk=excluded.risk, associations=excluded.associations, updated_at=excluded.updated_at
+                       -- The review columns are deliberately absent: a
+                       -- re-correlation refines what the system concluded and
+                       -- must never undo what a person decided about it.""",
                     (inc.id, inc.severity.value, inc.summary, inc.opened_at_millis, inc.closed_at_millis, inc.distinct_objects,
                      json.dumps(list(inc.cameras)), json.dumps(list(inc.zones)),
                      json.dumps({"score": inc.risk.score, "factors": [asdict(f) for f in inc.risk.factors]}),
@@ -300,10 +324,41 @@ class Store:
                 c.execute("DELETE FROM incident_events WHERE incident_id = ?", (inc.id,))
                 c.executemany("INSERT OR IGNORE INTO incident_events VALUES (?,?)", [(inc.id, e.id) for e in inc.events])
 
-    def incidents(self, *, limit: int = 500) -> list[Incident]:
+    def incidents(self, *, limit: int = 500, states: Sequence[str] | None = None, since: int | None = None,
+                  until: int | None = None, camera_id: str | None = None, zone: str | None = None,
+                  severities: Sequence[str] | None = None, contains: str | None = None) -> list[Incident]:
+        """Incidents, newest first, filtered in SQL.
+
+        `cameras` and `zones` are JSON arrays on the row, so a camera or zone
+        is matched with LIKE on the quoted name — exact enough because both
+        are ids the site controls, and it keeps the filter in the database.
+        """
         self._check_thread()
         out = []
-        for row in self._connection.execute("SELECT * FROM incidents ORDER BY opened_at DESC LIMIT ?", (limit,)):
+        clauses, args = [], []
+        if states:
+            clauses.append(f"state IN ({','.join('?' * len(states))})")
+            args.extend(str(s) for s in states)
+        if since is not None:
+            clauses.append("closed_at >= ?"); args.append(since)
+        if until is not None:
+            clauses.append("opened_at <= ?"); args.append(until)
+        if camera_id:
+            clauses.append("cameras LIKE ?"); args.append(f'%"{camera_id}"%')
+        if zone:
+            clauses.append("zones LIKE ?"); args.append(f'%"{zone}"%')
+        if severities:
+            clauses.append(f"severity IN ({','.join('?' * len(severities))})")
+            args.extend(str(s) for s in severities)
+        if contains:
+            clauses.append("(summary LIKE ? OR note LIKE ?)")
+            args.extend([f"%{contains}%", f"%{contains}%"])
+        sql = "SELECT * FROM incidents"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY opened_at DESC LIMIT ?"
+        args.append(limit)
+        for row in self._connection.execute(sql, args):
             events = [_event_of(r) for r in self._connection.execute(
                 "SELECT e.* FROM events e JOIN incident_events ie ON ie.event_id = e.id WHERE ie.incident_id = ? ORDER BY e.occurred_at",
                 (row["id"],))]
@@ -311,7 +366,30 @@ class Store:
         return out
 
     def incident(self, incident_id: str) -> Incident | None:
-        return next((i for i in self.incidents(limit=100_000) if i.id == incident_id), None)
+        self._check_thread()
+        row = self._connection.execute("SELECT * FROM incidents WHERE id = ?", (incident_id,)).fetchone()
+        if row is None:
+            return None
+        events = [_event_of(r) for r in self._connection.execute(
+            "SELECT e.* FROM events e JOIN incident_events ie ON ie.event_id = e.id WHERE ie.incident_id = ? ORDER BY e.occurred_at",
+            (incident_id,))]
+        return _incident_of(row, events)
+
+    def newest_event_millis(self) -> int | None:
+        """When the newest event happened, or ``None``. Read to bound a correlation.
+
+        Not the wall clock: a file source stamps its events from the file's
+        own timeline, so "the last hour" has to be measured from the events
+        themselves or a whole run falls outside it.
+        """
+        self._check_thread()
+        row = self._connection.execute("SELECT MAX(occurred_at) FROM events").fetchone()
+        return int(row[0]) if row and row[0] is not None else None
+
+    def set_incident_review(self, incident_id: str, state: str, *, by: str, at: int, note: str | None) -> None:
+        with self.transaction() as c:
+            c.execute("UPDATE incidents SET state=?, reviewed_by=?, reviewed_at=?, note=?, updated_at=? WHERE id=?",
+                      (state, by, at, note, _now(), incident_id))
 
     def delete_incidents(self) -> int:
         with self.transaction() as c:
@@ -496,6 +574,13 @@ def _event_of(row: sqlite3.Row) -> Event:
                  row["confidence"], evidence, row["zone_id"], row["zone_name"])
 
 
+def _review_of(row: sqlite3.Row) -> Review:
+    keys = row.keys()
+    if "state" not in keys:
+        return Review()
+    return Review(ReviewState(row["state"]), row["reviewed_by"], row["reviewed_at"], row["note"])
+
+
 def _incident_of(row: sqlite3.Row, events: list[Event]) -> Incident:
     risk_raw = json.loads(row["risk"])
     risk = Risk(risk_raw["score"], tuple(RiskFactor(**f) for f in risk_raw["factors"]))
@@ -503,4 +588,5 @@ def _incident_of(row: sqlite3.Row, events: list[Event]) -> Incident:
                                      a["time_gap_millis"], tuple(a["reasons"])) for a in json.loads(row["associations"]))
     return Incident(row["id"], Severity(row["severity"]), row["summary"], row["opened_at"], row["closed_at"],
                     datetime.fromtimestamp(row["opened_at"] / 1000, tz=timezone.utc), row["distinct_objects"],
-                    tuple(json.loads(row["cameras"])), tuple(json.loads(row["zones"])), tuple(events), associations, risk)
+                    tuple(json.loads(row["cameras"])), tuple(json.loads(row["zones"])), tuple(events), associations, risk,
+                    _review_of(row))

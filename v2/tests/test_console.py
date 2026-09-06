@@ -322,6 +322,9 @@ def test_the_camera_list_shows_all_five_columns_without_a_scrollbar(console, qt_
     assert sum(widths) <= tree.viewport().width() + 2, (widths, tree.viewport().width())
     assert not tree.horizontalScrollBar().isVisible()
     assert widths[3] >= 70 and widths[4] >= 40
+    item = tree.topLevelItem(0)
+    assert item.toolTip(3), "an elided status must still be readable on hover"
+    assert item.toolTip(1) == str(reference_video)
 
 
 def test_the_record_box_follows_the_lock_and_a_tick_is_audited(console, qt_app, reference_video):
@@ -437,3 +440,198 @@ def test_selecting_an_incident_shows_why_it_was_raised(console, qt_app):
     for factor in incident.risk.factors:
         assert factor.reason in shown, "a risk score must show what it is made of"
     assert "same object" in shown or "No association" in shown
+
+
+def test_a_track_the_geometry_could_not_place_is_shown_as_unplaced_never_as_a_fix(qt_app, pose):
+    """`CameraFallback` exists so an operator still learns "something is at this camera"."""
+    from vigil.domain.geo import PositionEstimate, PositionSource
+    from vigil.interfaces.console.plan import PlanView
+
+    class _Track:
+        id = 3
+        heading_degrees = None
+        speed_mps = None
+        position = PositionEstimate(pose.position, pose.range_meters, PositionSource.CAMERA_FALLBACK)
+
+    plan = PlanView()
+    plan.resize(400, 400)
+    plan.set_cameras({"gate": pose})
+    plan.set_tracks("gate", [_Track()])
+    drawn = []
+    plan._draw_unprojected = lambda painter, camera_id, count: drawn.append((camera_id, count))
+    plan.grab()
+    assert drawn == [("gate", 1)], "an unplaced track was drawn as nothing at all"
+    plan.deleteLater()
+
+
+def test_a_selected_row_keeps_the_colour_that_says_what_the_camera_is_doing(qt_app):
+    """Green LIVE text on a saturated blue selection was unreadable."""
+    from vigil.interfaces.console import theme
+
+    sheet = theme.stylesheet()
+    tree_rule = sheet[sheet.index("QTreeWidget::item:selected"):]
+    tree_rule = tree_rule[:tree_rule.index("}")]
+    assert "selection-color" not in tree_rule and "color:" not in tree_rule.replace("background", "")
+    assert "rgba(" in tree_rule, "the selection must be a wash, not a solid fill"
+
+
+def test_two_camera_labels_a_few_metres_apart_do_not_print_over_each_other(qt_app, pose):
+    from PySide6.QtCore import QPointF, QRectF
+    from PySide6.QtGui import QPainter
+    from vigil.domain.geo import destination_point
+    from vigil.interfaces.console.plan import PlanView
+
+    close = CameraPose(destination_point(pose.position, 90, 3.0), 4.0, 90.0, -25.0)
+    plan = PlanView()
+    plan.resize(500, 500)
+    plan.set_cameras({"laptop": pose, "street": close})
+    picture = plan.grab()
+    painter = QPainter(picture)
+    taken: list[QRectF] = []
+    first = plan._free_label_spot(painter, QPointF(100, 100), "laptop", taken)
+    second = plan._free_label_spot(painter, QPointF(100, 100), "street", taken)
+    painter.end()
+    assert first.y() < second.y(), "the second label sat on top of the first"
+    assert len(taken) == 2
+    plan.deleteLater()
+
+
+def _one_incident(console):
+    from test_incidents import event
+    from vigil.domain.incidents import Correlator
+
+    events = [event("a", 1, 10_000), event("a", 2, 40_000)]
+    console.commands._site.store.save_events(events)
+    incidents = Correlator().correlate(events)
+    console.commands._site.store.save_incidents(incidents)
+    console._refresh_incidents()
+    console.incidents.tree.topLevelItem(0).setSelected(True)
+    return console.incidents.selected_incident()
+
+
+def test_an_operator_works_the_queue_from_the_console(console, qt_app, monkeypatch):
+    incident = _one_incident(console)
+    assert incident is not None
+    assert console.incidents.tree.topLevelItem(0).text(5) == "new"
+    assert console.acknowledge_button.isEnabled() and console.dismiss_button.isEnabled()
+
+    console._acknowledge()
+    assert "Acknowledged" in console.status.currentMessage()
+    assert console.incidents.tree.topLevelItem(0).text(5) == "acknowledged · alice"
+    assert "acknowledged by user:alice" in console.detail.text.toPlainText()
+
+    monkeypatch.setattr(dialogs, "ask", lambda d: (d.deleteLater(), (True, "the cat again"))[1])
+    console._dismiss()
+    assert "the cat again" in console.status.currentMessage()
+    assert console.incidents.tree.topLevelItemCount() == 0, "the queue must not show what was dismissed"
+    console.dismissed_box.setChecked(True)
+    assert console.incidents.tree.topLevelItemCount() == 1
+    assert console.incidents.tree.topLevelItem(0).text(5) == "dismissed · alice"
+    actions = [r["action"] for r in console.commands.audit_rows()]
+    assert "incident.acknowledged" in actions and "incident.dismissed" in actions
+
+
+def test_a_dismissal_needs_a_reason_and_a_cancelled_dialog_changes_nothing(console, qt_app, monkeypatch):
+    incident = _one_incident(console)
+    monkeypatch.setattr(dialogs, "ask", lambda d: (d.deleteLater(), (False, None))[1])
+    console._dismiss()
+    assert console.incidents.tree.topLevelItemCount() == 1, "cancelling changed something"
+
+    from vigil.interfaces.console.dialogs import NoteDialog
+
+    dialog = NoteDialog("Dismiss", "why?")
+    assert dialog.check() == "A reason is required."
+    dialog.note.setText("  a delivery  ")
+    assert dialog.check() is None and dialog.value() == "a delivery"
+    dialog.deleteLater()
+
+
+@pytest.mark.parametrize("console", [VIEWER], indirect=True)
+def test_a_viewer_may_not_judge_an_incident(console, qt_app):
+    _one_incident(console)
+    assert not console.acknowledge_button.isEnabled() and not console.dismiss_button.isEnabled()
+    console._acknowledge()
+    assert "may not" in console.status.currentMessage()
+    assert "console.refused" in [r["action"] for r in console.commands.audit_rows()]
+
+
+def test_the_bar_names_the_site_and_the_clock_its_schedules_are_read_in(console, qt_app):
+    """A zone that closes at 22:00 closes in this clock; an operator has to be able to check that."""
+    assert console.site_label.text() == "Unnamed site · UTC"
+    console.commands._site.name_site("Depot", "Asia/Beirut", by=OPERATOR)
+    console._show_site()
+    assert console.site_label.text() == "Depot · Asia/Beirut"
+    assert "Depot" in console.windowTitle()
+    assert "clock" in console.site_label.toolTip()
+
+
+def test_a_zone_is_edited_through_the_same_dialog_that_drew_it(console, qt_app, monkeypatch):
+    from vigil.domain.zones import Schedule, ZoneKind
+    from vigil.interfaces.console.dialogs import ZoneDialog
+
+    console.configure_button.setChecked(True)
+    ring = [LatLon(0, 0), LatLon(0, 0.001), LatLon(0.001, 0.001)]
+    console.commands.add_zone("yard", "Yrad", "INTEREST", ring, watch=["person"], schedule=Schedule(22, 6))
+    console.refresh_site()
+    existing = console.commands.zones()[0]
+
+    dialog = ZoneDialog((), ["person", "car"], existing=existing)
+    assert dialog.identifier.text() == "yard" and dialog.identifier.isReadOnly()
+    assert dialog.name.text() == "Yrad" and dialog.kind.currentData() == "INTEREST"
+    assert dialog.closed.isChecked() and dialog.closed_from.value() == 22
+    checked = [dialog.watch.item(i).text() for i in range(dialog.watch.count())
+               if dialog.watch.item(i).checkState() == Qt.CheckState.Checked]
+    assert checked == ["person"], "the existing watch list was not shown"
+    dialog.deleteLater()
+
+    monkeypatch.setattr(console, "_pick_zone", lambda title: existing)
+
+    def instead(shown):
+        shown.name.setText("Yard")
+        shown.kind.setCurrentIndex(shown.kind.findData(ZoneKind.RESTRICTED.value))
+        value = shown.value()
+        shown.deleteLater()
+        return True, value
+
+    monkeypatch.setattr(dialogs, "ask", instead)
+    console._edit_zone()
+    saved = console.commands.zones()[0]
+    assert saved.name == "Yard" and saved.kind is ZoneKind.RESTRICTED
+    assert saved.ring == tuple(ring), "the ring somebody drew was lost"
+    assert "zone.changed" in [r["action"] for r in console.commands.audit_rows()]
+
+
+def test_the_incident_filters_narrow_the_list_and_say_what_was_asked(console, qt_app):
+    from test_incidents import event
+    from vigil.domain.events import Severity
+    from vigil.domain.incidents import Correlator
+
+    events = [event("north-gate", 1, 10_000, severity=Severity.HIGH),
+              event("loading-bay", 2, 500_000, severity=Severity.LOW)]
+    console.commands._site.store.save_events(events)
+    console.commands._site.store.save_incidents(Correlator().correlate(events))
+    console.commands.add_camera("north-gate", "one.mp4")
+    console.commands.add_camera("loading-bay", "two.mp4")
+    console.refresh_site()
+    console._refresh_incidents()
+    assert console.incidents.tree.topLevelItemCount() == 2
+
+    picker = console.incidents.camera_filter
+    assert [picker.itemData(i) for i in range(picker.count())] == ["", "loading-bay", "north-gate"]
+    picker.setCurrentIndex(picker.findData("north-gate"))
+    assert console.incidents.tree.topLevelItemCount() == 1
+    assert "camera north-gate" in console.status.currentMessage()
+
+    picker.setCurrentIndex(0)
+    console.incidents.severity_filter.setCurrentIndex(console.incidents.severity_filter.findData("HIGH"))
+    assert console.incidents.tree.topLevelItemCount() == 1
+    console.incidents.severity_filter.setCurrentIndex(0)
+    console.incidents.text_filter.setText("nothing like this")
+    assert console.incidents.tree.topLevelItemCount() == 0
+    console.incidents.text_filter.setText("")
+    assert console.incidents.tree.topLevelItemCount() == 2
+
+    # The picker keeps the operator's choice when the site is refreshed.
+    picker.setCurrentIndex(picker.findData("loading-bay"))
+    console.refresh_site()
+    assert picker.currentData() == "loading-bay"

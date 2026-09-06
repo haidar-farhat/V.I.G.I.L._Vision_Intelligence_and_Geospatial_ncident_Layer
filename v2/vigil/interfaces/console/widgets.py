@@ -131,6 +131,9 @@ class CameraList(QWidget):
                 item.setCheckState(RECORD_COLUMN, Qt.CheckState.Checked if camera.record else Qt.CheckState.Unchecked)
                 if state is not None:
                     item.setForeground(STATUS_COLUMN, _state_colour(state.state))
+                    # The column stretches but can still be narrower than the
+                    # sentence; an elided status must stay readable on hover.
+                    item.setToolTip(STATUS_COLUMN, state.describe())
                 if not camera.placed:
                     item.setToolTip(PLACED_COLUMN, "Unplaced: this camera cannot locate anything on the ground.")
                 self._apply_flags(item)
@@ -157,33 +160,93 @@ class CameraList(QWidget):
                                  item.checkState(RECORD_COLUMN) == Qt.CheckState.Checked)
 
 
+def _review_text(review) -> str:
+    if str(review.state) == "NEW":
+        return "new"
+    who = (review.by or "").split(":")[-1]
+    return f"{str(review.state).lower()} · {who}"
+
+
+def _review_colour(state: str):
+    return {"NEW": theme.STALE, "ACKNOWLEDGED": theme.LIVE, "DISMISSED": theme.TEXT_FAINT}.get(state, theme.TEXT_MUTED)
+
+
 def _state_colour(state: str):
     return {"LIVE": theme.LIVE, "STARTING": theme.STALE, "DARK": theme.STALE, "FAULTED": theme.FAULT}.get(state, theme.TEXT_MUTED)
 
 
 class IncidentList(QWidget):
-    """The conclusions, worst first. What an operator is here to read."""
+    """The conclusions, worst first, with the filters to find one among many."""
 
     selected = Signal(object)
+    #: The filter changed: (camera or "", severity or "", text). The window
+    #: turns it into a query; this widget knows nothing about the store.
+    filtered = Signal(str, str, str)
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self._incidents: list = []
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self._build_filters())
         self.tree = QTreeWidget()
-        self.tree.setColumnCount(5)
-        self.tree.setHeaderLabels(["Opened", "Severity", "Risk", "Summary", "Cameras"])
+        self.tree.setColumnCount(6)
+        self.tree.setHeaderLabels(["Opened", "Severity", "Risk", "Summary", "Cameras", "State"])
         self.tree.setRootIsDecorated(False)
         self.tree.setAlternatingRowColors(True)
         self.tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         header = self.tree.header()
         header.setStretchLastSection(False)
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
-        for column, width in ((0, 78), (1, 74), (2, 52), (4, 110)):
+        for column, width in ((0, 78), (1, 74), (2, 52), (4, 110), (5, 108)):
             self.tree.setColumnWidth(column, width)
         self.tree.itemSelectionChanged.connect(self._selection_changed)
         layout.addWidget(self.tree)
+
+    def _build_filters(self) -> QWidget:
+        from PySide6.QtWidgets import QComboBox, QHBoxLayout, QLineEdit
+
+        bar = QWidget()
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(4, 2, 4, 2)
+        row.setSpacing(6)
+        self.camera_filter = QComboBox()
+        self.camera_filter.addItem("every camera", "")
+        self.camera_filter.currentIndexChanged.connect(self._filters_changed)
+        self.severity_filter = QComboBox()
+        self.severity_filter.addItem("any severity", "")
+        for severity in ("LOW", "MEDIUM", "HIGH", "CRITICAL"):
+            self.severity_filter.addItem(f"{severity.lower()} and worse", severity)
+        self.severity_filter.currentIndexChanged.connect(self._filters_changed)
+        self.text_filter = QLineEdit()
+        self.text_filter.setPlaceholderText("text in the summary or a note")
+        self.text_filter.setClearButtonEnabled(True)
+        self.text_filter.textChanged.connect(self._filters_changed)
+        row.addWidget(self.camera_filter)
+        row.addWidget(self.severity_filter)
+        row.addWidget(self.text_filter, 1)
+        return bar
+
+    def set_cameras(self, camera_ids: Sequence[str]) -> None:
+        """Keep the picker in step with the site without losing the choice."""
+        chosen = self.camera_filter.currentData()
+        self.camera_filter.blockSignals(True)
+        try:
+            self.camera_filter.clear()
+            self.camera_filter.addItem("every camera", "")
+            for camera_id in camera_ids:
+                self.camera_filter.addItem(camera_id, camera_id)
+            index = self.camera_filter.findData(chosen)
+            self.camera_filter.setCurrentIndex(max(0, index))
+        finally:
+            self.camera_filter.blockSignals(False)
+
+    def filters(self) -> tuple[str, str, str]:
+        return (self.camera_filter.currentData() or "", self.severity_filter.currentData() or "",
+                self.text_filter.text().strip())
+
+    def _filters_changed(self, *_args) -> None:
+        self.filtered.emit(*self.filters())
 
     def show_incidents(self, incidents: Sequence) -> None:
         chosen = self.selected_incident()
@@ -193,10 +256,12 @@ class IncidentList(QWidget):
             item = QTreeWidgetItem([
                 time.strftime("%H:%M:%S", time.gmtime(incident.opened_at_millis / 1000)),
                 str(incident.severity), f"{incident.risk.score:.2f}", incident.summary,
-                ", ".join(incident.cameras),
+                ", ".join(incident.cameras), _review_text(incident.review),
             ])
             item.setData(0, Qt.ItemDataRole.UserRole, incident.id)
             item.setForeground(1, theme.severity_colour(str(incident.severity)))
+            item.setForeground(5, _review_colour(str(incident.review.state)))
+            item.setToolTip(5, incident.review.describe())
             item.setToolTip(3, "\n".join(f"{e.occurred_at:%H:%M:%S} [{e.severity}] {e.summary}" for e in incident.events))
             self.tree.addTopLevelItem(item)
             if chosen is not None and incident.id == chosen.id:
@@ -321,6 +386,8 @@ class IncidentDetail(QWidget):
                 f"{incident.distinct_objects} distinct object(s) &nbsp;·&nbsp; "
                 f"cameras {_escape(', '.join(incident.cameras))}</p>"]
 
+        rows.append(f"<p style='margin:2px 0;color:{theme.TEXT_MUTED.name()}'>Review: "
+                    f"{_escape(incident.review.describe())}</p>")
         rows.append("<h4>Risk</h4><ul>")
         for factor in incident.risk.factors:
             rows.append(f"<li>{_escape(factor.name)} <b>+{factor.weight:.2f}</b> — {_escape(factor.reason)}</li>")

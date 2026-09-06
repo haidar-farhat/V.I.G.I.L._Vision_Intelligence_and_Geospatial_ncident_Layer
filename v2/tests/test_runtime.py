@@ -172,3 +172,116 @@ def test_the_record_flag_on_a_run_records_a_camera_the_site_has_not_flagged(tmp_
         segments = store.segments(camera_id="gate")
         assert segments and all(s.path.is_file() for s in segments)
         assert not site.camera("gate", OPERATOR).record, "an override for one run must not change the site"
+
+
+def test_an_unattended_run_says_what_it_is_doing_in_the_log_and_as_json(tmp_path, reference_video, keychain, caplog, monkeypatch):
+    """Nobody is reading the screen; the log is the only place this can be seen afterwards."""
+    import json
+    import logging
+
+    from vigil import logs
+    from vigil.service import runtime as runtime_module
+
+    caplog.set_level(logging.INFO, logger="vigil")
+    with Store(tmp_path / "r.db") as store:
+        site = SiteService(store, keychain)
+        site.add_camera("gate", str(reference_video), by=OPERATOR)
+        runtime = Runtime(site, detector_factory=MotionDetector, alerts=Alerts(synchronous=True))
+        assert runtime.metrics()["cameras"] == 1 and runtime.metrics()["running"] is False
+        monkeypatch.setattr(runtime_module, "METRICS_EVERY_SECONDS", 0.0)
+        runtime.start(OPERATOR)
+        _pump(runtime, 10)
+        runtime.stop(OPERATOR)
+        reading = runtime.metrics()
+        assert reading["frames"] >= 0 and set(reading) >= {"node", "live", "dark", "fps", "events", "alerts_open"}
+        assert any("metrics:" in r.getMessage() for r in caplog.records), "an unattended run said nothing"
+
+    # The real path: `configure(json=True)` writes one object per line to the
+    # log file, and restoring prose afterwards leaves the suite as it was.
+    written = logs.configure(tmp_path / "jsonlogs", json=True)
+    logging.getLogger("vigil.test").info("a line", extra={"frames": 7})
+    for handler in logging.getLogger("vigil").handlers:
+        handler.flush()
+    first = [l for l in written.read_text(encoding="utf-8").splitlines() if l.strip()][0]
+    assert json.loads(first)["message"] == "a line" and json.loads(first)["frames"] == 7
+    logs.configure(None)
+
+    line = logs._Json().format(logging.LogRecord("vigil.t", logging.INFO, "f", 1, "metrics: %d", (2,), None))
+    assert json.loads(line)["message"] == "metrics: 2" and json.loads(line)["level"] == "INFO"
+    secret = logging.LogRecord("vigil.t", logging.INFO, "f", 1, "opened rtsp" + "://u:hunter2@10.0.0.9/s", (), None)
+    assert "hunter2" not in logs._Json().format(secret), "the json form must redact what the prose form does"
+
+
+def test_correlation_is_bounded_so_a_node_that_has_been_up_for_a_month_keeps_up(tmp_path, keychain, monkeypatch):
+    """Re-reading every event ever stored, every two seconds, does not scale."""
+    from test_incidents import event as make_event
+    from vigil.service.runtime import CORRELATION_SPAN_MILLIS
+
+    with Store(tmp_path / "r.db") as store:
+        site = SiteService(store, keychain)
+        runtime = Runtime(site, detector_factory=MotionDetector, alerts=Alerts(synchronous=True))
+        old = [make_event("a", 1, 1_000), make_event("a", 2, 2_000)]
+        recent = [make_event("b", 3, CORRELATION_SPAN_MILLIS * 3), make_event("b", 4, CORRELATION_SPAN_MILLIS * 3 + 1000)]
+        store.save_events(old + recent)
+
+        read = []
+        real = Store.events
+        monkeypatch.setattr(Store, "events", lambda self, **kw: read.append(kw) or real(self, **kw))
+        live = runtime.correlate()
+        assert read and read[0]["since"] is not None, "the whole history was read"
+        assert all(e.evidence.camera_id == "b" for i in live for e in i.events), "old events were re-correlated"
+        # The old ones are still there; they are simply not re-derived.
+        assert len(store.events()) == 4
+        assert store.incidents(), "the live incidents were persisted"
+
+
+def test_one_incident_is_read_without_loading_every_incident(tmp_path, keychain):
+    from test_incidents import event as make_event
+    from vigil.domain.incidents import Correlator
+
+    with Store(tmp_path / "r.db") as store:
+        events = [make_event("a", 1, 10_000), make_event("a", 2, 11_000)]
+        store.save_events(events)
+        incident = Correlator().correlate(events)[0]
+        store.save_incidents([incident])
+        found = store.incident(incident.id)
+        assert found is not None and found.id == incident.id and len(found.events) == len(incident.events)
+        assert store.incident("inc-nothing") is None
+
+
+def test_a_schedule_is_read_in_the_sites_own_clock_not_the_meridians(tmp_path, keychain):
+    """"Closed 22:00 to 06:00" means the site's night. Evaluated in UTC it fires at the wrong hours."""
+    from datetime import timezone
+    from zoneinfo import ZoneInfo
+
+    with Store(tmp_path / "r.db") as store:
+        site = SiteService(store, keychain)
+        runtime = Runtime(site, detector_factory=MotionDetector, alerts=Alerts(synchronous=True))
+        assert runtime.site_timezone() is timezone.utc, "an unnamed site is UTC"
+
+        site.name_site("Depot", "Asia/Beirut", by=OPERATOR)
+        assert runtime.site_timezone() == ZoneInfo("Asia/Beirut")
+
+        # An unknown zone is refused where it is typed. Only a database that
+        # went missing after the fact can reach the fall-back below.
+        from vigil.service.site import SiteError
+
+        with pytest.raises(SiteError, match="does not know the time zone"):
+            site.name_site("Depot", "Mars/Olympus", by=OPERATOR)
+        store.save_site("Depot", "Mars/Olympus")
+        assert runtime.site_timezone() is timezone.utc, "a zone that went missing must fall back, loudly"
+
+
+def test_the_workers_are_given_the_sites_clock(tmp_path, reference_video, keychain):
+    from zoneinfo import ZoneInfo
+
+    with Store(tmp_path / "r.db") as store:
+        site = SiteService(store, keychain)
+        site.name_site("Depot", "Asia/Beirut", by=OPERATOR)
+        site.add_camera("gate", str(reference_video), by=OPERATOR)
+        runtime = Runtime(site, detector_factory=MotionDetector, alerts=Alerts(synchronous=True))
+        runtime.start(OPERATOR)
+        try:
+            assert runtime._workers["gate"]._site_tz == ZoneInfo("Asia/Beirut"), "the rules would read the wrong clock"
+        finally:
+            runtime.stop(OPERATOR)

@@ -906,6 +906,32 @@ control answers a click with the reason). The plan view draws the ground from
 the site's own geometry with no tiles, and a "Why" tab shows each incident's
 risk factors, each event's conditions and each association's reasons.
 
+**Then the operator's day, and the clock.** An incident queue (migration 2:
+acknowledge, or dismiss with a *required* reason; the judgement names the
+person, is audited with its before-state, and survives re-correlation), and
+editing what exists — a camera that moved keeps its placement and its
+password follows; a zone's meaning changes while the ring somebody drew
+stays. `vigil doctor` checks an installation the way an installer would
+before leaving site, and exits non-zero on any failure.
+
+**Search, and a split before it was needed.** `Search` finds incidents and
+events by camera, zone, severity, time, review state or text, with every
+filter applied in SQL — a search must not read a month of history into
+memory. Times are typed the way people say them (`2h`, `3d`, a date, an ISO
+moment) and anything else is refused rather than silently widened to
+everything. The console got the same filters above its incident list. Then
+`cli.py` reached 754 lines against the 800 budget and was split into the
+parser and dispatch (`cli.py`), the site commands and the work commands —
+done at 754 rather than at 801, which is the point of having a budget.
+
+**The clock bug worth remembering.** `Zone.schedule` says "closed 22:00 to
+06:00", and the after-hours rule was reading it in **UTC** — the runtime
+never passed the site's timezone to its workers. Worse: fixing that revealed
+Windows ships no IANA database and `tzdata` was not installed, so every zone
+name silently fell back to UTC anyway. The database now ships with the
+product, an unknown zone is refused where it is typed rather than at 03:00,
+and the console names the clock in its status bar.
+
 **What the first console photographs found, that no test had.** Four defects
 in one screenshot: a frozen `__main__` cannot use relative imports (the
 packaged build died in 0 s); a QTimer connected to a bound method of an

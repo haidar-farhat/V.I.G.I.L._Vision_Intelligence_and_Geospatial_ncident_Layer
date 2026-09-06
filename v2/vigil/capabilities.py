@@ -39,8 +39,11 @@ MANIFEST: tuple[Capability, ...] = (
     Capability("zones", "Zones with membership hysteresis and a watch list", State.TESTED,
                ("vigil.domain.zones.Zone", "vigil.domain.zones.PresenceTracker"), ("tests/test_zones_events.py",)),
     Capability("rules", "Zone entry, loitering and after-hours rules with evidence", State.TESTED,
-               ("vigil.domain.events.ZoneEntryRule", "vigil.domain.events.LoiteringRule", "vigil.domain.events.AfterHoursRule"),
-               ("tests/test_zones_events.py",)),
+               ("vigil.domain.events.ZoneEntryRule", "vigil.domain.events.LoiteringRule", "vigil.domain.events.AfterHoursRule",
+                "vigil.service.runtime.Runtime.site_timezone"),
+               ("tests/test_zones_events.py", "tests/test_runtime.py"),
+               "A schedule is read in the site's own clock, which the workers are given at start; the IANA database "
+               "ships with the product because Windows has none, and an unknown zone is refused where it is typed"),
     Capability("incidents", "Time-and-place correlation into incidents with risk", State.TESTED,
                ("vigil.domain.incidents.Correlator", "vigil.domain.incidents.associate", "vigil.domain.incidents.score_risk",
                 "vigil.domain.incidents.link_same_camera_fragments"),
@@ -63,11 +66,25 @@ MANIFEST: tuple[Capability, ...] = (
     Capability("auth", "Accounts, scrypt, lockout, permission-based roles, principals", State.TESTED,
                ("vigil.service.auth.Accounts", "vigil.service.auth.Principal"), ("tests/test_auth.py",)),
     Capability("site", "Every site change through one service with a principal and an audit row", State.TESTED,
-               ("vigil.service.site.SiteService",), ("tests/test_site.py",)),
+               ("vigil.service.site.SiteService", "vigil.service.site.SiteService.edit_zone",
+                "vigil.service.site.SiteService.set_source"),
+               ("tests/test_site.py", "tests/test_cli.py", "tests/test_console.py"),
+               "Cameras and zones are edited in place: a camera that moved keeps its placement and its password "
+               "follows; a zone's meaning changes while the ring somebody drew stays"),
     Capability("runtime", "Camera workers with bounded outboxes; poll persists, correlates, watches health", State.TESTED,
                ("vigil.service.runtime.Runtime", "vigil.service.runtime.CameraWorker"), ("tests/test_runtime.py",)),
     Capability("alerts", "Dark camera, stopped recording, retention shortfall, stuck thread, low disk leave the process", State.TESTED,
                ("vigil.service.alerts.Alerts",), ("tests/test_alerts.py", "tests/test_runtime.py")),
+    Capability("review", "Working the queue: acknowledge, or dismiss with a reason", State.TESTED,
+               ("vigil.service.review.IncidentReview",), ("tests/test_review.py", "tests/test_console.py", "tests/test_cli.py"),
+               "Migration 2. A judgement names the person and is audited with what it was before; a dismissal without "
+               "a reason is refused; re-correlation refines the conclusion and never undoes the judgement"),
+    Capability("search", "Finding what happened: by camera, zone, severity, time, state or text", State.TESTED,
+               ("vigil.service.search.Search", "vigil.service.search.moment"),
+               ("tests/test_search.py", "tests/test_cli.py", "tests/test_console.py"),
+               "Every filter is applied in SQL, so a search does not read a month of history into memory. Times may "
+               "be typed as 2h, 3d, a date, or a full ISO moment; anything else is refused rather than widened to "
+               "everything. `vigil incidents --camera … --since …`, `vigil events …`, and a filter bar in the console"),
     Capability("evidence", "Incident export with clips, hashes and a verifiable manifest", State.TESTED,
                ("vigil.service.evidence.export_incident", "vigil.service.evidence.verify_package"), ("tests/test_evidence.py",)),
     Capability("keychain", "Camera passwords in the OS keychain under a random handle", State.TESTED,
@@ -84,6 +101,16 @@ MANIFEST: tuple[Capability, ...] = (
     Capability("faces-plates", "Faces, plates and a subject register behind an identity switch", State.PLAN, (), (), "DECISIONS.md D-08"),
     Capability("packaging", "One executable, built and camera-tested by the task runner", State.IMPL,
                (), (), "`tasks.py package` builds dist/vigil/vigil.exe; `exetest` ran it on device:0 with recording and passed on 2026-09-05 (README.md); no installer, no signing"),
+    Capability("observability", "An unattended run is watchable: metrics in the log, JSON on demand, a crash file", State.TESTED,
+               ("vigil.service.runtime.Runtime.metrics", "vigil.logs.configure"),
+               ("tests/test_runtime.py",),
+               "A metrics line every minute while running; `VIGIL_LOG_JSON=1` makes every line one JSON object, redacted "
+               "the same way; `faulthandler` writes a native crash to crash.log beside the log"),
+    Capability("doctor", "An installation check: every way a deployment fails quietly, asked out loud", State.TESTED,
+               ("vigil.service.diagnostics.run_checks",), ("tests/test_diagnostics.py", "tests/test_cli.py"),
+               "`vigil doctor` checks the data directory, the database's integrity and schema, the site clock, the "
+               "model, the keychain, free disk, accounts, cameras, zones and alert sinks; `--probe` opens every "
+               "camera. Non-zero exit on any failure, so it can end an install script"),
     Capability("ci", "Every suite on three platforms, and again with the network taken away", State.IMPL,
                (), (),
                "`.github/workflows/ci.yml` jobs `v2` (ubuntu, windows, macos) and `v2-offline` (outbound traffic dropped, "

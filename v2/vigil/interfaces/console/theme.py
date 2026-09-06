@@ -50,8 +50,15 @@ def stylesheet() -> str:
     QPushButton:disabled {{ color: {TEXT_FAINT.name()}; background: {PANEL.name()}; }}
     QPushButton:checked {{ background: {ACCENT.name()}; color: {BACKGROUND.name()}; font-weight: 600; }}
     QTreeWidget, QTableWidget, QTextEdit, QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {{
-        background: {PANEL.name()}; border: 1px solid {BORDER.name()}; border-radius: 3px; selection-background-color: {ACCENT.name()};
-        selection-color: {BACKGROUND.name()}; }}
+        background: {PANEL.name()}; border: 1px solid {BORDER.name()}; border-radius: 3px; }}
+    /* A muted wash, and deliberately no `selection-color`: a row carries the
+       state colours — LIVE green, FAULTED red — and a selection that repaints
+       the text kills exactly the information the row exists to give. Green on
+       a saturated blue row was unreadable in the first two-camera photograph. */
+    QTreeWidget::item:selected, QTableWidget::item:selected {{
+        background: rgba(96, 165, 250, 64); border-left: 2px solid {ACCENT.name()}; }}
+    QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {{
+        selection-background-color: {ACCENT.name()}; selection-color: {BACKGROUND.name()}; }}
     QHeaderView::section {{ background: {PANEL_RAISED.name()}; color: {TEXT_MUTED.name()}; border: 0; border-bottom: 1px solid {BORDER.name()}; padding: 4px; }}
     QTabBar::tab {{ background: {PANEL.name()}; padding: 5px 12px; border: 1px solid {BORDER.name()}; border-bottom: 0; }}
     QTabBar::tab:selected {{ background: {PANEL_RAISED.name()}; color: {TEXT.name()}; }}

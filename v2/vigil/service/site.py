@@ -22,6 +22,9 @@ from .auth import SITE_CONFIGURE, SITE_VIEW, Principal
 
 _log = _get_logger(__name__)
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
+#: "Not given" for an edit, so that clearing a value and leaving it alone
+#: are different requests. ``None`` means clear; absent means keep.
+KEEP = object()
 
 
 class SiteError(ValueError):
@@ -132,6 +135,37 @@ class SiteService:
         self._store.audit(by.actor, "camera.credential", camera_id, "password stored in the keychain")
         return self.camera(camera_id, by)
 
+    def set_source(self, camera_id: str, source: str, *, by: Principal) -> Camera:
+        """The camera moved to a new address. Everything else about it stays.
+
+        Without this, a camera whose address changed had to be removed and
+        added again — which threw away its placement, and with it every zone
+        that acted on what it saw.
+        """
+        by.require(SITE_CONFIGURE)
+        current = self.camera(camera_id, by)
+        clean, password = split_password(str(source))
+        ref = current.credentials_ref
+        if password:
+            self._keychain.forget(ref)
+            ref = self._keychain.store(password)
+        self._store.save_camera(camera_id, current.name, clean, credentials_ref=ref, pose=current.pose,
+                                record=current.record)
+        self._store.audit(by.actor, "camera.source_changed", camera_id, redacted(clean),
+                          before={"source": redacted(current.source)}, after={"source": redacted(clean)})
+        return self.camera(camera_id, by)
+
+    def rename_camera(self, camera_id: str, name: str, *, by: Principal) -> Camera:
+        by.require(SITE_CONFIGURE)
+        current = self.camera(camera_id, by)
+        if not (name or "").strip():
+            raise SiteError("a camera needs a name")
+        self._store.save_camera(camera_id, name.strip(), current.source, credentials_ref=current.credentials_ref,
+                                pose=current.pose, record=current.record)
+        self._store.audit(by.actor, "camera.renamed", camera_id, name.strip(),
+                          before={"name": current.name}, after={"name": name.strip()})
+        return self.camera(camera_id, by)
+
     def remove_camera(self, camera_id: str, *, by: Principal) -> None:
         by.require(SITE_CONFIGURE)
         current = self.camera(camera_id, by)
@@ -156,6 +190,35 @@ class SiteService:
                           after={"name": name, "kind": zone.kind.value, "watch": sorted(zone.watch)})
         return zone
 
+    def edit_zone(self, zone_id: str, *, name=KEEP, kind=KEEP, watch=KEEP, enter_after_millis=KEEP,
+                  exit_after_millis=KEEP, min_membership=KEEP, schedule=KEEP, ring=KEEP, by: Principal) -> Zone:
+        """Change what a zone means, keeping the ring somebody drew.
+
+        Deleting and re-adding was the only way to fix a mistyped name or a
+        wrong watch list, and it threw away the geometry — which is the part
+        that took care to get right.
+        """
+        by.require(SITE_CONFIGURE)
+        current = self._store.zone(zone_id)
+        if current is None:
+            raise SiteError(f"no zone called {zone_id!r}")
+        updated = Zone(
+            current.id,
+            current.name if name is KEEP else (str(name).strip() or current.name),
+            current.kind if kind is KEEP else ZoneKind(str(kind).upper()),
+            current.ring if ring is KEEP else tuple(ring),
+            current.watch if watch is KEEP else frozenset(w.lower() for w in watch),
+            current.enter_after_millis if enter_after_millis is KEEP else int(enter_after_millis),
+            current.exit_after_millis if exit_after_millis is KEEP else int(exit_after_millis),
+            current.min_membership if min_membership is KEEP else Membership(str(min_membership).upper()),
+            current.schedule if schedule is KEEP else schedule,
+        )
+        updated.validate()
+        self._store.save_zone(updated)
+        self._store.audit(by.actor, "zone.changed", zone_id, updated.name,
+                          before=_zone_dict(current), after=_zone_dict(updated))
+        return updated
+
     def remove_zone(self, zone_id: str, *, by: Principal) -> None:
         by.require(SITE_CONFIGURE)
         zone = self._store.zone(zone_id)
@@ -164,8 +227,31 @@ class SiteService:
         self._store.delete_zone(zone_id)
         self._store.audit(by.actor, "zone.removed", zone_id, zone.name, before={"name": zone.name, "kind": zone.kind.value})
 
+    @staticmethod
+    def known_timezone(name: str):
+        """The zone, or a `SiteError` naming what went wrong.
+
+        Checked when it is typed rather than when a schedule is read: a site
+        that learns at 03:00 that its clock was never valid has already been
+        told the wrong thing all night.
+        """
+        from datetime import timezone
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+        name = (name or "UTC").strip()
+        if name.upper() == "UTC":
+            return timezone.utc
+        try:
+            return ZoneInfo(name)
+        except ZoneInfoNotFoundError as error:
+            raise SiteError(f"this machine does not know the time zone {name!r}. Use an IANA name such as "
+                            f"Asia/Beirut, or UTC. ({error})") from error
+        except (ValueError, KeyError) as error:
+            raise SiteError(f"{name!r} is not a time zone name: {error}") from error
+
     def name_site(self, name: str, timezone_name: str, *, by: Principal) -> None:
         by.require(SITE_CONFIGURE)
+        self.known_timezone(timezone_name)
         before = self._store.site()
         self._store.save_site(name, timezone_name)
         self._store.audit(by.actor, "site.named", name, timezone_name,
@@ -180,6 +266,13 @@ def _valid_id(value: str) -> str:
 
 def _camera(row: dict) -> Camera:
     return Camera(row["id"], row["name"], row["source"], row["credentials_ref"], row["pose"], row["record"])
+
+
+def _zone_dict(zone: Zone) -> dict:
+    return {"name": zone.name, "kind": zone.kind.value, "watch": sorted(zone.watch),
+            "enter_after_millis": zone.enter_after_millis, "exit_after_millis": zone.exit_after_millis,
+            "min_membership": zone.min_membership.value, "points": len(zone.ring),
+            "closed": None if zone.schedule is None else zone.schedule.describe()}
 
 
 def _pose_dict(pose: CameraPose | None) -> dict | None:

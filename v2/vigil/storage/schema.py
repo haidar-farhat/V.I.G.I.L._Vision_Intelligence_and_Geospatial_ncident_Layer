@@ -139,6 +139,30 @@ MIGRATIONS: tuple[Migration, ...] = (
         DROP TABLE site;
         """,
     ),
+    Migration(
+        version=2,
+        name="incident_review",
+        up="""
+        -- An operator works a queue. Without a state every incident stays new
+        -- for ever, the list only grows, and the one that matters is buried
+        -- under the ones somebody already looked at.
+        ALTER TABLE incidents ADD COLUMN state TEXT NOT NULL DEFAULT 'NEW'
+            CHECK (state IN ('NEW', 'ACKNOWLEDGED', 'DISMISSED'));
+        ALTER TABLE incidents ADD COLUMN reviewed_by TEXT;
+        ALTER TABLE incidents ADD COLUMN reviewed_at INTEGER;
+        ALTER TABLE incidents ADD COLUMN note TEXT;
+        CREATE INDEX incidents_by_state ON incidents (state, opened_at);
+        """,
+        down="""
+        -- A build without review shows every incident, which is what it did
+        -- before. The judgements are lost; the incidents are not.
+        DROP INDEX incidents_by_state;
+        ALTER TABLE incidents DROP COLUMN note;
+        ALTER TABLE incidents DROP COLUMN reviewed_at;
+        ALTER TABLE incidents DROP COLUMN reviewed_by;
+        ALTER TABLE incidents DROP COLUMN state;
+        """,
+    ),
 )
 
 SCHEMA_VERSION = MIGRATIONS[-1].version

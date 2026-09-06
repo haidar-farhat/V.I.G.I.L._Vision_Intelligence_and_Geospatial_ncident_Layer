@@ -10,8 +10,10 @@ import sys
 from pathlib import Path
 
 LEVEL_VARIABLE = "VIGIL_LOG_LEVEL"
+#: One JSON object per line instead of prose. For a node nobody is watching,
+#: where the reader is a monitoring agent rather than a person.
+JSON_VARIABLE = "VIGIL_LOG_JSON"
 _PASSWORD = re.compile(r"(://[^:/@\s]+:)[^@\s]+@")
-_configured = False
 _crash_handle = None
 
 
@@ -20,14 +22,42 @@ class _Redact(logging.Formatter):
         return _PASSWORD.sub(r"\1***@", super().format(record))
 
 
-def configure(directory: Path | None = None, *, level: str | None = None) -> Path | None:
-    global _configured, _crash_handle
+class _Json(logging.Formatter):
+    """One object per line. Redacted by the same rule as the prose form.
+
+    Anything a caller passes as ``extra`` is carried through, so a metrics
+    line is machine-readable without a second logging path to keep in step.
+    """
+
+    _BUILT_IN = frozenset(vars(logging.LogRecord("", 0, "", 0, "", (), None)))
+
+    def format(self, record: logging.LogRecord) -> str:
+        import json as _json
+
+        payload = {
+            "at": self.formatTime(record, "%Y-%m-%dT%H:%M:%S"),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": _PASSWORD.sub(r"\1***@", record.getMessage()),
+        }
+        for key, value in vars(record).items():
+            if key not in self._BUILT_IN and key not in ("message", "asctime"):
+                payload[key] = value if isinstance(value, (str, int, float, bool, type(None))) else str(value)
+        if record.exc_info:
+            payload["exception"] = _PASSWORD.sub(r"\1***@", self.formatException(record.exc_info))
+        return _json.dumps(payload, default=str)
+
+
+def configure(directory: Path | None = None, *, level: str | None = None, json: bool | None = None) -> Path | None:
+    """Set up logging. ``json`` overrides `JSON_VARIABLE` when it is given."""
+    global _crash_handle
     root = logging.getLogger("vigil")
     for handler in list(root.handlers):
         root.removeHandler(handler)
     chosen = (level or os.environ.get(LEVEL_VARIABLE) or "INFO").upper()
     root.setLevel(getattr(logging, chosen, logging.INFO))
-    formatter = _Redact("%(asctime)s %(levelname)-7s %(name)s: %(message)s")
+    as_json = json if json is not None else os.environ.get(JSON_VARIABLE, "").strip().lower() in ("1", "true", "yes")
+    formatter = _Json() if as_json else _Redact("%(asctime)s %(levelname)-7s %(name)s: %(message)s")
     stream = logging.StreamHandler(sys.stderr)
     stream.setFormatter(formatter)
     root.addHandler(stream)
@@ -44,7 +74,6 @@ def configure(directory: Path | None = None, *, level: str | None = None) -> Pat
         except OSError:
             _crash_handle = None
     root.propagate = False
-    _configured = True
     return path
 
 

@@ -17,8 +17,10 @@ from typing import Any, Sequence
 
 from ...domain.geo import CameraPose, LatLon
 from ...domain.zones import Schedule, ZoneKind
-from ...service.auth import ANALYSIS_CONTROL, INCIDENT_EXPORT, SITE_CONFIGURE, AuthError, Principal
+from ...service.auth import ANALYSIS_CONTROL, INCIDENT_EXPORT, INCIDENT_REVIEW, SITE_CONFIGURE, AuthError, Principal
 from ...service.evidence import export_incident
+from ...service.review import IncidentReview, ReviewError
+from ...service.search import Query, Search, SearchError
 from ...service.runtime import Runtime
 from ...service.site import SiteError, SiteService
 from ...logs import get as _get_logger
@@ -49,6 +51,12 @@ class Commands:
         #: The window says both, so a silent fall-back to motion is impossible.
         self.model = model
         self.model_places = tuple(model_places)
+        self._review = IncidentReview(site.store)
+        self._search = Search(site.store)
+        #: Whether the list shows what somebody already dismissed.
+        self.show_dismissed = False
+        #: What the operator is looking for. Set by the filter bar.
+        self.query = Query()
 
     # ------------------------------------------------------------ who, what
 
@@ -89,11 +97,27 @@ class Commands:
     def zones(self):
         return self._site.zones(self._principal)
 
+    def site(self) -> tuple[str, str]:
+        """The site's name and the clock its schedules are read in."""
+        row = self._site.store.site()
+        return row["name"], row["timezone"]
+
     def health(self):
         return self._runtime.health()
 
     def incidents(self):
-        return self._runtime.incidents or tuple(self._site.store.incidents(limit=200))
+        """What the operator asked to see, filtered in the database.
+
+        Read from the store rather than from the last correlation, because a
+        judgement lives in the store and the correlation knows nothing of it.
+        """
+        from dataclasses import replace
+
+        query = replace(self.query, state="all" if self.show_dismissed else "queue", limit=200)
+        try:
+            return tuple(self._search.incidents(query, by=self._principal))
+        except (SearchError, AuthError):
+            return ()
 
     def audit_rows(self, limit: int = 200):
         return self._site.store.audit_trail(limit=limit)
@@ -110,7 +134,7 @@ class Commands:
         except AuthError:
             self._site.store.audit(self._principal.actor, "console.refused", getattr(what, "__name__", "?"), permission)
             return Outcome(False, self.refusal(permission))
-        except (SiteError, ValueError) as error:
+        except (SiteError, ReviewError, ValueError) as error:
             return Outcome(False, str(error))
         except Exception as error:  # noqa: BLE001 - a slot must never die silently
             _log.exception("console: %s failed", getattr(what, "__name__", "?"))
@@ -145,6 +169,10 @@ class Commands:
                               schedule=schedule, by=self._principal)
         return Outcome(True, f"Added zone {name}.", outcome.value) if outcome else outcome
 
+    def edit_zone(self, zone_id: str, **changes) -> Outcome:
+        outcome = self._guard(SITE_CONFIGURE, self._site.edit_zone, zone_id, by=self._principal, **changes)
+        return Outcome(True, f"Saved zone {zone_id}.", outcome.value) if outcome else outcome
+
     def remove_zone(self, zone_id: str) -> Outcome:
         outcome = self._guard(SITE_CONFIGURE, self._site.remove_zone, zone_id, by=self._principal)
         return Outcome(True, "Removed the zone.") if outcome else outcome
@@ -168,6 +196,24 @@ class Commands:
 
     def poll(self):
         return self._runtime.poll()
+
+    def set_filter(self, camera: str, severity: str, contains: str) -> None:
+        from dataclasses import replace
+
+        self.query = replace(self.query, camera=camera or None, severity=severity or None,
+                             contains=contains or None)
+
+    def acknowledge(self, incident, note: str | None = None) -> Outcome:
+        outcome = self._guard(INCIDENT_REVIEW, self._review.acknowledge, incident.id, by=self._principal, note=note)
+        return Outcome(True, f"Acknowledged {incident.id}.", outcome.value) if outcome else outcome
+
+    def dismiss(self, incident, note: str) -> Outcome:
+        outcome = self._guard(INCIDENT_REVIEW, self._review.dismiss, incident.id, by=self._principal, note=note)
+        return Outcome(True, f"Dismissed {incident.id}: {note}", outcome.value) if outcome else outcome
+
+    def reopen(self, incident, note: str | None = None) -> Outcome:
+        outcome = self._guard(INCIDENT_REVIEW, self._review.reopen, incident.id, by=self._principal, note=note)
+        return Outcome(True, f"Reopened {incident.id}.", outcome.value) if outcome else outcome
 
     def export(self, incident) -> Outcome:
         outcome = self._guard(INCIDENT_EXPORT, export_incident, self._site.store, incident, self._evidence_dir,

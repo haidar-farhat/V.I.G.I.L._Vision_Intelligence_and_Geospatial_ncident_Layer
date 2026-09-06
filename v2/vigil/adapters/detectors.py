@@ -12,7 +12,7 @@ import hashlib
 import os
 import threading
 from pathlib import Path
-from typing import Iterable, Protocol, Sequence
+from typing import Iterable, Protocol
 
 import cv2
 import numpy as np

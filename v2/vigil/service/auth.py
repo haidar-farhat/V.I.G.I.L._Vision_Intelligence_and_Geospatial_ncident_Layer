@@ -27,14 +27,19 @@ SITE_VIEW = "site.view"
 SITE_CONFIGURE = "site.configure"
 ANALYSIS_CONTROL = "analysis.control"
 INCIDENT_EXPORT = "incident.export"
+#: Judging an incident — acknowledged, or dismissed with a reason. Separate
+#: from export because reading out evidence and passing judgement on it are
+#: different acts, and a site may want different people doing them.
+INCIDENT_REVIEW = "incident.review"
 AUDIT_READ = "audit.read"
 USERS_MANAGE = "users.manage"
 
 PERMISSIONS: dict[Role, frozenset[str]] = {
     Role.VIEWER: frozenset({SITE_VIEW}),
-    Role.OPERATOR: frozenset({SITE_VIEW, SITE_CONFIGURE, ANALYSIS_CONTROL, INCIDENT_EXPORT}),
-    Role.ANALYST: frozenset({SITE_VIEW, INCIDENT_EXPORT, AUDIT_READ}),
-    Role.ADMIN: frozenset({SITE_VIEW, SITE_CONFIGURE, ANALYSIS_CONTROL, INCIDENT_EXPORT, AUDIT_READ, USERS_MANAGE}),
+    Role.OPERATOR: frozenset({SITE_VIEW, SITE_CONFIGURE, ANALYSIS_CONTROL, INCIDENT_EXPORT, INCIDENT_REVIEW}),
+    Role.ANALYST: frozenset({SITE_VIEW, INCIDENT_EXPORT, INCIDENT_REVIEW, AUDIT_READ}),
+    Role.ADMIN: frozenset({SITE_VIEW, SITE_CONFIGURE, ANALYSIS_CONTROL, INCIDENT_EXPORT, INCIDENT_REVIEW,
+                           AUDIT_READ, USERS_MANAGE}),
 }
 ALL_PERMISSIONS = frozenset().union(*PERMISSIONS.values())
 

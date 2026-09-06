@@ -17,7 +17,7 @@ from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import QSizePolicy, QWidget
 
-from ...domain.geo import CameraPose, LatLon, LocalFrame, field_of_view, haversine_distance
+from ...domain.geo import CameraPose, LatLon, LocalFrame, field_of_view
 from . import theme
 
 #: Metres of padding around whatever is being shown, so nothing touches the edge.
@@ -192,7 +192,10 @@ class PlanView(QWidget):
         painter.setBrush(Qt.BrushStyle.NoBrush)
 
     def _draw_cameras(self, painter: QPainter) -> None:
-        for camera_id, pose in self._cameras.items():
+        # Where a label has already been written, so two masts a few metres
+        # apart do not print one name over another — which they did.
+        taken: list[QRectF] = []
+        for camera_id, pose in sorted(self._cameras.items()):
             centre = self._to_screen(pose.position)
             colour = theme.ACCENT if camera_id == self._selected else theme.TEXT
             painter.setPen(QPen(colour, 2))
@@ -204,7 +207,22 @@ class PlanView(QWidget):
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawLine(centre, QPointF(centre.x() + math.sin(heading) * 14, centre.y() - math.cos(heading) * 14))
             painter.setPen(colour)
-            painter.drawText(QPointF(centre.x() + 9, centre.y() - 7), camera_id)
+            painter.drawText(self._free_label_spot(painter, QPointF(centre.x() + 9, centre.y() - 7), camera_id, taken),
+                             camera_id)
+
+    @staticmethod
+    def _free_label_spot(painter: QPainter, wanted: QPointF, text: str, taken: list[QRectF]) -> QPointF:
+        """The first place this label fits without covering one already drawn."""
+        metrics = painter.fontMetrics()
+        width, height = metrics.horizontalAdvance(text), metrics.height()
+        spot = QPointF(wanted)
+        for _ in range(8):
+            box = QRectF(spot.x(), spot.y() - height, width, height)
+            if not any(box.intersects(other) for other in taken):
+                break
+            spot = QPointF(spot.x(), spot.y() + height)
+        taken.append(QRectF(spot.x(), spot.y() - height, width, height))
+        return spot
 
     def _draw_zones(self, painter: QPainter) -> None:
         for zone in self._zones:
@@ -227,11 +245,19 @@ class PlanView(QWidget):
 
     def _draw_tracks(self, painter: QPainter) -> None:
         for camera_id, tracks in self._tracks.items():
+            unprojected = 0
             for track in tracks:
                 position = track.position
-                if position is None or not position.is_projected:
-                    # An unprojected track has no place on a plan. Drawing it
-                    # at the camera would claim a position nobody measured.
+                if position is None:
+                    continue
+                if not position.is_projected:
+                    # The geometry could not put this on the ground, so the
+                    # position is the camera's own with the whole field of
+                    # view as its error. That is still worth showing — an
+                    # operator learns "something is happening at this camera"
+                    # — but it must be impossible to mistake for a fix, so it
+                    # is drawn dashed, unfilled, and counted in words.
+                    unprojected += 1
                     continue
                 centre = self._to_screen(position.point)
                 colour = theme.track_colour(track.id)
@@ -250,7 +276,28 @@ class PlanView(QWidget):
                     length = 8 + min(24, track.speed_mps * 4)
                     painter.drawLine(centre, QPointF(centre.x() + math.sin(heading) * length,
                                                      centre.y() - math.cos(heading) * length))
+            if unprojected:
+                self._draw_unprojected(painter, camera_id, unprojected)
         painter.setBrush(Qt.BrushStyle.NoBrush)
+
+    def _draw_unprojected(self, painter: QPainter, camera_id: str, count: int) -> None:
+        """Something is at this camera that the geometry could not place.
+
+        Drawn as the camera's own range, dashed and unfilled, with the count
+        in words beside it. Never as a dot: a dot is a fix, and this is the
+        opposite of one.
+        """
+        pose = self._cameras.get(camera_id)
+        if pose is None:
+            return
+        centre = self._to_screen(pose.position)
+        radius = max(6.0, pose.range_meters * self._scale())
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(theme.STALE, 1, Qt.PenStyle.DashLine))
+        painter.drawEllipse(centre, radius, radius)
+        painter.setPen(theme.STALE)
+        painter.drawText(QPointF(centre.x() + 9, centre.y() + 16),
+                         f"{count} not placed on the ground — somewhere at {camera_id}")
 
     def _draw_draft(self, painter: QPainter) -> None:
         if not self._draft:

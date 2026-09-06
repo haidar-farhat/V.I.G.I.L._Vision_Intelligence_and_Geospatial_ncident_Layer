@@ -68,6 +68,12 @@ build on any other edge.
   persist, correlate, health, alerts).
 - `alerts.py` — raised once per condition until cleared, audited, fanned out
   to file / command / local webhook.
+- `search.py` — `Search`: incidents and events by camera, zone, severity,
+  time, review state or text, every filter applied in SQL.
+- `diagnostics.py` — `run_checks`: the installation check behind `vigil doctor`.
+- `review.py` — `IncidentReview`: acknowledge, dismiss with a required reason,
+  reopen. A judgement names the principal, is audited with its before-state,
+  and survives re-correlation.
 - `evidence.py` — incident export: JSON report, clips, manifest with hashes.
 
 ### interfaces
@@ -92,12 +98,21 @@ that cannot deliver drops the *oldest* result and counts the drop.
 ## 4. Identity and permission
 
 Roles: `VIEWER` (site.view), `OPERATOR` (+ site.configure, analysis.control,
-incident.export), `ANALYST` (site.view, incident.export, audit.read), `ADMIN`
-(everything + users.manage). Code asks `principal.may(permission)`. The CLI
+incident.export, incident.review), `ANALYST` (site.view, incident.export,
+incident.review, audit.read), `ADMIN` (everything + users.manage). Code asks `principal.may(permission)`. The CLI
 authenticates by `--as NAME` with the password on stdin, or runs as the
 operating-system account when no user exists yet (`Principal.system`). A
 store with no users is *open*: every principal may; the CLI says so on every
 command until an account exists.
+
+## 4a. Watching a node nobody is watching
+
+`Runtime.metrics()` is one flat reading — cameras, live, dark, faulted,
+recording, frames, fps, dropped results, events, incidents, open alerts — and
+a run logs it every minute, so an unattended node leaves a trail a person can
+read afterwards. `VIGIL_LOG_JSON=1` turns every line into one JSON object,
+redacted by the same rule as the prose, for a monitoring agent to tail.
+`faulthandler` writes a native crash to `crash.log` beside the log.
 
 ## 5. Alerts
 

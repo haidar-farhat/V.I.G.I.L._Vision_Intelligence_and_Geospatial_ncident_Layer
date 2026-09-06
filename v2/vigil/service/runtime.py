@@ -12,7 +12,7 @@ import queue
 import shutil
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Sequence
@@ -37,6 +37,14 @@ DARK_AFTER_SECONDS = 30.0
 STOP_TIMEOUT_SECONDS = 8.0
 DISK_WATERMARK_BYTES = 2 * 1024**3
 OUTBOX_EVENTS = 1000
+#: How often an unattended run says what it is doing, in seconds. Nobody is
+#: reading the screen; the log is the only place this can be seen afterwards.
+METRICS_EVERY_SECONDS = 60.0
+#: How far back a correlation looks. An incident is a statement about a span,
+#: and re-reading a month of events every two seconds is how a node that has
+#: been up for a month stops keeping up with its cameras. Well beyond the
+#: association window, so nothing that could be joined is cut off.
+CORRELATION_SPAN_MILLIS = 60 * 60 * 1000
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,9 +189,12 @@ class CameraWorker:
                     remaining = frame_interval - (time.monotonic() - started)
                     if remaining > 0:
                         self._stop.wait(remaining)
+            # Every live track ends with the camera. The departures this
+            # produces are dropped on purpose: no rule acts on leaving, and
+            # inventing an event for "the camera stopped" would put a
+            # conclusion in the trail that nothing observed.
             for track_id in tracker.reset():
-                for change in presence.forget_track(track_id, int(time.time() * 1000)):
-                    pass
+                presence.forget_track(track_id, int(time.time() * 1000))
         except DecodeError as error:
             self.stats.fault = str(error)
             _log.error("%s: %s", self.camera.id, error)
@@ -217,8 +228,9 @@ class CameraWorker:
         events: list[Event] = []
         info = detector.info
         for ended in update.ended:
-            for change in presence.forget_track(ended, frame.timestamp_millis):
-                pass
+            # A track that ended has left every zone it was in; see above for
+            # why the departures are not turned into events.
+            presence.forget_track(ended, frame.timestamp_millis)
             for rule in self._rules:
                 forget = getattr(rule, "forget", None)
                 if forget:
@@ -329,6 +341,7 @@ class Runtime:
         self.alerts = alerts if alerts is not None else Alerts()
         self.alerts.bind(self.store, f"node:{node_id}")
         self._running = False
+        self._last_metrics: float | None = None
 
     # ------------------------------------------------------------ control
 
@@ -340,11 +353,33 @@ class Runtime:
     def incidents(self) -> tuple[Incident, ...]:
         return self._incidents
 
+    def site_timezone(self):
+        """The clock the site's schedules are written in, or UTC.
+
+        Read here rather than assumed, because a schedule that says "closed
+        22:00 to 06:00" means the site's night, not the meridian's — and an
+        after-hours rule evaluated in the wrong clock fires at the wrong
+        hours, which is worse than not firing at all.
+        """
+        from datetime import timezone
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+        name = (self.store.site().get("timezone") or "UTC").strip()
+        if name.upper() == "UTC":
+            return timezone.utc
+        try:
+            return ZoneInfo(name)
+        except (ZoneInfoNotFoundError, ValueError, KeyError):
+            _log.error("the site's timezone %r is not one this machine knows; using UTC, so any schedule "
+                       "written in local hours will be wrong", name)
+            return timezone.utc
+
     def start(self, by: Principal, *, cameras: Sequence[str] | None = None) -> int:
         by.require(ANALYSIS_CONTROL)
         if self._running:
             return len(self._workers)
         zones = self.site.zones(by)
+        site_tz = self.site_timezone()
         chosen = [c for c in self.site.cameras(by) if cameras is None or c.id in cameras]
         started = 0
         for camera in chosen:
@@ -352,7 +387,7 @@ class Runtime:
                 camera, self.site.source_with_credentials(camera), self._factory(), zones,
                 self._rules_factory() if self._rules_factory else None, node_id=self.node_id,
                 record_to=self._record_to, realtime=self._realtime, keep_images=self._keep_images,
-                record_anyway=self._record_every_camera,
+                record_anyway=self._record_every_camera, site_tz=site_tz,
             )
             worker.start()
             self._workers[camera.id] = worker
@@ -406,6 +441,8 @@ class Runtime:
             self._events = self._events[-5000:]
         self._sweep_retention_if_due()
         self._watch_for_alerts()
+        if self._running:
+            self._log_metrics_if_due()
         due = (time.monotonic() - self._last_correlated) * 1000 >= self._correlate_every
         if fresh or force_correlate or due:
             self.correlate()
@@ -414,10 +451,17 @@ class Runtime:
         return results
 
     def correlate(self) -> tuple[Incident, ...]:
+        """Group the recent past into incidents. Bounded, and measured from the events.
+
+        Older incidents are not re-derived; they are already in the store and
+        `Store.incidents` reads them. What this returns is what is live.
+        """
         self._last_correlated = time.monotonic()
         zones = {z.id: z.kind for z in self.store.zones()}
+        newest = self.store.newest_event_millis()
+        since = None if newest is None else newest - CORRELATION_SPAN_MILLIS
         correlator = Correlator(zone_kinds=zones)
-        self._incidents = tuple(correlator.correlate(self.store.events()))
+        self._incidents = tuple(correlator.correlate(self.store.events(since=since)))
         if self._incidents:
             self.store.save_incidents(self._incidents)
         return self._incidents
@@ -428,6 +472,35 @@ class Runtime:
         """What is drawing one camera's conclusions, or ``None`` when it is not running."""
         worker = self._workers.get(camera_id)
         return getattr(worker, "detector_info", None) if worker is not None else None
+
+    def metrics(self) -> dict:
+        """One flat reading of everything worth watching, for a log or a probe."""
+        health = self.health()
+        return {
+            "node": self.node_id,
+            "running": self._running,
+            "cameras": len(health),
+            "live": sum(1 for h in health.values() if h.state == "LIVE"),
+            "dark": sum(1 for h in health.values() if h.state == "DARK"),
+            "faulted": sum(1 for h in health.values() if h.state == "FAULTED"),
+            "recording": sum(1 for h in health.values() if h.recording),
+            "frames": sum(h.frames for h in health.values()),
+            "fps": round(sum(h.analysis_fps for h in health.values()), 1),
+            "dropped": sum(w.stats.dropped_results for w in self._workers.values()),
+            "events": self.store.event_count(),
+            "incidents": len(self._incidents),
+            "alerts_open": len(self.alerts.active()),
+        }
+
+    def _log_metrics_if_due(self) -> None:
+        now = time.monotonic()
+        if self._last_metrics is not None and now - self._last_metrics < METRICS_EVERY_SECONDS:
+            return
+        self._last_metrics = now
+        reading = self.metrics()
+        _log.info("metrics: %d camera(s), %d live, %.0f fps, %d frames, %d event(s), %d incident(s), %d alert(s)",
+                  reading["cameras"], reading["live"], reading["fps"], reading["frames"],
+                  reading["events"], reading["incidents"], reading["alerts_open"], extra=reading)
 
     def health(self) -> dict[str, CameraHealth]:
         out = {}
