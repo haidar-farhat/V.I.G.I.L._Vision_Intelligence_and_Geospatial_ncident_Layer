@@ -101,6 +101,12 @@ def test_the_webhook_sink_posts_to_the_local_network_and_refuses_anywhere_else()
     thread.start()
     try:
         port = server.server_address[1]
+        import socket
+
+        try:
+            socket.create_connection(("127.0.0.1", port), timeout=1).close()
+        except OSError:
+            pytest.skip("loopback is blocked here (the offline stage poisons every socket)")
         sink = WebhookSink("http" + f"://127.0.0.1:{port}/alerts")
         alerts = Alerts([sink], clock=lambda: 5.0, synchronous=True)
         alerts.raise_(RETENTION_SHORTFALL, "local", "everything left is preserved")

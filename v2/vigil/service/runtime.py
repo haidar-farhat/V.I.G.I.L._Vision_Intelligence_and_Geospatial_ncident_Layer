@@ -1,0 +1,537 @@
+"""The analysis, running. One worker thread per camera, one owner of the store.
+
+A worker does decode → detect → track → presence → rules → record and hands
+results over a bounded outbox. The runtime, on the owning thread, drains the
+outboxes, persists, correlates, watches health and raises alerts. Workers
+never touch the store.
+"""
+
+from __future__ import annotations
+
+import queue
+import shutil
+import threading
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Callable, Sequence
+
+from ..adapters.decode import DecodeError, Frame, LiveReader, VideoSource
+from ..adapters.detectors import Detector
+from ..adapters.recorder import Recorder, Segment
+from ..domain.detection import DetectorInfo
+from ..domain.events import Event, Rule, RuleContext, default_rules
+from ..domain.incidents import Correlator, Incident
+from ..domain.tracking import Track, Tracker, TrackerConfig
+from ..domain.zones import PresenceTracker, Zone
+from ..logs import get as _get_logger
+from ..storage.store import Store
+from .alerts import CAMERA_DARK, DISK_LOW, RECORDING_STOPPED, RETENTION_SHORTFALL, THREAD_STUCK, Alerts
+from .auth import ANALYSIS_CONTROL, Principal
+from .site import Camera, SiteService
+
+_log = _get_logger(__name__)
+
+DARK_AFTER_SECONDS = 30.0
+STOP_TIMEOUT_SECONDS = 8.0
+DISK_WATERMARK_BYTES = 2 * 1024**3
+OUTBOX_EVENTS = 1000
+
+
+@dataclass(frozen=True, slots=True)
+class FrameResult:
+    camera_id: str
+    frame_index: int
+    at_millis: int
+    tracks: tuple[Track, ...]
+    detections: int
+    image: object | None = None
+
+
+@dataclass
+class WorkerStats:
+    frames: int = 0
+    detections: int = 0
+    events: int = 0
+    dropped_results: int = 0
+    analysis_fps: float = 0.0
+    last_frame_at: float | None = None
+    started_at: float | None = None
+    fault: str | None = None
+    recording_fault: str | None = None
+    clips: int = 0
+
+
+class CameraWorker:
+    def __init__(self, camera: Camera, source_url: str, detector_factory: Callable[[], Detector], zones: Sequence[Zone],
+                 rules: Sequence[Rule] | None = None, *, node_id: str = "local", record_to: Path | None = None,
+                 realtime: bool = False, keep_images: bool = False, site_tz=None, segment_seconds: float = 60.0):
+        self.camera = camera
+        self._url = source_url
+        self._detector_factory = detector_factory
+        self._zones = list(zones)
+        self._rules = list(rules) if rules is not None else default_rules()
+        self._node_id = node_id
+        self._record_to = record_to
+        self._realtime = realtime
+        self._keep_images = keep_images
+        self._site_tz = site_tz
+        self._segment_seconds = segment_seconds
+        self.stats = WorkerStats()
+        self.detector_info: DetectorInfo | None = None
+        self._latest: FrameResult | None = None
+        self._latest_lock = threading.Lock()
+        self._events: queue.Queue[Event] = queue.Queue(maxsize=OUTBOX_EVENTS)
+        self._segments: queue.Queue[Segment] = queue.Queue()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._recent: list[float] = []
+
+    # ------------------------------------------------------------ control
+
+    def start(self) -> None:
+        self._stop.clear()
+        self.stats.started_at = time.monotonic()
+        self._thread = threading.Thread(target=self._run, name=f"vigil-camera-{self.camera.id}", daemon=True)
+        self._thread.start()
+
+    def ask_to_stop(self) -> None:
+        self._stop.set()
+
+    def stop(self, timeout: float = STOP_TIMEOUT_SECONDS) -> bool:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout)
+            return not self._thread.is_alive()
+        return True
+
+    @property
+    def alive(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    # ------------------------------------------------------------- outbox
+
+    def take_latest(self) -> FrameResult | None:
+        with self._latest_lock:
+            result, self._latest = self._latest, None
+            return result
+
+    def take_events(self) -> list[Event]:
+        out = []
+        while True:
+            try:
+                out.append(self._events.get_nowait())
+            except queue.Empty:
+                return out
+
+    def take_segments(self) -> list[Segment]:
+        out = []
+        while True:
+            try:
+                out.append(self._segments.get_nowait())
+            except queue.Empty:
+                return out
+
+    def seconds_since_frame(self) -> float | None:
+        return None if self.stats.last_frame_at is None else time.monotonic() - self.stats.last_frame_at
+
+    def seconds_since_started(self) -> float | None:
+        return None if self.stats.started_at is None else time.monotonic() - self.stats.started_at
+
+    # --------------------------------------------------------------- work
+
+    def _run(self) -> None:
+        source = VideoSource(self._url, source_id=self.camera.id)
+        reader: LiveReader | None = None
+        recorder: Recorder | None = None
+        try:
+            detector = self._detector_factory()
+            self.detector_info = detector.info
+            tracker = Tracker(TrackerConfig(), self.camera.pose)
+            presence = PresenceTracker(self._zones)
+            info = source.open()
+            if self._record_to is not None and self.camera.record:
+                recorder = Recorder(self.camera.id, self._record_to, fps=info.nominal_fps or 15.0, segment_seconds=self._segment_seconds)
+                try:
+                    recorder.start()
+                except OSError as error:
+                    self.stats.recording_fault = str(error)
+                    recorder = None
+            if source.live:
+                reader = LiveReader(source)
+                reader.start()
+            frame_interval = 1.0 / info.nominal_fps if (self._realtime and info.nominal_fps > 0) else 0.0
+            while not self._stop.is_set():
+                started = time.monotonic()
+                frame = reader.read(timeout=1.0) if reader is not None else source.read()
+                if frame is None:
+                    if reader is not None:
+                        if reader.fault and not reader.alive:
+                            raise DecodeError(reader.fault)
+                        continue
+                    break  # a file ended
+                self._process(frame, detector, tracker, presence, recorder)
+                if frame_interval:
+                    remaining = frame_interval - (time.monotonic() - started)
+                    if remaining > 0:
+                        self._stop.wait(remaining)
+            for track_id in tracker.reset():
+                for change in presence.forget_track(track_id, int(time.time() * 1000)):
+                    pass
+        except DecodeError as error:
+            self.stats.fault = str(error)
+            _log.error("%s: %s", self.camera.id, error)
+        except Exception as error:  # noqa: BLE001 - a worker must not die silently
+            self.stats.fault = f"{type(error).__name__}: {error}"
+            _log.exception("%s: analysis failed", self.camera.id)
+        finally:
+            if reader is not None:
+                reader.stop()
+            if recorder is not None:
+                for segment in recorder.close():
+                    self._segments.put(segment)
+                if recorder.stats.fault:
+                    self.stats.recording_fault = recorder.stats.fault
+            source.close()
+            _log.info("%s: analysis finished: %d frames, %d detections, %d events", self.camera.id,
+                      self.stats.frames, self.stats.detections, self.stats.events)
+
+    def _process(self, frame: Frame, detector: Detector, tracker: Tracker, presence: PresenceTracker, recorder: Recorder | None) -> None:
+        now = time.monotonic()
+        self.stats.frames += 1
+        self.stats.last_frame_at = now
+        self._recent = [t for t in self._recent if now - t <= 1.0] + [now]
+        self.stats.analysis_fps = float(len(self._recent))
+
+        detections = detector.detect(frame.image)
+        self.stats.detections += len(detections)
+        update = tracker.update(detections, frame.timestamp_millis)
+        tracks = tracker.tracks()
+        moment = datetime.fromtimestamp(frame.timestamp_millis / 1000, tz=timezone.utc)
+        events: list[Event] = []
+        info = detector.info
+        for ended in update.ended:
+            for change in presence.forget_track(ended, frame.timestamp_millis):
+                pass
+            for rule in self._rules:
+                forget = getattr(rule, "forget", None)
+                if forget:
+                    forget(ended)
+        by_id = {t.id: t for t in tracks}
+        zones = presence.zones
+        for change in presence.update(tracks, frame.timestamp_millis, label_for=info.label_for):
+            zone = zones[change.presence.zone_id]
+            track = by_id.get(change.presence.track_id)
+            context = RuleContext(self._node_id, self.camera.id, zone, track, change.presence, frame.timestamp_millis,
+                                  moment, info, frame.index, self._site_tz)
+            for rule in self._rules:
+                events.extend(rule.on_presence_change(change, context))
+        for p in presence.presences():
+            track = by_id.get(p.track_id)
+            if track is None:
+                continue
+            context = RuleContext(self._node_id, self.camera.id, zones[p.zone_id], track, p, frame.timestamp_millis,
+                                  moment, info, frame.index, self._site_tz)
+            for rule in self._rules:
+                events.extend(rule.on_frame(context))
+        for event in events:
+            try:
+                self._events.put_nowait(event)
+                self.stats.events += 1
+            except queue.Full:
+                self.stats.dropped_results += 1
+        if recorder is not None:
+            try:
+                recorder.write(frame.image, frame.timestamp_millis)
+                for segment in recorder.take_closed():
+                    self._segments.put(segment)
+                    self.stats.clips += 1
+            except OSError as error:
+                self.stats.recording_fault = str(error)
+                _log.error("%s: RECORDING STOPPED EARLY - %s", self.camera.id, error)
+        result = FrameResult(self.camera.id, frame.index, frame.timestamp_millis, tuple(tracks), len(detections),
+                             frame.image if self._keep_images else None)
+        with self._latest_lock:
+            if self._latest is not None:
+                self.stats.dropped_results += 1
+            self._latest = result
+
+
+@dataclass(frozen=True, slots=True)
+class CameraHealth:
+    camera_id: str
+    state: str  # STOPPED | STARTING | LIVE | DARK | FAULTED
+    running: bool
+    placed: bool
+    analysis_fps: float
+    frames: int
+    fault: str | None
+    seconds_since_frame: float | None
+    recording: bool
+    recording_fault: str | None
+    clips: int
+
+    def describe(self) -> str:
+        parts = [self.state]
+        if self.state == "LIVE":
+            parts.append(f"{self.analysis_fps:.0f} fps")
+        if self.state == "DARK" and self.seconds_since_frame is not None:
+            parts.append(f"no frame for {self.seconds_since_frame:.0f} s")
+        if self.fault:
+            parts.append(self.fault)
+        if self.recording:
+            parts.append(f"recording ({self.clips} clip(s))")
+        if self.recording_fault:
+            parts.append(f"recording stopped: {self.recording_fault}")
+        return " | ".join(parts)
+
+
+@dataclass
+class RetentionPolicy:
+    max_age_days: float | None = 14.0
+    max_bytes: int | None = None
+    min_free_bytes: int | None = 5 * 1024**3
+
+
+class Runtime:
+    """Start, stop, poll. Owns the store's thread. Every control action takes a principal."""
+
+    def __init__(self, site: SiteService, *, node_id: str = "local", detector_factory: Callable[[], Detector] | None = None,
+                 record_to: Path | None = None, retention: RetentionPolicy | None = None, alerts: Alerts | None = None,
+                 realtime: bool = False, keep_images: bool = False, rules_factory: Callable[[], list[Rule]] | None = None,
+                 correlate_every_millis: int = 2000, retention_every_seconds: float = 600.0):
+        self.site = site
+        self.store: Store = site.store
+        self.node_id = node_id
+        self._detector_factory = detector_factory
+        self._record_to = record_to
+        self._retention = retention if retention is not None else (RetentionPolicy() if record_to else None)
+        self._retention_every = retention_every_seconds
+        self._last_retention: float | None = None
+        self.retention_shortfall: str | None = None
+        self._realtime = realtime
+        self._keep_images = keep_images
+        self._rules_factory = rules_factory
+        self._correlate_every = correlate_every_millis
+        self._last_correlated = 0.0
+        self._workers: dict[str, CameraWorker] = {}
+        self._events: list[Event] = []
+        self._incidents: tuple[Incident, ...] = ()
+        self.alerts = alerts if alerts is not None else Alerts()
+        self.alerts.bind(self.store, f"node:{node_id}")
+        self._running = False
+
+    # ------------------------------------------------------------ control
+
+    @property
+    def running(self) -> bool:
+        return self._running
+
+    @property
+    def incidents(self) -> tuple[Incident, ...]:
+        return self._incidents
+
+    def start(self, by: Principal, *, cameras: Sequence[str] | None = None) -> int:
+        by.require(ANALYSIS_CONTROL)
+        if self._running:
+            return len(self._workers)
+        zones = self.site.zones(by)
+        chosen = [c for c in self.site.cameras(by) if cameras is None or c.id in cameras]
+        started = 0
+        for camera in chosen:
+            worker = CameraWorker(
+                camera, self.site.source_with_credentials(camera), self._factory(), zones,
+                self._rules_factory() if self._rules_factory else None, node_id=self.node_id,
+                record_to=self._record_to, realtime=self._realtime, keep_images=self._keep_images,
+            )
+            worker.start()
+            self._workers[camera.id] = worker
+            started += 1
+        self._running = started > 0
+        self.store.audit(by.actor, "analysis.started", self.node_id, f"{started} camera(s)")
+        return started
+
+    def stop(self, by: Principal) -> bool:
+        by.require(ANALYSIS_CONTROL)
+        for worker in self._workers.values():
+            worker.ask_to_stop()
+        stubborn = [cid for cid, w in self._workers.items() if not w.stop()]
+        if stubborn:
+            self.store.audit(by.actor, "analysis.thread_stuck", ", ".join(stubborn), "left running rather than killed")
+            self.alerts.raise_(THREAD_STUCK, ", ".join(stubborn), "analysis thread did not stop; left running rather than killed")
+        self.poll(force_correlate=True)
+        self._running = False
+        self.store.audit(by.actor, "analysis.stopped", self.node_id)
+        return not stubborn
+
+    def close(self, by: Principal | None = None) -> None:
+        if self._running:
+            self.stop(by or Principal.system())
+        self.store.close()
+
+    def _factory(self) -> Callable[[], Detector]:
+        if self._detector_factory is not None:
+            return self._detector_factory
+        from ..adapters.detectors import MotionDetector
+
+        return MotionDetector
+
+    # --------------------------------------------------------------- poll
+
+    def poll(self, *, force_correlate: bool = False) -> list[FrameResult]:
+        results: list[FrameResult] = []
+        fresh: list[Event] = []
+        for worker in self._workers.values():
+            result = worker.take_latest()
+            if result is not None:
+                results.append(result)
+            for segment in worker.take_segments():
+                self.store.save_segment(segment)
+            events = worker.take_events()
+            if events:
+                fresh.extend(events)
+        if fresh:
+            self.store.save_events(fresh)
+            self._events.extend(fresh)
+            self._events = self._events[-5000:]
+        self._sweep_retention_if_due()
+        self._watch_for_alerts()
+        due = (time.monotonic() - self._last_correlated) * 1000 >= self._correlate_every
+        if fresh or force_correlate or due:
+            self.correlate()
+        if self._running and self._workers and not any(w.alive for w in self._workers.values()):
+            self._running = False
+        return results
+
+    def correlate(self) -> tuple[Incident, ...]:
+        self._last_correlated = time.monotonic()
+        zones = {z.id: z.kind for z in self.store.zones()}
+        correlator = Correlator(zone_kinds=zones)
+        self._incidents = tuple(correlator.correlate(self.store.events()))
+        if self._incidents:
+            self.store.save_incidents(self._incidents)
+        return self._incidents
+
+    # ------------------------------------------------------------- health
+
+    def health(self) -> dict[str, CameraHealth]:
+        out = {}
+        for camera in self.store.cameras():
+            worker = self._workers.get(camera["id"])
+            out[camera["id"]] = self._health_for(camera, worker)
+        return out
+
+    @staticmethod
+    def _health_for(camera: dict, worker: CameraWorker | None) -> CameraHealth:
+        if worker is None:
+            return CameraHealth(camera["id"], "STOPPED", False, camera["pose"] is not None, 0.0, 0, None, None, False, None, 0)
+        running = worker.alive
+        since_frame = worker.seconds_since_frame()
+        since_start = worker.seconds_since_started()
+        fault = worker.stats.fault
+        if fault:
+            state = "FAULTED"
+        elif not running:
+            state = "STOPPED"
+        else:
+            silent = since_frame if since_frame is not None else since_start
+            if silent is not None and silent >= DARK_AFTER_SECONDS:
+                state = "DARK"
+            elif since_frame is None:
+                state = "STARTING"
+            else:
+                state = "LIVE"
+        fps = worker.stats.analysis_fps if running and since_frame is not None and since_frame <= 1.0 else 0.0
+        recording = camera["record"] and running and worker.stats.recording_fault is None and worker._record_to is not None
+        return CameraHealth(camera["id"], state, running, camera["pose"] is not None, fps, worker.stats.frames, fault,
+                            since_frame, bool(recording), worker.stats.recording_fault, worker.stats.clips)
+
+    def _watch_for_alerts(self) -> None:
+        for camera_id, health in self.health().items():
+            if health.state == "DARK":
+                self.alerts.raise_(CAMERA_DARK, camera_id, health.describe())
+            elif health.state in ("LIVE", "STOPPED"):
+                self.alerts.clear(CAMERA_DARK, camera_id)
+            if health.recording_fault:
+                self.alerts.raise_(RECORDING_STOPPED, camera_id, health.recording_fault)
+        if self.retention_shortfall:
+            self.alerts.raise_(RETENTION_SHORTFALL, self.node_id, self.retention_shortfall)
+        else:
+            self.alerts.clear(RETENTION_SHORTFALL, self.node_id)
+        free = self._free_recording_bytes()
+        if free is not None and free < DISK_WATERMARK_BYTES:
+            self.alerts.raise_(DISK_LOW, self.node_id, f"{free / 1024**3:.1f} GiB free where recordings go, below the {DISK_WATERMARK_BYTES // 1024**3} GiB watermark")
+        elif free is not None:
+            self.alerts.clear(DISK_LOW, self.node_id)
+
+    def _free_recording_bytes(self) -> float | None:
+        if self._record_to is None:
+            return None
+        probe = Path(self._record_to)
+        while not probe.exists() and probe.parent != probe:
+            probe = probe.parent
+        try:
+            return float(shutil.disk_usage(probe).free)
+        except OSError:
+            return None
+
+    # ---------------------------------------------------------- retention
+
+    def _sweep_retention_if_due(self) -> None:
+        if self._retention is None:
+            return
+        now = time.monotonic()
+        if self._last_retention is not None and now - self._last_retention < self._retention_every:
+            return
+        self._last_retention = now
+        try:
+            self.retention_shortfall = apply_retention(self.store, self._retention, principal=f"node:{self.node_id}")
+        except Exception:  # noqa: BLE001
+            _log.exception("retention sweep failed")
+
+
+def apply_retention(store: Store, policy: RetentionPolicy, *, principal: str = "retention",
+                    now_millis: int | None = None) -> str | None:
+    """Delete the oldest unpreserved clips until the policy is met; the shortfall if it cannot be."""
+    now = now_millis if now_millis is not None else int(time.time() * 1000)
+    everything = store.segments()
+    preserved = store.preserved_paths()
+    candidates = sorted((s for s in everything if str(s.path) not in preserved), key=lambda s: s.started_millis)
+    total = store.recorded_bytes()
+    free = _free_bytes(everything)
+
+    def over_budget() -> bool:
+        if policy.max_bytes is not None and total > policy.max_bytes:
+            return True
+        return policy.min_free_bytes is not None and free < policy.min_free_bytes
+
+    for segment in candidates:
+        too_old = policy.max_age_days is not None and now - segment.ended_millis > policy.max_age_days * 86_400_000
+        if not too_old and not over_budget():
+            continue
+        try:
+            segment.path.unlink(missing_ok=True)
+        except OSError as error:
+            _log.warning("could not delete %s: %s", segment.path, error)
+            continue
+        store.forget_segment(segment.path)
+        store.audit(principal, "recording.deleted", str(segment.path), f"{segment.camera_id}, {segment.size_bytes / 1048576:.1f} MiB")
+        total -= segment.size_bytes
+        free += segment.size_bytes
+    if over_budget():
+        kept = len(everything) - len(candidates)
+        shortfall = (f"retention could not reach its target: {total / 1024**3:.1f} GiB recorded, {free / 1024**3:.1f} GiB free, "
+                     f"{kept} clip(s) preserved as evidence and not eligible for deletion")
+        _log.error("%s", shortfall)
+        return shortfall
+    return None
+
+
+def _free_bytes(segments: Sequence[Segment]) -> float:
+    for segment in segments:
+        try:
+            return float(shutil.disk_usage(segment.path.parent).free)
+        except OSError:
+            continue
+    return float("inf")

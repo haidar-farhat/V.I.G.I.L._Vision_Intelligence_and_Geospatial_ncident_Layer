@@ -1,0 +1,30 @@
+[project]
+name = "vigil"
+version = "2.0.0a1"
+description = "Sentinel Vision v2: local-first multi-camera incident intelligence."
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.0",
+    "opencv-python-headless>=4.10",
+    "onnxruntime>=1.20",
+    "keyring>=25",
+]
+
+[project.scripts]
+vigil = "vigil.interfaces.cli:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pyinstaller>=6.0"]
+
+[build-system]
+requires = ["setuptools>=70"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["vigil*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"
+filterwarnings = ["ignore::DeprecationWarning"]

@@ -1,0 +1,79 @@
+"""The capability manifest: what the product does, as data a test can check.
+
+Each capability names the symbols that implement it and the test files that
+exercise it. `tests/test_capabilities.py` fails when a symbol does not exist,
+when a TESTED capability's tests do not reference its symbols, and when a
+public service method is called by no interface. `CAPABILITIES.md` is
+generated from this file by `python tasks.py capabilities`; it is never
+edited by hand.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from enum import StrEnum
+
+
+class State(StrEnum):
+    TESTED = "TESTED"   # implemented, tested, reachable from an interface
+    IMPL = "IMPL"       # implemented and reachable; tests incomplete
+    PLAN = "PLAN"       # decided, not built
+
+
+@dataclass(frozen=True, slots=True)
+class Capability:
+    id: str
+    title: str
+    state: State
+    symbols: tuple[str, ...]
+    tests: tuple[str, ...]
+    note: str = ""
+
+
+MANIFEST: tuple[Capability, ...] = (
+    Capability("geo", "Ground projection with honest uncertainty and fallback", State.TESTED,
+               ("vigil.domain.geo.project_to_ground", "vigil.domain.geo.project_point", "vigil.domain.geo.field_of_view", "vigil.domain.geo.image_coordinates"),
+               ("tests/test_geo.py",)),
+    Capability("tracking", "Multi-object tracking with cumulative confirmation and coasting", State.TESTED,
+               ("vigil.domain.tracking.Tracker",), ("tests/test_tracking.py",)),
+    Capability("zones", "Zones with membership hysteresis and a watch list", State.TESTED,
+               ("vigil.domain.zones.Zone", "vigil.domain.zones.PresenceTracker"), ("tests/test_zones_events.py",)),
+    Capability("rules", "Zone entry, loitering and after-hours rules with evidence", State.TESTED,
+               ("vigil.domain.events.ZoneEntryRule", "vigil.domain.events.LoiteringRule", "vigil.domain.events.AfterHoursRule"),
+               ("tests/test_zones_events.py",)),
+    Capability("incidents", "Time-and-place correlation into incidents with risk", State.TESTED,
+               ("vigil.domain.incidents.Correlator", "vigil.domain.incidents.associate", "vigil.domain.incidents.score_risk"),
+               ("tests/test_incidents.py",)),
+    Capability("decode", "Files, local devices and RTSP behind the egress guard", State.TESTED,
+               ("vigil.adapters.decode.VideoSource", "vigil.adapters.decode.LiveReader", "vigil.adapters.decode.require_private"),
+               ("tests/test_decode.py",)),
+    Capability("motion", "Motion detection that says it does not classify", State.TESTED,
+               ("vigil.adapters.detectors.MotionDetector",), ("tests/test_detectors.py",)),
+    Capability("onnx", "ONNX detection and segmentation, model read once per process", State.TESTED,
+               ("vigil.adapters.detectors.OnnxDetector", "vigil.adapters.detectors.model_info"), ("tests/test_detectors.py",),
+               "The inference path is exercised with a synthetic ONNX model built in the test; real weights are the operator's"),
+    Capability("recording", "Clips on disk with digests, retention with preservation", State.TESTED,
+               ("vigil.adapters.recorder.Recorder", "vigil.service.runtime.apply_retention"), ("tests/test_recording.py",)),
+    Capability("store", "SQLite with migrations that have a way back, integrity check, backup/restore", State.TESTED,
+               ("vigil.storage.store.Store", "vigil.storage.store.verify_backup", "vigil.storage.store.restore_backup"),
+               ("tests/test_store.py",)),
+    Capability("auth", "Accounts, scrypt, lockout, permission-based roles, principals", State.TESTED,
+               ("vigil.service.auth.Accounts", "vigil.service.auth.Principal"), ("tests/test_auth.py",)),
+    Capability("site", "Every site change through one service with a principal and an audit row", State.TESTED,
+               ("vigil.service.site.SiteService",), ("tests/test_site.py",)),
+    Capability("runtime", "Camera workers with bounded outboxes; poll persists, correlates, watches health", State.TESTED,
+               ("vigil.service.runtime.Runtime", "vigil.service.runtime.CameraWorker"), ("tests/test_runtime.py",)),
+    Capability("alerts", "Dark camera, stopped recording, retention shortfall, stuck thread, low disk leave the process", State.TESTED,
+               ("vigil.service.alerts.Alerts",), ("tests/test_alerts.py", "tests/test_runtime.py")),
+    Capability("evidence", "Incident export with clips, hashes and a verifiable manifest", State.TESTED,
+               ("vigil.service.evidence.export_incident", "vigil.service.evidence.verify_package"), ("tests/test_evidence.py",)),
+    Capability("keychain", "Camera passwords in the OS keychain under a random handle", State.TESTED,
+               ("vigil.adapters.keychain.Keychain",), ("tests/test_site.py",)),
+    Capability("cli", "One command for every service method", State.TESTED,
+               ("vigil.interfaces.cli.main",), ("tests/test_cli.py",)),
+    Capability("console", "Desktop console as a thin view over the service", State.PLAN, (), (), "DECISIONS.md D-07"),
+    Capability("faces-plates", "Faces, plates and a subject register behind an identity switch", State.PLAN, (), (), "DECISIONS.md D-08"),
+    Capability("packaging", "One executable, built and camera-tested by the task runner", State.IMPL,
+               (), (), "`tasks.py package` builds dist/vigil/vigil.exe; `exetest` ran it on device:0 with recording and passed on 2026-09-05 (README.md); no installer, no signing"),
+    Capability("service", "Run unattended with restart-on-crash", State.PLAN, (), (), "v1's supervise module is the design; not ported yet"),
+)

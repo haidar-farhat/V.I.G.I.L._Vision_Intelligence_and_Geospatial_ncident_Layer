@@ -884,6 +884,17 @@ remembered when declined (`accounts/first_admin_declined` in the settings),
 so a deployment that has not decided on accounts is told once, and the
 status bar keeps saying "the audit trail names nobody" until one exists.
 
+### 2026-09-06 (later) — "extreme review, then a v2 from scratch"
+
+The user asked for a merciless review of v1 and a rewrite that starts from
+what v1 taught. Both live in `v2/`: `REVIEW_OF_V1.md` (the review, with the
+ten principles v2 is built on), `ARCHITECTURE.md`, `DECISIONS.md`, a
+*generated* `CAPABILITIES.md`, the `vigil` package (four layers, one language,
+every mutation through a service method that takes a principal, reachability
+and layering enforced by tests) and its own `tasks.py` (`check`, `package`,
+`exetest`). V1 stays in place as the reference and as the thing that still
+runs on the camera today. See `v2/README.md` for the state of the camera run.
+
 ## 7. Hard-won facts worth not rediscovering
 
 - **The recurring defect in this repository is correct, tested code that nothing
