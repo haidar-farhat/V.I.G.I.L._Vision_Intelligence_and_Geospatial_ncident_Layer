@@ -94,3 +94,35 @@ def test_the_doctor_fails_when_the_model_cannot_produce_a_watched_label(tmp_path
         model = tmp_path / "not-a-model.onnx"
         model.write_bytes(b"not an onnx file")
         assert _detection(_Settings(model), store).state is State.WARN, "an unreadable model is the model check's job"
+
+
+def test_how_often_to_look_is_a_setting_with_a_ceiling_that_means_something():
+    """Detecting on a subset of frames and tracking between them, measured at
+    3.0x less detection for 0.008 box heights of lag at N=3.
+
+    A setting rather than a flag, for the reason migration 4 exists: a service
+    started at boot has nobody to type a flag at it.
+    """
+    from vigil.service.detection import MAX_DETECT_EVERY, DetectionError, DetectionSettings
+
+    assert DetectionSettings().detect_every == 1, "every frame, unless a site says otherwise"
+    assert DetectionSettings.checked([], None, 3).detect_every == 3
+    assert "detecting every 3 frames" in DetectionSettings.checked([], None, 3).describe()
+    assert "detecting every" not in DetectionSettings.checked([], None, 1).describe(), (
+        "the common case must not be narrated"
+    )
+    for absurd in (0, -1, MAX_DETECT_EVERY + 1, 50):
+        with pytest.raises(DetectionError):
+            DetectionSettings.checked([], None, absurd)
+
+
+def test_the_interval_survives_a_restart_and_a_flag_overrides_it_for_one_run():
+    from vigil.service.detection import DetectionSettings
+
+    stored = DetectionSettings.from_site({"watch_labels": ["person"], "min_confidence": 0.6,
+                                          "detect_every": 3})
+    assert stored.detect_every == 3 and stored.confidence == 0.6
+    # A site written before the column existed reads as every frame.
+    assert DetectionSettings.from_site({"watch_labels": [], "min_confidence": None}).detect_every == 1
+    assert stored.override(None, None, 1).detect_every == 1
+    assert stored.override(None, None, None).detect_every == 3, "an absent flag keeps the setting"

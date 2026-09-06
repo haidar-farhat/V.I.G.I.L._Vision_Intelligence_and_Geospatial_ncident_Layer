@@ -478,6 +478,7 @@ class ConsoleWindow(QMainWindow):
         self.incidents.set_cameras([c.id for c in cameras])
         self.plan.set_cameras({c.id: c.pose for c in cameras if c.pose is not None})
         self.plan.set_zones(self.commands.zones())
+        self.plan.set_ground(self.commands.ground())
         placed = [c for c in cameras if c.placed]
         if not cameras:
             self.placement_label.setText("No camera yet")

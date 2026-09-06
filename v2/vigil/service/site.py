@@ -273,17 +273,21 @@ class SiteService:
 
         return DetectionSettings.from_site(self._store.site())
 
-    def set_detection(self, labels, confidence: float | None, *, by: Principal):
-        """Store the watch list and the threshold, after checking they make sense."""
+    def set_detection(self, labels, confidence: float | None, *, by: Principal,
+                      detect_every: int | None = None):
+        """Store the watch list, the threshold and how often to look."""
         from .detection import DetectionSettings
 
         by.require(SITE_CONFIGURE)
         before = self.detection()
-        after = DetectionSettings.checked(labels, confidence)
-        self._store.set_detection(sorted(after.labels or ()), after.confidence)
+        after = DetectionSettings.checked(
+            labels, confidence, before.detect_every if detect_every is None else detect_every)
+        self._store.set_detection(sorted(after.labels or ()), after.confidence, after.detect_every)
         self._store.audit(by.actor, "site.detection_changed", None, after.describe(),
-                          before={"labels": sorted(before.labels or ()), "confidence": before.confidence},
-                          after={"labels": sorted(after.labels or ()), "confidence": after.confidence})
+                          before={"labels": sorted(before.labels or ()), "confidence": before.confidence,
+                                  "detect_every": before.detect_every},
+                          after={"labels": sorted(after.labels or ()), "confidence": after.confidence,
+                                 "detect_every": after.detect_every})
         return after
 
     def name_site(self, name: str, timezone_name: str, *, by: Principal) -> None:

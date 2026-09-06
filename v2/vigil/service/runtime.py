@@ -79,6 +79,9 @@ class FrameResult:
 @dataclass
 class WorkerStats:
     frames: int = 0
+    #: Frames the detector actually ran on. Below `frames` when the site is
+    #: detecting on a subset and tracking through the rest.
+    detected_frames: int = 0
     detections: int = 0
     events: int = 0
     dropped_results: int = 0
@@ -102,7 +105,7 @@ class CameraWorker:
     def __init__(self, camera: Camera, source_url: str, detector_factory: Callable[[], Detector], zones: Sequence[Zone],
                  rules: Sequence[Rule] | None = None, *, node_id: str = "local", record_to: Path | None = None,
                  realtime: bool = False, keep_images: bool = False, site_tz=None, segment_seconds: float = 60.0,
-                 record_anyway: bool = False):
+                 record_anyway: bool = False, detect_every: int = 1):
         self.camera = camera
         self._url = source_url
         self._detector_factory = detector_factory
@@ -118,6 +121,10 @@ class CameraWorker:
         #: `--record`, which would otherwise set a destination and record
         #: nothing — which is what happened, and what nobody was told.
         self._record_anyway = record_anyway
+        #: Run the detector on one frame in this many and track through the
+        #: rest. See `vigil.service.detection.MAX_DETECT_EVERY` for the
+        #: measurement; 1 is every frame.
+        self._detect_every = max(1, int(detect_every))
         self.stats = WorkerStats()
         self.detector_info: DetectorInfo | None = None
         self._latest: FrameResult | None = None
@@ -276,12 +283,20 @@ class CameraWorker:
             camera_motion.reset()
         warp = motion.warp if (motion is not None and motion.measured and not motion.still) else None
 
-        detections = detector.detect(frame.image)
-        self.stats.detections += len(detections)
-        # An appearance per detection: what stops one person becoming
-        # eleven objects the moment the detector blinks.
-        looks = [describe(frame.image, (d.bbox.x, d.bbox.y, d.bbox.width, d.bbox.height), d.mask)
-                 for d in detections]
+        # Detect on one frame in `detect_every` and track through the rest.
+        # The tracker carries the gap: it predicts with a Kalman filter rather
+        # than extrapolating an average, so a skipped frame widens the gate by
+        # the right amount instead of by whatever the frame counter did.
+        detections: list = []
+        looks: list = []
+        if self.stats.frames % self._detect_every == 0:
+            detections = detector.detect(frame.image)
+            self.stats.detected_frames += 1
+            self.stats.detections += len(detections)
+            # An appearance per detection: what stops one person becoming
+            # eleven objects the moment the detector blinks.
+            looks = [describe(frame.image, (d.bbox.x, d.bbox.y, d.bbox.width, d.bbox.height), d.mask)
+                     for d in detections]
         update = tracker.update(detections, frame.timestamp_millis, appearances=looks, warp=warp)
         tracks = tracker.tracks()
         moment = datetime.fromtimestamp(frame.timestamp_millis / 1000, tz=timezone.utc)
@@ -475,6 +490,7 @@ class Runtime:
                 list(rules), node_id=self.node_id,
                 record_to=self._record_to, realtime=self._realtime, keep_images=self._keep_images,
                 record_anyway=self._record_every_camera, site_tz=site_tz,
+                detect_every=self._detect_every(),
             )
             worker.start()
             self._workers[camera.id] = worker
@@ -621,6 +637,17 @@ class Runtime:
             worker = self._workers.get(camera["id"])
             out[camera["id"]] = self._health_for(camera, worker)
         return out
+
+    def _detect_every(self) -> int:
+        """How often this site looks, read at start rather than at build time.
+
+        Off the site's own settings, like the watch list and the threshold —
+        a service started at boot has nobody to type a flag at it, which is
+        the lesson migration 4 was written for.
+        """
+        factory = self._detector_factory
+        settings = getattr(factory, "settings", None)
+        return max(1, int(getattr(settings, "detect_every", 1) or 1))
 
     @staticmethod
     def _health_for(camera: dict, worker: CameraWorker | None) -> CameraHealth:

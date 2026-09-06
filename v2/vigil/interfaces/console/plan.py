@@ -14,7 +14,7 @@ import math
 from typing import Sequence
 
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPen, QPolygonF
+from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPen, QPixmap, QPolygonF
 from PySide6.QtWidgets import QSizePolicy, QWidget
 
 from ...domain.geo import CameraPose, LatLon, LocalFrame, field_of_view
@@ -41,6 +41,10 @@ class PlanView(QWidget):
         #: a group reads as a group and not as three unrelated dots.
         self._relations: dict[str, tuple] = {}
         self._draft: list[LatLon] = []
+        #: The site's own ground, when one has been built. See `set_ground`.
+        self._ground = None
+        self._ground_pixmap = None
+        self._ground_key: tuple | None = None
         self._drawing = False
         self._selected: str | None = None
         self._zoom = 1.0
@@ -53,6 +57,25 @@ class PlanView(QWidget):
     def set_cameras(self, poses: dict[str, CameraPose]) -> None:
         self._cameras = dict(poses)
         self._reframe()
+        self.update()
+
+    def set_ground(self, ground) -> None:
+        """The map the cameras built, drawn under everything else.
+
+        `vigil.service.mapping` opens by saying a plan view needs ground under
+        it. It has been able to produce that ground since it was written and
+        nothing drew it — correct, tested code no product path reached, which
+        is this repository's recurring defect.
+
+        Only the cells the map is confident about are drawn. A cell it cannot
+        vouch for is left as background rather than shaded in, because the
+        whole reason an operator looks at this view is to judge which side of
+        a line somebody was on, and ground that might be a smeared wall is
+        worse than no ground at all.
+        """
+        self._ground = ground
+        self._ground_pixmap = None
+        self._ground_key = None
         self.update()
 
     def set_zones(self, zones: Sequence) -> None:
@@ -172,6 +195,7 @@ class PlanView(QWidget):
                              "Nothing is placed yet.\nPlace a camera to see the ground it covers.")
             painter.end()
             return
+        self._draw_ground(painter)
         self._draw_zones(painter)
         self._draw_coverage(painter)
         self._draw_cameras(painter)
@@ -179,6 +203,62 @@ class PlanView(QWidget):
         self._draw_draft(painter)
         self._draw_scale(painter)
         painter.end()
+
+    def _draw_ground(self, painter: QPainter) -> None:
+        """The map, warped onto this view's frame.
+
+        Cached against the geometry it was drawn for: the raster is hundreds
+        of thousands of cells and rebuilding it on every repaint would make
+        panning unusable. The key is everything that changes where a cell
+        lands on screen.
+        """
+        ground = self._ground
+        if ground is None or self._frame is None:
+            return
+        key = (id(ground), self.width(), self.height(), round(self._scale(), 4),
+               self._frame.origin.lat, self._frame.origin.lon)
+        if self._ground_pixmap is None or self._ground_key != key:
+            self._ground_pixmap = self._render_ground(ground)
+            self._ground_key = key
+        if self._ground_pixmap is None:
+            return
+        # Where the raster's own corners land on this view. Its rows run north
+        # to south, so the top-left cell is the north-west corner.
+        grid = ground.grid
+        north_west = grid.centre_of(0, 0)
+        south_east = grid.centre_of(grid.rows - 1, grid.cols - 1)
+        top_left = self._to_screen(north_west)
+        bottom_right = self._to_screen(south_east)
+        target = QRectF(top_left, bottom_right).normalized()
+        if target.width() < 1 or target.height() < 1:
+            return
+        painter.drawPixmap(target, self._ground_pixmap, QRectF(self._ground_pixmap.rect()))
+
+    @staticmethod
+    def _render_ground(ground):
+        """The usable cells as an image with transparency everywhere else."""
+        try:
+            import numpy as np
+            from PySide6.QtGui import QImage
+
+            usable = ground.usable
+            if not usable.any():
+                return None
+            rows, cols = usable.shape
+            rgba = np.zeros((rows, cols, 4), dtype=np.uint8)
+            # The map is BGR; Qt wants RGB, and the alpha carries the
+            # confidence so ground the map is less sure of fades rather than
+            # claiming the same standing as ground it is sure of.
+            rgba[..., 0] = ground.colour[..., 2]
+            rgba[..., 1] = ground.colour[..., 1]
+            rgba[..., 2] = ground.colour[..., 0]
+            alpha = np.clip(ground.confidence, 0.0, 1.0) * 255.0
+            rgba[..., 3] = np.where(usable, alpha, 0).astype(np.uint8)
+            buffer = np.ascontiguousarray(rgba)
+            image = QImage(buffer.data, cols, rows, cols * 4, QImage.Format.Format_RGBA8888)
+            return QPixmap.fromImage(image.copy())
+        except Exception:  # noqa: BLE001 - a map that will not draw must not take the window with it
+            return None
 
     def _draw_coverage(self, painter: QPainter) -> None:
         for camera_id, pose in self._cameras.items():

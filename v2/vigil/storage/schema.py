@@ -197,6 +197,28 @@ MIGRATIONS: tuple[Migration, ...] = (
         ALTER TABLE site DROP COLUMN watch_labels;
         """,
     ),
+    Migration(
+        version=5,
+        name="site_detect_every",
+        up="""
+        -- Run the detector on one frame in N and track through the rest.
+        --
+        -- Measured on this machine: detecting every third frame costs 3.0x
+        -- less and moves a track 0.008 box heights from where full-rate
+        -- detection put it, against a projection error of over a metre at
+        -- range. It is only safe because the tracker was rebuilt around a
+        -- Kalman filter, a weak-detection recovery pass and re-identification
+        -- across a gap; on the exponential-average tracker this replaced it
+        -- would have been reckless.
+        --
+        -- 1 is every frame, which is what every run did before this.
+        ALTER TABLE site ADD COLUMN detect_every INTEGER NOT NULL DEFAULT 1;
+        """,
+        down="""
+        -- A build without it detects on every frame, which is what it did.
+        ALTER TABLE site DROP COLUMN detect_every;
+        """,
+    ),
 )
 
 SCHEMA_VERSION = MIGRATIONS[-1].version

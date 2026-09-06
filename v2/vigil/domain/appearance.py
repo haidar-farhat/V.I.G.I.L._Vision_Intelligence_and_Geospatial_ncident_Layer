@@ -172,3 +172,108 @@ class Gallery:
         """Absorb another track's appearances, for a re-identified fragment."""
         for entry in other.entries:
             self.observe(entry)
+
+
+#: Between-object distances kept to calibrate a scene. Two hundred spans
+#: several minutes of a busy view and a whole night of a quiet one, and it is
+#: a ring so the figure follows the light rather than averaging noon into
+#: midnight.
+SEPARATION_SAMPLES = 200
+
+#: Fewest samples before the measured threshold is trusted over the shipped
+#: one. Below this the quantile is dominated by whichever two objects happened
+#: to be in view.
+MIN_SEPARATION_SAMPLES = 30
+
+#: Quantile of the between-object distribution used as the ceiling. A
+#: candidate must be closer than 95% of the pairs this scene has proved are
+#: *different* objects — so the stated worst case is a 5% chance that any one
+#: comparison admits a stranger, before the margin below is applied.
+SEPARATION_QUANTILE = 5.0
+
+#: How much better the best candidate must be than the runner-up, as a
+#: fraction of the measured spread. Without it, two objects that look equally
+#: like a lost track let the solver pick one, and picking is guessing.
+SEPARATION_MARGIN = 0.5
+
+
+@dataclass(slots=True)
+class SceneSeparation:
+    """How far apart *different* objects look in this particular scene.
+
+    # Why this exists
+
+    `MAX_REIDENTIFY_DISTANCE` was calibrated on synthetic colour blocks, which
+    separated two coats at a cosine distance of 0.56. `tools/calibrate.py` ran
+    the same measurement on twenty seconds of real video and found the
+    *different-object* median at **0.105** — so the shipped gate of 0.35 would
+    have admitted nearly everything and merged two objects rather than telling
+    them apart. A fragment is visible on screen; a merge is not.
+
+    No fixed number survives that, because the right one is a property of the
+    scene: a yard holding a red van and a white car separates cleanly, and a
+    corridor of people in dark coats does not. So it is measured instead of
+    assumed, and the ground truth for it needs no labels at all — **two tracks
+    visible in the same frame are certainly different objects**, because one
+    object cannot be in two places.
+
+    The tracker feeds every concurrent pair in here and asks what a stranger
+    normally scores. A candidate has to beat that to be called the same
+    object.
+
+    # What it does when it cannot tell
+
+    Refuses. If this scene's own measurements say two different objects
+    routinely look identical, no threshold exists that both re-identifies one
+    object and keeps two apart, and the honest behaviour is to decline and let
+    the track fragment — which an operator can see — rather than merge two
+    people into one, which nobody can.
+    """
+
+    samples: list[float] = field(default_factory=list)
+
+    def observe(self, distance: float) -> None:
+        """Record how far apart two *concurrently visible* objects looked."""
+        if not (0.0 <= distance < 2.0):
+            return
+        self.samples.append(float(distance))
+        if len(self.samples) > SEPARATION_SAMPLES:
+            del self.samples[0]
+
+    @property
+    def measured(self) -> bool:
+        return len(self.samples) >= MIN_SEPARATION_SAMPLES
+
+    def ceiling(self) -> float:
+        """The furthest a candidate may be and still count as the same object.
+
+        The shipped constant until this scene has said otherwise, and the
+        smaller of the two afterwards — a scene may prove that the default is
+        too generous, and none may raise it.
+        """
+        if not self.measured:
+            return MAX_REIDENTIFY_DISTANCE
+        import numpy as np
+
+        return float(min(MAX_REIDENTIFY_DISTANCE,
+                         np.percentile(np.asarray(self.samples), SEPARATION_QUANTILE)))
+
+    def margin(self) -> float:
+        """How much better the winner must be than the runner-up.
+
+        Scaled by what this scene's spread actually is, so a view where
+        everything looks alike demands a larger lead than one where nothing
+        does.
+        """
+        return self.ceiling() * SEPARATION_MARGIN
+
+    def describe(self) -> str:
+        if not self.measured:
+            return (f"not yet measured ({len(self.samples)}/{MIN_SEPARATION_SAMPLES} samples); "
+                    f"using the shipped ceiling of {MAX_REIDENTIFY_DISTANCE}")
+        import numpy as np
+
+        a = np.asarray(self.samples)
+        return (f"different objects in this scene: median {np.median(a):.3f}, "
+                f"p{SEPARATION_QUANTILE:.0f} {np.percentile(a, SEPARATION_QUANTILE):.3f}; "
+                f"re-identifying below {self.ceiling():.3f} with a {self.margin():.3f} margin")

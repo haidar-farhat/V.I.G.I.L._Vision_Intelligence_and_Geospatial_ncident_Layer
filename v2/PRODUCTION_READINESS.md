@@ -376,7 +376,8 @@ off unlabelled video:
 Run on one 573-frame clip it already found two problems (C and D below). Run
 it on a night's footage from each camera before doing anything else.
 
-**A1. Harvest the corpus the product already writes.**
+**A1. Harvest the corpus the product already writes.** — **built**:
+`vigil dataset export`.
 
 Do not start a labelling project. Start by reading what running the product
 has already produced:
@@ -389,9 +390,17 @@ has already produced:
   built, and **nothing reads it**.
 
 An incident-level precision figure is available from data already on disk.
-What is missing is a `vigil dataset export` that joins clips to events to
-judgements and writes frames plus pre-labels in COCO or YOLO form. A day or
-two of work, and it belongs before any labelling.
+`vigil dataset export` is now the join: it walks the incidents, finds the clip
+covering each, cuts the frame out on the millisecond, pre-labels it with the
+detector's own output, and writes images, YOLO labels, a `data.yaml` and a
+manifest carrying the incident, the human judgement, the dismissal reason and
+the model's digest — so a corrected set can never be confused about whose
+mistakes it was correcting.
+
+**The split is by day, and a single day gets no validation set at all.** Not a
+policy but a refusal: consecutive video frames are near-duplicates, a random
+split over them leaks almost perfectly, and there is no honest split of one
+day's footage. Inventing one is how a meaningless number comes to be believed.
 
 **A2. Then label the minimum that matters, and label it correctly.**
 
@@ -434,10 +443,25 @@ shipped two-thread setting.
 
 | Option | Measured | Cost | Status |
 |---|---|---|---|
+| **GPU via DirectML** | 38.5 → **4.5 ms**, **8.6x** | one `pip install onnxruntime-directml`; it *replaces* the `onnxruntime` package | **measured, not adopted** — see below |
 | **Threads 2 → 8** | 88.1 → **49.1 ms**, **1.8x** | none for one camera; worse for many, which is why the default is 2 | **available now**: `VIGIL_ORT_THREADS=8` |
-| **Detect every 3rd frame, track between** | 67.6 → **22.5 ms**, **3.0x** | position lag **0.003 box heights median, 0.008 p95** — under a centimetre on a person, against a projection error over a metre at range | needs a config knob; **not built** |
+| **Detect every 3rd frame, track between** | 67.6 → **22.5 ms**, **3.0x** | position lag **0.003 box heights median, 0.008 p95** — under a centimetre on a person, against a projection error over a metre at range | **built**: `vigil site detection --detect-every 3` |
 | INT8 dynamic quantisation | 67.6 → **70.2 ms**, **0.96x — slower** | model 13.9 → 3.8 MB, 96% agreement | **do not bother** |
-| GPU / NPU via DirectML | not measured | one `pip install onnxruntime-directml` | **untested; likely the largest single win** |
+
+**DirectML is the answer, and it was measured in an isolated virtualenv so
+this machine's environment was not touched.** The integrated GPU runs the
+shipped `yolov8n-seg` session in **4.5 ms against the CPU's 38.5 ms** — 220
+raw inferences a second. Two caveats before anyone quotes it:
+
+- That is the **session alone**. Letterboxing, non-maximum suppression and
+  mask decoding still happen in Python, so end-to-end `detect()` would be
+  perhaps 10-12 ms rather than 4.5. The bottleneck moves from the model to
+  the pre- and post-processing, which is a different and much better problem.
+- `onnxruntime-directml` **replaces** `onnxruntime`. That is a change to the
+  deployment's dependency set and it has not been made here; the provider
+  selection and the `vigil doctor` report that would tell an operator which
+  one they got are both already in place, so adopting it is one install and
+  one `doctor` run.
 
 Three things worth saying about that table.
 
@@ -478,24 +502,45 @@ everything, and would merge two objects rather than tell them apart. There is
 no value that works here: the distributions overlap, so any threshold both
 splits one object and merges two.
 
-**This is the risk named in section 7, now confirmed with evidence.** The
-honest reading is that a masked colour histogram may not carry enough
-information to re-identify on real footage. What that leaves, in order:
+**This is the risk named in section 7, now confirmed with evidence.**
 
-1. **Re-measure on real site footage before concluding.** The clip used is a
-   static indoor webcam scene with few objects of similar colour — close to
-   the worst case for a colour descriptor, and nothing like a security site.
-   Run `tools/calibrate.py` on a night from each camera. First thing to do,
-   and it costs nothing.
-2. **If it holds, a learned re-identification embedding is the answer** — a
-   small OSNet or similar, exported to ONNX. It is a *download*, which this
-   product forbids, so it takes the route the detector already takes: the
-   operator supplies the file and its digest travels with the evidence. The
-   interface in `domain/appearance.py` is already the right shape; only
-   `perception/appearance.py` would change.
-3. **Until then, prefer the split to the merge.** A fragment is visible — an
-   operator sees two boxes on one person. A merge is invisible and reports two
-   people as one. If a threshold has to be guessed, guess tight.
+**What was done about it: the threshold is no longer a constant.** No fixed
+number survives that measurement, because the right one is a property of the
+scene — a yard holding a red van and a white car separates cleanly, and a
+corridor of people in dark coats does not. So `domain/appearance.SceneSeparation`
+measures it live, and the ground truth needs no labels: **two tracks visible
+in the same frame are certainly different objects**, because one object cannot
+be in two places. The tracker feeds every concurrent pair in and asks what a
+stranger normally scores in this scene; a candidate has to beat that.
+
+Two conditions now, and both are needed:
+
+- **Below the scene's own ceiling** — closer than 95% of the pairs this scene
+  has proved are different objects. This protects the case where there is one
+  candidate and nothing to compare it against.
+- **Ahead by a margin** — better than the runner-up by enough that the choice
+  is not a coin toss, symmetric across rows and columns. Two objects that look
+  equally like a lost track mean the descriptor cannot tell, and picking one
+  is guessing with an operator's incident report.
+
+A scene whose own measurements say different objects routinely look identical
+therefore **declines to re-identify at all** and lets the track fragment,
+which an operator can see, rather than merging two people, which nobody can.
+The benchmark confirms the improvement is not lost where the descriptor does
+work: fragmentation is still 5 ids → 1, and identity switches still 118 → 89.
+
+Still open:
+
+1. **Re-measure on real site footage.** The clip used is a static indoor
+   webcam scene with few objects of similar colour — close to the worst case
+   for a colour descriptor, and nothing like a security site. Run
+   `tools/calibrate.py` on a night from each camera.
+2. **If the descriptor genuinely cannot separate, a learned re-identification
+   embedding is the answer** — a small OSNet or similar, exported to ONNX. It
+   is a *download*, which this product forbids, so it takes the route the
+   detector already takes: the operator supplies the file and its digest
+   travels with the evidence. The interface in `domain/appearance.py` is
+   already the right shape; only `perception/appearance.py` would change.
 
 ### D. And one more thing the calibration found
 

@@ -58,13 +58,20 @@ MANIFEST: tuple[Capability, ...] = (
                "cumulative and a coasted box is still never recorded as a measurement"),
     Capability("appearance", "What a tracked thing looks like, during association rather than after it", State.TESTED,
                ("vigil.domain.appearance.Appearance", "vigil.domain.appearance.Gallery",
-                "vigil.perception.appearance.describe"),
+                "vigil.domain.appearance.SceneSeparation", "vigil.perception.appearance.describe"),
                ("tests/test_perception.py", "tests/test_tracking.py"),
                "A masked HSV histogram, migrated from v1's `reid.py` and moved to where it can prevent "
                "a fragment instead of reconciling one an hour later. A gallery of recent looks rather "
                "than v1's single moving average, because the mean of a person's front and their back "
                "is a person who does not exist. Colour is all it has, so similarity never links on its "
-               "own: time and place are conditions, not tie-breakers"),
+               "own: time and place are conditions, not tie-breakers. The re-identification "
+               "threshold is **measured, not assumed**: two tracks visible in one frame are "
+               "different objects by construction, so `SceneSeparation` learns what a stranger "
+               "scores in this particular scene and a candidate has to beat that by a margin. "
+               "`tools/calibrate.py` found the shipped constant far too generous on real video — "
+               "different objects at a median of 0.105 against a gate of 0.35 — and a scene that "
+               "proves its strangers look alike now refuses to re-identify rather than merging "
+               "two people, which is the invisible error"),
     Capability("camera-motion", "Whether the camera moved, told apart from whether the scene did", State.TESTED,
                ("vigil.perception.motion.CameraMotionEstimator", "vigil.perception.motion.CameraMotion"),
                ("tests/test_perception.py", "tests/test_tracking.py"),
@@ -104,6 +111,27 @@ MANIFEST: tuple[Capability, ...] = (
                "well enough to say which side of a line somebody was on\" are different questions. "
                "Every figure is an upper bound and says so: nothing here models occlusion or "
                "resolution, and both would make coverage smaller"),
+    Capability("dataset", "The corpus running this product already writes, made readable", State.TESTED,
+               ("vigil.service.dataset.collect", "vigil.service.dataset.write",
+                "vigil.service.dataset.Sample"),
+               ("tests/test_dataset.py",),
+               "`vigil dataset export`. The clips, the events and the *reasons a person typed when "
+               "dismissing a false positive* were all already on disk and nothing joined them. "
+               "Frames are cut from the clip covering each incident, pre-labelled with the "
+               "detector's own output, and written with the model's digest so a corrected set "
+               "cannot be confused about whose mistakes it was correcting. The split is by DAY and "
+               "a single day gets no validation set at all: consecutive video frames are "
+               "near-duplicates, a random split leaks almost perfectly, and inventing one is how a "
+               "meaningless number comes to be believed"),
+    Capability("detect-every", "Detecting on a subset of frames and tracking through the rest", State.TESTED,
+               ("vigil.service.detection.MAX_DETECT_EVERY",),
+               ("tests/test_detection.py",),
+               "Measured at 3.0x less detection for 0.008 box heights of position lag at N=3, "
+               "against a projection error over a metre at range. Only safe because the tracker "
+               "was rebuilt around a Kalman filter, a weak-detection recovery pass and "
+               "re-identification across a gap — on the exponential-average tracker it replaced "
+               "this would have been reckless. A per-site setting rather than a flag, because a "
+               "service started at boot has nobody to type a flag at it"),
     Capability("engine-core", "The arithmetic that runs per pixel, in Rust behind a C ABI", State.TESTED,
                ("vigil.kernel.native.load", "vigil.kernel.native.ortho_sample",
                 "vigil.kernel.native.assign", "vigil.kernel.native.kalman_predict"),

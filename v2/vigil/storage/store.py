@@ -469,7 +469,7 @@ class Store:
         row = self._connection.execute("SELECT * FROM site WHERE id = 'site'").fetchone()
         if row is None:
             return {"id": "site", "name": "Unnamed site", "timezone": "UTC", "threat_labels": [],
-                    "watch_labels": [], "min_confidence": None, "updated_at": 0}
+                    "watch_labels": [], "min_confidence": None, "detect_every": 1, "updated_at": 0}
         site = dict(row)
         site["threat_labels"] = json.loads(site.get("threat_labels") or "[]")
         site["watch_labels"] = json.loads(site.get("watch_labels") or "[]")
@@ -482,15 +482,17 @@ class Store:
                       "ON CONFLICT(id) DO UPDATE SET threat_labels=excluded.threat_labels, updated_at=excluded.updated_at",
                       (json.dumps(sorted({str(l).strip().lower() for l in labels if str(l).strip()})), _now()))
 
-    def set_detection(self, labels: Sequence[str], confidence: float | None) -> None:
-        """What to watch for and how sure to be. An empty list means the built-in one."""
+    def set_detection(self, labels: Sequence[str], confidence: float | None,
+                      detect_every: int = 1) -> None:
+        """What to watch for, how sure to be, and how often to look."""
         with self.transaction() as c:
-            c.execute("INSERT INTO site (id, name, timezone, watch_labels, min_confidence, updated_at) "
-                      "VALUES ('site', 'Unnamed site', 'UTC', ?, ?, ?) "
+            c.execute("INSERT INTO site (id, name, timezone, watch_labels, min_confidence, detect_every, updated_at) "
+                      "VALUES ('site', 'Unnamed site', 'UTC', ?, ?, ?, ?) "
                       "ON CONFLICT(id) DO UPDATE SET watch_labels=excluded.watch_labels, "
-                      "min_confidence=excluded.min_confidence, updated_at=excluded.updated_at",
+                      "min_confidence=excluded.min_confidence, detect_every=excluded.detect_every, "
+                      "updated_at=excluded.updated_at",
                       (json.dumps(sorted({str(l).strip().lower() for l in labels if str(l).strip()})),
-                       None if confidence is None else float(confidence), _now()))
+                       None if confidence is None else float(confidence), int(detect_every), _now()))
 
     def save_site(self, name: str, timezone_name: str) -> None:
         with self.transaction() as c:

@@ -186,14 +186,16 @@ def _site(ctx: _Context) -> int:
         from ..service.detection import DetectionError
 
         try:
+            every = getattr(ctx.args, "detect_every", None)
             if ctx.args.clear:
-                chosen = ctx.site.set_detection([], None, by=ctx.principal)
-            elif ctx.args.watch is not None or ctx.args.confidence is not None:
+                chosen = ctx.site.set_detection([], None, by=ctx.principal, detect_every=1)
+            elif ctx.args.watch is not None or ctx.args.confidence is not None or every is not None:
                 current = ctx.site.detection()
                 labels = (current.labels if ctx.args.watch is None
                           else [l for l in ctx.args.watch.split(",") if l.strip()])
                 confidence = current.confidence if ctx.args.confidence is None else ctx.args.confidence
-                chosen = ctx.site.set_detection(labels, confidence, by=ctx.principal)
+                chosen = ctx.site.set_detection(labels, confidence, by=ctx.principal,
+                                                detect_every=every)
             else:
                 chosen = ctx.site.detection()
         except (DetectionError, AuthError) as error:

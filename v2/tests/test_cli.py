@@ -117,6 +117,34 @@ def test_the_console_is_dispatched_however_the_global_flags_are_ordered(monkeypa
     assert handed == [["--data-dir", "X", "--for", "5", "--start"]], handed
 
 
+def test_double_clicking_the_executable_opens_the_window(monkeypatch, capsys):
+    """No arguments at all means somebody double-clicked it, and they want the
+    window.
+
+    argparse answered `error: the following arguments are required: command`
+    and exit 2 — a usage message flashed into a console that closes before it
+    can be read, from an executable the README calls "both the command line
+    and the console". It is the first thing a person does with a product and
+    it did the one thing that looks like a broken install.
+    """
+    handed = []
+    monkeypatch.setattr("vigil.interfaces.console.main.run", lambda argv: handed.append(list(argv)) or 0)
+    assert main([]) == 0
+    assert handed == [[]], handed
+
+
+def test_asking_for_help_or_a_version_still_prints_rather_than_opening_a_window(monkeypatch):
+    """Only the *empty* command line opens a window. Somebody who typed
+    `--help` asked for text, and a window instead of it would be worse than
+    the usage error this replaced."""
+    monkeypatch.setattr("vigil.interfaces.console.main.run",
+                        lambda argv: pytest.fail("--help must not open a window"))
+    for flag in ("--help", "--version"):
+        with pytest.raises(SystemExit) as caught:
+            main([flag])
+        assert caught.value.code == 0
+
+
 def test_an_incident_can_be_acknowledged_and_dismissed_from_the_command_line(data, capsys):
     from test_incidents import event
     from vigil.domain.incidents import Correlator

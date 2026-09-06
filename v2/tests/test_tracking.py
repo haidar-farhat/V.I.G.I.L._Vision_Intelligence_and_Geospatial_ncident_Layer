@@ -14,7 +14,7 @@ import numpy as np
 import pytest
 
 from vigil.domain.detection import BoundingBox, Detection
-from vigil.domain.tracking import Tracker, TrackerConfig, TrackState
+from vigil.domain.tracking import FORBIDDEN, Tracker, TrackerConfig, TrackState
 from vigil.perception.appearance import describe
 
 FPS = 15
@@ -454,3 +454,103 @@ def test_an_occluded_crop_is_not_remembered_as_what_somebody_looks_like():
     masked.update([Detection(behind, 0.9, 1, mask=mask), Detection(infront, 0.9, 2, mask=mask)], 0,
                   appearances=[look, look])
     assert all(len(t.gallery) == 1 for t in masked.tracks())
+
+
+# ------------------------------------------------- self-calibrating re-id
+
+
+def test_the_scene_measures_what_a_stranger_looks_like_without_being_told():
+    """Two tracks in one frame are different objects by construction, so the
+    between-object distribution is ground truth nobody had to label."""
+    from vigil.domain.appearance import MIN_SEPARATION_SAMPLES, Appearance
+
+    tracker = Tracker(TrackerConfig(min_hits_to_confirm=1))
+    red = Appearance(np.array([1.0, 0.0, 0.0], dtype=np.float32), 500)
+    blue = Appearance(np.array([0.0, 1.0, 0.0], dtype=np.float32), 500)
+    assert not tracker.separation.measured
+    for i in range(MIN_SEPARATION_SAMPLES + 5):
+        tracker.update(
+            [Detection(_box(0.2, y=0.5), 0.9, 1), Detection(_box(0.7, y=0.5), 0.9, 1)],
+            i * STEP, appearances=[red, blue],
+        )
+    assert tracker.separation.measured
+    # Orthogonal descriptors are a cosine distance of 1 apart.
+    assert abs(tracker.separation.ceiling() - min(1.0, 0.35)) < 1e-6, (
+        "a scene where strangers are obviously different must not raise the ceiling above "
+        "the shipped one"
+    )
+    assert "different objects in this scene" in tracker.separation.describe()
+
+
+def test_a_scene_where_everything_looks_alike_tightens_its_own_gate():
+    """The finding `tools/calibrate.py` produced on real video: different
+    objects at a median of 0.105 against a shipped gate of 0.35. A scene that
+    proves its strangers look similar must lower its own ceiling."""
+    from vigil.domain.appearance import MAX_REIDENTIFY_DISTANCE, SceneSeparation
+
+    scene = SceneSeparation()
+    for _ in range(60):
+        scene.observe(0.10)
+    assert scene.measured
+    assert scene.ceiling() < MAX_REIDENTIFY_DISTANCE
+    assert scene.ceiling() <= 0.11
+    assert scene.margin() > 0
+
+
+def test_an_unmeasured_scene_falls_back_to_the_shipped_ceiling_and_no_margin():
+    from vigil.domain.appearance import MAX_REIDENTIFY_DISTANCE, SceneSeparation
+
+    scene = SceneSeparation()
+    scene.observe(0.5)
+    assert not scene.measured
+    assert scene.ceiling() == MAX_REIDENTIFY_DISTANCE
+    assert "not yet measured" in scene.describe()
+
+
+def test_two_equally_good_candidates_are_refused_rather_than_guessed_between():
+    """A margin, symmetric. Two objects that look equally like a lost track
+    mean the descriptor cannot tell, and picking one is guessing with an
+    operator's incident report."""
+    tracker = Tracker(TrackerConfig(min_hits_to_confirm=1))
+    cost = np.array([[0.10, 0.12], [0.90, 0.95]])
+    tracker._require_margin(cost, margin=0.10)
+    assert cost[0, 0] > 1e8 and cost[0, 1] > 1e8, "an ambiguous row must be refused whole"
+
+    clear = np.array([[0.10, 0.60], [0.90, 0.95]])
+    tracker._require_margin(clear, margin=0.10)
+    assert clear[0, 0] == 0.10, "a clear winner survives"
+
+    # A single feasible candidate is decided by the ceiling, not by a
+    # comparison with nothing.
+    alone = np.array([[0.10, FORBIDDEN]])
+    tracker._require_margin(alone, margin=0.10)
+    assert alone[0, 0] == 0.10
+
+
+def test_a_scene_that_cannot_tell_two_objects_apart_declines_to_merge_them():
+    """End to end: two identical-looking objects, one of which disappears and
+    the other stays. The tracker must not hand the survivor the lost one's
+    identity — a fragment is visible on screen and a merge is not."""
+    from vigil.domain.appearance import Appearance
+
+    same = Appearance(np.array([1.0, 0.0, 0.0], dtype=np.float32), 500)
+    tracker = Tracker(TrackerConfig(min_hits_to_confirm=1, coast_millis=200))
+    # Long enough for the scene to learn that its two objects are identical.
+    for i in range(60):
+        tracker.update(
+            [Detection(_box(0.20, y=0.5), 0.9, 1), Detection(_box(0.60, y=0.5), 0.9, 1)],
+            i * STEP, appearances=[same, same],
+        )
+    assert tracker.separation.measured
+    assert tracker.separation.ceiling() < 0.05, "identical objects must collapse the ceiling"
+    left = {t.id for t in tracker.tracks() if t.bbox.center.x < 0.4}
+    assert left
+
+    # The left one leaves; the right one drifts towards where it was.
+    for i in range(60, 90):
+        x = 0.60 - 0.01 * (i - 60)
+        tracker.update([Detection(_box(x, y=0.5), 0.9, 1)], i * STEP, appearances=[same])
+    survivors = {t.id for t in tracker.tracks()}
+    assert not (survivors & left), (
+        "the survivor was handed the departed object's identity, which is a merge"
+    )

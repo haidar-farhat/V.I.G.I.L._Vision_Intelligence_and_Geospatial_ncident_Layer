@@ -112,6 +112,47 @@ def _commit() -> str | None:
         return None
 
 
+def _pyinstaller(library: Path | None, *, windowed: bool) -> list[str]:
+    """One argument list, two executables.
+
+    `vigil.exe` is console-subsystem so the command line has a standard
+    output. `vigil-console.exe` is GUI-subsystem so double-clicking it opens
+    the window without a black terminal behind it for the whole shift.
+
+    Built from the same tree in the same run, because two builds of one
+    product from two trees is the defect `exetest` already had to be taught
+    to refuse.
+    """
+    name = "vigil-console" if windowed else "vigil"
+    entry = "console_entry.py" if windowed else "entry.py"
+    argv = [
+        sys.executable, "-m", "PyInstaller", "--noconfirm", "--name", name,
+        "--distpath", str(ROOT / "dist"), "--workpath", str(ROOT / "build"),
+        "--specpath", str(ROOT / "build"),
+        "--collect-all", "onnxruntime", "--collect-data", "tzdata",
+        "--hidden-import", "keyring.backends.Windows",
+        "--hidden-import", "keyring.backends.macOS",
+        "--hidden-import", "keyring.backends.SecretService",
+        "--hidden-import", "PySide6.QtWidgets", "--hidden-import", "PySide6.QtGui",
+        "--exclude-module", "PySide6.QtWebEngineCore",
+        "--exclude-module", "PySide6.QtWebEngineWidgets",
+        "--exclude-module", "PySide6.Qt3DCore", "--exclude-module", "PySide6.QtQuick",
+        "--exclude-module", "PySide6.QtQml", "--exclude-module", "PySide6.QtMultimedia",
+        "--exclude-module", "matplotlib", "--exclude-module", "pytest",
+        "--exclude-module", "onnx",
+        "--paths", str(ROOT),
+    ]
+    if windowed:
+        argv.append("--windowed")
+    else:
+        # Only the first build cleans; the second must not delete the first.
+        argv.insert(4, "--clean")
+    if library is not None:
+        argv += ["--add-binary", f"{library}{os.pathsep}."]
+    argv.append(str(ROOT / "packaging" / entry))
+    return argv
+
+
 def package() -> int:
     if shutil.which("pyinstaller") is None and _run([sys.executable, "-c", "import PyInstaller"]) != 0:
         print("PyInstaller is not installed: pip install pyinstaller")
@@ -126,18 +167,13 @@ def package() -> int:
     if library is None:
         print("the engine core is not built, so the package will have no `vigil map` and no fast "
               "paths. Build it first with `python tasks.py core`.")
-    code = _run([sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "--name", "vigil", "--distpath", str(ROOT / "dist"),
-                 "--workpath", str(ROOT / "build"), "--specpath", str(ROOT / "build"), "--collect-all", "onnxruntime", "--collect-data", "tzdata",
-                 "--hidden-import", "keyring.backends.Windows", "--hidden-import", "keyring.backends.macOS",
-                 "--hidden-import", "keyring.backends.SecretService",
-                 "--hidden-import", "PySide6.QtWidgets", "--hidden-import", "PySide6.QtGui",
-                 "--exclude-module", "PySide6.QtWebEngineCore", "--exclude-module", "PySide6.QtWebEngineWidgets",
-                 "--exclude-module", "PySide6.Qt3DCore", "--exclude-module", "PySide6.QtQuick",
-                 "--exclude-module", "PySide6.QtQml", "--exclude-module", "PySide6.QtMultimedia",
-                 "--exclude-module", "matplotlib", "--exclude-module", "pytest", "--exclude-module", "onnx",
-                 "--paths", str(ROOT),
-                 *(["--add-binary", f"{library}{os.pathsep}."] if library else []),
-                 str(ROOT / "packaging" / "entry.py")])
+    code = _run(_pyinstaller(library, windowed=False))
+    if code != 0:
+        return code
+    # The windowed twin, into the same folder. `--noconfirm` keeps the shared
+    # `_internal` tree; only a second executable is added, so the 750 MB of
+    # Qt and onnxruntime is paid for once rather than twice.
+    code = _run(_pyinstaller(library, windowed=True))
     if code != 0:
         return code
     (DIST / "build.json").write_text(json.dumps({"commit": _commit(), "sources": sources,
@@ -146,6 +182,14 @@ def package() -> int:
     models = ROOT / "models"
     if models.is_dir():
         shutil.copytree(models, DIST / "models", dirs_exist_ok=True)
+    windowed = ROOT / "dist" / "vigil-console"
+    if windowed.is_dir():
+        # PyInstaller gives each build its own folder. The two share every
+        # byte of `_internal`, so the second executable is moved beside the
+        # first and its duplicate tree removed: 750 MB once, not twice.
+        shutil.copy2(windowed / "vigil-console.exe", DIST / "vigil-console.exe")
+        shutil.rmtree(windowed, ignore_errors=True)
+        print("windowed build folded in: dist/vigil/vigil-console.exe")
     if library is not None:
         # Beside the executable as well as inside `_internal`: the loader
         # looks in both, and a deployment that unpacks only what it can see

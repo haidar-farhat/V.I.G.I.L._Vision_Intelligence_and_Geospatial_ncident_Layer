@@ -79,7 +79,7 @@ from ..kernel.filtering import (
     CHI2_GATE_2DOF, CHI2_GATE_4DOF, STATE_VALUES, box_xywh, to_measurement,
 )
 from .appearance import (
-    MAX_APPEARANCE_DISTANCE, MAX_REIDENTIFY_DISTANCE, Appearance, Gallery,
+    MAX_APPEARANCE_DISTANCE, MAX_REIDENTIFY_DISTANCE, Appearance, Gallery, SceneSeparation,
 )
 from .detection import BoundingBox, Detection
 from .geo import (
@@ -284,6 +284,9 @@ class Tracker:
         self._tracks: list[Track] = []
         self._next_id = 1
         self._last_update: int | None = None
+        #: What a *different* object looks like in this scene, measured
+        #: live from pairs that are different by construction.
+        self.separation = SceneSeparation()
 
     # ------------------------------------------------------------- accessors
 
@@ -390,6 +393,12 @@ class Tracker:
         for track, index in matched:
             self._apply(track, detections[index], looks[index], at_millis)
             claimed.add(index)
+
+        # Two objects detected in the same frame are certainly different
+        # objects, so every such pair measures what a stranger scores in
+        # this scene. That is the ground truth re-identification is
+        # calibrated against, and nobody had to label it.
+        self._measure_separation(detections, looks)
 
         # 4. Lost tracks: the re-identification.
         lost = [t for t in self._tracks if t.state is TrackState.LOST]
@@ -531,9 +540,29 @@ class Tracker:
         alone over a gap of seconds is not evidence, and matching on it is how
         two different people become one — which is worse than the fragment,
         because a fragment is visible and a merge is not.
+
+        # How close is close enough
+
+        Not a constant. `MAX_REIDENTIFY_DISTANCE` was calibrated on synthetic
+        colour blocks and `tools/calibrate.py` found it far too generous on
+        real video — different objects there sat at a median of 0.105 against
+        a gate of 0.35. `SceneSeparation` measures what a stranger actually
+        scores *in this scene*, and a candidate has to beat that.
+
+        Two conditions, and both are needed:
+
+        - **Below the ceiling.** Closer than 95% of the pairs this scene has
+          proved are different objects. This is what protects the case where
+          there is only one candidate and nothing to compare it against.
+        - **Ahead by a margin.** Better than the runner-up by enough that the
+          choice is not a coin toss. Two objects that look equally like a
+          lost track mean the descriptor cannot tell, and picking one is
+          guessing with an operator's incident report.
         """
         if not lost or not candidates:
             return []
+        ceiling = self.separation.ceiling()
+        margin = self.separation.margin()
         rows, cols = len(lost), len(candidates)
         cost = np.full((rows, cols), FORBIDDEN, dtype=np.float64)
         for r, track in enumerate(lost):
@@ -550,15 +579,18 @@ class Tracker:
                 if look is None:
                     continue
                 appearance = track.gallery.distance(look)
-                # The re-identification gate, not the association one. Across
-                # a gap of seconds the box has moved and geometry is barely
-                # evidence, so this is the threshold that has to hold.
-                if appearance > MAX_REIDENTIFY_DISTANCE:
+                # This scene's own ceiling, not the shipped constant.
+                if appearance > ceiling:
                     continue
                 centre = detection.bbox.center
                 if math.hypot(centre.x - last.x, centre.y - last.y) > reach:
                     continue
                 cost[r, c] = appearance
+        # A row or a column with two plausible answers has no answer. Both
+        # directions matter: a lost track that two detections both fit, and
+        # a detection that two lost tracks both claim, are the same failure
+        # seen from opposite sides.
+        self._require_margin(cost, margin)
         assignment = native.assign(cost)
         out: list[tuple[Track, int]] = []
         for r, c in enumerate(assignment):
@@ -566,6 +598,50 @@ class Tracker:
                 continue
             out.append((lost[r], candidates[c]))
         return out
+
+    @staticmethod
+    def _require_margin(cost: np.ndarray, margin: float) -> None:
+        """Forbid any row or column whose best answer is not clearly best.
+
+        In place, and symmetric. A margin of zero disables it, which is what
+        a scene with no measured separation gets — there, the ceiling is the
+        shipped constant and it is doing all the work.
+        """
+        if margin <= 0 or cost.size == 0:
+            return
+        for axis in (1, 0):
+            ordered = np.sort(cost, axis=axis)
+            if cost.shape[axis] < 2:
+                continue
+            best = np.take(ordered, 0, axis=axis)
+            second = np.take(ordered, 1, axis=axis)
+            # Only a *real* runner-up counts. A single feasible candidate is
+            # decided by the ceiling, not by a comparison with nothing.
+            ambiguous = (second < _FORBIDDEN_THRESHOLD) & ((second - best) < margin)
+            if axis == 1:
+                cost[ambiguous, :] = FORBIDDEN
+            else:
+                cost[:, ambiguous] = FORBIDDEN
+
+    def _measure_separation(self, detections: Sequence[Detection],
+                            looks: list[Appearance | None]) -> None:
+        """Record how far apart the objects in this frame look.
+
+        Every pair of detections in one frame is a pair of different objects,
+        because one object cannot be in two places. Same class only: a person
+        and a van being far apart says nothing about telling two people
+        apart, and re-identification never crosses classes anyway.
+        """
+        for i, look in enumerate(looks):
+            if look is None:
+                continue
+            for j in range(i + 1, len(looks)):
+                other = looks[j]
+                if other is None or detections[i].class_id != detections[j].class_id:
+                    continue
+                distance = look.distance(other)
+                if math.isfinite(distance):
+                    self.separation.observe(distance)
 
     # ------------------------------------------------------------- lifecycle
 

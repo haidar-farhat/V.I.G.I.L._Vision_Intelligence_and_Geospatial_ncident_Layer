@@ -139,7 +139,7 @@ def run(argv: list[str] | None = None) -> int:
                       record_every_camera=arguments.record,
                       alerts=Alerts.from_settings(settings, store=store))
     commands = Commands(site, runtime, principal, evidence_dir=settings.evidence, model=model,
-                        model_places=settings.model_directories())
+                        model_places=settings.model_directories(), map_dir=settings.data_dir / "map")
     if model is None and not arguments.no_model:
         _log.warning("no model found in %s; motion detection only, which cannot classify",
                      ", ".join(str(p) for p in settings.model_directories()))

@@ -853,3 +853,102 @@ def test_the_plan_links_two_tracks_a_relation_joins(qt_app, pose):
     plan.clear_tracks()
     plan.grab()
     plan.deleteLater()
+
+
+def test_the_camera_view_says_when_the_frame_cannot_support_what_is_drawn_on_it(qt_app):
+    """`FrameResult.quality` and `.camera_motion` were written by the worker
+    and read by nothing — tested code no product path reached, which is this
+    repository's recurring defect and was self-inflicted here.
+
+    The failure being warned about is precisely the one that *looks* like a
+    working camera: an unfocused lens produces a calm, empty scene and boxes
+    over it look exactly like boxes over a good frame.
+    """
+    import numpy as np
+
+    from vigil.interfaces.console.video import VideoView
+    from vigil.perception.motion import CameraMotion
+    from vigil.perception.quality import FrameQuality
+    from vigil.service.runtime import FrameResult
+
+    view = VideoView("gate")
+    view.resize(400, 300)
+
+    good = FrameQuality(200.0, 0.0, 40.0, 128.0, 12.0)
+    still = CameraMotion(np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]), True, 60, 60, None, 16 / 9)
+    view.show_result(FrameResult("gate", 0, 0, (), 0, None, (), good, still))
+    assert view.warnings() == [], "a good frame must cost nothing to draw"
+
+    blurred = FrameQuality(5.0, 0.0, 40.0, 128.0, 12.0, ("out of focus or badly blurred",))
+    view.show_result(FrameResult("gate", 1, 0, (), 0, None, (), blurred, still))
+    assert any("focus" in w for w in view.warnings())
+
+    frozen = FrameQuality(200.0, 0.0, 40.0, 128.0, 0.0, (), True)
+    view.show_result(FrameResult("gate", 2, 0, (), 0, None, (), frozen, still))
+    assert any("repeating itself" in w for w in view.warnings())
+
+    moving = CameraMotion(np.array([[1.0, 0.0, 0.05], [0.0, 1.0, 0.0]]), True, 60, 60, None, 16 / 9)
+    view.show_result(FrameResult("gate", 3, 0, (), 0, None, (), good, moving))
+    assert any("camera is moving" in w for w in view.warnings())
+    assert any("positions are unreliable" in w for w in view.warnings())
+
+    # And it paints without raising, which is the only way to know the banner
+    # geometry is not nonsense.
+    view.grab()
+    view.clear()
+    assert view.warnings() == []
+
+
+def test_the_plan_draws_the_ground_the_cameras_built(qt_app):
+    """`vigil.service.mapping` opens by saying a plan view needs ground under
+    it. It has been able to produce that ground since it was written and the
+    plan view drew wedges over an empty background — correct, tested code that
+    no product path reached, which is this repository's recurring defect.
+
+    Only the cells the map is confident about are drawn. An operator looks at
+    this view to judge which side of a line somebody was on, and ground that
+    might be a smeared wall is worse than no ground at all.
+    """
+    import numpy as np
+
+    from vigil.domain.geo import CameraPose, LatLon
+    from vigil.interfaces.console.plan import PlanView
+    from vigil.service.mapping import Grid, GroundMap
+
+    rows, cols = 40, 60
+    grid = Grid(LatLon(33.8930, 35.5010), 0.5, rows, cols)
+    colour = np.full((rows, cols, 3), 120, dtype=np.uint8)
+    valid = np.ones((rows, cols), dtype=np.uint8)
+    confidence = np.full((rows, cols), 0.9, dtype=np.float32)
+    # A band the map cannot vouch for: it must not be painted.
+    confidence[:10, :] = 0.05
+    ground = GroundMap(grid, colour, valid, confidence,
+                       np.full((rows, cols), 0.05, dtype=np.float32),
+                       np.full((rows, cols), 0.5, dtype=np.float32),
+                       np.zeros((rows, cols), dtype=np.float32),
+                       np.zeros((rows, cols), dtype=np.int16), ("gate",), {})
+
+    plan = PlanView()
+    plan.resize(320, 320)
+    plan.set_cameras({"gate": CameraPose(LatLon(33.8938, 35.5018), 4.0, 0.0, -25.0)})
+    plan.set_ground(ground)
+    plan.grab()  # paints; a raster that will not draw raises here
+
+    rendered = PlanView._render_ground(ground)
+    assert rendered is not None and not rendered.isNull()
+    image = rendered.toImage()
+    assert image.width() == cols and image.height() == rows
+    # Confident ground is opaque; ground the map cannot vouch for is not drawn.
+    assert image.pixelColor(cols // 2, rows - 5).alpha() > 200
+    assert image.pixelColor(cols // 2, 2).alpha() == 0
+
+    # And a map with nothing usable in it draws nothing rather than a blank slab.
+    nothing = GroundMap(grid, colour, np.zeros((rows, cols), dtype=np.uint8),
+                        np.zeros((rows, cols), dtype=np.float32),
+                        np.zeros((rows, cols), dtype=np.float32),
+                        np.zeros((rows, cols), dtype=np.float32),
+                        np.zeros((rows, cols), dtype=np.float32),
+                        np.zeros((rows, cols), dtype=np.int16), (), {})
+    assert PlanView._render_ground(nothing) is None
+    plan.set_ground(None)
+    plan.grab()

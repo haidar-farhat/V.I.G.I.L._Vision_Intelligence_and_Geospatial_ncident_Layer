@@ -42,11 +42,17 @@ class Outcome:
 
 class Commands:
     def __init__(self, site: SiteService, runtime: Runtime, principal: Principal, *, evidence_dir: Path,
-                 model: Path | None = None, model_places: Sequence[Path] = ()):
+                 model: Path | None = None, model_places: Sequence[Path] = (),
+                 map_dir: Path | None = None):
         self._site = site
         self._runtime = runtime
         self._principal = principal
         self._evidence_dir = Path(evidence_dir)
+        #: Where `vigil map build` writes. Passed rather than derived from the
+        #: evidence folder: two paths that happen to share a parent today are
+        #: two paths, and guessing one from the other is how a rename breaks
+        #: something nobody was looking at.
+        self._map_dir = Path(map_dir) if map_dir is not None else None
         #: The model this console will use, and everywhere it was looked for.
         #: The window says both, so a silent fall-back to motion is impossible.
         self.model = model
@@ -104,6 +110,25 @@ class Commands:
 
     def health(self):
         return self._runtime.health()
+
+    def ground(self):
+        """The site's ground map, if one has been built and still verifies.
+
+        `None` is the ordinary answer — most sites have never run
+        `vigil map build` — and the plan view draws wedges over an empty
+        background exactly as it always did. A map that no longer hashes to
+        its own fingerprint is also `None`: an incident judged against *this*
+        map has to be re-checkable against this map, and a file that has been
+        edited or half-written must not reach a screen.
+        """
+        if self._map_dir is None:
+            return None
+        try:
+            from ...service.mapping import load_map
+
+            return load_map(self._map_dir)
+        except Exception:  # noqa: BLE001 - a map that will not load must not stop the console
+            return None
 
     def incidents(self):
         """What the operator asked to see, filtered in the database.

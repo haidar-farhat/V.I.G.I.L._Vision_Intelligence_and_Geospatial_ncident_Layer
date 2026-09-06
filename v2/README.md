@@ -53,6 +53,13 @@ python tools/calibrate.py CLIP.mp4        # what real video says about the const
 python tools/detector_options.py --clip CLIP.mp4   # how to make detection affordable
 ```
 
+And the corpus running the product has already written:
+
+```bash
+python -m vigil dataset export --to ./corpus   # frames, pre-labels, split BY DAY
+python -m vigil site detection --detect-every 3  # 3x less detection, measured
+```
+
 **Accounts.** `python -m vigil users add root --role ADMIN`. After the first
 account exists every command runs as `--as NAME` (password prompted, or on
 standard input with `--password-stdin`) and the console asks for a sign-in. A
@@ -183,10 +190,19 @@ not contain — which has already happened here once, quietly.
 
 | | |
 |---|---|
-| Product code | 14,218 lines of Python, 2,683 lines of Rust behind a C ABI |
-| Tests | 298 Python + 53 Rust, all green through `python tasks.py check` |
-| Capabilities | 33 tested, 2 implemented, 1 planned ([CAPABILITIES.md](CAPABILITIES.md)) |
-| Packaged | one `vigil.exe` that is both the command line and the console, with the core beside it |
+| Product code | 15,068 lines of Python, 2,683 lines of Rust behind a C ABI |
+| Tests | 315 Python + 53 Rust, all green through `python tasks.py check` |
+| Capabilities | 35 tested, 2 implemented, 1 planned ([CAPABILITIES.md](CAPABILITIES.md)) |
+| Packaged | `vigil.exe` for the command line and `vigil-console.exe` for the window, sharing one `_internal` |
+
+**Two executables, one tree.** `vigil.exe` is console-subsystem so every
+command prints, pipes and redirects; `vigil-console.exe` is GUI-subsystem so
+double-clicking it opens the window with no black terminal behind it for the
+whole shift. Both are built in the same run from the same sources, so they
+cannot drift. Running `vigil.exe` with **no arguments** opens the window too —
+it used to answer `error: the following arguments are required: command` and
+exit 2, which is a usage message flashed into a console that closes before
+anybody can read it.
 
 The engine core is **optional but not decorative**. Without it the product
 still analyses, tracks and raises events — the NumPy paths are the same
@@ -208,6 +224,8 @@ those needs.
 
 | When (UTC) | What ran | Result |
 |---|---|---|
+| 2026-09-06 18:04 | packaged `vigil.exe`, `exetest --seconds 20 --record --console`, after the two-executable split | **PASS in 22 s.** All six panels photographed; the camera wall drew a real frame at 15 fps with no warning banner, which is the correct answer for a good frame. Separately verified: `vigil.exe` **with no arguments** now opens the window instead of printing `error: the following arguments are required: command` and exiting 2, and the new GUI-subsystem `vigil-console.exe` runs with no console behind it. Migration 5 applied inside the packaged build. |
+| 2026-09-06 17:47 | `onnxruntime-directml` in an **isolated virtualenv**, so this machine's environment was untouched | The integrated GPU runs the shipped `yolov8n-seg` session in **4.5 ms against the CPU's 38.5 ms — 8.6x**, 220 raw inferences a second. Session only: letterboxing, NMS and mask decoding are still Python, so end-to-end `detect()` would be nearer 10-12 ms. Not adopted — `onnxruntime-directml` *replaces* `onnxruntime`, which is a deployment decision. |
 | 2026-09-06 16:56 | `tools/camera_check.py --seconds 25 --map` on `device:0` — **the rebuilt pipeline, end to end** | 356 frames in 25.3 s = **14.1 fps** with `yolov8n-seg` on the CPU. Detection 64.5 ms/frame; the three new perception stages cost **3.5 ms together** (quality 0.6, camera motion 2.9, appearance ~0). 0 unusable frames, 0 stale, the camera correctly reported still on 99% of frames. A ground map built from the same run: 95 m² usable of 160 m² seen, 0.05 m per source pixel — and, pointed at a room rather than a yard, it correctly marked 41% unusable, because a wall projected onto the ground plane is a smear and the confidence layer says so. |
 | 2026-09-05 22:55 | packaged `vigil.exe`, `exetest --seconds 20 --record` | **PASS** in 21 s: 191 frames at 10 fps through the segmentation model, one clip written and indexed, exit 0, no traceback. The room was dark, so 0 detections. |
 | 2026-09-06 05:44 | the console on `device:0`, 22 s, recording | **The whole chain, on a real camera.** A person detected and classified at 0.84, tracked, projected to ±0.1 m, entering a restricted zone; two zone-entry events; one HIGH incident at risk 0.46; a 384-frame clip; the exported package verifies against its manifest and carries the clip. |

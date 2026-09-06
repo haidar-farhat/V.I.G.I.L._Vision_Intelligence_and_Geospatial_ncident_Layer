@@ -162,6 +162,43 @@ def _coverage(ctx) -> int:
     return 0
 
 
+def _dataset(ctx) -> int:
+    """Export the corpus running this product has already produced."""
+    from ..adapters.detectors import detector_for
+    from ..service.dataset import DatasetError, collect, write
+    from ..service.search import moment
+
+    destination = Path(ctx.args.to or (ctx.settings.data_dir / "dataset"))
+    detector = None
+    model = ctx.settings.default_model()
+    if model is not None and not ctx.args.no_predictions:
+        detector = detector_for(model)
+    since = None
+    if ctx.args.since:
+        try:
+            since = moment(ctx.args.since)
+        except ValueError as error:
+            print(f"error: {error}")
+            return 2
+    try:
+        export = collect(ctx.store, detector, since_millis=since, limit=ctx.args.limit,
+                         frames_per_incident=ctx.args.per_incident)
+    except DatasetError as error:
+        print(str(error))
+        return 2
+    info = detector.info if detector is not None else None
+    write(export, destination,
+          model_sha256=getattr(info, "model_sha256", None),
+          class_names=getattr(info, "class_names", None))
+    print(export.describe())
+    print(f"written to {destination}")
+    print()
+    print("Next: open it in CVAT or Label Studio (both run offline) and *correct* the boxes.")
+    print("The split is by day and is in data.yaml. Do not re-split it at random —")
+    print("consecutive video frames are near-duplicates and a random split leaks.")
+    return 0
+
+
 def _map(ctx) -> int:
     if not native.available():
         print(f"building a map needs the engine core, which is not loaded: {native.fault()}")
@@ -193,3 +230,16 @@ def add_arguments(commands) -> None:
         "coverage", help="which ground these cameras reach, and which they do not")
     coverage.add_argument("--boundary", help="the site's fence: lat,lon;lat,lon;lat,lon[;...]")
     coverage.set_defaults(handler=_coverage)
+
+    dataset = commands.add_parser(
+        "dataset", help="export the frames, pre-labels and human judgements already on disk")
+    ds = dataset.add_subparsers(dest="dataset_command", required=True)
+    export = ds.add_parser("export", help="images, YOLO pre-labels and a manifest, split by day")
+    export.add_argument("--to", help="where to write it (default: the data directory)")
+    export.add_argument("--since", help="2h, 3d, a date, or a full ISO moment")
+    export.add_argument("--limit", type=int, default=200, help="incidents to walk")
+    export.add_argument("--per-incident", type=int, default=3, dest="per_incident",
+                        help="frames around each incident")
+    export.add_argument("--no-predictions", action="store_true", dest="no_predictions",
+                        help="images only, no pre-labels from the detector")
+    dataset.set_defaults(handler=_dataset)

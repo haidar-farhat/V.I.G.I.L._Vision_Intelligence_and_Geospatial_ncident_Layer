@@ -28,6 +28,16 @@ _LABEL = re.compile(r"^[a-z0-9][a-z0-9 _\-]{0,39}$")
 #: bounds refuse the two settings that make a site look broken.
 CONFIDENCE_FLOOR, CONFIDENCE_CEILING = 0.05, 0.95
 
+#: The most frames a site may skip between detections.
+#:
+#: Measured on this machine: every third frame costs 3.0x less detection and
+#: moves a track 0.008 box heights from where full-rate detection put it. The
+#: measurement was taken on a scene with one slow track, and the lag scales
+#: with speed — so the ceiling is well short of where the arithmetic stops
+#: working, because past it a running person is being *extrapolated* for a
+#: third of a second and the boxes an operator sees are a guess.
+MAX_DETECT_EVERY = 5
+
 
 class DetectionError(ValueError):
     """A watch list or a threshold that would make the site behave absurdly."""
@@ -39,14 +49,18 @@ class DetectionSettings:
 
     labels: frozenset[str] | None = None
     confidence: float | None = None
+    #: Run the detector on one frame in this many, and track through the rest.
+    #: 1 is every frame.
+    detect_every: int = 1
 
     @classmethod
     def from_site(cls, site: dict) -> "DetectionSettings":
         labels = frozenset(site.get("watch_labels") or ()) or None
-        return cls(labels, site.get("min_confidence"))
+        return cls(labels, site.get("min_confidence"), int(site.get("detect_every") or 1))
 
     @classmethod
-    def checked(cls, labels, confidence: float | None) -> "DetectionSettings":
+    def checked(cls, labels, confidence: float | None,
+                detect_every: int | None = None) -> "DetectionSettings":
         """The settings, or a `DetectionError` saying which value is wrong.
 
         Checked when it is typed. A watch list nobody can satisfy is only
@@ -61,7 +75,14 @@ class DetectionSettings:
                 raise DetectionError(f"a confidence of {confidence} is outside {CONFIDENCE_FLOOR}–"
                                      f"{CONFIDENCE_CEILING}; below that a site reports noise, above it nothing")
             confidence = float(confidence)
-        return cls(frozenset(cleaned) or None, confidence)
+        every = 1 if detect_every is None else int(detect_every)
+        if not 1 <= every <= MAX_DETECT_EVERY:
+            raise DetectionError(
+                f"detecting every {every} frames is outside 1-{MAX_DETECT_EVERY}. Past that a "
+                f"running person is extrapolated for long enough that the boxes on screen are a "
+                f"guess rather than a measurement"
+            )
+        return cls(frozenset(cleaned) or None, confidence, every)
 
     def classes(self) -> frozenset[str]:
         """The labels a model is asked for, including the built-in default."""
@@ -71,14 +92,20 @@ class DetectionSettings:
         watch = ("the built-in list (" + ", ".join(sorted(WATCHED_LABELS)) + ")" if self.labels is None
                  else ", ".join(sorted(self.labels)))
         sure = "the detector's own threshold" if self.confidence is None else f"{self.confidence:.2f}"
-        return f"watching {watch}; confidence at least {sure}"
+        often = ("" if self.detect_every <= 1
+                 else f"; detecting every {self.detect_every} frames and tracking between")
+        return f"watching {watch}; confidence at least {sure}{often}"
 
-    def override(self, labels, confidence: float | None) -> "DetectionSettings":
+    def override(self, labels, confidence: float | None,
+                 detect_every: int | None = None) -> "DetectionSettings":
         """This run's flags on top of the stored setting; absent flags keep it."""
-        if labels is None and confidence is None:
+        if labels is None and confidence is None and detect_every is None:
             return self
-        return DetectionSettings.checked(self.labels if labels is None else labels,
-                                         self.confidence if confidence is None else confidence)
+        return DetectionSettings.checked(
+            self.labels if labels is None else labels,
+            self.confidence if confidence is None else confidence,
+            self.detect_every if detect_every is None else detect_every,
+        )
 
 
 class DetectorFactory:

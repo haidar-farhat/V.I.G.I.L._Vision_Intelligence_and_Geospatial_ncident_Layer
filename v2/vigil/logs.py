@@ -58,9 +58,16 @@ def configure(directory: Path | None = None, *, level: str | None = None, json: 
     root.setLevel(getattr(logging, chosen, logging.INFO))
     as_json = json if json is not None else os.environ.get(JSON_VARIABLE, "").strip().lower() in ("1", "true", "yes")
     formatter = _Json() if as_json else _Redact("%(asctime)s %(levelname)-7s %(name)s: %(message)s")
-    stream = logging.StreamHandler(sys.stderr)
-    stream.setFormatter(formatter)
-    root.addHandler(stream)
+    # A windowed build has no standard error at all — on Windows a
+    # GUI-subsystem executable is given none, so `sys.stderr` is `None`.
+    # `StreamHandler(None)` does not fail on construction; it fails on the
+    # first log line, inside logging's own error handling, which then tries to
+    # report the failure to the stream that is not there. The file handler
+    # below is the one that matters for a windowed run anyway.
+    if sys.stderr is not None:
+        stream = logging.StreamHandler(sys.stderr)
+        stream.setFormatter(formatter)
+        root.addHandler(stream)
     path = None
     if directory is not None:
         directory.mkdir(parents=True, exist_ok=True)

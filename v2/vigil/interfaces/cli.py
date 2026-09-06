@@ -257,6 +257,11 @@ def build_parser() -> argparse.ArgumentParser:
     detection = sc.add_parser("detection", help="what this site watches for, for every run")
     detection.add_argument("--watch", help="comma-separated labels, replacing what is there")
     detection.add_argument("--confidence", type=float, help="how sure the detector must be, 0.05 to 0.95")
+    detection.add_argument("--detect-every", type=int, dest="detect_every", metavar="N",
+                           help="run the detector on one frame in N and track through the rest. "
+                                "Measured at 3.0x less detection for 0.008 box heights of lag at N=3; "
+                                "the lag grows with how fast things move, so measure it on your own "
+                                "footage with `tools/detector_options.py`")
     detection.add_argument("--clear", action="store_true", help="go back to the built-in list and threshold")
     threats = sc.add_parser("threats", help="which labels this site treats as dangerous")
     threats.add_argument("--set", help="comma-separated labels, replacing what is there")
@@ -301,6 +306,20 @@ def main(argv: list[str] | None = None) -> int:
     # the rest of the command line whole rather than parsed here.
     argv = list(sys.argv[1:] if argv is None else argv)
     command, position = _command_of(argv)
+
+    # No arguments at all means somebody double-clicked the executable, and
+    # what they want is the window. argparse's answer was `error: the
+    # following arguments are required: command` and exit 2 — a usage message
+    # flashed in a console that closes before it can be read, from a product
+    # whose README calls this file "both the command line and the console".
+    #
+    # `--help` and `--version` still print, because somebody who typed those
+    # asked for text. Only the empty command line opens a window.
+    if not argv:
+        from .console.main import run as run_console
+
+        return run_console([])
+
     if command == "console":
         from .console.main import run as run_console
 

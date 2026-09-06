@@ -4,6 +4,17 @@ The image and the boxes travel together in one `FrameResult` and are drawn
 together. Drawing a track box over a *different* frame than the one it was
 computed from misrepresents what the system saw, so this widget never keeps
 one without the other.
+
+For the same reason it draws the frame's **own verdict on itself**. A frame
+that is out of focus, blown out, or the same frame the decoder handed over a
+second ago still produces boxes, and boxes drawn over it look exactly like
+boxes drawn over a good frame. An operator watching a camera whose lens has
+been sprayed sees a calm, empty scene and no indication that calm is all it
+can ever show. The banner is that indication.
+
+The camera's own motion is shown for the same reason: when a mast is moving,
+every position on the map is being computed from a pose that is no longer
+true, and that is worth knowing while it is happening rather than afterwards.
 """
 
 from __future__ import annotations
@@ -28,6 +39,8 @@ class VideoView(QWidget):
         self._detector: DetectorInfo | None = None
         self._caption = "waiting for the first frame"
         self._fps = 0.0
+        self._quality = None
+        self._motion = None
         self.setMinimumSize(220, 165)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
@@ -37,6 +50,8 @@ class VideoView(QWidget):
     def show_result(self, result, fps: float = 0.0) -> None:
         self._tracks = tuple(result.tracks)
         self._fps = fps
+        self._quality = getattr(result, "quality", None)
+        self._motion = getattr(result, "camera_motion", None)
         image = getattr(result, "image", None)
         if image is not None:
             self._pixmap = QPixmap.fromImage(_to_qimage(image))
@@ -50,7 +65,30 @@ class VideoView(QWidget):
     def clear(self) -> None:
         self._pixmap = None
         self._tracks = ()
+        self._quality = None
+        self._motion = None
         self.update()
+
+    def warnings(self) -> list[str]:
+        """What this frame cannot support, in an operator's words.
+
+        Empty when the frame is fine, which is the common case and must cost
+        nothing to draw.
+        """
+        out: list[str] = []
+        quality = self._quality
+        if quality is not None:
+            degraded = getattr(quality, "degraded", None)
+            if degraded:
+                out.append(degraded)
+        motion = self._motion
+        if motion is not None and getattr(motion, "measured", False) and not motion.still:
+            # A camera that is moving is a camera whose stored pose is wrong
+            # for as long as it moves, and every position on the plan is
+            # computed from that pose.
+            out.append(f"the camera is moving ({motion.magnitude:.0%} of a frame, "
+                       f"{motion.rotation_degrees:+.1f}°): positions are unreliable while it does")
+        return out
 
     # ------------------------------------------------------------ painting
 
@@ -84,7 +122,32 @@ class VideoView(QWidget):
         painter.setFont(font)
         rate = f"  ·  {self._fps:.0f} fps" if self._fps else ""
         painter.drawText(6, self.height() - 6, f"{self.camera_id}  ·  {self._caption}{rate}")
+        self._draw_warnings(painter, font)
         painter.end()
+
+    def _draw_warnings(self, painter: QPainter, font: QFont) -> None:
+        """A banner across the top when the frame cannot support what is drawn
+        on it.
+
+        Across the top and opaque, not a subtle tint: the failure being warned
+        about is precisely the one that *looks* like a working camera, so it
+        has to be the thing an operator notices first.
+        """
+        warnings = self.warnings()
+        if not warnings:
+            return
+        painter.setFont(font)
+        metrics = painter.fontMetrics()
+        line = metrics.height() + 4
+        height = line * len(warnings) + 4
+        banner = QRectF(0, 0, self.width(), height)
+        painter.fillRect(banner, theme.FAULT.darker(180))
+        painter.setPen(theme.TEXT)
+        for index, text in enumerate(warnings):
+            painter.drawText(QRectF(8, 2 + index * line, self.width() - 16, line),
+                             Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                             metrics.elidedText(text, Qt.TextElideMode.ElideRight,
+                                                int(self.width() - 16)))
 
     def _draw_track(self, painter: QPainter, frame: QRectF, track) -> None:
         colour = theme.track_colour(track.id)
