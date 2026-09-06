@@ -8,6 +8,7 @@ import json
 import sys
 import time
 from pathlib import Path
+from typing import Sequence
 
 from .. import logs
 from ..adapters.decode import is_live_source, redacted, split_password
@@ -19,6 +20,7 @@ from ..service.auth import Accounts, AuthError, Principal, Role
 from ..service.evidence import export_incident, verify_package
 from ..service.runtime import Runtime
 from ..service.site import SiteError, SiteService
+from ..service.supervise import clear_stop, install_service, request_stop, service_definition, stop_file, supervise
 from ..service.maintenance import StoreError, backup, open_store, restore_backup, verify_backup
 from ..service.runtime import RetentionPolicy, apply_retention
 from ..version import build_info, describe
@@ -63,6 +65,13 @@ def _keychain():
 
 
 # ------------------------------------------------------------------ commands
+
+
+def _console_placeholder(ctx: _Context) -> int:  # pragma: no cover - `main` intercepts it
+    from .console.main import run as run_console
+
+    ctx.close()
+    return run_console(list(ctx.args.rest))
 
 
 def _where(ctx: _Context) -> int:
@@ -169,6 +178,15 @@ def _run(ctx: _Context) -> int:
     args, by = ctx.args, ctx.principal
     from ..adapters.detectors import DetectionError
 
+    if args.stop:
+        path = request_stop(ctx.settings.data_dir)
+        print(f"asked the running analysis to stop ({path})")
+        return 0
+    # A stale request from a run that was killed before it could clear its own
+    # file would stop this one on its first poll. Cleared here, before start.
+    if clear_stop(ctx.settings.data_dir):
+        _log.info("cleared a stop request left by an earlier run")
+
     model = Path(args.model) if args.model else (None if args.no_model else ctx.settings.default_model())
     try:
         factory = _detector_factory(model, args.watch, args.confidence)
@@ -181,7 +199,8 @@ def _run(ctx: _Context) -> int:
             if ctx.store.camera(cid) is None:
                 ctx.site.add_camera(cid, source, pose=_pose(args.place) if args.place else None, record=args.record, by=by)
     runtime = Runtime(ctx.site, detector_factory=factory, record_to=ctx.settings.recordings if args.record else None,
-                      realtime=args.realtime, alerts=Alerts.from_settings(ctx.settings, store=ctx.store))
+                      realtime=args.realtime, alerts=Alerts.from_settings(ctx.settings, store=ctx.store),
+                      record_every_camera=args.record)
     try:
         started = runtime.start(by, cameras=[f"adhoc-{i}" for i in range(len(args.source))] + (["adhoc"] if len(args.source) == 1 else []) if args.source else None)
     except AuthError as error:
@@ -192,10 +211,19 @@ def _run(ctx: _Context) -> int:
         return 2
     print(f"running {started} camera(s){' for ' + str(args.seconds) + ' s' if args.seconds else ''}; Ctrl-C stops")
     deadline = time.monotonic() + args.seconds if args.seconds else None
+    stop = stop_file(ctx.settings.data_dir)
     last_line = 0.0
+    asked_to_stop = False
     try:
         while runtime.running and (deadline is None or time.monotonic() < deadline):
             runtime.poll()
+            if stop.exists():
+                # The one way to stop a run on every platform, including a
+                # scheduled task with no terminal. Cleared here so the
+                # supervisor sees it too, then does not restart.
+                asked_to_stop = True
+                print("a stop was requested")
+                break
             if time.monotonic() - last_line >= 5:
                 last_line = time.monotonic()
                 for cid, h in runtime.health().items():
@@ -205,6 +233,8 @@ def _run(ctx: _Context) -> int:
         print("stopping")
     finally:
         runtime.stop(by)
+        if asked_to_stop:
+            clear_stop(ctx.settings.data_dir)
     incidents = runtime.incidents
     print(f"{ctx.store.event_count()} event(s) -> {len(incidents)} incident(s)")
     for inc in incidents:
@@ -293,6 +323,54 @@ def _restore(ctx: _Context) -> int:
         return 1
     print(f"restored {ctx.settings.database} from {ctx.args.backup}")
     return 0
+
+
+def _supervise(ctx: _Context) -> int:
+    """Run the product as a child and start it again when it dies."""
+    arguments = list(ctx.args.child or ["run"])
+    if "--data-dir" not in arguments:
+        arguments = ["--data-dir", str(ctx.settings.data_dir), *arguments]
+    from ..service.supervise import child_command
+
+    ctx.store.audit(ctx.principal.actor, "supervisor.started", None, " ".join(arguments))
+    ctx.close()
+    return supervise(child_command(arguments), data_dir=ctx.settings.data_dir, max_restarts=ctx.args.max_restarts)
+
+
+def _service(ctx: _Context) -> int:
+    """Register the supervisor with this operating system, or print what would be."""
+    import sys as _sys
+
+    arguments = list(ctx.args.child or ["run"])
+    if "--data-dir" not in arguments:
+        arguments = ["--data-dir", str(ctx.settings.data_dir), *arguments]
+    if ctx.args.service_command == "print":
+        definition = service_definition(_sys.platform, arguments)
+        print(f"{definition['kind']} for {_sys.platform}")
+        if definition["path"] is not None:
+            print(f"file: {definition['path']}")
+            print(definition["content"])
+        print("install:   " + " ".join(str(p) for p in definition["install"]))
+        print("uninstall: " + " ".join(str(p) for p in definition["uninstall"]))
+        print(definition["note"])
+        return 0
+    from ..service.auth import SITE_CONFIGURE
+
+    if not ctx.principal.may(SITE_CONFIGURE):
+        print("error: installing a service needs an operator or administrator account", file=sys.stderr)
+        return 1
+    if ctx.args.service_command == "install":
+        code, definition = install_service(arguments)
+        ctx.store.audit(ctx.principal.actor, "service.installed", definition["kind"], " ".join(arguments))
+    else:
+        from ..service.supervise import uninstall_service
+
+        code, definition = uninstall_service()
+        ctx.store.audit(ctx.principal.actor, "service.uninstalled", definition["kind"])
+    print(f"{'installed' if ctx.args.service_command == 'install' else 'removed'} the {definition['kind']}"
+          f"{'' if code == 0 else f' (the platform command exited {code})'}")
+    print(definition["note"])
+    return code
 
 
 def _site(ctx: _Context) -> int:
@@ -419,9 +497,24 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--no-model", action="store_true", help="motion only")
     run.add_argument("--watch", help="labels to track (default: person, bicycle, car, motorcycle, bus, truck)")
     run.add_argument("--confidence", type=float, default=None)
-    run.add_argument("--record", action="store_true")
+    run.add_argument("--record", action="store_true",
+                     help="record every camera for this run, whatever each camera's stored Record flag says")
     run.add_argument("--realtime", action="store_true", help="pace a file to its own frame rate")
+    run.add_argument("--stop", action="store_true", help="ask a running analysis to stop, and exit")
     run.set_defaults(handler=_run)
+
+    sup = commands.add_parser("supervise", help="run the product as a child and restart it when it dies")
+    sup.add_argument("--max-restarts", type=int, default=None, help="give up after this many (default: never)")
+    sup.add_argument("child", nargs="*", help="what to supervise, after `--` (default: run)")
+    sup.set_defaults(handler=_supervise)
+
+    svc = commands.add_parser("service", help="register the supervisor with this operating system")
+    vc = svc.add_subparsers(dest="service_command", required=True)
+    for name in ("install", "print"):
+        sub = vc.add_parser(name)
+        sub.add_argument("child", nargs="*", help="what the service runs, after `--` (default: run)")
+    vc.add_parser("uninstall").set_defaults(child=[])
+    svc.set_defaults(handler=_service)
 
     inc = commands.add_parser("incidents", help="what was concluded"); inc.add_argument("--limit", type=int, default=50); inc.set_defaults(handler=_incidents)
     exp = commands.add_parser("export", help="an incident as an evidence package"); exp.add_argument("incident"); exp.add_argument("--to"); exp.set_defaults(handler=_export)
@@ -431,6 +524,10 @@ def build_parser() -> argparse.ArgumentParser:
     bk = commands.add_parser("backup", help="copy the database with a checksum"); bk.add_argument("--to"); bk.set_defaults(handler=_backup)
     rs = commands.add_parser("restore", help="replace the database with a verified backup"); rs.add_argument("backup"); rs.set_defaults(handler=_restore)
     commands.add_parser("health", help="every camera's state").set_defaults(handler=_health)
+    # Listed so `--help` names it; `main` hands it the rest of the line.
+    console = commands.add_parser("console", help="open the operator console (a window)")
+    console.add_argument("rest", nargs="*", help="--as NAME, --for SECONDS, --start, --record, --screenshots DIR")
+    console.set_defaults(handler=_console_placeholder)
     site = commands.add_parser("site", help="the site's name and clock")
     sc = site.add_subparsers(dest="site_command", required=True)
     sname = sc.add_parser("name"); sname.add_argument("name"); sname.add_argument("--timezone", default="UTC")
@@ -442,7 +539,42 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+#: Flags that may appear before the command, and whether each takes a value.
+GLOBAL_FLAGS = {"--data-dir": True, "--as": True, "--password-stdin": False, "--verbose": False, "--version": False}
+
+
+def _command_of(argv: Sequence[str]) -> tuple[str | None, int]:
+    """The command and where it sits, skipping the global flags before it.
+
+    Written out rather than guessed at: `vigil --data-dir X console --for 20`
+    put the command third, and a check for `argv[0] == "console"` sent the
+    whole line to argparse, which refused it. A camera *called* console is
+    still just a value, because this stops at the first non-flag token.
+    """
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token in GLOBAL_FLAGS:
+            index += 2 if GLOBAL_FLAGS[token] else 1
+            continue
+        if token.startswith("--") and "=" in token and token.split("=", 1)[0] in GLOBAL_FLAGS:
+            index += 1
+            continue
+        if token.startswith("-"):
+            return None, index
+        return token, index
+    return None, index
+
+
 def main(argv: list[str] | None = None) -> int:
+    # The console owns its own store, window and event loop, so it is handed
+    # the rest of the command line whole rather than parsed here.
+    argv = list(sys.argv[1:] if argv is None else argv)
+    command, position = _command_of(argv)
+    if command == "console":
+        from .console.main import run as run_console
+
+        return run_console(argv[:position] + argv[position + 1:])
     if hasattr(sys.stdout, "reconfigure"):
         try:
             sys.stdout.reconfigure(errors="replace")

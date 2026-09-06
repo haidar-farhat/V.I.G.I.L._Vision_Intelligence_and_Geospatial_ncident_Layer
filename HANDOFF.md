@@ -895,6 +895,29 @@ and layering enforced by tests) and its own `tasks.py` (`check`, `package`,
 `exetest`). V1 stays in place as the reference and as the thing that still
 runs on the camera today. See `v2/README.md` for the state of the camera run.
 
+Then, in the same session, v2 got the two things that separated it from being
+a replacement: **supervision** (`vigil supervise -- run`, `vigil service
+install|print|uninstall`, `vigil run --stop`) and **the operator console**
+(`vigil console`) — Qt again, but as a thin view: no domain state in the
+window, every change through one `Commands` object carrying the principal,
+and the three v1 Qt rules as structural tests (no lambda over `self` in a
+connection, no `WA_DeleteOnClose` on a dialog read after `exec()`, a greyed
+control answers a click with the reason). The plan view draws the ground from
+the site's own geometry with no tiles, and a "Why" tab shows each incident's
+risk factors, each event's conditions and each association's reasons.
+
+**What the first console photographs found, that no test had.** Four defects
+in one screenshot: a frozen `__main__` cannot use relative imports (the
+packaged build died in 0 s); a QTimer connected to a bound method of an
+unowned object never fired, so screenshots were silently never written; the
+model was searched for in one directory only, so the console had silently
+fallen back to motion detection and every class column read "—"; and
+`--record` set a destination while each camera's stored flag still decided,
+so it recorded nothing. A fifth came from reading an exported report: one
+person the detector blinked on was counted as "2 persons", so same-camera
+fragment linking was ported. Every one of them now has a test. **Photograph
+the interface — it is still the highest-yield check in this repository.**
+
 ## 7. Hard-won facts worth not rediscovering
 
 - **The recurring defect in this repository is correct, tested code that nothing

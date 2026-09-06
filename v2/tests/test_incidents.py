@@ -52,7 +52,9 @@ def test_the_correlator_groups_one_situation_and_separates_another():
 
 
 def test_a_motion_only_incident_says_object_not_person():
-    incidents = Correlator().correlate([event("a", 1, 0, detector=MOTION), event("a", 2, 1000, detector=MOTION)])
+    # Five seconds apart, so the fragment link does not join them and the
+    # point of this test stays the *noun*, not the count.
+    incidents = Correlator().correlate([event("a", 1, 0, detector=MOTION), event("a", 2, 5000, detector=MOTION)])
     assert len(incidents) == 1 and incidents[0].summary.startswith("2 objects")
 
 
@@ -61,3 +63,29 @@ def test_risk_bands_rise_with_severity_and_group_and_are_bounded():
     high = score_risk([event("a", 1, 0, severity=Severity.CRITICAL), event("b", 2, 1000, severity=Severity.CRITICAL)], 2, ("a", "b"), 120_000, [ZoneKind.RESTRICTED])
     assert low.score < high.score <= 1.0
     assert high.band in (Severity.HIGH, Severity.CRITICAL)
+
+
+def test_one_camera_that_lost_a_person_for_a_moment_counts_one_person_not_two():
+    """A blinking detector handed out two ids; the summary read "2 persons" for one."""
+    from vigil.domain.incidents import FRAGMENT_MAX_GAP_MILLIS, link_same_camera_fragments
+
+    near = destination_point(ORIGIN, 30, 1.0)
+    rejoined = link_same_camera_fragments([event("a", 1, 0), event("a", 2, 1500, near)])
+    assert [(l.a, l.b) for l in rejoined] == [(("a", 1), ("a", 2))]
+    assert any("lost it for" in r for r in rejoined[0].reasons)
+    assert any("appearance" in r for r in rejoined[0].reasons), "the link must say what it rests on"
+
+    incidents = Correlator().correlate([event("a", 1, 0), event("a", 2, 1500, near)])
+    assert len(incidents) == 1 and incidents[0].distinct_objects == 1
+    assert incidents[0].summary.startswith("1 person")
+
+
+def test_a_fragment_is_refused_when_it_is_late_far_or_a_different_class():
+    from vigil.domain.incidents import link_same_camera_fragments
+
+    near = destination_point(ORIGIN, 30, 1.0)
+    far = destination_point(ORIGIN, 30, 40.0)
+    assert link_same_camera_fragments([event("a", 1, 0), event("a", 2, 9000, near)]) == [], "too late"
+    assert link_same_camera_fragments([event("a", 1, 0), event("a", 2, 1000, far)]) == [], "too far"
+    assert link_same_camera_fragments([event("a", 1, 0), event("a", 2, 1000, near, label="car")]) == [], "another class"
+    assert link_same_camera_fragments([event("a", 1, 0), event("b", 2, 1000, near)]) == [], "another camera"

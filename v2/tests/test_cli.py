@@ -75,3 +75,43 @@ def test_a_password_in_argv_is_warned_about_and_never_stored(data, capsys):
     assert "secret" not in capsys.readouterr().out
     log = (data / "logs" / "vigil.log").read_text(encoding="utf-8")
     assert "secret" not in log
+
+
+def test_a_stop_can_be_asked_for_and_the_service_definition_printed(data, capsys, monkeypatch):
+    from vigil.service.supervise import stop_file
+
+    assert main(["run", "--stop"]) == 0
+    assert stop_file(data).is_file()
+    assert main(["service", "print"]) == 0
+    out = capsys.readouterr().out
+    assert "supervise" in out and ("install:" in out)
+    # A stale request must not stop the next run before it starts.
+    assert main(["run", "--no-model", "--for", "1"]) == 2, "no camera yet"
+    assert not stop_file(data).is_file()
+
+
+def test_supervise_runs_the_child_and_a_stop_ends_it(data, monkeypatch, capsys):
+    from vigil.service import supervise as supervise_module
+
+    attempts = []
+    monkeypatch.setattr(supervise_module, "_run_child", lambda command: attempts.append(command) or 3)
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    assert main(["supervise", "--max-restarts", "2", "--", "run", "--for", "1"]) == 3
+    assert len(attempts) == 3 and "run" in attempts[0]
+    assert "--data-dir" in attempts[0], "the child inherits the data directory it was supervised from"
+
+
+def test_the_console_is_dispatched_however_the_global_flags_are_ordered(monkeypatch):
+    """`vigil --data-dir X console --for 20` reached argparse, which refused it."""
+    from vigil.interfaces.cli import _command_of
+
+    handed = []
+    monkeypatch.setattr("vigil.interfaces.console.main.run", lambda argv: handed.append(list(argv)) or 0)
+    assert _command_of(["console", "--for", "5"]) == ("console", 0)
+    assert _command_of(["--data-dir", "X", "console", "--for", "5"]) == ("console", 2)
+    assert _command_of(["--verbose", "--as", "alice", "console"]) == ("console", 3)
+    assert _command_of(["cameras", "add", "console", "device:0"]) == ("cameras", 0), "a camera called console is a value"
+    assert _command_of([]) == (None, 0)
+
+    assert main(["--data-dir", "X", "console", "--for", "5", "--start"]) == 0
+    assert handed == [["--data-dir", "X", "--for", "5", "--start"]], handed

@@ -42,8 +42,11 @@ MANIFEST: tuple[Capability, ...] = (
                ("vigil.domain.events.ZoneEntryRule", "vigil.domain.events.LoiteringRule", "vigil.domain.events.AfterHoursRule"),
                ("tests/test_zones_events.py",)),
     Capability("incidents", "Time-and-place correlation into incidents with risk", State.TESTED,
-               ("vigil.domain.incidents.Correlator", "vigil.domain.incidents.associate", "vigil.domain.incidents.score_risk"),
-               ("tests/test_incidents.py",)),
+               ("vigil.domain.incidents.Correlator", "vigil.domain.incidents.associate", "vigil.domain.incidents.score_risk",
+                "vigil.domain.incidents.link_same_camera_fragments"),
+               ("tests/test_incidents.py",),
+               "Cross-camera identity rests on time and place alone and each link says so; same-camera fragments are "
+               "rejoined within 2 s and half the allowance, so a blinking detector does not report one person as two"),
     Capability("decode", "Files, local devices and RTSP behind the egress guard", State.TESTED,
                ("vigil.adapters.decode.VideoSource", "vigil.adapters.decode.LiveReader", "vigil.adapters.decode.require_private"),
                ("tests/test_decode.py",)),
@@ -71,9 +74,22 @@ MANIFEST: tuple[Capability, ...] = (
                ("vigil.adapters.keychain.Keychain",), ("tests/test_site.py",)),
     Capability("cli", "One command for every service method", State.TESTED,
                ("vigil.interfaces.cli.main",), ("tests/test_cli.py",)),
-    Capability("console", "Desktop console as a thin view over the service", State.PLAN, (), (), "DECISIONS.md D-07"),
+    Capability("console", "Desktop console: a thin view over the service, with the lock and the plan", State.TESTED,
+               ("vigil.interfaces.console.window.ConsoleWindow", "vigil.interfaces.console.commands.Commands",
+                "vigil.interfaces.console.plan.PlanView", "vigil.interfaces.console.dialogs.ask"),
+               ("tests/test_console.py",),
+               "`vigil console`. No domain state in the view; every change through Commands with the principal. "
+               "Structural tests hold the three v1 Qt rules: no lambda over self in a connection, no WA_DeleteOnClose, "
+               "a greyed control answers a click"),
     Capability("faces-plates", "Faces, plates and a subject register behind an identity switch", State.PLAN, (), (), "DECISIONS.md D-08"),
     Capability("packaging", "One executable, built and camera-tested by the task runner", State.IMPL,
                (), (), "`tasks.py package` builds dist/vigil/vigil.exe; `exetest` ran it on device:0 with recording and passed on 2026-09-05 (README.md); no installer, no signing"),
-    Capability("service", "Run unattended with restart-on-crash", State.PLAN, (), (), "v1's supervise module is the design; not ported yet"),
+    Capability("ci", "Every suite on three platforms, and again with the network taken away", State.IMPL,
+               (), (),
+               "`.github/workflows/ci.yml` jobs `v2` (ubuntu, windows, macos) and `v2-offline` (outbound traffic dropped, "
+               "and the drop proved before anything runs). Written, never executed: it runs on the first push"),
+    Capability("supervise", "Run unattended: restart on crash, a stop file, an OS service registration", State.TESTED,
+               ("vigil.service.supervise.supervise", "vigil.service.supervise.service_definition", "vigil.service.supervise.install_service"),
+               ("tests/test_supervise.py", "tests/test_cli.py"),
+               "`vigil supervise -- run`, `vigil service install|print|uninstall`, `vigil run --stop`. The scheduled task runs at logon, not at boot"),
 )

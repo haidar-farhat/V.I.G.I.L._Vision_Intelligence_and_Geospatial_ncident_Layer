@@ -28,10 +28,16 @@ calls. `CAPABILITIES.md` is generated.
 ## D-06 · SQLite, one file, WAL, one owning thread (taken)
 As v1, with the ownership checked at runtime.
 
-## D-07 · The console (not yet taken)
-Qt again, as a thin view over `SiteService` and `Runtime`, with the lifetime
-rules in a structural test. Not built in this tree; the CLI is the complete
-interface today and the exetest medium is the CLI executable.
+## D-07 · The console (taken)
+Qt again — native widgets, no embedded browser — as a thin view over
+`SiteService` and `Runtime`. It holds no domain state: every change goes
+through one `Commands` object that carries the principal and returns a
+sentence rather than raising, so a refusal reaches the status bar instead of
+being swallowed by a Qt slot. The three v1 Qt rules are structural tests: no
+lambda closing over `self` in a connection, no `WA_DeleteOnClose` on a dialog
+that is read after `exec()`, and a greyed control still answers a click with
+the reason it is greyed. `vigil console`; `python tasks.py exetest --console`
+drives it on the camera and photographs it.
 
 ## D-08 · Faces, plates, subject registry (not yet taken)
 V1 built all three; each was a privacy switch, a model dependency and a

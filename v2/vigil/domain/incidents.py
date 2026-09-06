@@ -99,6 +99,72 @@ def associate(events: Sequence[Event], *, window_millis: int = DEFAULT_WINDOW_MI
     return out
 
 
+# ------------------------------------------------------ same-camera fragments
+
+#: Without appearance, the longest a fragment may be missing and still be
+#: rejoined. Inside this the detector blinked — a person turned, or went half
+#: behind a chair — and place can vouch for that. Beyond it the object was
+#: genuinely gone, and "the same one came back" is a claim only a look could
+#: support, which this build does not have.
+FRAGMENT_MAX_GAP_MILLIS = 2000
+
+#: The fraction of the cross-camera allowance a fragment must fall within.
+#: Halved, not merely trimmed: the cross-camera gate is sized for a pair that
+#: two cameras agree about, and on one camera with time and place alone the
+#: same gate would join two people through one doorway a second apart.
+FRAGMENT_ALLOWANCE_FRACTION = 0.5
+
+
+def link_same_camera_fragments(events: Sequence[Event], *, radius_meters: float = DEFAULT_RADIUS_METERS) -> list[Association]:
+    """Rejoin one camera's tracks that a blinking detector split in two.
+
+    Deliberately narrow. Without appearance features this can only say "the
+    detector lost it for under two seconds and it came back within a metre or
+    two of where it was", and the association's reasons say exactly that, so
+    a reader can disagree with it. Without this a person the detector dropped
+    for one second is counted twice, and the summary reads "2 persons" for
+    one — which is the kind of inflation this system exists not to do.
+    """
+    by_track: dict[tuple[str, int], list[Event]] = {}
+    for event in events:
+        by_track.setdefault((event.evidence.camera_id, event.evidence.track_id), []).append(event)
+    for span in by_track.values():
+        span.sort(key=lambda e: e.occurred_at_millis)
+
+    links: list[Association] = []
+    keys = sorted(by_track)
+    for index, earlier_key in enumerate(keys):
+        for later_key in keys[index + 1:]:
+            if earlier_key[0] != later_key[0] or earlier_key[1] == later_key[1]:
+                continue
+            earlier, later = by_track[earlier_key], by_track[later_key]
+            last, first = earlier[-1], later[0]
+            if first.occurred_at_millis < last.occurred_at_millis:
+                last, first = later[-1], earlier[0]
+            gap = first.occurred_at_millis - last.occurred_at_millis
+            if gap < 0 or gap > FRAGMENT_MAX_GAP_MILLIS:
+                continue
+            if last.evidence.class_label != first.evidence.class_label:
+                # A person track must never absorb a vehicle, however close.
+                continue
+            point_a, point_b = _position_of(last), _position_of(first)
+            if point_a is None or point_b is None:
+                continue
+            separation = haversine_distance(point_a, point_b)
+            slack = min(MAX_UNCERTAINTY_ALLOWANCE_METERS,
+                        (last.evidence.position_uncertainty_meters or 0.0) + (first.evidence.position_uncertainty_meters or 0.0))
+            allowance = (radius_meters + slack) * FRAGMENT_ALLOWANCE_FRACTION
+            if separation > allowance:
+                continue
+            score = time_and_place_score(1 - separation / allowance, 1 - gap / FRAGMENT_MAX_GAP_MILLIS)
+            links.append(Association(earlier_key, later_key, score, round(separation, 2), round(allowance, 2), gap, (
+                f"one camera lost it for {gap / 1000:.1f} s, within {FRAGMENT_MAX_GAP_MILLIS / 1000:.0f} s",
+                f"it came back {separation:.1f} m away, within {allowance:.1f} m",
+                "time and place only: this build has no appearance features to check a look",
+            )))
+    return links
+
+
 @dataclass(frozen=True, slots=True)
 class RiskFactor:
     name: str
@@ -192,6 +258,10 @@ class Correlator:
         ordered = sorted(events, key=lambda e: (e.occurred_at_millis, e.id))
         self.stats.events_in += len(ordered)
         links = associate(ordered, window_millis=self._window, radius_meters=self._radius)
+        # Same-camera fragments join the same identity as cross-camera pairs,
+        # so the distinct count is of objects and not of the ids a flickering
+        # detector handed out.
+        links = links + link_same_camera_fragments(ordered, radius_meters=self._radius)
         self.stats.associations += len(links)
         identity = ObjectIdentity()
         for event in ordered:

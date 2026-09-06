@@ -14,6 +14,18 @@ from vigil.domain.geo import CameraPose, LatLon
 os.environ.setdefault("VIGIL_ALERT_FILE", "")
 
 
+@pytest.fixture(scope="session")
+def qt_app():
+    """One offscreen QApplication for the session. Qt allows exactly one."""
+    pytest.importorskip("PySide6")
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+
+    application = QApplication.instance() or QApplication([])
+    yield application
+    application.processEvents()
+
+
 @pytest.fixture
 def keychain() -> Keychain:
     return Keychain(InMemoryBackend())

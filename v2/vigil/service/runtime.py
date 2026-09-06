@@ -66,7 +66,8 @@ class WorkerStats:
 class CameraWorker:
     def __init__(self, camera: Camera, source_url: str, detector_factory: Callable[[], Detector], zones: Sequence[Zone],
                  rules: Sequence[Rule] | None = None, *, node_id: str = "local", record_to: Path | None = None,
-                 realtime: bool = False, keep_images: bool = False, site_tz=None, segment_seconds: float = 60.0):
+                 realtime: bool = False, keep_images: bool = False, site_tz=None, segment_seconds: float = 60.0,
+                 record_anyway: bool = False):
         self.camera = camera
         self._url = source_url
         self._detector_factory = detector_factory
@@ -78,6 +79,10 @@ class CameraWorker:
         self._keep_images = keep_images
         self._site_tz = site_tz
         self._segment_seconds = segment_seconds
+        #: This run records whatever the camera's stored flag says. Set by
+        #: `--record`, which would otherwise set a destination and record
+        #: nothing — which is what happened, and what nobody was told.
+        self._record_anyway = record_anyway
         self.stats = WorkerStats()
         self.detector_info: DetectorInfo | None = None
         self._latest: FrameResult | None = None
@@ -151,7 +156,7 @@ class CameraWorker:
             tracker = Tracker(TrackerConfig(), self.camera.pose)
             presence = PresenceTracker(self._zones)
             info = source.open()
-            if self._record_to is not None and self.camera.record:
+            if self._record_to is not None and (self.camera.record or self._record_anyway):
                 recorder = Recorder(self.camera.id, self._record_to, fps=info.nominal_fps or 15.0, segment_seconds=self._segment_seconds)
                 try:
                     recorder.start()
@@ -300,12 +305,15 @@ class Runtime:
     def __init__(self, site: SiteService, *, node_id: str = "local", detector_factory: Callable[[], Detector] | None = None,
                  record_to: Path | None = None, retention: RetentionPolicy | None = None, alerts: Alerts | None = None,
                  realtime: bool = False, keep_images: bool = False, rules_factory: Callable[[], list[Rule]] | None = None,
-                 correlate_every_millis: int = 2000, retention_every_seconds: float = 600.0):
+                 correlate_every_millis: int = 2000, retention_every_seconds: float = 600.0,
+                 record_every_camera: bool = False):
         self.site = site
         self.store: Store = site.store
         self.node_id = node_id
         self._detector_factory = detector_factory
         self._record_to = record_to
+        #: ``--record``: this run records every camera, whatever the site says.
+        self._record_every_camera = record_every_camera
         self._retention = retention if retention is not None else (RetentionPolicy() if record_to else None)
         self._retention_every = retention_every_seconds
         self._last_retention: float | None = None
@@ -344,6 +352,7 @@ class Runtime:
                 camera, self.site.source_with_credentials(camera), self._factory(), zones,
                 self._rules_factory() if self._rules_factory else None, node_id=self.node_id,
                 record_to=self._record_to, realtime=self._realtime, keep_images=self._keep_images,
+                record_anyway=self._record_every_camera,
             )
             worker.start()
             self._workers[camera.id] = worker
@@ -415,6 +424,11 @@ class Runtime:
 
     # ------------------------------------------------------------- health
 
+    def detector_info(self, camera_id: str) -> DetectorInfo | None:
+        """What is drawing one camera's conclusions, or ``None`` when it is not running."""
+        worker = self._workers.get(camera_id)
+        return getattr(worker, "detector_info", None) if worker is not None else None
+
     def health(self) -> dict[str, CameraHealth]:
         out = {}
         for camera in self.store.cameras():
@@ -443,7 +457,8 @@ class Runtime:
             else:
                 state = "LIVE"
         fps = worker.stats.analysis_fps if running and since_frame is not None and since_frame <= 1.0 else 0.0
-        recording = camera["record"] and running and worker.stats.recording_fault is None and worker._record_to is not None
+        recording = ((camera["record"] or worker._record_anyway) and running
+                     and worker.stats.recording_fault is None and worker._record_to is not None)
         return CameraHealth(camera["id"], state, running, camera["pose"] is not None, fps, worker.stats.frames, fault,
                             since_frame, bool(recording), worker.stats.recording_fault, worker.stats.clips)
 
@@ -455,6 +470,8 @@ class Runtime:
                 self.alerts.clear(CAMERA_DARK, camera_id)
             if health.recording_fault:
                 self.alerts.raise_(RECORDING_STOPPED, camera_id, health.recording_fault)
+            elif health.recording:
+                self.alerts.clear(RECORDING_STOPPED, camera_id)
         if self.retention_shortfall:
             self.alerts.raise_(RETENTION_SHORTFALL, self.node_id, self.retention_shortfall)
         else:

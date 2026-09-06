@@ -1,0 +1,286 @@
+"""The ground plan: where things are, drawn from the site's own geometry.
+
+No external tiles, ever — that is the product's central promise, and a map
+that needs the Internet would break it silently the first time a site was
+air-gapped. What is drawn is what the system knows: camera positions, the
+ground each camera can actually see, zones, and projected tracks with their
+uncertainty. A scale bar says what a pixel is worth, because a plan with no
+scale is a picture.
+"""
+
+from __future__ import annotations
+
+import math
+from typing import Sequence
+
+from PySide6.QtCore import QPointF, QRectF, Qt, Signal
+from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPen, QPolygonF
+from PySide6.QtWidgets import QSizePolicy, QWidget
+
+from ...domain.geo import CameraPose, LatLon, LocalFrame, field_of_view, haversine_distance
+from . import theme
+
+#: Metres of padding around whatever is being shown, so nothing touches the edge.
+MARGIN_METERS = 8.0
+
+
+class PlanView(QWidget):
+    """Cameras, coverage, zones and tracks on one local ground frame."""
+
+    #: A click on the plan, in latitude/longitude. The window uses it to draw
+    #: a zone; nothing else in the console has a use for a map click yet.
+    clicked = Signal(object)
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._frame: LocalFrame | None = None
+        self._cameras: dict[str, CameraPose] = {}
+        self._zones: list = []
+        self._tracks: dict[str, tuple] = {}
+        self._draft: list[LatLon] = []
+        self._drawing = False
+        self._selected: str | None = None
+        self._zoom = 1.0
+        self.setMinimumSize(240, 200)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setMouseTracking(True)
+
+    # -------------------------------------------------------------- inputs
+
+    def set_cameras(self, poses: dict[str, CameraPose]) -> None:
+        self._cameras = dict(poses)
+        self._reframe()
+        self.update()
+
+    def set_zones(self, zones: Sequence) -> None:
+        self._zones = list(zones)
+        self._reframe()
+        self.update()
+
+    def set_tracks(self, camera_id: str, tracks: Sequence) -> None:
+        self._tracks[camera_id] = tuple(tracks)
+        self.update()
+
+    def clear_tracks(self) -> None:
+        self._tracks.clear()
+        self.update()
+
+    def select(self, camera_id: str | None) -> None:
+        self._selected = camera_id
+        self.update()
+
+    def begin_zone(self) -> None:
+        self._drawing = True
+        self._draft = []
+        self.setCursor(Qt.CursorShape.CrossCursor)
+        self.update()
+
+    def end_zone(self) -> list[LatLon]:
+        ring, self._draft = list(self._draft), []
+        self._drawing = False
+        self.unsetCursor()
+        self.update()
+        return ring
+
+    @property
+    def drawing(self) -> bool:
+        return self._drawing
+
+    @property
+    def draft(self) -> list[LatLon]:
+        return list(self._draft)
+
+    def zoom_by(self, factor: float) -> None:
+        self._zoom = min(8.0, max(0.2, self._zoom * factor))
+        self.update()
+
+    # ------------------------------------------------------------ geometry
+
+    def _points_of_interest(self) -> list[LatLon]:
+        points: list[LatLon] = []
+        for pose in self._cameras.values():
+            points.append(pose.position)
+            points.extend(field_of_view(pose, 8) or [])
+        for zone in self._zones:
+            points.extend(zone.ring)
+        points.extend(self._draft)
+        return points
+
+    def _reframe(self) -> None:
+        points = self._points_of_interest()
+        if not points:
+            self._frame = None
+            return
+        self._frame = LocalFrame(LatLon(sum(p.lat for p in points) / len(points),
+                                        sum(p.lon for p in points) / len(points)))
+
+    def _scale(self) -> float:
+        """Pixels per metre, so everything of interest fits with a margin."""
+        if self._frame is None:
+            return 1.0
+        points = self._points_of_interest()
+        extent = 1.0
+        for point in points:
+            local = self._frame.to_local(point)
+            extent = max(extent, abs(local.x), abs(local.y))
+        extent += MARGIN_METERS
+        return (min(self.width(), self.height()) / 2) / extent * self._zoom
+
+    def _to_screen(self, point: LatLon) -> QPointF:
+        assert self._frame is not None
+        local = self._frame.to_local(point)
+        scale = self._scale()
+        # North is up: the local frame's +y is north, the screen's is down.
+        return QPointF(self.width() / 2 + local.x * scale, self.height() / 2 - local.y * scale)
+
+    def _to_lat_lon(self, x: float, y: float) -> LatLon | None:
+        if self._frame is None:
+            return None
+        scale = self._scale()
+        from ...domain.geo import Vec2
+
+        return self._frame.to_lat_lon(Vec2((x - self.width() / 2) / scale, (self.height() / 2 - y) / scale))
+
+    # -------------------------------------------------------------- events
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt's name
+        point = self._to_lat_lon(event.position().x(), event.position().y())
+        if point is None:
+            return
+        if self._drawing:
+            self._draft.append(point)
+            self.update()
+        self.clicked.emit(point)
+
+    def wheelEvent(self, event) -> None:  # noqa: N802 - Qt's name
+        self.zoom_by(1.15 if event.angleDelta().y() > 0 else 1 / 1.15)
+
+    # ------------------------------------------------------------ painting
+
+    def paintEvent(self, event) -> None:  # noqa: N802 - Qt's name
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.fillRect(self.rect(), theme.BACKGROUND)
+        if self._frame is None:
+            painter.setPen(theme.TEXT_FAINT)
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter,
+                             "Nothing is placed yet.\nPlace a camera to see the ground it covers.")
+            painter.end()
+            return
+        self._draw_zones(painter)
+        self._draw_coverage(painter)
+        self._draw_cameras(painter)
+        self._draw_tracks(painter)
+        self._draw_draft(painter)
+        self._draw_scale(painter)
+        painter.end()
+
+    def _draw_coverage(self, painter: QPainter) -> None:
+        for camera_id, pose in self._cameras.items():
+            ring = field_of_view(pose, 24)
+            if not ring:
+                continue
+            polygon = QPolygonF([self._to_screen(p) for p in ring])
+            colour = QColor(theme.ACCENT if camera_id == self._selected else theme.LIVE)
+            fill = QColor(colour)
+            fill.setAlpha(34 if camera_id == self._selected else 20)
+            painter.setBrush(QBrush(fill))
+            outline = QColor(colour)
+            outline.setAlpha(120)
+            painter.setPen(QPen(outline, 1))
+            painter.drawPolygon(polygon)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+
+    def _draw_cameras(self, painter: QPainter) -> None:
+        for camera_id, pose in self._cameras.items():
+            centre = self._to_screen(pose.position)
+            colour = theme.ACCENT if camera_id == self._selected else theme.TEXT
+            painter.setPen(QPen(colour, 2))
+            painter.setBrush(QBrush(theme.PANEL_RAISED))
+            painter.drawEllipse(centre, 5, 5)
+            # A short spike in the heading, so which way a camera looks is
+            # readable without reading a number.
+            heading = math.radians(pose.heading)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawLine(centre, QPointF(centre.x() + math.sin(heading) * 14, centre.y() - math.cos(heading) * 14))
+            painter.setPen(colour)
+            painter.drawText(QPointF(centre.x() + 9, centre.y() - 7), camera_id)
+
+    def _draw_zones(self, painter: QPainter) -> None:
+        for zone in self._zones:
+            polygon = QPolygonF([self._to_screen(p) for p in zone.ring])
+            colour = theme.FAULT if str(zone.kind) == "RESTRICTED" else theme.STALE
+            fill = QColor(colour)
+            fill.setAlpha(28)
+            painter.setBrush(QBrush(fill))
+            painter.setPen(QPen(colour, 1, Qt.PenStyle.DashLine))
+            painter.drawPolygon(polygon)
+            painter.setPen(colour)
+            box = polygon.boundingRect()
+            watch = f" · {', '.join(sorted(zone.watch))}" if zone.watch else ""
+            text = f"{zone.name}{watch}"
+            # Below the ring and centred on it. Above put it on the camera
+            # marker's own label, which the first console photograph showed.
+            width = painter.fontMetrics().horizontalAdvance(text)
+            painter.drawText(QPointF(box.center().x() - width / 2, box.bottom() + 14), text)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+
+    def _draw_tracks(self, painter: QPainter) -> None:
+        for camera_id, tracks in self._tracks.items():
+            for track in tracks:
+                position = track.position
+                if position is None or not position.is_projected:
+                    # An unprojected track has no place on a plan. Drawing it
+                    # at the camera would claim a position nobody measured.
+                    continue
+                centre = self._to_screen(position.point)
+                colour = theme.track_colour(track.id)
+                radius = max(3.0, position.radius_meters * self._scale())
+                halo = QColor(colour)
+                halo.setAlpha(46)
+                painter.setBrush(QBrush(halo))
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.drawEllipse(centre, radius, radius)
+                painter.setBrush(QBrush(colour))
+                painter.setPen(QPen(theme.BACKGROUND, 1))
+                painter.drawEllipse(centre, 4, 4)
+                if track.heading_degrees is not None and track.speed_mps:
+                    heading = math.radians(track.heading_degrees)
+                    painter.setPen(QPen(colour, 2))
+                    length = 8 + min(24, track.speed_mps * 4)
+                    painter.drawLine(centre, QPointF(centre.x() + math.sin(heading) * length,
+                                                     centre.y() - math.cos(heading) * length))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+
+    def _draw_draft(self, painter: QPainter) -> None:
+        if not self._draft:
+            return
+        painter.setPen(QPen(theme.ACCENT, 2, Qt.PenStyle.DashLine))
+        points = [self._to_screen(p) for p in self._draft]
+        if len(points) > 1:
+            painter.drawPolyline(QPolygonF(points))
+        painter.setBrush(QBrush(theme.ACCENT))
+        painter.setPen(QPen(theme.BACKGROUND, 1))
+        for point in points:
+            painter.drawEllipse(point, 3, 3)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(theme.ACCENT)
+        painter.drawText(8, 18, f"drawing a zone: {len(points)} point(s) — three or more, then Finish")
+
+    def _draw_scale(self, painter: QPainter) -> None:
+        scale = self._scale()
+        target = self.width() / 5
+        metres = 1.0
+        for candidate in (1, 2, 5, 10, 20, 50, 100, 200, 500, 1000):
+            if candidate * scale <= target:
+                metres = float(candidate)
+        length = metres * scale
+        y = self.height() - 14
+        painter.setPen(QPen(theme.TEXT_MUTED, 1))
+        painter.drawLine(QPointF(12, y), QPointF(12 + length, y))
+        painter.drawLine(QPointF(12, y - 3), QPointF(12, y + 3))
+        painter.drawLine(QPointF(12 + length, y - 3), QPointF(12 + length, y + 3))
+        font = QFont(painter.font())
+        font.setPointSizeF(max(7.5, font.pointSizeF() - 1))
+        painter.setFont(font)
+        painter.drawText(QPointF(16 + length, y + 4), f"{metres:g} m")

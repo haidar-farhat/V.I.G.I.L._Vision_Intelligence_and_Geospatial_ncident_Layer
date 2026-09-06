@@ -8,7 +8,7 @@
 | tracking | Multi-object tracking with cumulative confirmation and coasting | `TESTED` | `vigil.domain.tracking.Tracker` | `tests/test_tracking.py` |  |
 | zones | Zones with membership hysteresis and a watch list | `TESTED` | `vigil.domain.zones.Zone`, `vigil.domain.zones.PresenceTracker` | `tests/test_zones_events.py` |  |
 | rules | Zone entry, loitering and after-hours rules with evidence | `TESTED` | `vigil.domain.events.ZoneEntryRule`, `vigil.domain.events.LoiteringRule`, `vigil.domain.events.AfterHoursRule` | `tests/test_zones_events.py` |  |
-| incidents | Time-and-place correlation into incidents with risk | `TESTED` | `vigil.domain.incidents.Correlator`, `vigil.domain.incidents.associate`, `vigil.domain.incidents.score_risk` | `tests/test_incidents.py` |  |
+| incidents | Time-and-place correlation into incidents with risk | `TESTED` | `vigil.domain.incidents.Correlator`, `vigil.domain.incidents.associate`, `vigil.domain.incidents.score_risk`, `vigil.domain.incidents.link_same_camera_fragments` | `tests/test_incidents.py` | Cross-camera identity rests on time and place alone and each link says so; same-camera fragments are rejoined within 2 s and half the allowance, so a blinking detector does not report one person as two |
 | decode | Files, local devices and RTSP behind the egress guard | `TESTED` | `vigil.adapters.decode.VideoSource`, `vigil.adapters.decode.LiveReader`, `vigil.adapters.decode.require_private` | `tests/test_decode.py` |  |
 | motion | Motion detection that says it does not classify | `TESTED` | `vigil.adapters.detectors.MotionDetector` | `tests/test_detectors.py` |  |
 | onnx | ONNX detection and segmentation, model read once per process | `TESTED` | `vigil.adapters.detectors.OnnxDetector`, `vigil.adapters.detectors.model_info` | `tests/test_detectors.py` | The inference path is exercised with a synthetic ONNX model built in the test; real weights are the operator's |
@@ -21,9 +21,10 @@
 | evidence | Incident export with clips, hashes and a verifiable manifest | `TESTED` | `vigil.service.evidence.export_incident`, `vigil.service.evidence.verify_package` | `tests/test_evidence.py` |  |
 | keychain | Camera passwords in the OS keychain under a random handle | `TESTED` | `vigil.adapters.keychain.Keychain` | `tests/test_site.py` |  |
 | cli | One command for every service method | `TESTED` | `vigil.interfaces.cli.main` | `tests/test_cli.py` |  |
-| console | Desktop console as a thin view over the service | `PLAN` | — | — | DECISIONS.md D-07 |
+| console | Desktop console: a thin view over the service, with the lock and the plan | `TESTED` | `vigil.interfaces.console.window.ConsoleWindow`, `vigil.interfaces.console.commands.Commands`, `vigil.interfaces.console.plan.PlanView`, `vigil.interfaces.console.dialogs.ask` | `tests/test_console.py` | `vigil console`. No domain state in the view; every change through Commands with the principal. Structural tests hold the three v1 Qt rules: no lambda over self in a connection, no WA_DeleteOnClose, a greyed control answers a click |
 | faces-plates | Faces, plates and a subject register behind an identity switch | `PLAN` | — | — | DECISIONS.md D-08 |
 | packaging | One executable, built and camera-tested by the task runner | `IMPL` | — | — | `tasks.py package` builds dist/vigil/vigil.exe; `exetest` ran it on device:0 with recording and passed on 2026-09-05 (README.md); no installer, no signing |
-| service | Run unattended with restart-on-crash | `PLAN` | — | — | v1's supervise module is the design; not ported yet |
+| ci | Every suite on three platforms, and again with the network taken away | `IMPL` | — | — | `.github/workflows/ci.yml` jobs `v2` (ubuntu, windows, macos) and `v2-offline` (outbound traffic dropped, and the drop proved before anything runs). Written, never executed: it runs on the first push |
+| supervise | Run unattended: restart on crash, a stop file, an OS service registration | `TESTED` | `vigil.service.supervise.supervise`, `vigil.service.supervise.service_definition`, `vigil.service.supervise.install_service` | `tests/test_supervise.py`, `tests/test_cli.py` | `vigil supervise -- run`, `vigil service install|print|uninstall`, `vigil run --stop`. The scheduled task runs at logon, not at boot |
 
-Counts: IMPL 1, PLAN 3, TESTED 17
+Counts: IMPL 2, PLAN 1, TESTED 19

@@ -149,3 +149,26 @@ def test_a_worker_reports_a_missing_file_as_a_fault_not_a_crash(tmp_path, keycha
     worker.start()
     assert worker.stop()
     assert worker.stats.fault and "no file" in worker.stats.fault
+
+
+def test_the_record_flag_on_a_run_records_a_camera_the_site_has_not_flagged(tmp_path, reference_video, keychain):
+    """`--record` set a destination and then recorded nothing, silently. Found by exporting a live incident."""
+    with Store(tmp_path / "r.db") as store:
+        site = SiteService(store, keychain)
+        site.add_camera("gate", str(reference_video), record=False, by=OPERATOR)
+        runtime = Runtime(site, detector_factory=MotionDetector, record_to=tmp_path / "rec",
+                          record_every_camera=True, alerts=Alerts(synchronous=True))
+        runtime.start(OPERATOR)
+        # Read while it is running: "is this recording" is only true of the
+        # instant it is asked, and the file ends part way through the pump.
+        said_recording = False
+        deadline = time.monotonic() + 30
+        while runtime.running and time.monotonic() < deadline:
+            runtime.poll()
+            said_recording = said_recording or runtime.health()["gate"].recording
+            time.sleep(0.05)
+        assert said_recording, "the health never said it was recording"
+        runtime.stop(OPERATOR)
+        segments = store.segments(camera_id="gate")
+        assert segments and all(s.path.is_file() for s in segments)
+        assert not site.camera("gate", OPERATOR).record, "an override for one run must not change the site"

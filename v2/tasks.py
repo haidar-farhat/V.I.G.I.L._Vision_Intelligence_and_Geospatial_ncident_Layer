@@ -78,7 +78,13 @@ def package() -> int:
     code = _run([sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "--name", "vigil", "--distpath", str(ROOT / "dist"),
                  "--workpath", str(ROOT / "build"), "--specpath", str(ROOT / "build"), "--collect-all", "onnxruntime",
                  "--hidden-import", "keyring.backends.Windows", "--hidden-import", "keyring.backends.macOS",
-                 "--hidden-import", "keyring.backends.SecretService", "--paths", str(ROOT),
+                 "--hidden-import", "keyring.backends.SecretService",
+                 "--hidden-import", "PySide6.QtWidgets", "--hidden-import", "PySide6.QtGui",
+                 "--exclude-module", "PySide6.QtWebEngineCore", "--exclude-module", "PySide6.QtWebEngineWidgets",
+                 "--exclude-module", "PySide6.Qt3DCore", "--exclude-module", "PySide6.QtQuick",
+                 "--exclude-module", "PySide6.QtQml", "--exclude-module", "PySide6.QtMultimedia",
+                 "--exclude-module", "matplotlib", "--exclude-module", "pytest", "--exclude-module", "onnx",
+                 "--paths", str(ROOT),
                  str(ROOT / "packaging" / "entry.py")])
     if code != 0:
         return code
@@ -99,6 +105,7 @@ def exetest() -> int:
     parser.add_argument("--camera", default="device:0")
     parser.add_argument("--no-model", action="store_true")
     parser.add_argument("--record", action="store_true")
+    parser.add_argument("--console", action="store_true", help="drive the window, and photograph it before it closes")
     args = parser.parse_args(sys.argv[2:])
     exe = DIST / ("vigil.exe" if os.name == "nt" else "vigil")
     if not exe.is_file():
@@ -106,11 +113,24 @@ def exetest() -> int:
         return 1
     workspace = ROOT / "dist" / "exetest" / time.strftime("%Y%m%d-%H%M%S")
     workspace.mkdir(parents=True)
-    argv = [str(exe), "--data-dir", str(workspace), "run", args.camera, "--for", f"{args.seconds:g}",
-            "--place", "33.8938,35.5018,2.0,180,-15"]
+    if args.console:
+        # The window is added a camera first, from the same executable, so the
+        # console starts on a site that already exists — the way an operator's
+        # second launch does.
+        add = [str(exe), "--data-dir", str(workspace), "cameras", "add", "laptop", args.camera,
+               "--place", "33.8938,35.5018,2.0,180,-15"]
+        if args.record:
+            add.append("--record")
+        print(">>", " ".join(add), flush=True)
+        subprocess.run(add, capture_output=True, text=True, timeout=120)
+        argv = [str(exe), "--data-dir", str(workspace), "console", "--for", f"{args.seconds:g}", "--start",
+                "--screenshots", str(workspace / "shots")]
+    else:
+        argv = [str(exe), "--data-dir", str(workspace), "run", args.camera, "--for", f"{args.seconds:g}",
+                "--place", "33.8938,35.5018,2.0,180,-15"]
     if args.no_model:
         argv.append("--no-model")
-    if args.record:
+    if args.record and not args.console:
         argv.append("--record")
     print(">>", " ".join(argv), flush=True)
     started = time.monotonic()
@@ -129,6 +149,12 @@ def exetest() -> int:
         problems.append(f"ran {elapsed:.0f} s for a {args.seconds:g} s request")
     if "frames" not in log_text:
         problems.append("the log never reported frames")
+    if args.console:
+        shots = sorted((workspace / "shots").glob("*.png")) if (workspace / "shots").is_dir() else []
+        if len(shots) < 5:
+            problems.append(f"the console produced {len(shots)} screenshot(s), expected 6")
+        else:
+            print("screenshots: " + ", ".join(s.name for s in shots))
     print(proc.stdout[-2000:])
     verdict = "PASS" if not problems else "FAIL: " + "; ".join(problems)
     print(f"exetest {verdict} in {elapsed:.0f} s; artefacts in {workspace}")

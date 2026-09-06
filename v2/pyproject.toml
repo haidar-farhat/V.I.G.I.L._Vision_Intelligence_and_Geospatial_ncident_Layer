@@ -8,10 +8,14 @@ dependencies = [
     "opencv-python-headless>=4.10",
     "onnxruntime>=1.20",
     "keyring>=25",
+    # The operator console. Native widgets, no embedded browser: a browser
+    # engine would be a network stack inside an offline product.
+    "PySide6>=6.7",
 ]
 
 [project.scripts]
 vigil = "vigil.interfaces.cli:main"
+vigil-console = "vigil.interfaces.console.main:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "pyinstaller>=6.0"]

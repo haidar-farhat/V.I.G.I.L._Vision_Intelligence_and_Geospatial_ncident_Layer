@@ -105,3 +105,20 @@ def test_a_newer_schema_is_refused_and_a_corrupt_file_is_named(tmp_path):
     garbage.write_bytes(b"not a database at all" * 100)
     with pytest.raises(StoreError):
         Store(garbage)
+
+
+def test_a_model_is_looked_for_in_every_place_it_could_be(tmp_path, monkeypatch):
+    """Looking in one place is how a run silently falls back to motion detection."""
+    from vigil.config import Settings
+
+    settings = Settings(tmp_path / "data", None, None, None, False)
+    places = settings.model_directories()
+    assert (tmp_path / "data" / "models") in places
+    assert len(places) == len(set(places)), "a place must not be searched twice"
+    assert settings.default_model() is None or settings.default_model().suffix == ".onnx"
+
+    (tmp_path / "data" / "models").mkdir(parents=True)
+    (tmp_path / "data" / "models" / "plain.onnx").write_bytes(b"x")
+    assert settings.default_model().name == "plain.onnx"
+    (tmp_path / "data" / "models" / "world-seg.onnx").write_bytes(b"x")
+    assert settings.default_model().name == "world-seg.onnx", "a segmentation model is preferred"

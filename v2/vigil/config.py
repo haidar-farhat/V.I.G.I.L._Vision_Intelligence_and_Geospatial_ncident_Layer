@@ -57,13 +57,38 @@ class Settings:
 
     @property
     def models(self) -> Path:
+        """Where a model *should* be put. See `model_directories` for where one is looked for."""
+        return self.model_directories()[0]
+
+    def model_directories(self) -> list[Path]:
+        """Every place a model may be, in order.
+
+        More than one on purpose: a packaged build ships them beside the
+        executable, a checkout keeps them in the repository, and a deployment
+        may put them with its data. Looking in only one of those is how a run
+        silently falls back to motion detection — which happened, and the
+        photograph of the console is what caught it.
+        """
+        places = []
         if getattr(sys, "frozen", False):
-            return Path(sys.executable).resolve().parent / "models"
-        return self.data_dir / "models"
+            places.append(Path(sys.executable).resolve().parent / "models")
+        places.append(self.data_dir / "models")
+        if not getattr(sys, "frozen", False):
+            places.append(Path(__file__).resolve().parent.parent / "models")
+        seen, ordered = set(), []
+        for place in places:
+            if place not in seen:
+                seen.add(place)
+                ordered.append(place)
+        return ordered
 
     def default_model(self) -> Path | None:
-        if not self.models.is_dir():
-            return None
-        candidates = sorted(self.models.glob("*.onnx"))
-        segment = [c for c in candidates if "seg" in c.name.lower()]
-        return (segment or candidates or [None])[0]
+        """The newest segmentation model found, or any model, or ``None``."""
+        for directory in self.model_directories():
+            if not directory.is_dir():
+                continue
+            candidates = sorted(directory.glob("*.onnx"))
+            segment = [c for c in candidates if "seg" in c.name.lower()]
+            if segment or candidates:
+                return (segment or candidates)[0]
+        return None

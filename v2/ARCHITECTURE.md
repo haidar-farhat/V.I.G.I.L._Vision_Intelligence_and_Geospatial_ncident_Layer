@@ -72,7 +72,11 @@ build on any other edge.
 
 ### interfaces
 - `cli.py` — `vigil` command. Every service method has a command.
-- console — **not built** (DECISIONS.md D-07).
+- `console/` — the operator window. `commands.py` is the only path from the
+  view to the service; `window.py` is layout, the Monitor/Configure lock and
+  a repaint timer; `plan.py` draws the ground from the site's own geometry
+  with no external tiles; `video.py`, `widgets.py` and `dialogs.py` are
+  plain views. `vigil console`.
 
 ## 3. Threads and ownership
 
