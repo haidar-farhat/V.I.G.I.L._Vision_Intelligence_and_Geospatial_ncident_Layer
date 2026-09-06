@@ -300,3 +300,57 @@ def test_the_command_line_reads_sets_and_clears_it(data, capsys):
     assert "outside" in capsys.readouterr().err
     assert main(["site", "detection", "--clear"]) == 0
     assert "built-in" in capsys.readouterr().out
+
+
+def test_a_camera_pose_is_measured_from_the_command_line_and_refused_when_it_is_worse(data, capsys):
+    """The whole path: place a camera roughly, mark points that can be found on
+    both the picture and the map, and have the assumption replaced by a number
+    that says what it is worth."""
+    from vigil.domain.geo import CameraPose, LatLon, project_to_ground
+
+    truth = CameraPose(LatLon(33.8938, 35.5018), 4.0, 37.0, -22.0, 3.0, 62.0, 36.0, 60.0)
+    marks = []
+    for u in (0.12, 0.35, 0.5, 0.68, 0.9):
+        for v in (0.6, 0.75, 0.95):
+            ground = project_to_ground(truth, u, v, enforce_range=False)
+            if ground is not None:
+                marks.append(f"{u},{v},{ground.position.lat:.8f},{ground.position.lon:.8f}")
+    points = "; ".join(marks)
+
+    assert main(["cameras", "add", "gate", "file:///x", "--place", "33.8938,35.5018,4.5,34,-25"]) == 0
+    capsys.readouterr()
+    assert main(["cameras", "calibrate", "gate", "--points", points, "--dry-run"]) == 0
+    assert "not saved (--dry-run)" in capsys.readouterr().out
+
+    assert main(["cameras", "calibrate", "gate", "--points", points]) == 0
+    out = capsys.readouterr().out
+    assert "heading" in out and "37.0" in out, out
+    assert main(["cameras", "list"]) == 0
+    assert "+/-" in capsys.readouterr().out, "a measured camera must say so in the list"
+
+    # One point is refused for being one point, not for being unparseable.
+    assert main(["cameras", "calibrate", "gate", "--points", "0.5,0.5,33.9,35.5"]) == 1
+    assert "not enough" in capsys.readouterr().err
+
+    # A cluster is refused, and the pose already measured stands.
+    cluster = []
+    for u in (0.5000, 0.5002):
+        for v in (0.8000, 0.8002):
+            g = project_to_ground(truth, u, v, enforce_range=False)
+            cluster.append(f"{u},{v},{g.position.lat:.10f},{g.position.lon:.10f}")
+    assert main(["cameras", "calibrate", "gate", "--points", "; ".join(cluster)]) == 1
+    assert "cannot separate" in capsys.readouterr().err
+    assert main(["cameras", "list"]) == 0
+    assert "+/-" in capsys.readouterr().out, "the refused fit must not have overwritten the good one"
+    assert main(["audit"]) == 0
+    assert "camera.calibrated" in capsys.readouterr().out
+
+
+def test_pixels_typed_where_fractions_were_asked_for_are_refused(data, capsys):
+    """960,540 is somebody typing pixels. Read as fractions it is off the frame,
+    and clamping it would produce a confident wrong pose from a typo."""
+    assert main(["cameras", "add", "gate", "file:///x", "--place", "33.8938,35.5018,4,0,-25"]) == 0
+    capsys.readouterr()
+    assert main(["cameras", "calibrate", "gate", "--points",
+                 "960,540,33.894,35.502; 100,200,33.895,35.503"]) == 1
+    assert "fractions of the picture, not pixels" in capsys.readouterr().err

@@ -77,6 +77,58 @@ def test_cameras_zones_and_site_round_trip(pose):
         assert store.cameras() == [] and store.zones() == []
 
 
+def test_a_measured_lens_and_pose_uncertainty_survive_a_round_trip(pose):
+    """Migration 6. The uncertainty is the whole product of a calibration, so
+    a round trip that quietly restored the default would throw away the
+    measurement and leave a pose that merely looks confident."""
+    from dataclasses import replace
+
+    from vigil.domain.geo import Distortion, PoseUncertainty
+
+    measured = replace(
+        pose,
+        uncertainty=PoseUncertainty(heading_deg=0.064, pitch_deg=0.243, roll_deg=0.105,
+                                    mount_height_m=0.038),
+        lens=Distortion(k1=-0.081, k2=0.012, p1=0.0004, p2=-0.0002, k3=0.0),
+    )
+    with Store(":memory:") as store:
+        store.save_camera("gate", "Gate", "file:///x", pose=measured,
+                          calibration=(1_757_000_000, 0.0021, 15))
+        got = store.camera("gate")
+        assert got["pose"] == measured
+        assert got["calibration_points"] == 15 and got["calibration_rms"] == 0.0021
+
+
+def test_turning_recording_on_does_not_erase_a_calibration(pose):
+    """`save_camera` is how every edit to a camera is written, so provenance
+    that vanished when it was not restated would be destroyed by an unrelated
+    setting -- and the sigmas would survive with nothing to explain them."""
+    from dataclasses import replace
+
+    from vigil.domain.geo import PoseUncertainty
+
+    measured = replace(pose, uncertainty=PoseUncertainty(0.064, 0.243, 0.105, 0.038))
+    with Store(":memory:") as store:
+        store.save_camera("gate", "Gate", "file:///x", pose=measured, calibration=(1_757_000_000, 0.0021, 15))
+        store.save_camera("gate", "Gate", "file:///x", pose=measured, record=True)
+        after = store.camera("gate")
+        assert after["record"] and after["calibration_points"] == 15
+        assert after["calibrated_at"] == 1_757_000_000
+        assert after["pose"].uncertainty == measured.uncertainty
+
+
+def test_an_uncalibrated_camera_comes_back_assumed_rather_than_measured(pose):
+    """NULL sigmas must stay distinguishable from measured ones that happen to
+    equal the assumption; otherwise nothing can tell a measurement from a
+    default and the provenance is worthless."""
+    with Store(":memory:") as store:
+        store.save_camera("gate", "Gate", "file:///x", pose=pose)
+        assert store.camera("gate")["calibrated_at"] is None
+        row = store._connection.execute("SELECT sigma_heading, k1 FROM cameras").fetchone()
+        assert row["sigma_heading"] is None, "an unmeasured sigma must be stored as NULL"
+        assert row["k1"] == 0.0, "an uncalibrated lens is rectilinear, which is what it was"
+
+
 def test_backup_verify_and_restore(tmp_path):
     database = tmp_path / "s.db"
     with Store(database) as store:

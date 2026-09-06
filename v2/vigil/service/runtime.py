@@ -12,7 +12,7 @@ import queue
 import shutil
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Sequence
@@ -37,6 +37,12 @@ from .alerts import (
 )
 from .auth import ANALYSIS_CONTROL, Principal
 from .site import Camera, SiteService
+from .livemap import LiveMap
+from .mapping import MappingError
+from .triangulation import MIN_GROUND_SAMPLES, Geometry, tilted
+# Re-exported: `FrameResult` is this module's published shape as far as every
+# interface is concerned, and moving the class must not move its import.
+from .worker import CameraWorker, FrameResult, WorkerStats  # noqa: F401
 
 _log = _get_logger(__name__)
 
@@ -57,316 +63,14 @@ METRICS_EVERY_SECONDS = 60.0
 #: association window, so nothing that could be joined is cut off.
 CORRELATION_SPAN_MILLIS = 60 * 60 * 1000
 
+#: How often the ground plane is re-fitted from accumulated observations.
+#:
+#: A minute, not a frame. The fit is over thousands of points and the ground
+#: does not move; running it per frame would spend real time re-deriving a
+#: constant. The accumulator is fed every cycle, so nothing is missed — only
+#: the conclusion is drawn less often than the evidence arrives.
+GROUND_SOLVE_EVERY_SECONDS = 60.0
 
-@dataclass(frozen=True, slots=True)
-class FrameResult:
-    camera_id: str
-    frame_index: int
-    at_millis: int
-    tracks: tuple[Track, ...]
-    detections: int
-    image: object | None = None
-    #: What those tracks are doing with each other, as far as one camera can
-    #: tell. Inferred, never observed; see `vigil.domain.relations`.
-    relations: tuple = ()
-    #: What the frame itself was worth. A console that draws boxes over a
-    #: frame nothing could be detected in should say so.
-    quality: object = None
-    #: How the camera moved into this frame, when it could be measured.
-    camera_motion: object = None
-
-
-@dataclass
-class WorkerStats:
-    frames: int = 0
-    #: Frames the detector actually ran on. Below `frames` when the site is
-    #: detecting on a subset and tracking through the rest.
-    detected_frames: int = 0
-    detections: int = 0
-    events: int = 0
-    dropped_results: int = 0
-    analysis_fps: float = 0.0
-    #: Rolling frame quality, 0..1, or `None` before the first frame.
-    quality: float | None = None
-    #: Why the most recent frame was unusable, or `None`.
-    quality_fault: str | None = None
-    #: Consecutive unusable frames.
-    unusable_frames: int = 0
-    #: Frames on which the camera itself measurably moved.
-    moved_frames: int = 0
-    last_frame_at: float | None = None
-    started_at: float | None = None
-    fault: str | None = None
-    recording_fault: str | None = None
-    clips: int = 0
-
-
-class CameraWorker:
-    def __init__(self, camera: Camera, source_url: str, detector_factory: Callable[[], Detector], zones: Sequence[Zone],
-                 rules: Sequence[Rule] | None = None, *, node_id: str = "local", record_to: Path | None = None,
-                 realtime: bool = False, keep_images: bool = False, site_tz=None, segment_seconds: float = 60.0,
-                 record_anyway: bool = False, detect_every: int = 1):
-        self.camera = camera
-        self._url = source_url
-        self._detector_factory = detector_factory
-        self._zones = list(zones)
-        self._rules = list(rules) if rules is not None else default_rules()
-        self._node_id = node_id
-        self._record_to = record_to
-        self._realtime = realtime
-        self._keep_images = keep_images
-        self._site_tz = site_tz
-        self._segment_seconds = segment_seconds
-        #: This run records whatever the camera's stored flag says. Set by
-        #: `--record`, which would otherwise set a destination and record
-        #: nothing — which is what happened, and what nobody was told.
-        self._record_anyway = record_anyway
-        #: Run the detector on one frame in this many and track through the
-        #: rest. See `vigil.service.detection.MAX_DETECT_EVERY` for the
-        #: measurement; 1 is every frame.
-        self._detect_every = max(1, int(detect_every))
-        self.stats = WorkerStats()
-        self.detector_info: DetectorInfo | None = None
-        self._latest: FrameResult | None = None
-        self._latest_lock = threading.Lock()
-        self._events: queue.Queue[Event] = queue.Queue(maxsize=OUTBOX_EVENTS)
-        self._segments: queue.Queue[Segment] = queue.Queue()
-        self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
-        self._recent: list[float] = []
-
-    # ------------------------------------------------------------ control
-
-    def start(self) -> None:
-        self._stop.clear()
-        self.stats.started_at = time.monotonic()
-        self._thread = threading.Thread(target=self._run, name=f"vigil-camera-{self.camera.id}", daemon=True)
-        self._thread.start()
-
-    def ask_to_stop(self) -> None:
-        self._stop.set()
-
-    def stop(self, timeout: float = STOP_TIMEOUT_SECONDS) -> bool:
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout)
-            return not self._thread.is_alive()
-        return True
-
-    @property
-    def alive(self) -> bool:
-        return self._thread is not None and self._thread.is_alive()
-
-    # ------------------------------------------------------------- outbox
-
-    def take_latest(self) -> FrameResult | None:
-        with self._latest_lock:
-            result, self._latest = self._latest, None
-            return result
-
-    def take_events(self) -> list[Event]:
-        out = []
-        while True:
-            try:
-                out.append(self._events.get_nowait())
-            except queue.Empty:
-                return out
-
-    def take_segments(self) -> list[Segment]:
-        out = []
-        while True:
-            try:
-                out.append(self._segments.get_nowait())
-            except queue.Empty:
-                return out
-
-    def seconds_since_frame(self) -> float | None:
-        return None if self.stats.last_frame_at is None else time.monotonic() - self.stats.last_frame_at
-
-    def seconds_since_started(self) -> float | None:
-        return None if self.stats.started_at is None else time.monotonic() - self.stats.started_at
-
-    # --------------------------------------------------------------- work
-
-    def _run(self) -> None:
-        source = VideoSource(self._url, source_id=self.camera.id)
-        reader: LiveReader | None = None
-        recorder: Recorder | None = None
-        try:
-            detector = self._detector_factory()
-            self.detector_info = detector.info
-            tracker = Tracker(TrackerConfig(), self.camera.pose)
-            presence = PresenceTracker(self._zones)
-            relations = RelationTracker()
-            quality = FrameQualityMonitor()
-            camera_motion = CameraMotionEstimator()
-            info = source.open()
-            if self._record_to is not None and (self.camera.record or self._record_anyway):
-                recorder = Recorder(self.camera.id, self._record_to, fps=info.nominal_fps or 15.0, segment_seconds=self._segment_seconds)
-                try:
-                    recorder.start()
-                except OSError as error:
-                    self.stats.recording_fault = str(error)
-                    recorder = None
-            if source.live:
-                reader = LiveReader(source)
-                reader.start()
-            frame_interval = 1.0 / info.nominal_fps if (self._realtime and info.nominal_fps > 0) else 0.0
-            while not self._stop.is_set():
-                started = time.monotonic()
-                frame = reader.read(timeout=1.0) if reader is not None else source.read()
-                if frame is None:
-                    if reader is not None:
-                        if reader.fault and not reader.alive:
-                            raise DecodeError(reader.fault)
-                        continue
-                    break  # a file ended
-                self._process(frame, detector, tracker, presence, relations, recorder,
-                              quality, camera_motion)
-                if frame_interval:
-                    remaining = frame_interval - (time.monotonic() - started)
-                    if remaining > 0:
-                        self._stop.wait(remaining)
-            # Every live track ends with the camera. The departures this
-            # produces are dropped on purpose: no rule acts on leaving, and
-            # inventing an event for "the camera stopped" would put a
-            # conclusion in the trail that nothing observed.
-            for track_id in tracker.reset():
-                presence.forget_track(track_id, int(time.time() * 1000))
-        except DecodeError as error:
-            self.stats.fault = str(error)
-            _log.error("%s: %s", self.camera.id, error)
-        except Exception as error:  # noqa: BLE001 - a worker must not die silently
-            self.stats.fault = f"{type(error).__name__}: {error}"
-            _log.exception("%s: analysis failed", self.camera.id)
-        finally:
-            if reader is not None:
-                reader.stop()
-            if recorder is not None:
-                for segment in recorder.close():
-                    self._segments.put(segment)
-                if recorder.stats.fault:
-                    self.stats.recording_fault = recorder.stats.fault
-            source.close()
-            _log.info("%s: analysis finished: %d frames, %d detections, %d events", self.camera.id,
-                      self.stats.frames, self.stats.detections, self.stats.events)
-
-    def _process(self, frame: Frame, detector: Detector, tracker: Tracker, presence: PresenceTracker,
-                 relations: RelationTracker, recorder: Recorder | None,
-                 quality: FrameQualityMonitor, camera_motion: CameraMotionEstimator) -> None:
-        now = time.monotonic()
-        self.stats.frames += 1
-        self.stats.last_frame_at = now
-        self._recent = [t for t in self._recent if now - t <= 1.0] + [now]
-        self.stats.analysis_fps = float(len(self._recent))
-
-        # What this frame is worth, before anything is asked of it. A
-        # detector reports how sure it is *given the pixels it was shown*
-        # and has no way to say the lens is dirty.
-        measured = quality.measure(frame.image)
-        self.stats.quality = quality.recent_score
-        # Either kind of degradation counts here: an unusable image and a
-        # frozen stream are both cameras that will never report anything, and
-        # both were invisible to a frame counter.
-        self.stats.quality_fault = measured.degraded
-        self.stats.unusable_frames = 0 if measured.degraded is None else self.stats.unusable_frames + 1
-
-        # How the camera moved. Not attempted on a frame nothing can be
-        # measured in: optical flow over a blown-out frame returns a
-        # confident transform built from points that matched nothing.
-        motion: CameraMotion | None = None
-        if measured.usable:
-            motion = camera_motion.estimate(frame.image)
-            if motion.measured and not motion.still:
-                self.stats.moved_frames += 1
-        else:
-            camera_motion.reset()
-        warp = motion.warp if (motion is not None and motion.measured and not motion.still) else None
-
-        # Detect on one frame in `detect_every` and track through the rest.
-        # The tracker carries the gap: it predicts with a Kalman filter rather
-        # than extrapolating an average, so a skipped frame widens the gate by
-        # the right amount instead of by whatever the frame counter did.
-        detections: list = []
-        looks: list = []
-        if self.stats.frames % self._detect_every == 0:
-            detections = detector.detect(frame.image)
-            self.stats.detected_frames += 1
-            self.stats.detections += len(detections)
-            # An appearance per detection: what stops one person becoming
-            # eleven objects the moment the detector blinks.
-            looks = [describe(frame.image, (d.bbox.x, d.bbox.y, d.bbox.width, d.bbox.height), d.mask)
-                     for d in detections]
-        update = tracker.update(detections, frame.timestamp_millis, appearances=looks, warp=warp)
-        tracks = tracker.tracks()
-        moment = datetime.fromtimestamp(frame.timestamp_millis / 1000, tz=timezone.utc)
-        events: list[Event] = []
-        info = detector.info
-        for ended in update.ended:
-            # A track that ended has left every zone it was in; see above for
-            # why the departures are not turned into events.
-            presence.forget_track(ended, frame.timestamp_millis)
-            relations.forget_track(ended)
-            for rule in self._rules:
-                forget = getattr(rule, "forget", None)
-                if forget:
-                    forget(ended)
-        by_id = {t.id: t for t in tracks}
-        zones = presence.zones
-        # What the tracks are doing with each other, before any rule looks at
-        # them: a rule may say "carrying" only if this measured it.
-        found = tuple(relations.update(tracks, frame.timestamp_millis, label_of=info.label_for,
-                                       zones=list(zones.values())))
-        names = {t.id: info.label_for(t.class_id) for t in tracks}
-        for change in presence.update(tracks, frame.timestamp_millis, label_for=info.label_for):
-            zone = zones[change.presence.zone_id]
-            track = by_id.get(change.presence.track_id)
-            context = RuleContext(self._node_id, self.camera.id, zone, track, change.presence, frame.timestamp_millis,
-                                  moment, info, frame.index, self._site_tz,
-                                  _for(found, change.presence.track_id), names)
-            for rule in self._rules:
-                events.extend(rule.on_presence_change(change, context))
-        # A relation is the only way a rule hears about something that has
-        # not arrived yet, so it is offered before presence is considered.
-        for relation in found:
-            track = by_id.get(relation.subject)
-            if track is None:
-                continue
-            zone = zones.get(relation.zone_id) if relation.zone_id else None
-            context = RuleContext(self._node_id, self.camera.id, zone, track, None, frame.timestamp_millis,
-                                  moment, info, frame.index, self._site_tz, _for(found, relation.subject), names)
-            for rule in self._rules:
-                events.extend(rule.on_relation(relation, context))
-
-        for p in presence.presences():
-            track = by_id.get(p.track_id)
-            if track is None:
-                continue
-            context = RuleContext(self._node_id, self.camera.id, zones[p.zone_id], track, p, frame.timestamp_millis,
-                                  moment, info, frame.index, self._site_tz, _for(found, p.track_id), names)
-            for rule in self._rules:
-                events.extend(rule.on_frame(context))
-        for event in events:
-            try:
-                self._events.put_nowait(event)
-                self.stats.events += 1
-            except queue.Full:
-                self.stats.dropped_results += 1
-        if recorder is not None:
-            try:
-                recorder.write(frame.image, frame.timestamp_millis)
-                for segment in recorder.take_closed():
-                    self._segments.put(segment)
-                    self.stats.clips += 1
-            except OSError as error:
-                self.stats.recording_fault = str(error)
-                _log.error("%s: RECORDING STOPPED EARLY - %s", self.camera.id, error)
-        result = FrameResult(self.camera.id, frame.index, frame.timestamp_millis, tuple(tracks), len(detections),
-                             frame.image if self._keep_images else None, found, measured, motion)
-        with self._latest_lock:
-            if self._latest is not None:
-                self.stats.dropped_results += 1
-            self._latest = result
 
 
 @dataclass(frozen=True, slots=True)
@@ -419,7 +123,8 @@ class Runtime:
                  record_to: Path | None = None, retention: RetentionPolicy | None = None, alerts: Alerts | None = None,
                  realtime: bool = False, keep_images: bool = False, rules_factory: Callable[[], list[Rule]] | None = None,
                  correlate_every_millis: int = 2000, retention_every_seconds: float = 600.0,
-                 record_every_camera: bool = False):
+                 record_every_camera: bool = False, map_dir: Path | None = None,
+                 build_map: bool = True):
         self.site = site
         self.store: Store = site.store
         self.node_id = node_id
@@ -443,6 +148,19 @@ class Runtime:
         self.alerts.bind(self.store, f"node:{node_id}")
         self._running = False
         self._last_metrics: float | None = None
+        #: Cross-camera positions and the site's own ground. Built on the first
+        #: poll that has two placed cameras, because it needs an origin and
+        #: there is nothing to triangulate before then.
+        self._geometry: Geometry | None = None
+        self._last_ground_solve = 0.0
+        #: Where the live map is kept between runs. `None` means it is built
+        #: and drawn but never written, which is what an ad-hoc `vigil run`
+        #: over a file wants.
+        self._map_dir = Path(map_dir) if map_dir is not None else None
+        #: Off for a run that has no business building one — a test, or a
+        #: pass over a recording whose poses describe a different day.
+        self._build_map = build_map
+        self._map: LiveMap | None = None
 
     # ------------------------------------------------------------ control
 
@@ -490,8 +208,9 @@ class Runtime:
                 list(rules), node_id=self.node_id,
                 record_to=self._record_to, realtime=self._realtime, keep_images=self._keep_images,
                 record_anyway=self._record_every_camera, site_tz=site_tz,
-                detect_every=self._detect_every(),
+                detect_every=self._detect_every(), watch=self._watch(),
             )
+            worker.live_map = self._ensure_map(chosen)
             worker.start()
             self._workers[camera.id] = worker
             started += 1
@@ -501,6 +220,12 @@ class Runtime:
 
     def stop(self, by: Principal) -> bool:
         by.require(ANALYSIS_CONTROL)
+        if self._map is not None:
+            # Built over the whole run and written once here, so a site that
+            # is stopped between the five-minute persists does not throw away
+            # everything since the last one.
+            self._map.tick()
+            self._map.save()
         for worker in self._workers.values():
             worker.ask_to_stop()
         stubborn = [cid for cid, w in self._workers.items() if not w.stop()]
@@ -568,6 +293,9 @@ class Runtime:
             self.store.save_events(fresh)
             self._events.extend(fresh)
             self._events = self._events[-5000:]
+        self._triangulate(results)
+        if self._map is not None:
+            self._map.tick()
         self._sweep_retention_if_due()
         self._watch_for_alerts()
         if self._running:
@@ -579,6 +307,127 @@ class Runtime:
             self._running = False
         return results
 
+    def _watch(self) -> frozenset[str] | None:
+        """Labels this site raises events for, from the detector factory when
+        there is one. `None` leaves the worker on the built-in list."""
+        factory = self._detector_factory
+        watch = getattr(factory, "watch", None)
+        return watch() if callable(watch) else None
+
+    def _ensure_map(self, cameras: Sequence[Camera]) -> "LiveMap | None":
+        """The site's live map, built on the first placed camera.
+
+        `None` when nothing is placed — there is no origin to hang a lattice
+        on, and a map of a site whose cameras have no positions would be a
+        picture of nothing. Also `None` without the engine core: `MapBuilder`
+        refuses rather than falling back, because v1 measured the NumPy path
+        at 79 ms per frame per camera and quietly running eighty times slower
+        is not a fallback.
+        """
+        if not self._build_map:
+            return None
+        if self._map is None:
+            placed = [c.pose for c in cameras if c.pose is not None]
+            if not placed:
+                return None
+            try:
+                self._map = LiveMap(placed[0].position, self._map_dir)
+            except MappingError as error:
+                _log.info("no live map on this machine: %s", error)
+                self._build_map = False
+                return None
+            _log.info("building the site's map from the running analysis")
+        return self._map
+
+    def ground(self):
+        """The site's ground map as it stands, or `None`.
+
+        The live one when this node is analysing, which is fresher than
+        anything on disk by definition. A caller wanting the stored map — the
+        console before a run has started — reads it with `mapping.load_map`.
+        """
+        return None if self._map is None else self._map.ground
+
+    def map_state(self) -> str:
+        return "no map" if self._map is None else self._map.describe()
+
+    # ------------------------------------------------------- cross-camera
+
+    def _triangulate(self, results: Sequence[FrameResult]) -> None:
+        """Offer this cycle's frames to the cross-camera geometry.
+
+        Positions on the tracks are **not** rewritten here. A `FrameResult` is
+        what one camera concluded from one frame, and quietly replacing a
+        track's position with one derived from another camera would make that
+        no longer true — the console draws boxes on the frame they came from
+        for the same reason. The triangulated positions are published
+        alongside, through `pairings()`, and the ground plane feeds back into
+        the poses, which is where it belongs.
+        """
+        if not results:
+            return
+        poses = {c["id"]: c["pose"] for c in self.store.cameras() if c["pose"] is not None}
+        if len(poses) < 2:
+            return
+        if self._geometry is None:
+            origin = poses[sorted(poses)[0]].position
+            self._geometry = Geometry(origin)
+        for result in results:
+            pose = poses.get(result.camera_id)
+            if pose is not None:
+                self._geometry.observe(result.camera_id, pose, result.at_millis, result.tracks,
+                                       getattr(result, "appearance", None))
+        self._geometry.resolve()
+        now = time.monotonic()
+        if now - self._last_ground_solve >= GROUND_SOLVE_EVERY_SECONDS:
+            self._last_ground_solve = now
+            self._apply_ground(self._geometry.solve_ground(), poses)
+
+    def _apply_ground(self, plane, poses: dict) -> None:
+        """Write a solved ground back to the cameras that will project onto it.
+
+        To the **store** and to the running workers both. The store, because
+        the next run should start from what this one measured rather than
+        re-deriving it from nothing; the workers, because a camera projecting
+        onto a level plane it has been shown is not level goes on producing
+        biased positions until somebody restarts it.
+
+        This reaches every placed camera, not only the overlapping pair that
+        produced the evidence. That is the point: a site's ground is one
+        surface, and the camera watching the far corner alone is the one whose
+        positions were worst and which could never have measured it itself.
+        """
+        if plane is None or plane.inliers < MIN_GROUND_SAMPLES:
+            return
+        if all(abs(p.ground_tilt_east - plane.tilt_east) < 1e-6
+               and abs(p.ground_tilt_north - plane.tilt_north) < 1e-6 for p in poses.values()):
+            return
+        solved = (int(time.time()), plane.inliers)
+        for camera in self.store.cameras():
+            pose = camera["pose"]
+            if pose is None:
+                continue
+            revised = tilted(replace(pose, ground_tilt_east=plane.tilt_east,
+                                     ground_tilt_north=plane.tilt_north), plane)
+            self.store.save_camera(camera["id"], camera["name"], camera["source"],
+                                   credentials_ref=camera["credentials_ref"], pose=revised,
+                                   record=camera["record"], ground=solved)
+            worker = self._workers.get(camera["id"])
+            if worker is not None:
+                worker.revise_pose(revised)
+        self.store.audit("node:" + self.node_id, "site.ground_solved", None, plane.describe())
+        _log.info("ground written back to %d camera(s): %s", len(poses), plane.describe())
+
+    def pairings(self) -> tuple:
+        """What two cameras agreed on, most recently. Empty when nothing
+        overlaps, which is the common case for a single-camera site."""
+        return () if self._geometry is None else self._geometry.pairings()
+
+    def ground_plane(self):
+        """The site's own ground, once enough of it has been observed, or
+        `None` while every projection is still assuming a level yard."""
+        return None if self._geometry is None else self._geometry.ground
+
     def correlate(self) -> tuple[Incident, ...]:
         """Group the recent past into incidents. Bounded, and measured from the events.
 
@@ -589,7 +438,8 @@ class Runtime:
         zones = {z.id: z.kind for z in self.store.zones()}
         newest = self.store.newest_event_millis()
         since = None if newest is None else newest - CORRELATION_SPAN_MILLIS
-        correlator = Correlator(zone_kinds=zones)
+        ceiling = None if self._geometry is None else self._geometry.appearance_ceiling()
+        correlator = Correlator(zone_kinds=zones, appearance_ceiling=ceiling)
         self._incidents = tuple(correlator.correlate(self.store.events(since=since)))
         if self._incidents:
             self.store.save_incidents(self._incidents)
@@ -731,10 +581,6 @@ class Runtime:
         except Exception:  # noqa: BLE001
             _log.exception("retention sweep failed")
 
-
-def _for(relations: tuple, track_id: int) -> tuple:
-    """The relations one track takes part in, either end."""
-    return tuple(r for r in relations if r.subject == track_id or r.object == track_id)
 
 
 def apply_retention(store: Store, policy: RetentionPolicy, *, principal: str = "retention",

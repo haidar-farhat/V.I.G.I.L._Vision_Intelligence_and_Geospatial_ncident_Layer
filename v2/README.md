@@ -25,6 +25,7 @@ From the command line, without the window:
 
 ```bash
 python -m vigil cameras add gate device:0 --place 33.8938,35.5018,2,180,-15
+python -m vigil cameras calibrate gate --points "0.2,0.8,33.8937,35.5018; …"  # measure the pose
 python -m vigil zones add yard "33.8937,35.5018;33.8937,35.5019;33.8936,35.5019" --watch person
 python -m vigil run --for 30 --record
 python -m vigil incidents
@@ -190,9 +191,9 @@ not contain — which has already happened here once, quietly.
 
 | | |
 |---|---|
-| Product code | 15,068 lines of Python, 2,683 lines of Rust behind a C ABI |
-| Tests | 315 Python + 53 Rust, all green through `python tasks.py check` |
-| Capabilities | 35 tested, 2 implemented, 1 planned ([CAPABILITIES.md](CAPABILITIES.md)) |
+| Product code | 18,946 lines of Python, 4,997 lines of Rust behind a C ABI |
+| Tests | 392 Python + 70 Rust, all green through `python tasks.py check` |
+| Capabilities | 39 tested, 2 implemented, 1 planned ([CAPABILITIES.md](CAPABILITIES.md)) |
 | Packaged | `vigil.exe` for the command line and `vigil-console.exe` for the window, sharing one `_internal` |
 
 **Two executables, one tree.** `vigil.exe` is console-subsystem so every
@@ -224,6 +225,10 @@ those needs.
 
 | When (UTC) | What ran | Result |
 |---|---|---|
+| 2026-09-06 20:19 | packaged `vigil.exe`, `exetest --seconds 20 --record --console`, after the pose calibration, triangulation, cross-camera, live-map and detection work | **PASS in 23 s.** The window carries the new *Measure pose…* control, and the status bar reads **watching 80 classes** rather than six. It detected and tracked a **cell phone** — a class the old frozen watch list made invisible to the detector, the tracker, the plan and the map — drew it, inferred `carried` between it and the person, and raised **no event** for it, which is the whole point of splitting what is detected from what is alerted on. Migrations 6, 7 and 8 applied inside the packaged build. |
+| 2026-09-06 20:18 | packaged `vigil.exe`, `exetest --seconds 25 --record` on `device:0` | **PASS in 29 s** at a sustained **20 fps** with the lowered 0.25 floor, soft-NMS and the full COCO vocabulary, on DirectML. |
+| 2026-09-06 20:28 | `tools/camera_check.py --seconds 75 --map` on `device:0` — the rebuilt detection path end to end | 1,491 frames in 75.3 s = **19.8 fps**, against 14.1 fps on the CPU path earlier the same day. **2.3 detections per frame** where the shipped 0.50 threshold and six classes produced 0.00 on the same view; 3 distinct track ids for 3 objects, so no fragmentation came with them. Detection 12.45 ms median. Map: **123 m² usable of 163 m² seen (75%)**. Tiling correctly did nothing — a 640x480 webcam is already below the model's 640x640 input, and cropping an image the model sees whole buys nothing. |
+| 2026-09-06 20:12 | the shipped `yolov8n-seg` on DirectML over twelve **1080p** frames, before and after the detection changes | The measurement Phase 6 rests on. At the old 0.50 floor with hard NMS and the six classes: **0.00 detections per frame**. At 0.25: **1.08**. With four tiles over the far ground: **1.33**, at **55.3 ms against 11.0 ms** — exactly the 1+4 inferences it costs. The far-half recall proxy came out **zero on both sides**, because a laptop webcam pointed at a room has no far ground; that number stays unmeasured until this runs on a camera that can see something distant, and it is the number tiling was built for. |
 | 2026-09-06 18:04 | packaged `vigil.exe`, `exetest --seconds 20 --record --console`, after the two-executable split | **PASS in 22 s.** All six panels photographed; the camera wall drew a real frame at 15 fps with no warning banner, which is the correct answer for a good frame. Separately verified: `vigil.exe` **with no arguments** now opens the window instead of printing `error: the following arguments are required: command` and exiting 2, and the new GUI-subsystem `vigil-console.exe` runs with no console behind it. Migration 5 applied inside the packaged build. |
 | 2026-09-06 17:47 | `onnxruntime-directml` in an **isolated virtualenv**, so this machine's environment was untouched | The integrated GPU runs the shipped `yolov8n-seg` session in **4.5 ms against the CPU's 38.5 ms — 8.6x**, 220 raw inferences a second. Session only: letterboxing, NMS and mask decoding are still Python, so end-to-end `detect()` would be nearer 10-12 ms. Not adopted — `onnxruntime-directml` *replaces* `onnxruntime`, which is a deployment decision. |
 | 2026-09-06 16:56 | `tools/camera_check.py --seconds 25 --map` on `device:0` — **the rebuilt pipeline, end to end** | 356 frames in 25.3 s = **14.1 fps** with `yolov8n-seg` on the CPU. Detection 64.5 ms/frame; the three new perception stages cost **3.5 ms together** (quality 0.6, camera motion 2.9, appearance ~0). 0 unusable frames, 0 stale, the camera correctly reported still on 99% of frames. A ground map built from the same run: 95 m² usable of 160 m² seen, 0.05 m per source pixel — and, pointed at a room rather than a yard, it correctly marked 41% unusable, because a wall projected onto the ground plane is a smear and the confidence layer says so. |

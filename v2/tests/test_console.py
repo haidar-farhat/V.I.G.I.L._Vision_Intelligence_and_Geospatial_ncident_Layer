@@ -952,3 +952,77 @@ def test_the_plan_draws_the_ground_the_cameras_built(qt_app):
     assert PlanView._render_ground(nothing) is None
     plan.set_ground(None)
     plan.grab()
+
+
+def test_measuring_a_pose_by_clicking_the_picture_and_the_plan(console, qt_app, monkeypatch):
+    """The dialog's whole job: pairs of clicks become a measured covariance,
+    and nothing is saved until that covariance beats the assumption."""
+    from PySide6.QtGui import QPixmap
+
+    from vigil.domain.geo import project_to_ground
+    from vigil.interfaces.console.calibrate import CalibrateDialog
+
+    truth = CameraPose(LatLon(33.8938, 35.5018), 4.0, 37.0, -22.0, 3.0, 62.0, 36.0, 60.0)
+    console.configure_button.setChecked(True)
+    # Placed as an operator would: a few degrees and half a metre out.
+    console.commands.add_camera("gate", "clip.mp4",
+                                pose=CameraPose(LatLon(33.8938, 35.5018), 4.5, 34.0, -25.0, 0.0, 62.0, 36.0, 60.0))
+    console.refresh_site()
+    camera = next(c for c in console.commands.cameras() if c.id == "gate")
+
+    dialog = CalibrateDialog(camera, console.commands, QPixmap(640, 360))
+    dialog.resize(900, 600)
+    dialog.show()
+    qt_app.processEvents()
+    assert not dialog.save.isEnabled(), "nothing is saveable before there is a fit"
+
+    for u in (0.12, 0.35, 0.5, 0.68, 0.9):
+        for v in (0.6, 0.75, 0.95):
+            ground = project_to_ground(truth, u, v, enforce_range=False)
+            if ground is None:
+                continue
+            # Exactly what a click produces: a frame point, then a map point.
+            dialog._image_clicked(dialog.video.frame_point(*_in_frame(dialog.video, u, v)))
+            dialog._ground_clicked(ground.position)
+
+    assert len(dialog._pairs) >= 12
+    assert dialog._result is not None, dialog.report.text()
+    assert dialog.save.isEnabled(), dialog.report.text()
+    assert abs(dialog._result.pose.heading - truth.heading) < 0.01
+    assert "heading" in dialog.report.text()
+
+    points, solve_position = dialog.value()
+    assert not solve_position
+    dialog.deleteLater()
+
+    outcome = console.commands.calibrate_camera("gate", points)
+    assert outcome, outcome.message
+    after = next(c for c in console.commands.cameras() if c.id == "gate")
+    assert after.calibrated and after.pose.uncertainty.heading_deg < 0.2
+    assert any(r["action"] == "camera.calibrated" for r in console.commands.audit_rows())
+
+
+def test_a_click_beside_the_letterboxed_picture_is_not_a_point_in_it(console, qt_app):
+    """The widget is wider than the image it draws. A click on the bar down the
+    side is not a point in the picture, and reading it as one would put a
+    correspondence at a place the camera never saw."""
+    from PySide6.QtGui import QPixmap
+
+    from vigil.interfaces.console.video import VideoView
+
+    view = VideoView("gate")
+    view.resize(400, 200)          # 2:1, showing a 1:1 image -> bars left and right
+    view.show_still(QPixmap(100, 100))
+    qt_app.processEvents()
+    assert view.frame_point(200, 100) is not None, "the middle is in the picture"
+    assert view.frame_point(5, 100) is None, "the left bar is not"
+    assert view.frame_point(395, 100) is None, "nor the right"
+    inside = view.frame_point(200, 100)
+    assert abs(inside.x - 0.5) < 0.02 and abs(inside.y - 0.5) < 0.02
+    view.deleteLater()
+
+
+def _in_frame(view, u: float, v: float):
+    """Widget pixels for a point at frame fraction (u, v)."""
+    rect = view._frame_rect()
+    return rect.x() + u * rect.width(), rect.y() + v * rect.height()

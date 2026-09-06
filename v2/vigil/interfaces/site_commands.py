@@ -23,7 +23,7 @@ from ..service.auth import AuthError
 from ..service.evidence import export_incident, verify_package
 from ..service.maintenance import StoreError, backup, restore_backup, verify_backup
 from ..service.runtime import RetentionPolicy, Runtime, apply_retention
-from ..service.site import SiteError
+from ..service.site import KEEP, SiteError
 from ..service.supervise import clear_stop, install_service, request_stop, service_definition, stop_file, supervise
 from ..version import build_info, describe
 
@@ -44,6 +44,38 @@ def _pose(text: str) -> CameraPose:
                       parts[5] if len(parts) > 5 else 62.0, parts[6] if len(parts) > 6 else 36.0, parts[7] if len(parts) > 7 else 60.0)
     pose.validate()
     return pose
+
+def _correspondences(text: str):
+    """`u,v,lat,lon[,label]; …` — a point in the picture and where it is.
+
+    `u` and `v` are fractions of the frame rather than pixels, because that is
+    what a detection uses and what the projection is written in, so the same
+    numbers mean the same thing at any resolution. Refused outside `[0, 1]`
+    rather than clamped: a value of 540 is somebody typing pixels, and
+    silently reading it as a fraction would produce a confident wrong pose.
+    """
+    from ..service.calibration import Correspondence
+    from ..domain.geo import Vec2
+
+    out = []
+    for n, chunk in enumerate((c.strip() for c in text.split(";")), start=1):
+        if not chunk:
+            continue
+        parts = [p.strip() for p in chunk.split(",")]
+        if len(parts) < 4:
+            raise ValueError(f"point {n} is '{chunk}'; each is u,v,lat,lon[,label]")
+        try:
+            u, v, lat, lon = (float(p) for p in parts[:4])
+        except ValueError:
+            raise ValueError(f"point {n} is '{chunk}'; u, v, lat and lon must all be numbers") from None
+        if not (0.0 <= u <= 1.0 and 0.0 <= v <= 1.0):
+            raise ValueError(
+                f"point {n} has u,v = {u},{v}, which is off the frame. These are fractions of the "
+                f"picture, not pixels: the centre is 0.5,0.5 and the bottom-left corner is 0,1"
+            )
+        out.append(Correspondence(Vec2(u, v), LatLon(lat, lon), ",".join(parts[4:]) or f"point {n}"))
+    return out
+
 
 def _adhoc_id(source: str, existing) -> str:
     """A readable id for a source named on the command line, unique in this site."""
@@ -115,10 +147,39 @@ def _cameras(ctx: _Context) -> int:
             if not cameras:
                 print("no cameras")
             for c in cameras:
-                print(f"{c.id:<16} {redacted(c.source):<40} {'placed' if c.placed else 'unplaced':<9} {'record' if c.record else ''}")
+                # A measured heading is the number that decides how good this
+                # camera's positions are, so it is on the line rather than
+                # behind another command.
+                how = "unplaced"
+                if c.placed:
+                    how = (f"+/-{c.pose.uncertainty.heading_deg:.2f}deg" if c.calibrated
+                           else "placed")
+                print(f"{c.id:<16} {redacted(c.source):<40} {how:<12} {'record' if c.record else ''}")
         elif args.cameras_command == "place":
             camera = site.place_camera(args.id, _pose(args.place), by=by)
             print(f"placed {camera.id} at {camera.pose.position.lat:.6f},{camera.pose.position.lon:.6f}")
+        elif args.cameras_command == "calibrate":
+            points = _correspondences(args.points)
+            if args.dry_run:
+                from ..service.calibration import CalibrationError, calibrate_pose
+
+                camera = site.camera(args.id, by)
+                if camera.pose is None:
+                    print(f"error: {args.id} has no placement to refine", file=sys.stderr)
+                    return 1
+                try:
+                    result = calibrate_pose(camera.pose, points, solve_position=args.solve_position)
+                except CalibrationError as error:
+                    print(f"error: {error}", file=sys.stderr)
+                    return 1
+                print(result.describe())
+                print("not saved (--dry-run)"
+                      if result.better_than(camera.pose.uncertainty)
+                      else "not saved: this is worse than what the camera already assumes")
+                return 0
+            camera, result = site.calibrate_camera(args.id, points, solve_position=args.solve_position, by=by)
+            print(f"measured {camera.id} from {len(points)} points")
+            print(result.describe())
         elif args.cameras_command == "record":
             camera = site.set_recording(args.id, args.state == "on", by=by)
             print(f"{camera.id} recording {'on' if camera.record else 'off'}")
@@ -187,15 +248,18 @@ def _site(ctx: _Context) -> int:
 
         try:
             every = getattr(ctx.args, "detect_every", None)
+            tiling = getattr(ctx.args, "tile", None)
+            tile = {"on": True, "off": False, "auto": None}.get(tiling, KEEP)
             if ctx.args.clear:
-                chosen = ctx.site.set_detection([], None, by=ctx.principal, detect_every=1)
-            elif ctx.args.watch is not None or ctx.args.confidence is not None or every is not None:
+                chosen = ctx.site.set_detection([], None, by=ctx.principal, detect_every=1, tile=None)
+            elif (ctx.args.watch is not None or ctx.args.confidence is not None
+                  or every is not None or tiling is not None):
                 current = ctx.site.detection()
                 labels = (current.labels if ctx.args.watch is None
                           else [l for l in ctx.args.watch.split(",") if l.strip()])
                 confidence = current.confidence if ctx.args.confidence is None else ctx.args.confidence
                 chosen = ctx.site.set_detection(labels, confidence, by=ctx.principal,
-                                                detect_every=every)
+                                                detect_every=every, tile=tile)
             else:
                 chosen = ctx.site.detection()
         except (DetectionError, AuthError) as error:

@@ -121,6 +121,11 @@ class Commands:
         map has to be re-checkable against this map, and a file that has been
         edited or half-written must not reach a screen.
         """
+        live = self._runtime.ground()
+        if live is not None:
+            # Fresher than anything on disk by definition: it is being built
+            # from the frames this console is drawing.
+            return live
         if self._map_dir is None:
             return None
         try:
@@ -129,6 +134,20 @@ class Commands:
             return load_map(self._map_dir)
         except Exception:  # noqa: BLE001 - a map that will not load must not stop the console
             return None
+
+    def map_state(self) -> str:
+        """A sentence about the map being built, for the status bar."""
+        return self._runtime.map_state()
+
+    def ground_plane(self):
+        """The ground the cameras have solved between them, or `None` while
+        every projection is still assuming a level yard."""
+        return self._runtime.ground_plane()
+
+    def pairings(self):
+        """What two cameras most recently agreed on. Empty on a site where
+        nothing overlaps, which is most single-camera sites."""
+        return self._runtime.pairings()
 
     def incidents(self):
         """What the operator asked to see, filtered in the database.
@@ -175,6 +194,34 @@ class Commands:
     def place_camera(self, camera_id: str, pose: CameraPose) -> Outcome:
         outcome = self._guard(SITE_CONFIGURE, self._site.place_camera, camera_id, pose, by=self._principal)
         return Outcome(True, f"Placed {camera_id}.", outcome.value) if outcome else outcome
+
+    def calibrate_camera(self, camera_id: str, points, *, solve_position: bool = False) -> Outcome:
+        """Measure a camera's pose from marked points. `value` is the fit."""
+        outcome = self._guard(SITE_CONFIGURE, self._site.calibrate_camera, camera_id, points,
+                              solve_position=solve_position, by=self._principal)
+        if not outcome:
+            return outcome
+        _camera, result = outcome.value
+        return Outcome(True, f"Measured {camera_id}: heading +/- "
+                             f"{result.uncertainty.heading_deg:.2f}°.", result)
+
+    def try_calibration(self, camera_id: str, points, *, solve_position: bool = False) -> Outcome:
+        """The same fit without saving it, so the dialog can show what the
+        points so far are worth while they are still being placed.
+
+        Separate from `calibrate_camera` rather than a flag on it, because a
+        method that sometimes writes and sometimes does not is one typo away
+        from writing when it should not.
+        """
+        from ...service.calibration import CalibrationError, calibrate_pose
+
+        camera = next((c for c in self.cameras() if c.id == camera_id), None)
+        if camera is None or camera.pose is None:
+            return Outcome(False, "This camera has no placement to refine yet.")
+        try:
+            return Outcome(True, "", calibrate_pose(camera.pose, points, solve_position=solve_position))
+        except CalibrationError as error:
+            return Outcome(False, str(error))
 
     def set_recording(self, camera_id: str, on: bool) -> Outcome:
         outcome = self._guard(SITE_CONFIGURE, self._site.set_recording, camera_id, on, by=self._principal)

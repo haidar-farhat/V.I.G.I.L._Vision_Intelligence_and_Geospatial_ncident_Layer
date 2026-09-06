@@ -22,11 +22,16 @@ from typing import Iterator, Sequence
 from ..adapters.recorder import Segment
 from ..domain.detection import DetectorInfo
 from ..domain.events import Event, EventType, Evidence, Severity
-from ..domain.geo import CameraPose, LatLon
+from ..domain.geo import CameraPose, Distortion, LatLon, PoseUncertainty
 from ..domain.incidents import Association, Incident, Review, ReviewState, Risk, RiskFactor
 from ..domain.zones import Membership, Schedule, Zone, ZoneKind
 from ..logs import get as _get_logger
+from .rows import _camera_dict, _evidence_dict, _event_of, _incident_of, _review_of, _zone_of
 from .schema import MIGRATIONS, SCHEMA_VERSION, Migration
+
+#: "Not given", so that clearing a value and leaving it alone are different
+#: requests. The same sentinel `service.site` uses, for the same reason.
+KEEP = object()
 
 _log = _get_logger(__name__)
 
@@ -187,24 +192,80 @@ class Store:
     # -------------------------------------------------------------- cameras
 
     def save_camera(self, camera_id: str, name: str, source: str, *, credentials_ref: str | None = None,
-                    pose: CameraPose | None = None, record: bool = False) -> None:
+                    pose: CameraPose | None = None, record: bool = False,
+                    calibration: tuple[int, float, int] | None | object = KEEP,
+                    ground: tuple[int, int] | None | object = KEEP) -> None:
+        """Save a camera, and the lens and pose uncertainty that came with it.
+
+        A sigma equal to the stated assumption is written as NULL, per
+        parameter, so "nobody measured this" survives a round trip instead of
+        arriving back as a measurement that happens to agree with the default.
+        Per parameter because a fit that pinned the heading down and left the
+        roll alone is worth keeping as exactly that.
+
+        `calibration` is `(when, rms, points)` — provenance for those sigmas.
+        It defaults to `KEEP` rather than `None` because this method is how
+        *every* edit to a camera is written: `set_recording` re-saves the pose
+        it just read, and if omitting the provenance meant erasing it, turning
+        recording on would silently throw away a calibration. Pass `None` to
+        clear it deliberately.
+        """
         now = _now()
         p = pose
+        lens = p.lens if p else None
+        assumed = PoseUncertainty()
+        u = p.uncertainty if p else None
+
+        def sigma(name: str) -> float | None:
+            if u is None:
+                return None
+            value = getattr(u, name)
+            return None if value == getattr(assumed, name) else value
+
+        when, rms, points = (None, None, None) if calibration in (KEEP, None) else calibration
+        solved, observations = (None, None) if ground in (KEEP, None) else ground
         with self.transaction() as c:
+            was = None
+            if calibration is KEEP or ground is KEEP:
+                was = c.execute("SELECT calibrated_at, calibration_rms, calibration_points, "
+                                "ground_solved_at, ground_observations FROM cameras WHERE id = ?",
+                                (camera_id,)).fetchone()
+            if calibration is KEEP and was is not None:
+                when, rms, points = was["calibrated_at"], was["calibration_rms"], was["calibration_points"]
+            if ground is KEEP and was is not None:
+                solved, observations = was["ground_solved_at"], was["ground_observations"]
             c.execute(
                 """INSERT INTO cameras (id, name, source, credentials_ref, lat, lon, mount_height, heading, pitch, roll,
-                   horizontal_fov, vertical_fov, range_meters, record, created_at, updated_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   horizontal_fov, vertical_fov, range_meters, record, created_at, updated_at,
+                   k1, k2, p1, p2, k3, sigma_heading, sigma_pitch, sigma_roll, sigma_height,
+                   calibrated_at, calibration_rms, calibration_points,
+                   ground_tilt_east, ground_tilt_north, ground_solved_at, ground_observations)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(id) DO UPDATE SET name=excluded.name, source=excluded.source,
                    credentials_ref=excluded.credentials_ref, lat=excluded.lat, lon=excluded.lon,
                    mount_height=excluded.mount_height, heading=excluded.heading, pitch=excluded.pitch, roll=excluded.roll,
                    horizontal_fov=excluded.horizontal_fov, vertical_fov=excluded.vertical_fov,
-                   range_meters=excluded.range_meters, record=excluded.record, updated_at=excluded.updated_at""",
+                   range_meters=excluded.range_meters, record=excluded.record, updated_at=excluded.updated_at,
+                   k1=excluded.k1, k2=excluded.k2, p1=excluded.p1, p2=excluded.p2, k3=excluded.k3,
+                   sigma_heading=excluded.sigma_heading, sigma_pitch=excluded.sigma_pitch,
+                   sigma_roll=excluded.sigma_roll, sigma_height=excluded.sigma_height,
+                   calibrated_at=excluded.calibrated_at, calibration_rms=excluded.calibration_rms,
+                   calibration_points=excluded.calibration_points,
+                   ground_tilt_east=excluded.ground_tilt_east,
+                   ground_tilt_north=excluded.ground_tilt_north,
+                   ground_solved_at=excluded.ground_solved_at,
+                   ground_observations=excluded.ground_observations""",
                 (camera_id, name, source, credentials_ref,
                  p.position.lat if p else None, p.position.lon if p else None, p.mount_height if p else None,
                  p.heading if p else None, p.pitch if p else None, p.roll if p else None,
                  p.horizontal_fov if p else None, p.vertical_fov if p else None, p.range_meters if p else None,
-                 1 if record else 0, now, now),
+                 1 if record else 0, now, now,
+                 lens.k1 if lens else 0.0, lens.k2 if lens else 0.0, lens.p1 if lens else 0.0,
+                 lens.p2 if lens else 0.0, lens.k3 if lens else 0.0,
+                 sigma("heading_deg"), sigma("pitch_deg"), sigma("roll_deg"), sigma("mount_height_m"),
+                 when, rms, points,
+                 p.ground_tilt_east if p else 0.0, p.ground_tilt_north if p else 0.0,
+                 solved, observations),
             )
 
     def camera(self, camera_id: str) -> dict | None:
@@ -483,16 +544,114 @@ class Store:
                       (json.dumps(sorted({str(l).strip().lower() for l in labels if str(l).strip()})), _now()))
 
     def set_detection(self, labels: Sequence[str], confidence: float | None,
-                      detect_every: int = 1) -> None:
-        """What to watch for, how sure to be, and how often to look."""
+                      detect_every: int = 1, tile: bool | None = None) -> None:
+        """What to watch for, how sure to be, how often to look, and whether to
+        look closely at the far ground as well as at the whole frame."""
         with self.transaction() as c:
-            c.execute("INSERT INTO site (id, name, timezone, watch_labels, min_confidence, detect_every, updated_at) "
-                      "VALUES ('site', 'Unnamed site', 'UTC', ?, ?, ?, ?) "
+            c.execute("INSERT INTO site (id, name, timezone, watch_labels, min_confidence, detect_every, "
+                      "tile_far, updated_at) VALUES ('site', 'Unnamed site', 'UTC', ?, ?, ?, ?, ?) "
                       "ON CONFLICT(id) DO UPDATE SET watch_labels=excluded.watch_labels, "
                       "min_confidence=excluded.min_confidence, detect_every=excluded.detect_every, "
-                      "updated_at=excluded.updated_at",
+                      "tile_far=excluded.tile_far, updated_at=excluded.updated_at",
                       (json.dumps(sorted({str(l).strip().lower() for l in labels if str(l).strip()})),
-                       None if confidence is None else float(confidence), int(detect_every), _now()))
+                       None if confidence is None else float(confidence), int(detect_every),
+                       None if tile is None else int(bool(tile)), _now()))
+
+    # ------------------------------------------------------------- identity
+
+    def set_identity(self, enabled: bool, retention_days: int | None) -> None:
+        """The identity switch and the biometric retention limit.
+
+        One method for both, because they are one decision. Turning face and
+        plate recognition on without saying how long the data lives is the
+        state `vigil doctor` fails on, and making them separate calls would
+        make that state reachable one statement at a time.
+        """
+        with self.transaction() as c:
+            c.execute("INSERT INTO site (id, name, timezone, identity_enabled, "
+                      "biometric_retention_days, updated_at) VALUES ('site', 'Unnamed site', 'UTC', ?, ?, ?) "
+                      "ON CONFLICT(id) DO UPDATE SET identity_enabled=excluded.identity_enabled, "
+                      "biometric_retention_days=excluded.biometric_retention_days, "
+                      "updated_at=excluded.updated_at",
+                      (1 if enabled else 0,
+                       None if retention_days is None else int(retention_days), _now()))
+
+    def save_subject(self, subject_id: str, label: str, embedding: Sequence[float],
+                     model_sha256: str, *, enrolled_by: str, note: str | None = None) -> None:
+        now = _now()
+        with self.transaction() as c:
+            c.execute("INSERT INTO subjects (id, label, note, embedding, model_sha256, enrolled_by, "
+                      "created_at, updated_at) VALUES (?,?,?,?,?,?,?,?) "
+                      "ON CONFLICT(id) DO UPDATE SET label=excluded.label, note=excluded.note, "
+                      "embedding=excluded.embedding, model_sha256=excluded.model_sha256, "
+                      "updated_at=excluded.updated_at",
+                      (subject_id, label, note, json.dumps([float(v) for v in embedding]),
+                       model_sha256, enrolled_by, now, now))
+
+    def subjects(self) -> list[sqlite3.Row]:
+        self._check_thread()
+        return self._connection.execute("SELECT * FROM subjects ORDER BY label").fetchall()
+
+    def delete_subject(self, subject_id: str) -> int:
+        """Remove a subject and, by cascade, every observation of them.
+
+        The cascade is the point and it is in the schema rather than here: a
+        person who asks to be removed from a biometric register is not served
+        by having their row deleted and ten thousand observations of them left
+        pointing at nothing.
+        """
+        with self.transaction() as c:
+            return c.execute("DELETE FROM subjects WHERE id = ?", (subject_id,)).rowcount
+
+    def save_face_observation(self, camera_id: str, track_id: int | None, at: int, *,
+                              subject_id: str | None, distance: float | None,
+                              margin: float | None, quality: float, model_sha256: str) -> None:
+        with self.transaction() as c:
+            c.execute("INSERT INTO face_observations (camera_id, track_id, at, subject_id, distance, "
+                      "margin, quality, model_sha256) VALUES (?,?,?,?,?,?,?,?)",
+                      (camera_id, track_id, at, subject_id, distance, margin, float(quality),
+                       model_sha256))
+
+    def save_plate_observation(self, camera_id: str, track_id: int | None, at: int, *,
+                               text: str, characters: Sequence[float], confidence: float,
+                               model_sha256: str) -> None:
+        with self.transaction() as c:
+            c.execute("INSERT INTO plate_observations (camera_id, track_id, at, text, characters, "
+                      "confidence, model_sha256) VALUES (?,?,?,?,?,?,?)",
+                      (camera_id, track_id, at, text,
+                       json.dumps([round(float(v), 4) for v in characters]),
+                       float(confidence), model_sha256))
+
+    def face_observations(self, *, limit: int = 200) -> list[sqlite3.Row]:
+        self._check_thread()
+        return self._connection.execute(
+            "SELECT * FROM face_observations ORDER BY at DESC LIMIT ?", (limit,)).fetchall()
+
+    def plate_observations(self, *, limit: int = 200) -> list[sqlite3.Row]:
+        self._check_thread()
+        return self._connection.execute(
+            "SELECT * FROM plate_observations ORDER BY at DESC LIMIT ?", (limit,)).fetchall()
+
+    def biometric_counts(self) -> dict[str, int]:
+        self._check_thread()
+        return {
+            "subjects": self._connection.execute("SELECT COUNT(*) FROM subjects").fetchone()[0],
+            "faces": self._connection.execute("SELECT COUNT(*) FROM face_observations").fetchone()[0],
+            "plates": self._connection.execute("SELECT COUNT(*) FROM plate_observations").fetchone()[0],
+        }
+
+    def sweep_biometrics(self, older_than_millis: int) -> dict[str, int]:
+        """Delete face and plate observations older than a cut-off.
+
+        Observations only. An enrolled subject is not swept: somebody put them
+        there deliberately and removing them silently on a timer would be a
+        different feature, and a surprising one. `delete_subject` is how a
+        subject goes.
+        """
+        with self.transaction() as c:
+            faces = c.execute("DELETE FROM face_observations WHERE at < ?", (older_than_millis,)).rowcount
+            plates = c.execute("DELETE FROM plate_observations WHERE at < ?", (older_than_millis,)).rowcount
+        return {"faces": max(0, faces), "plates": max(0, plates)}
 
     def save_site(self, name: str, timezone_name: str) -> None:
         with self.transaction() as c:
@@ -565,59 +724,3 @@ def restore_backup(backup: str | Path, database: str | Path) -> Path:
     return database
 
 
-# ------------------------------------------------------------- row mapping
-
-
-def _camera_dict(row: sqlite3.Row) -> dict:
-    d = dict(row)
-    pose = None
-    if d["lat"] is not None:
-        pose = CameraPose(LatLon(d["lat"], d["lon"]), d["mount_height"], d["heading"], d["pitch"], d["roll"] or 0.0,
-                          d["horizontal_fov"], d["vertical_fov"], d["range_meters"])
-    return {"id": d["id"], "name": d["name"], "source": d["source"], "credentials_ref": d["credentials_ref"],
-            "pose": pose, "record": bool(d["record"]), "updated_at": d["updated_at"]}
-
-
-def _zone_of(row: sqlite3.Row) -> Zone:
-    schedule = Schedule(row["closed_from"], row["closed_until"]) if row["closed_from"] is not None else None
-    return Zone(row["id"], row["name"], ZoneKind(row["kind"]), tuple(LatLon(p[0], p[1]) for p in json.loads(row["ring"])),
-                frozenset(json.loads(row["watch"])), row["enter_after_millis"], row["exit_after_millis"],
-                Membership(row["min_membership"]), schedule)
-
-
-def _evidence_dict(e: Evidence) -> dict:
-    return {"camera_id": e.camera_id, "track_id": e.track_id, "frame_index": e.frame_index,
-            "detector": asdict(e.detector), "class_label": e.class_label, "latitude": e.latitude, "longitude": e.longitude,
-            "position_uncertainty_meters": e.position_uncertainty_meters, "observations": e.observations,
-            "conditions": list(e.conditions)}
-
-
-def _event_of(row: sqlite3.Row) -> Event:
-    raw = json.loads(row["evidence"])
-    det = raw["detector"]
-    det["class_names"] = {int(k): v for k, v in det.get("class_names", {}).items()}
-    det["input_size"] = tuple(det["input_size"]) if det.get("input_size") else None
-    evidence = Evidence(raw["camera_id"], raw["track_id"], raw["frame_index"], DetectorInfo(**det), raw["class_label"],
-                        raw["latitude"], raw["longitude"], raw["position_uncertainty_meters"], raw["observations"],
-                        tuple(raw["conditions"]))
-    return Event(row["id"], EventType(row["type"]), Severity(row["severity"]), row["summary"], row["occurred_at"],
-                 datetime.fromtimestamp(row["occurred_at"] / 1000, tz=timezone.utc), row["node_id"], row["rule_id"],
-                 row["confidence"], evidence, row["zone_id"], row["zone_name"])
-
-
-def _review_of(row: sqlite3.Row) -> Review:
-    keys = row.keys()
-    if "state" not in keys:
-        return Review()
-    return Review(ReviewState(row["state"]), row["reviewed_by"], row["reviewed_at"], row["note"])
-
-
-def _incident_of(row: sqlite3.Row, events: list[Event]) -> Incident:
-    risk_raw = json.loads(row["risk"])
-    risk = Risk(risk_raw["score"], tuple(RiskFactor(**f) for f in risk_raw["factors"]))
-    associations = tuple(Association(tuple(a["a"]), tuple(a["b"]), a["score"], a["separation_meters"], a["allowance_meters"],
-                                     a["time_gap_millis"], tuple(a["reasons"])) for a in json.loads(row["associations"]))
-    return Incident(row["id"], Severity(row["severity"]), row["summary"], row["opened_at"], row["closed_at"],
-                    datetime.fromtimestamp(row["opened_at"] / 1000, tz=timezone.utc), row["distinct_objects"],
-                    tuple(json.loads(row["cameras"])), tuple(json.loads(row["zones"])), tuple(events), associations, risk,
-                    _review_of(row))

@@ -43,6 +43,7 @@ here rather than being a blanket "try native, except: pass".
 
 from __future__ import annotations
 
+import math
 import ctypes
 import os
 import sys
@@ -60,16 +61,23 @@ _log = _get_logger(__name__)
 #: is refused rather than called: a signature that moved underneath produces
 #: plausible, wrong geometry rather than a crash.
 #:
-#: **2** since the pose grew its lens. A core built for ABI 1 would read
+#: **2** was the pose growing its lens. A core built for ABI 1 would read
 #: fourteen values where nine were sent, and the five it invented would be
 #: whatever was next in memory — a lens made of stack garbage applied to every
-#: ray. Refusing the load is the only safe answer.
-ABI_VERSION = 2
+#: ray. **3** added triangulation and the ground-plane fit; against an older
+#: core those symbols are simply absent, and one refusal at load beats an
+#: `AttributeError` from inside a frame loop. **4** grew the pose again by the
+#: two ground tilts, which is the dangerous kind of change: fourteen values
+#: sent where sixteen are read gives the core a ground plane tilted by
+#: whatever was next in memory.
+ABI_VERSION = 4
 
-#: Array lengths the ABI promises, `[pose, sigma, projection, grid, kalman]`.
-EXPECTED_LAYOUT = (14, 5, 6, 5, 72)
+#: Array lengths the ABI promises,
+#: `[pose, sigma, projection, grid, kalman, triangulation, plane]`.
+EXPECTED_LAYOUT = (16, 5, 6, 5, 72, 8, 8)
 
-POSE_VALUES, SIGMA_VALUES, PROJECTION_VALUES, GRID_VALUES, KALMAN_VALUES = EXPECTED_LAYOUT
+(POSE_VALUES, SIGMA_VALUES, PROJECTION_VALUES, GRID_VALUES, KALMAN_VALUES,
+ TRIANGULATION_VALUES, PLANE_VALUES) = EXPECTED_LAYOUT
 
 #: Override for a deployment that keeps the library somewhere of its own.
 LIBRARY_VARIABLE = "VIGIL_CORE_PATH"
@@ -163,6 +171,11 @@ def _declare(library: ctypes.CDLL) -> None:
 
     library.vigil_assign.restype = ctypes.c_int32
     library.vigil_assign.argtypes = [p64, u32, u32, pi64]
+
+    library.vigil_triangulate.restype = ctypes.c_int32
+    library.vigil_triangulate.argtypes = [p64, p64, p64, p64, f64, f64, p64]
+    library.vigil_fit_plane.restype = ctypes.c_int32
+    library.vigil_fit_plane.argtypes = [p64, u32, f64, u32, ctypes.c_uint64, p64]
 
     library.vigil_kalman_initiate.restype = ctypes.c_int32
     library.vigil_kalman_initiate.argtypes = [p64, f64, f64, f64, f64]
@@ -276,11 +289,12 @@ def _ptr(array: np.ndarray, kind=ctypes.c_double):
 
 
 def pose_values(pose) -> np.ndarray:
-    """A `CameraPose` as the fourteen numbers the ABI takes.
+    """A `CameraPose` as the sixteen numbers the ABI takes.
 
     The five lens coefficients are all-zero for an uncalibrated camera, which
-    is every camera until `vigil cameras calibrate` has been run on it — and
-    zero is exactly the identity on both sides of the boundary.
+    is every camera until `vigil cameras calibrate` has been run on it, and
+    the two ground tilts are zero until the site has solved a plane — and zero
+    is exactly the identity for both, on both sides of the boundary.
     """
     lens = getattr(pose, "lens", None)
     return _f64([
@@ -289,6 +303,7 @@ def pose_values(pose) -> np.ndarray:
         0.0 if lens is None else lens.k1, 0.0 if lens is None else lens.k2,
         0.0 if lens is None else lens.p1, 0.0 if lens is None else lens.p2,
         0.0 if lens is None else lens.k3,
+        getattr(pose, "ground_tilt_east", 0.0), getattr(pose, "ground_tilt_north", 0.0),
     ])
 
 
@@ -590,3 +605,174 @@ class MedianAccumulator:
             self.close()
         except Exception:  # noqa: BLE001 - a finaliser must not raise
             pass
+
+
+# ------------------------------------------------------------- triangulation
+
+#: Refusal codes the core returns, mirrored so callers can name them. The
+#: numbers are the ABI's; `domain.triangulation` turns them into an enum.
+PARALLEL, TOO_LITTLE_PARALLAX, BEHIND, TOO_FAR_APART = -2, -3, -4, -5
+
+
+def triangulate(a_origin, a_direction, b_origin, b_direction,
+                angular_sigma_deg: float, min_parallax_deg: float) -> tuple[int, np.ndarray]:
+    """Two ENU rays intersected. Returns `(code, values)`.
+
+    `code` is 0 or one of the refusals above; `values` is
+    `[x, y, z, parallax_deg, gap_m, range_a, range_b, sigma_m]` and is only
+    meaningful when the code is 0.
+
+    A code rather than an exception because a refused pair is the *expected*
+    outcome for most pairs a correlator offers — two cameras looking at
+    different people, or at the same one from nearly the same angle — and
+    raising on the common case would make the caller's normal path a
+    try/except.
+    """
+    a_o, a_d = _f64(a_origin), _f64(a_direction)
+    b_o, b_d = _f64(b_origin), _f64(b_direction)
+    for name, v in (("a_origin", a_o), ("a_direction", a_d),
+                    ("b_origin", b_o), ("b_direction", b_d)):
+        if v.shape != (3,):
+            raise ValueError(f"{name} is three numbers, east/north/up in metres")
+    out = np.zeros(TRIANGULATION_VALUES, dtype=np.float64)
+    library = load()
+    if library is None:
+        return _triangulate_numpy(a_o, a_d, b_o, b_d, angular_sigma_deg, min_parallax_deg, out)
+    code = library.vigil_triangulate(_ptr(a_o), _ptr(a_d), _ptr(b_o), _ptr(b_d),
+                                     float(angular_sigma_deg), float(min_parallax_deg), _ptr(out))
+    if code == -1:
+        raise NativeError("the core refused the rays: a direction of no length, or a NaN")
+    return int(code), out
+
+
+def _triangulate_numpy(a_o, a_d, b_o, b_d, angular_sigma_deg, min_parallax_deg,
+                       out) -> tuple[int, np.ndarray]:
+    """The same arithmetic without the core. `tests/test_native.py` holds the
+    two to agreement, which is what makes having both safe."""
+    na, nb = np.linalg.norm(a_d), np.linalg.norm(b_d)
+    if not np.isfinite(na) or not np.isfinite(nb) or na < 1e-12 or nb < 1e-12:
+        raise NativeError("a ray with a direction of no length")
+    a_d, b_d = a_d / na, b_d / nb
+    d = float(a_d @ b_d)
+    denominator = 1.0 - d * d
+    if denominator < 1e-12:
+        return PARALLEL, out
+    parallax = math.degrees(math.acos(min(1.0, max(-1.0, d))))
+    if parallax > 90.0:
+        parallax = 180.0 - parallax
+    if parallax < min_parallax_deg:
+        return TOO_LITTLE_PARALLAX, out
+    w = a_o - b_o
+    e, f = float(a_d @ w), float(b_d @ w)
+    s = (d * f - e) / denominator
+    t = (f - d * e) / denominator
+    if s <= 0.0 or t <= 0.0:
+        return BEHIND, out
+    pa, pb = a_o + a_d * s, b_o + b_d * t
+    gap = float(np.linalg.norm(pa - pb))
+    if gap > MAX_GAP_M:
+        return TOO_FAR_APART, out
+    point = 0.5 * (pa + pb)
+    sigma = 0.5 * (s + t) * math.radians(angular_sigma_deg) / max(1e-9, math.sin(math.radians(parallax)))
+    out[:] = (point[0], point[1], point[2], parallax, gap, s, t, sigma)
+    return 0, out
+
+
+#: Mirrors `core/src/triangulate.rs`. Kept here rather than imported from the
+#: domain because the fallback must give the same answer as the core with the
+#: core absent, and the core's copy is the definition.
+MAX_GAP_M = 3.0
+MIN_PARALLAX_DEG = 5.0
+
+
+def fit_plane(points: np.ndarray, threshold_m: float = 0.3, iterations: int = 200,
+              seed: int = 1) -> np.ndarray | None:
+    """RANSAC ground plane through `(n, 3)` ENU points.
+
+    Returns `[nx, ny, nz, offset, inliers, rms, tilt_east, tilt_north]`, or
+    `None` when no plane could be fitted.
+    """
+    cloud = _f64(points)
+    if cloud.ndim != 2 or cloud.shape[1] != 3:
+        raise ValueError("points are (n, 3): east, north, up in metres")
+    if len(cloud) < 3:
+        return None
+    out = np.zeros(PLANE_VALUES, dtype=np.float64)
+    library = load()
+    if library is None:
+        return _fit_plane_numpy(cloud, threshold_m, iterations, seed, out)
+    code = library.vigil_fit_plane(_ptr(cloud), len(cloud), float(threshold_m),
+                                   int(iterations), ctypes.c_uint64(int(seed) & 0xFFFFFFFFFFFFFFFF),
+                                   _ptr(out))
+    if code == -1:
+        raise NativeError("the core refused the point cloud: it holds a NaN")
+    return None if code < 0 else out
+
+
+def _fit_plane_numpy(cloud, threshold_m, iterations, seed, out) -> np.ndarray | None:
+    # The same xorshift as the core, so the same points draw the same triples
+    # and the two implementations agree exactly rather than approximately.
+    state = (int(seed) | 1) & 0xFFFFFFFFFFFFFFFF
+
+    def draw(n: int) -> int:
+        nonlocal state
+        state ^= (state << 13) & 0xFFFFFFFFFFFFFFFF
+        state ^= state >> 7
+        state ^= (state << 17) & 0xFFFFFFFFFFFFFFFF
+        return state % n
+
+    best, best_count = None, -1
+    for _ in range(max(1, iterations)):
+        i, j, k = draw(len(cloud)), draw(len(cloud)), draw(len(cloud))
+        if i == j or j == k or i == k:
+            continue
+        plane = _plane_through(cloud[i], cloud[j], cloud[k])
+        if plane is None:
+            continue
+        count = int(np.count_nonzero(np.abs(cloud @ plane[0] - plane[1]) <= threshold_m))
+        if count > best_count:
+            best, best_count = plane, count
+    if best is None:
+        best = _least_squares_plane(cloud)
+        if best is None:
+            return None
+    inliers = cloud[np.abs(cloud @ best[0] - best[1]) <= threshold_m]
+    if len(inliers) < 3:
+        return None
+    plane = _least_squares_plane(inliers)
+    if plane is None:
+        return None
+    normal, offset = plane
+    heights = inliers @ normal - offset
+    tilt = (0.0, 0.0) if abs(normal[2]) < 1e-9 else (-normal[0] / normal[2], -normal[1] / normal[2])
+    out[:] = (normal[0], normal[1], normal[2], offset, len(inliers),
+              float(np.sqrt(np.mean(heights ** 2))), tilt[0], tilt[1])
+    return out
+
+
+def _plane_through(a, b, c):
+    return _upward(np.cross(b - a, c - a), a)
+
+
+def _least_squares_plane(points):
+    """Least squares over `z = ax + by + c`; level when the points are in a line."""
+    centre = points.mean(axis=0)
+    d = points - centre
+    sxx, sxy, syy = float(d[:, 0] @ d[:, 0]), float(d[:, 0] @ d[:, 1]), float(d[:, 1] @ d[:, 1])
+    sxz, syz = float(d[:, 0] @ d[:, 2]), float(d[:, 1] @ d[:, 2])
+    determinant = sxx * syy - sxy * sxy
+    if abs(determinant) < 1e-12:
+        return _upward(np.array([0.0, 0.0, 1.0]), centre)
+    a = (sxz * syy - syz * sxy) / determinant
+    b = (syz * sxx - sxz * sxy) / determinant
+    return _upward(np.array([-a, -b, 1.0]), centre)
+
+
+def _upward(normal, through):
+    length = float(np.linalg.norm(normal))
+    if not np.isfinite(length) or length < 1e-12:
+        return None
+    unit = normal / length
+    if unit[2] < 0:
+        unit = -unit
+    return unit, float(unit @ through)

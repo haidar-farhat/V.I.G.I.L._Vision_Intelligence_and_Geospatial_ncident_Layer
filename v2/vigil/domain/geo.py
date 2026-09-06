@@ -137,6 +137,17 @@ class CameraPose:
     #: uncalibrated camera assumed rectilinear, which is what every camera was
     #: before `vigil cameras calibrate` existed.
     lens: Distortion = field(default_factory=Distortion)
+    #: Rise per metre east and per metre north of the ground this camera
+    #: projects onto. Zero is the level plane every projection assumed before
+    #: `service.triangulation` could solve one, and reproduces it exactly.
+    #:
+    #: A property of the *ground*, kept on the pose because that is what the
+    #: projection has in its hand. A yard with a 3% fall put every position
+    #: along the line of sight out by 3% of its range — over a metre at 40 m —
+    #: and `PoseUncertainty.terrain_slope` only ever widened the error bar
+    #: around that bias without removing it.
+    ground_tilt_east: float = 0.0
+    ground_tilt_north: float = 0.0
 
     def validate(self) -> None:
         if not self.position.is_valid():
@@ -189,6 +200,9 @@ class _Basis:
     tan_half_v: float
     mount_height: float
     lens: Distortion = Distortion()
+    #: The ground's rise per metre east and north. See `ground_offset`.
+    tilt_east: float = 0.0
+    tilt_north: float = 0.0
 
     def ray(self, u: float, v: float) -> tuple[float, float, float]:
         """The unnormalised world direction through a normalised image point.
@@ -221,11 +235,24 @@ class _Basis:
 
         This is the whole projection: `t = h / -d_up`, and the horizontal part
         of `t*d`. No `tan`, no case analysis, no decoupled axes.
+
+        With a solved ground the plane is `z = -h + a*x + b*y` rather than
+        `z = -h`, so the denominator gains the two tilt terms:
+        `t = h / (a*dx + b*dy - dz)`. At zero tilt that is `h / -dz`
+        identically -- not approximately -- which is why an uncalibrated
+        camera's answers do not move by so much as an ulp.
+
+        The horizon test moves with the plane, and has to: on ground that
+        falls away from the camera, a ray a fraction above level still meets
+        it, and on ground that rises, a ray slightly below level never does.
         """
         dx, dy, dz = self.ray(u, v)
-        if not dz < 0.0 or not math.isfinite(dz):
+        if not math.isfinite(dz):
             return None
-        t = self.mount_height / -dz
+        into_ground = self.tilt_east * dx + self.tilt_north * dy - dz
+        if not into_ground > 0.0 or not math.isfinite(into_ground):
+            return None
+        t = self.mount_height / into_ground
         if not math.isfinite(t) or t <= 0.0:
             return None
         east, north = t * dx, t * dy
@@ -236,7 +263,8 @@ class _Basis:
 
 def _basis(heading: float, pitch: float, roll: float, tan_half_h: float,
            tan_half_v: float, mount_height: float,
-           lens: Distortion = Distortion()) -> _Basis:
+           lens: Distortion = Distortion(),
+           tilt_east: float = 0.0, tilt_north: float = 0.0) -> _Basis:
     psi, theta, phi = math.radians(heading), math.radians(pitch), math.radians(roll)
     sin_psi, cos_psi = math.sin(psi), math.cos(psi)
     sin_th, cos_th = math.sin(theta), math.cos(theta)
@@ -248,7 +276,8 @@ def _basis(heading: float, pitch: float, roll: float, tan_half_h: float,
     up0 = (-sin_th * sin_psi, -sin_th * cos_psi, cos_th)
     right = tuple(right0[i] * cos_ph - up0[i] * sin_ph for i in range(3))
     up = tuple(right0[i] * sin_ph + up0[i] * cos_ph for i in range(3))
-    return _Basis(right, up, forward, tan_half_h, tan_half_v, mount_height, lens)  # type: ignore[arg-type]
+    return _Basis(right, up, forward, tan_half_h, tan_half_v, mount_height, lens,  # type: ignore[arg-type]
+                  tilt_east, tilt_north)
 
 
 def basis_for(pose: CameraPose) -> _Basis:
@@ -258,12 +287,21 @@ def basis_for(pose: CameraPose) -> _Basis:
         pose.heading, pose.pitch, pose.roll,
         math.tan(math.radians(pose.horizontal_fov / 2)),
         math.tan(math.radians(pose.vertical_fov / 2)),
-        pose.mount_height, pose.lens,
+        pose.mount_height, pose.lens, pose.ground_tilt_east, pose.ground_tilt_north,
     )
 
 
 class PositionSource(StrEnum):
+    """How a position was arrived at. Every estimate says which, because the
+    three are worth very different amounts."""
+
+    #: One ray onto an assumed level plane at the camera's mount height.
     GROUND_PROJECTION = "GROUND_PROJECTION"
+    #: Two cameras' rays intersected: no plane assumed, and a height above the
+    #: ground that is measured rather than taken to be zero. See
+    #: `domain.triangulation`.
+    TRIANGULATED = "TRIANGULATED"
+    #: Not a position at all — the camera's own, because the ray gave nothing.
     CAMERA_FALLBACK = "CAMERA_FALLBACK"
 
 
@@ -295,7 +333,15 @@ class PositionEstimate:
 
     @property
     def is_projected(self) -> bool:
-        return self.source is PositionSource.GROUND_PROJECTION
+        """Whether this is a place, rather than the camera saying "somewhere
+        near me".
+
+        Every caller uses it to mean exactly that -- draw it on the plan, test
+        it against a zone, measure a distance from it -- so a triangulated
+        point belongs on the true side. It is the camera fallback that is
+        excluded, and only that.
+        """
+        return self.source is not PositionSource.CAMERA_FALLBACK
 
 
 def separation(a: PositionEstimate, b: PositionEstimate) -> Distance:

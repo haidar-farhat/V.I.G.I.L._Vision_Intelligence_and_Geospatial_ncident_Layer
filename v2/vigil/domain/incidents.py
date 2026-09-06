@@ -91,8 +91,43 @@ def time_and_place_score(proximity: float, recency: float) -> float:
     return round(0.65 * proximity + 0.35 * recency, 4)
 
 
+def _looks_apart(first: Event, second: Event) -> float | None:
+    """Cosine distance between two events' colour descriptors, or `None` when
+    either is missing one.
+
+    Both are already normalised for the camera that produced them — see
+    `domain.appearance.ColourBalance` — so this compares the objects rather
+    than the two cameras' rendering, which is the stronger signal otherwise.
+    """
+    a, b = first.evidence.appearance, second.evidence.appearance
+    if not a or not b or len(a) != len(b):
+        return None
+    import numpy as np
+
+    va, vb = np.asarray(a, dtype=np.float64), np.asarray(b, dtype=np.float64)
+    if not np.any(va) or not np.any(vb):
+        return None
+    return float(1.0 - va @ vb)
+
+
 def associate(events: Sequence[Event], *, window_millis: int = DEFAULT_WINDOW_MILLIS,
-              radius_meters: float = DEFAULT_RADIUS_METERS) -> list[Association]:
+              radius_meters: float = DEFAULT_RADIUS_METERS,
+              appearance_ceiling: float | None = None) -> list[Association]:
+    """Cross-camera links from time, place, and — when it has been shown to
+    work here — how the two looked.
+
+    `appearance_ceiling` comes from `domain.appearance.CrossCameraSeparation`,
+    which measures on this site whether appearance can separate objects
+    between these cameras at all. `None` means it cannot, or has not been
+    measured yet, and then time and place decide alone exactly as before.
+
+    Appearance only ever **rejects**. A pair too far apart in colour is
+    dropped; a pair that looks alike gains nothing but a sentence in its
+    reasons. That asymmetry is deliberate: colour is weak evidence for
+    sameness — two people in dark coats look identical — and strong evidence
+    for difference. Letting it raise a score would let a coincidence of
+    lighting link two people that place had already put three metres apart.
+    """
     out: list[Association] = []
     for i, first in enumerate(events):
         for second in events[i + 1:]:
@@ -111,11 +146,23 @@ def associate(events: Sequence[Event], *, window_millis: int = DEFAULT_WINDOW_MI
                                    second.evidence.position_uncertainty_meters, radius_meters)
             if separation > allowance:
                 continue
-            score = time_and_place_score(1 - separation / allowance, 1 - gap / window_millis)
-            out.append(Association(ka, kb, score, round(separation, 2), round(allowance, 2), gap, (
+            reasons = [
                 f"{separation:.1f} m apart, within {allowance:.1f} m allowed by the two position uncertainties",
                 f"{gap / 1000:.1f} s apart, within {window_millis / 1000:.0f} s",
-            )))
+            ]
+            if appearance_ceiling is not None:
+                looks = _looks_apart(first, second)
+                if looks is not None:
+                    if looks > appearance_ceiling:
+                        continue
+                    reasons.append(
+                        f"they look alike: {looks:.3f} apart against the {appearance_ceiling:.3f} "
+                        f"this site measured for one object across two cameras — a similarity, "
+                        f"not an identity"
+                    )
+            score = time_and_place_score(1 - separation / allowance, 1 - gap / window_millis)
+            out.append(Association(ka, kb, score, round(separation, 2), round(allowance, 2), gap,
+                                   tuple(reasons)))
     return out
 
 
@@ -291,10 +338,16 @@ class Correlator:
     """Batch: an incident is a statement about a span, decided once nothing more is coming."""
 
     def __init__(self, *, window_millis: int = DEFAULT_WINDOW_MILLIS, radius_meters: float = DEFAULT_RADIUS_METERS,
-                 zone_kinds: dict[str, ZoneKind] | None = None):
+                 zone_kinds: dict[str, ZoneKind] | None = None,
+                 appearance_ceiling: float | None = None):
         self._window = window_millis
         self._radius = radius_meters
         self._zone_kinds = zone_kinds or {}
+        #: What this site measured about whether appearance can separate
+        #: objects between its cameras. `None` — the default, and the state
+        #: every site is in until two cameras have overlapped for a while —
+        #: means time and place decide alone.
+        self._appearance_ceiling = appearance_ceiling
         self.stats = CorrelationStats()
 
     def correlate(self, events: Sequence[Event]) -> list[Incident]:
@@ -302,7 +355,8 @@ class Correlator:
             return []
         ordered = sorted(events, key=lambda e: (e.occurred_at_millis, e.id))
         self.stats.events_in += len(ordered)
-        links = associate(ordered, window_millis=self._window, radius_meters=self._radius)
+        links = associate(ordered, window_millis=self._window, radius_meters=self._radius,
+                          appearance_ceiling=self._appearance_ceiling)
         # Same-camera fragments join the same identity as cross-camera pairs,
         # so the distinct count is of objects and not of the ids a flickering
         # detector handed out.

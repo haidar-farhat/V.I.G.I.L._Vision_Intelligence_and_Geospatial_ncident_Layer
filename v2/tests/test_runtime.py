@@ -301,11 +301,17 @@ def test_relations_reach_the_rules_and_the_frame_result(tmp_path, keychain, monk
     source = inspect.getsource(runtime_module.CameraWorker._process)
     assert "relations.update(" in source, "the worker never measures a relation"
     assert "_for(found," in source, "a rule is never given the relations for its track"
-    assert "frame.image if self._keep_images else None, found, measured, motion)" in source, (
-        "the frame result drops them"
-    )
-    signature = inspect.signature(runtime_module.FrameResult.__init__)
-    assert "relations" in signature.parameters
+    # Positional, and named: an argument list is edited far more often than a
+    # field is removed, and pinning the call's exact text made this fail every
+    # time the result grew something new. What matters is that `found` reaches
+    # the result at the position `relations` occupies.
+    call = source[source.index("result = FrameResult("):]
+    call = call[: call.index(")" + chr(10))]
+    fields = [f.strip() for f in call.split("(", 1)[1].split(",")]
+    signature = list(inspect.signature(runtime_module.FrameResult.__init__).parameters)
+    assert "relations" in signature
+    assert fields[signature.index("relations") - 1] == "found", (
+        f"the frame result drops the relations: {call}")
 
 
 def test_the_worker_offers_every_relation_to_the_rules(tmp_path, keychain):

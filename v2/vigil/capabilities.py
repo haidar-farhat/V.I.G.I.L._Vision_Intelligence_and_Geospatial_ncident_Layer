@@ -147,6 +147,86 @@ MANIFEST: tuple[Capability, ...] = (
                ("tests/test_geo.py",),
                "Errors combine in quadrature; `within` and `beyond` are not each other's negation, so a question the "
                "measurement cannot answer is answered neither way. A zone's distance is signed: inside reads negative"),
+    Capability("calibration", "A pose that has been measured, and says what the measurement is worth", State.TESTED,
+               ("vigil.service.calibration.calibrate_pose", "vigil.service.calibration.calibrate_lens",
+                "vigil.service.calibration.Calibration", "vigil.service.calibration.Correspondence",
+                "vigil.service.site.SiteService.calibrate_camera"),
+               ("tests/test_calibration.py", "tests/test_store.py", "tests/test_cli.py", "tests/test_console.py"),
+               "`PoseUncertainty`'s defaults are what a compass and a tape are worth, and they dominated every "
+               "position at range: at 40 m, two degrees of heading is 1.4 m of sideways error before the detector "
+               "has contributed anything. Levenberg-Marquardt over heading, pitch, roll and mount height against "
+               "reprojection error, with the covariance from sigma^2 (J^T J)^-1 -- and the covariance, not the "
+               "refined pose, is the product: a fit from points in a cluster returns a *large* uncertainty, which "
+               "is the correct answer. Measured on synthetic correspondences with 4 px of click noise, the reported "
+               "1 sigma bracketed the true error 62-68% of the time against the 68% a correctly scaled covariance "
+               "gives, and heading came out at +/-0.064 deg against the +/-2 assumed. Two things the intuition got "
+               "wrong and measurement corrected: points down one image column are *not* degenerate (1.6e4), a tight "
+               "cluster is (9.5e9); and position must be solved in metres east/north, because in degrees the "
+               "condition number measures the units and refuses every good fit. Refuses a fit worse than the "
+               "assumption it would replace rather than storing it"),
+    Capability("triangulation", "Two cameras instead of one assumed plane, and the ground solved from what they see",
+               State.TESTED,
+               ("vigil.domain.triangulation.triangulate", "vigil.domain.triangulation.fit_ground",
+                "vigil.domain.triangulation.TriangulatedPoint", "vigil.domain.triangulation.GroundPlane",
+                "vigil.service.triangulation.Geometry", "vigil.service.runtime.Runtime.ground_plane"),
+               ("tests/test_triangulation.py", "tests/test_native.py"),
+               "Every position this product produced came from intersecting one ray with an *assumed* level "
+               "plane at the camera's mount height, and it was wrong in three specific ways: anything not "
+               "standing on the ground was placed long (a person 1.6 m up on a dock, seen at 26 m, by over 2 m), "
+               "a sloped yard biased every position along the line of sight, and nothing could tell a wall from "
+               "a floor. Two rays need none of it. The midpoint of their common perpendicular is the position, "
+               "the gap between them at closest approach *is* the association test -- two rays at one object "
+               "pass within centimetres, two at different people do not come within three metres -- and the "
+               "height above the fitted plane is what says an object is not standing on the ground. RANSAC for "
+               "the plane, because the contacts are contaminated by construction and a least-squares fit tilts "
+               "towards every person on a dock. The minimum parallax is solved per pair from how well the two "
+               "poses are known rather than fixed: 5 degrees for a calibrated pair, 44 for an assumed one at "
+               "80 m, because below that the two-view error is worse than the projection it would replace. The "
+               "solved slope is written back to **every** placed camera, including the lone one that could "
+               "never have measured it -- which is the camera whose positions were worst",
+               ),
+    Capability("cross-camera", "One object followed between two cameras, with the threshold measured on this site",
+               State.TESTED,
+               ("vigil.domain.appearance.ColourBalance", "vigil.domain.appearance.CrossCameraSeparation",
+                "vigil.domain.incidents.associate", "vigil.domain.events.Evidence"),
+               ("tests/test_crosscamera.py", "tests/test_incidents.py"),
+               "ROADMAP section 4, and the part that was missing was never the matcher. Two cameras render the "
+               "same coat differently -- white balance, exposure, a sodium lamp over one of them -- so a cosine "
+               "distance between raw histograms measures *which camera took the picture* at least as strongly as "
+               "what was in it. Measured on synthetic tints: one coat through two cameras came out 0.117 apart "
+               "while two different coats through one camera came out 0.044, so the camera outweighed the object "
+               "by nearly three to one. Each camera's descriptors are now divided by that camera's own running "
+               "mean before they are compared, and what survives is how an object differs from its camera's "
+               "average. The threshold is then measured rather than assumed, and both halves of the evidence are "
+               "free: two tracks in one frame are certainly different objects, and two tracks whose rays converge "
+               "to within three metres are certainly the same one -- geometry decided that pair without "
+               "consulting appearance, which makes it genuine ground truth for appearance. When what the same "
+               "object scores overlaps what different objects score, no threshold does both jobs and the "
+               "correlator is told so: it falls back to time and place alone rather than adding noise. Appearance "
+               "only ever rejects a link, never raises a score, because colour is weak evidence for sameness and "
+               "strong evidence for difference"),
+    Capability("detection-recall", "Finding more, and being able to say what more cost", State.TESTED,
+               ("vigil.adapters.tiling.TiledDetector", "vigil.adapters.tiling.tiles_for",
+                "vigil.adapters.tiling.far_band", "vigil.adapters.detectors._soft_nms"),
+               ("tests/test_tiling.py", "tests/test_detectors.py"),
+               "Four changes, each measured on this machine with the shipped yolov8n-seg on DirectML over "
+               "1080p frames. **The vocabulary split**: the classes the detector runs with and the classes the "
+               "site alerts on were one frozen set of six, so a trailer, a dog or a ladder against a fence was "
+               "invisible to the tracker, the plan and the map. The detector now reports everything its model "
+               "knows and `watch_labels` governs only what reaches a rule. **The floor came down** from 0.50 to "
+               "0.25: measured at 0.00 detections per frame at 0.50 against 1.08 at 0.25 on the same twelve "
+               "frames -- the shipped threshold found nothing at all in an ordinary room -- and it is safe "
+               "because the tracker was rebuilt around cumulative confirmation, so a thing seen once at 0.3 and "
+               "never again is never confirmed. **Soft-NMS** decays an overlapping box instead of deleting it, "
+               "because a queue of people or a row of parked cars at 0.55 overlap is not a duplicate and a "
+               "suppressed detection leaves no trace for anybody to notice. **Tiling** runs the model over "
+               "crops of the far ground at native scale, where a person 40 m away is 24 px after letterboxing "
+               "and below what a nano model can find; the tiles are placed from the pose rather than uniformly, "
+               "because `project_to_ground` says which rows are far. Measured: 1.08 to 1.33 detections per "
+               "frame for 11.0 ms to 55.3 ms, which is exactly the 1+4 inferences it costs. That cost is why "
+               "it is off on CPU and why the honest gain is unproven -- the laptop webcam has no far ground, "
+               "so the far-half recall proxy this was built to measure came out zero on both sides and will "
+               "stay unmeasured until it runs on a camera that can see something distant"),
     Capability("relations", "What tracked things are doing together: inside, carried, with, approaching", State.TESTED,
                ("vigil.domain.relations.RelationTracker", "vigil.domain.relations.Relation",
                 "vigil.domain.relations.occupants_of", "vigil.domain.relations.describe_group"),

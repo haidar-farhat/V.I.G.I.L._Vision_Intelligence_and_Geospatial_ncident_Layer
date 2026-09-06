@@ -41,6 +41,8 @@ class PlanView(QWidget):
         #: a group reads as a group and not as three unrelated dots.
         self._relations: dict[str, tuple] = {}
         self._draft: list[LatLon] = []
+        #: `(LatLon, label)` control points, drawn numbered. See `set_marks`.
+        self._marks: list = []
         #: The site's own ground, when one has been built. See `set_ground`.
         self._ground = None
         self._ground_pixmap = None
@@ -76,6 +78,18 @@ class PlanView(QWidget):
         self._ground = ground
         self._ground_pixmap = None
         self._ground_key = None
+        self.update()
+
+    def set_marks(self, marks: Sequence) -> None:
+        """`(LatLon, label)` points to draw, and to frame the view around.
+
+        The calibration dialog's half of a correspondence. They are points of
+        interest as well as marks, so a control point outside the camera's
+        coverage still pulls the view out to include it rather than being
+        marked somewhere off-screen.
+        """
+        self._marks = list(marks)
+        self._reframe()
         self.update()
 
     def set_zones(self, zones: Sequence) -> None:
@@ -132,6 +146,7 @@ class PlanView(QWidget):
         for zone in self._zones:
             points.extend(zone.ring)
         points.extend(self._draft)
+        points.extend(p for p, _ in self._marks)
         return points
 
     def _reframe(self) -> None:
@@ -201,6 +216,7 @@ class PlanView(QWidget):
         self._draw_cameras(painter)
         self._draw_tracks(painter)
         self._draw_draft(painter)
+        self._draw_marks(painter)
         self._draw_scale(painter)
         painter.end()
 
@@ -420,6 +436,28 @@ class PlanView(QWidget):
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.setPen(theme.ACCENT)
         painter.drawText(8, 18, f"drawing a zone: {len(points)} point(s) — three or more, then Finish")
+
+    def _draw_marks(self, painter: QPainter) -> None:
+        """Numbered control points, matching the numbers on the picture.
+
+        The number is the whole point: an operator has to be able to see that
+        mark 3 on the plan is the same corner as mark 3 in the frame, because
+        a transposed pair produces a confident fit to the wrong geometry.
+        """
+        if not self._marks:
+            return
+        font = QFont(painter.font())
+        font.setBold(True)
+        painter.setFont(font)
+        for point, label in self._marks:
+            centre = self._to_screen(point)
+            painter.setPen(QPen(theme.BACKGROUND, 3))
+            painter.drawLine(QPointF(centre.x() - 7, centre.y()), QPointF(centre.x() + 7, centre.y()))
+            painter.drawLine(QPointF(centre.x(), centre.y() - 7), QPointF(centre.x(), centre.y() + 7))
+            painter.setPen(QPen(theme.ACCENT, 1.4))
+            painter.drawLine(QPointF(centre.x() - 7, centre.y()), QPointF(centre.x() + 7, centre.y()))
+            painter.drawLine(QPointF(centre.x(), centre.y() - 7), QPointF(centre.x(), centre.y() + 7))
+            painter.drawText(QPointF(centre.x() + 9, centre.y() - 4), label)
 
     def _draw_scale(self, painter: QPainter) -> None:
         scale = self._scale()

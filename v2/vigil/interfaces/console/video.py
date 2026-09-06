@@ -20,16 +20,24 @@ true, and that is worth knowing while it is happening rather than afterwards.
 from __future__ import annotations
 
 import numpy as np
-from PySide6.QtCore import QPointF, QRectF, Qt
+from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QFont, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QSizePolicy, QWidget
 
 from ...domain.detection import DetectorInfo
+from ...domain.geo import Vec2
 from . import theme
 
 
 class VideoView(QWidget):
     """One camera. Draws the frame scaled to fit, with boxes in image coordinates."""
+
+    #: A click on the picture, as a `Vec2` in frame fractions — the same
+    #: coordinates a detection and a projection use, so what is clicked and
+    #: what is computed are in one system. Emitted only for a click that
+    #: landed on the image: the widget is letterboxed, and a click on the bar
+    #: beside the picture is not a point in the picture.
+    clicked = Signal(object)
 
     def __init__(self, camera_id: str, parent: QWidget | None = None):
         super().__init__(parent)
@@ -41,8 +49,44 @@ class VideoView(QWidget):
         self._fps = 0.0
         self._quality = None
         self._motion = None
+        #: `(Vec2, label)` crosses drawn over the picture. Used by the
+        #: calibration dialog to show what has been marked so far.
+        self._marks: tuple = ()
         self.setMinimumSize(220, 165)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+    def show_still(self, pixmap) -> None:
+        """One frozen frame, with no tracks over it.
+
+        The tracks go because they belong to a moment and this widget is now
+        showing a still: boxes left over a frame nobody is updating are boxes
+        drawn over a scene that has moved on, which is the exact
+        misrepresentation `show_result` exists to prevent.
+        """
+        self._pixmap = pixmap if pixmap is not None and not pixmap.isNull() else None
+        self._tracks = ()
+        self._fps = 0.0
+        self.update()
+
+    def still(self):
+        """The frame currently on screen, or `None` before the first one."""
+        return self._pixmap
+
+    def set_marks(self, marks) -> None:
+        self._marks = tuple(marks)
+        self.update()
+
+    def frame_point(self, x: float, y: float) -> Vec2 | None:
+        """Widget pixels to frame fractions, or `None` off the picture."""
+        rect = self._frame_rect()
+        if self._pixmap is None or self._pixmap.isNull() or not rect.contains(QPointF(x, y)):
+            return None
+        return Vec2((x - rect.x()) / rect.width(), (y - rect.y()) / rect.height())
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt's name
+        point = self.frame_point(event.position().x(), event.position().y())
+        if point is not None:
+            self.clicked.emit(point)
 
     def set_detector_info(self, info: DetectorInfo | None) -> None:
         self._detector = info
@@ -115,6 +159,7 @@ class VideoView(QWidget):
 
         for track in self._tracks:
             self._draw_track(painter, frame, track)
+        self._draw_marks(painter, frame)
 
         painter.setPen(theme.TEXT_MUTED)
         font = QFont(painter.font())
@@ -124,6 +169,28 @@ class VideoView(QWidget):
         painter.drawText(6, self.height() - 6, f"{self.camera_id}  ·  {self._caption}{rate}")
         self._draw_warnings(painter, font)
         painter.end()
+
+    def _draw_marks(self, painter: QPainter, frame: QRectF) -> None:
+        """Numbered crosses where points have been marked.
+
+        A cross rather than a filled dot, because the thing being marked is
+        under the cursor and a dot large enough to see would hide it.
+        """
+        if not self._marks:
+            return
+        font = QFont(painter.font())
+        font.setBold(True)
+        painter.setFont(font)
+        for point, label in self._marks:
+            x = frame.x() + point.x * frame.width()
+            y = frame.y() + point.y * frame.height()
+            painter.setPen(QPen(theme.BACKGROUND, 3))
+            painter.drawLine(QPointF(x - 7, y), QPointF(x + 7, y))
+            painter.drawLine(QPointF(x, y - 7), QPointF(x, y + 7))
+            painter.setPen(QPen(theme.ACCENT, 1.4))
+            painter.drawLine(QPointF(x - 7, y), QPointF(x + 7, y))
+            painter.drawLine(QPointF(x, y - 7), QPointF(x, y + 7))
+            painter.drawText(QPointF(x + 9, y - 4), label)
 
     def _draw_warnings(self, painter: QPainter, font: QFont) -> None:
         """A banner across the top when the frame cannot support what is drawn

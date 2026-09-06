@@ -131,6 +131,11 @@ class ConsoleWindow(QMainWindow):
         self.user_label = ElidingLabel("")
         self.lock_label = ElidingLabel("")
         self.placement_label = ElidingLabel("")
+        #: What the cameras between them have worked out about the ground.
+        #: Blank until two of them overlap and enough has been triangulated,
+        #: because "assuming level" is what every projection did before and
+        #: saying so on every single-camera site would be noise.
+        self.ground_label = ElidingLabel("")
         self.detector_label = ElidingLabel("")
         self.alert_label = ElidingLabel("")
         self.alert_label.setStyleSheet(f"color: {theme.FAULT.name()}; font-weight: 600;")
@@ -170,6 +175,12 @@ class ConsoleWindow(QMainWindow):
         self.add_button.clicked.connect(self._add_camera)
         self.place_button = QPushButton("Place…")
         self.place_button.clicked.connect(self._place_camera)
+        self.calibrate_button = QPushButton("Measure pose…")
+        self.calibrate_button.setToolTip(
+            "Replace this camera's assumed accuracy with a measured one, by marking points you can "
+            "find both in the picture and on the plan. At 40 m, the two degrees a placed camera "
+            "assumes is 1.4 m of sideways error before the detector has contributed anything.")
+        self.calibrate_button.clicked.connect(self._calibrate_camera)
         self.edit_camera_button = QPushButton("Edit…")
         self.edit_camera_button.setToolTip("Rename this camera, or point it at a new address.")
         self.edit_camera_button.clicked.connect(self._edit_camera)
@@ -211,16 +222,16 @@ class ConsoleWindow(QMainWindow):
         # screen — nothing failed, nothing was logged, and only a photograph
         # showed it. This gives every control the width it asked for and
         # takes another line when it has to.
-        for widget in (self.add_button, self.place_button, self.edit_camera_button, self.password_button,
-                       self.remove_button, self.detection_button, self.zone_button, self.edit_zone_button,
+        for widget in (self.add_button, self.place_button, self.calibrate_button, self.edit_camera_button,
+                       self.password_button, self.remove_button, self.detection_button, self.zone_button, self.edit_zone_button,
                        self.drop_zone_button, self.start_button, self.stop_button, self.acknowledge_button,
                        self.dismiss_button, self.export_button, self.dismissed_box, self.about_button):
             row.addWidget(widget)
         return row
 
     def _configure_only(self) -> Sequence[QWidget]:
-        return (self.add_button, self.place_button, self.edit_camera_button, self.password_button,
-                self.remove_button, self.detection_button, self.zone_button, self.edit_zone_button,
+        return (self.add_button, self.place_button, self.calibrate_button, self.edit_camera_button,
+                self.password_button, self.remove_button, self.detection_button, self.zone_button, self.edit_zone_button,
                 self.drop_zone_button)
 
     # ----------------------------------------------------------- the lock
@@ -291,6 +302,33 @@ class ConsoleWindow(QMainWindow):
             return
         self._say(self.commands.place_camera(camera.id, pose).message)
         self.refresh_site()
+
+    def _calibrate_camera(self) -> None:
+        """Measure the selected camera's pose against points on the plan."""
+        from .calibrate import CalibrateDialog
+
+        camera = self._current_camera()
+        if camera is None:
+            self._say("Select a camera to measure.")
+            return
+        if camera.pose is None:
+            self._say(f"Place {camera.id} first, roughly. This measures a placement; it cannot "
+                      f"invent one.")
+            return
+        view = self._views.get(camera.id)
+        still = view.still() if view is not None else None
+        if still is None:
+            self._say(f"No frame from {camera.id} yet. Start the analysis, wait for the picture, "
+                      f"then measure — the points are marked on a frame.")
+            return
+        ok, value = dialogs.ask(CalibrateDialog(camera, self.commands, still, self))
+        if not ok or not value:
+            return
+        points, solve_position = value
+        outcome = self.commands.calibrate_camera(camera.id, points, solve_position=solve_position)
+        self._say(outcome.message)
+        if outcome:
+            self.refresh_site()
 
     def _edit_camera(self) -> None:
         camera = self._current_camera()
@@ -486,6 +524,7 @@ class ConsoleWindow(QMainWindow):
             self.placement_label.setText("No camera placed — nothing can be located")
         else:
             self.placement_label.setText(f"{len(placed)} of {len(cameras)} camera(s) placed")
+        self._show_ground()
         self._show_detector()
         self.start_button.setEnabled(bool(cameras) and not self.commands.runtime.running)
         self.stop_button.setEnabled(self.commands.runtime.running)
@@ -505,6 +544,12 @@ class ConsoleWindow(QMainWindow):
 
     def _collect(self, final: bool = False) -> None:
         results = self.commands.poll()
+        # The ground is refreshed every tick, not only when a camera is
+        # edited. It is being built from these very frames, and a plan that
+        # only redrew on a configuration change would show an empty yard for
+        # the whole of the run that was filling it in.
+        self.plan.set_ground(self.commands.ground())
+        self._show_ground()
         health = self.commands.health()
         poses = {c.id: c.pose for c in self.commands.cameras()}
         rows = []
@@ -651,9 +696,25 @@ class ConsoleWindow(QMainWindow):
         if text:
             self.status.showMessage(text, 12_000)
 
+    def _show_ground(self) -> None:
+        """The solved ground, when the cameras have solved one.
+
+        It belongs on screen because it changes what every position on the
+        plan means: a yard with a 3% fall was being projected onto a level
+        plane until this appeared, and an operator comparing today's positions
+        with last week's should be able to see that the ground under them
+        stopped being an assumption.
+        """
+        plane = self.commands.ground_plane()
+        parts = [] if plane is None else [plane.describe()]
+        state = self.commands.map_state()
+        if state != "no map":
+            parts.append(state)
+        self.ground_label.setText("  ·  ".join(parts))
+
     def _permanent_labels(self):
-        return (self.site_label, self.user_label, self.lock_label, self.placement_label, self.detector_label,
-                self.alert_label)
+        return (self.site_label, self.user_label, self.lock_label, self.placement_label,
+                self.ground_label, self.detector_label, self.alert_label)
 
     def _fit_labels(self) -> None:
         cap = int((self.status.width() or self.width()) * STATUS_LABEL_SHARE)

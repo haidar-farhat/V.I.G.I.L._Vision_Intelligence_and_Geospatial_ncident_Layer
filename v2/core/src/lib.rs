@@ -30,3 +30,4 @@ pub mod geodesy;
 pub mod lens;
 pub mod ortho;
 pub mod track;
+pub mod triangulate;

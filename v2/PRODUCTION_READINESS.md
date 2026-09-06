@@ -281,24 +281,56 @@ error with range.
 
 ### Known and bounded
 
-4. **Flat ground plane.** Stated, not hidden: terrain enters as a 2%
-   uncertainty term rather than being corrected for. A site on a slope will
-   have positions biased along the line of sight, and the reported error will
-   cover it only if the slope is under about 2%.
-5. **No lens distortion model.** Intrinsics come from a datasheet FOV. On a
-   90° security lens, radial distortion moves a corner by several percent, and
-   nothing here corrects or bounds it. `Intrinsics::from_matrix` exists for a
-   calibrated camera; nothing produces a calibration.
-6. **Pose uncertainty defaults are assumptions, not measurements.** ±2° of
-   heading and ±0.15 m of height are what an operator with a compass and a
-   tape is worth. They are stated in `PoseUncertainty` and they dominate the
-   error at range.
+4. ~~**Flat ground plane.**~~ **Closed where two cameras overlap**; assumed
+   level on a site where none do. The projection intersects `z = -h + ax + by`
+   rather than `z = -h`, which at zero tilt is the old arithmetic *identically*
+   — a bit-for-bit test on both the Python and the Rust holds it there, so no
+   existing camera's answers moved. `service/triangulation.py` fits the plane
+   by RANSAC from what overlapping cameras triangulate, and the solved slope is
+   written back to **every** placed camera, including the lone one watching the
+   far corner that could never have measured it and whose positions were worst.
+   Two further things the flat plane could not do and this can: a person 1.6 m
+   up on a dock, seen at 26 m, was placed over 2 m long and is now placed where
+   they are; and height above the fitted plane is a measurement, which is what
+   distinguishes a wall from a floor. **Still assumed:** that each camera's
+   mount height is measured from ground at the same level as every other's —
+   true on a yard to within centimetres, false for a camera on a roof and one
+   in a basement, which would need the fit run per region rather than per site.
+   And a single-camera site has nothing to triangulate, so it keeps the 2%
+   uncertainty term exactly as before.
+5. ~~**No lens distortion model.**~~ **Closed.** Brown-Conrady (k1, k2, p1,
+   p2, k3) in `domain/lens.py` and `core/src/lens.rs`, applied in normalised
+   camera coordinates, with `ray()` and `image_coordinates()` exact inverses
+   by construction. `calibrate_lens` produces the coefficients from
+   chessboard views. Zero coefficients reproduce the old behaviour bit for
+   bit, so an uncalibrated camera is unchanged. The remaining limit is stated
+   rather than hidden: the undistortion is a fixed-point iteration, measured
+   to converge in 10 steps at 62° and 30 at 90° and to **diverge** at 110°
+   with a strong barrel, so `CameraPose.validate()` refuses a lens it cannot
+   invert at the frame corner instead of placing detections anywhere.
+6. ~~**Pose uncertainty defaults are assumptions, not measurements.**~~
+   **Closed for any camera an operator calibrates**; the ±2° default still
+   applies to one they do not. `service/calibration.py` fits heading, pitch,
+   roll and mount height (optionally position, in metres east/north) to marked
+   ground points and reports `σ²(JᵀJ)⁻¹`. On synthetic correspondences with
+   4 px of click noise the measured heading came out at **±0.064°** against
+   the ±2° assumed, and the reported 1σ bracketed the true error 62–68% of the
+   time against the 68% a correctly scaled covariance gives. Reachable from
+   `vigil cameras calibrate` and from the console's *Measure pose…*, and a fit
+   worse than the assumption is refused rather than saved. **Still
+   provisional in one respect:** every one of those numbers is from synthetic
+   geometry. What an operator's click on a real plan of a real site is
+   actually worth is unmeasured, and it is the term that will dominate.
 7. **The ground map is only right on the ground.** A wall, a van or a person
    smears radially. The median removes what moves and the confidence layer
    marks what it cannot vouch for — 41% of the map on the real camera run —
    but a static wall is static, and it will be drawn as ground with high
    confidence. That is the failure mode to watch for, and there is currently
    no test for it because it needs a real scene with a known wall.
+   **Narrowed, not closed:** triangulation now measures height above the
+   fitted ground, which is the signal that tells a wall from a floor rather
+   than inferring it from disagreement. It only reaches ground two cameras
+   both see, and feeding it into the map's confidence layer is not done.
 8. **The error ellipse is rotated into (along, across) the line of sight**,
    which is within about a percent of the true eigenvectors for a mast camera
    but is not an eigendecomposition.

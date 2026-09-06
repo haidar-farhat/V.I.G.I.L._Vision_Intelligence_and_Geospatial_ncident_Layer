@@ -39,10 +39,46 @@ that is read after `exec()`, and a greyed control still answers a click with
 the reason it is greyed. `vigil console`; `python tasks.py exetest --console`
 drives it on the camera and photographs it.
 
-## D-08 · Faces, plates, subject registry (not yet taken)
+## D-08 · Faces, plates, subject registry (taken — the gate was **waived**)
 V1 built all three; each was a privacy switch, a model dependency and a
-thousand lines. V2 will bring them back behind the same identity switch only
-after the spine has run on a physical IP camera for an hour.
+thousand lines. V2 said it would bring them back behind the same identity
+switch **only after the spine had run on a physical IP camera for an hour**.
+
+**That precondition was not met, and the work was done anyway**, on 2026-09-06,
+at the explicit instruction of the repository owner (swteam@romisys.com), who
+was told what the gate was for and chose to override it. This entry records the
+waiver rather than quietly deleting the condition, because a decision that is
+reversed without a trace is indistinguishable from one that was never made.
+
+### What the gate was protecting against, and what is therefore unproven
+The hour on a physical IP camera was meant to establish that the *spine* — one
+camera, decoding, detecting, tracking, projecting, recording, for a sustained
+period — was reliable before anything as consequential as biometrics was built
+on top of it. What has actually been run is: a ten-minute unattended soak on a
+**laptop webcam**, and repeated shorter runs on the same. No IP camera, no RTSP
+transport, no hour.
+
+So the following remain unproven and must not be presented otherwise:
+
+- Behaviour under RTSP reconnection, packet loss and H.264 corruption, none of
+  which a USB webcam produces.
+- Any face or plate figure whatsoever. **No face or plate model ships**, none
+  has been run, and every threshold in `perception/faces.py` and
+  `perception/plates.py` is a stated default with no measurement behind it —
+  each says so in its own docstring.
+- That the identity features are worth their cost on this hardware.
+
+### What was built, and the conditions it was built under
+Mechanisms only, all **off by default** behind one switch, all audited:
+`perception/faces.py`, `perception/plates.py`, `domain/identity.py`, the
+`subjects` / `face_observations` / `plate_observations` tables, redaction on
+export, and a `vigil doctor` check that **fails** when the switch is on and no
+biometric retention limit is set. Weights are operator-supplied, as the
+detector's already are; nothing is downloaded.
+
+The register reports a **similarity with a threshold and a margin**, never an
+identity, and the wording is enforced in the code rather than left to whoever
+writes the report.
 
 ## D-09 · Packaging (taken)
 One CLI executable via PyInstaller (`python tasks.py package`), exercised by

@@ -48,6 +48,15 @@ class Evidence:
     position_uncertainty_meters: float | None
     observations: int
     conditions: tuple[str, ...]
+    #: How the position was arrived at, so a reader can weigh it. Defaults to
+    #: the ground projection every event carried before triangulation existed.
+    position_source: str = "GROUND_PROJECTION"
+    #: The colour descriptor at this moment, **normalised for this camera** so
+    #: it can be compared with another camera's. Empty when there was none, or
+    #: when the camera has not been watched long enough to know its own bias.
+    #: Stored so the correlator can use a look as well as a time and a place;
+    #: it is a similarity, never an identity.
+    appearance: tuple[float, ...] = ()
 
     @property
     def detector_classifies(self) -> bool:
@@ -63,8 +72,15 @@ class Evidence:
 
         if self.latitude is None or self.longitude is None:
             return None
+        try:
+            source = PositionSource(self.position_source)
+        except ValueError:
+            # An event written by a newer build than this one. The position is
+            # still a position; only the label for how it was reached is
+            # unknown, and guessing "ground projection" would be a claim.
+            source = PositionSource.GROUND_PROJECTION
         return PositionEstimate(LatLon(self.latitude, self.longitude),
-                                self.position_uncertainty_meters or 0.0, PositionSource.GROUND_PROJECTION)
+                                self.position_uncertainty_meters or 0.0, source)
 
     def distance_from(self, pose):
         """How far from the camera that saw it, with its error, or `None`.
@@ -124,11 +140,26 @@ class RuleContext:
     #: Track id to label, for the tracks a relation mentions. Without it a
     #: sentence would have to say "track 7" where it means "a backpack".
     _labels: dict = field(default_factory=dict)
+    #: Track id to that track's colour descriptor, already normalised for this
+    #: camera so another camera's can be compared with it. Supplied by the
+    #: worker, which owns the camera's colour statistics; empty when the
+    #: camera has not been watched long enough to know its own bias.
+    _appearance: dict = field(default_factory=dict)
 
     def carrying(self) -> tuple:
         from .relations import RelationKind
 
         return tuple(r for r in self.relations if r.kind is RelationKind.CARRIED and r.subject == self._track_id)
+
+    def appearance_of(self, track_id: int) -> tuple[float, ...]:
+        """One track's normalised colour descriptor, or empty.
+
+        Empty is common and correct: a box mostly off the frame has no usable
+        descriptor, and a camera that has just started has no idea what its
+        own colour bias is. An empty descriptor makes the correlator fall back
+        to time and place, which is what it did before any of this existed.
+        """
+        return tuple(self._appearance.get(track_id, ()))
 
     def occupants(self) -> tuple:
         """The tracks that appear to be inside this one — the people in the car."""
@@ -187,11 +218,12 @@ class Rule:
     def _build(self, context: RuleContext, *, summary: str, conditions: Sequence[str],
                confidence: float, observations: int, severity: Severity | None = None) -> Event:
         track = context.track
+        track_id = track.id if track is not None else -1
         position = track.position if track is not None else None
         projected = position is not None and position.is_projected
         evidence = Evidence(
             camera_id=context.camera_id,
-            track_id=track.id if track is not None else -1,
+            track_id=track_id,
             frame_index=context.frame_index,
             detector=context.detector,
             class_label=context.class_label,
@@ -200,6 +232,8 @@ class Rule:
             position_uncertainty_meters=position.radius_meters if projected else None,
             observations=observations,
             conditions=tuple(conditions),
+            position_source=position.source.value if position is not None else "GROUND_PROJECTION",
+            appearance=context.appearance_of(track_id),
         )
         return Event(
             id=event_id(context.node_id, context.camera_id, evidence.track_id, self.id, context.at_millis),

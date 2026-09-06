@@ -161,6 +161,13 @@ def build_parser() -> argparse.ArgumentParser:
     cadd.add_argument("--name"); cadd.add_argument("--place", help="lat,lon,height,heading,pitch[,hfov,vfov,range]"); cadd.add_argument("--record", action="store_true")
     cc.add_parser("list")
     cplace = cc.add_parser("place"); cplace.add_argument("id"); cplace.add_argument("place")
+    ccal = cc.add_parser("calibrate", help="measure a placed camera's pose from points you can find on both the picture and a map")
+    ccal.add_argument("id")
+    ccal.add_argument("--points", required=True,
+                      help="u,v,lat,lon[,label]; … — u and v are fractions of the frame, 0,0 top-left. At least four, spread across the frame and across the range")
+    ccal.add_argument("--solve-position", action="store_true",
+                      help="also solve where the camera is. Off by default: a click on a map is worth about a metre and the orientation is worth two degrees, and at 40 m the second matters more")
+    ccal.add_argument("--dry-run", action="store_true", help="report the fit without saving it")
     crec = cc.add_parser("record"); crec.add_argument("id"); crec.add_argument("state", choices=["on", "off"])
     cpw = cc.add_parser("password"); cpw.add_argument("id"); cpw.add_argument("--stdin", action="store_true")
     csrc = cc.add_parser("source", help="the camera moved to a new address; its placement stays")
@@ -262,6 +269,11 @@ def build_parser() -> argparse.ArgumentParser:
                                 "Measured at 3.0x less detection for 0.008 box heights of lag at N=3; "
                                 "the lag grows with how fast things move, so measure it on your own "
                                 "footage with `tools/detector_options.py`")
+    detection.add_argument("--tile", choices=["on", "off", "auto"],
+                           help="also run the detector over crops of the far ground, where a person is "
+                                "a couple of dozen pixels once the frame has been letterboxed. Costs one "
+                                "inference per tile. `auto`, the default, turns it on where inference runs "
+                                "on a GPU and off on CPU, where it would take a camera under 6 fps")
     detection.add_argument("--clear", action="store_true", help="go back to the built-in list and threshold")
     threats = sc.add_parser("threats", help="which labels this site treats as dangerous")
     threats.add_argument("--set", help="comma-separated labels, replacing what is there")

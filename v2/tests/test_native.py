@@ -211,11 +211,15 @@ def test_the_binding_refuses_a_core_that_is_not_the_right_core():
     # The ABI check is the thing standing between a moved signature and
     # plausible, wrong geometry. It is asserted rather than assumed.
     #
-    # ABI 2 since the pose grew its lens: a core built for ABI 1 would read
+    # ABI 2 was the pose growing its lens: a core built for ABI 1 would read
     # fourteen values where nine were sent and invent five from whatever was
     # next in memory — a lens made of stack garbage, applied to every ray.
-    assert native.ABI_VERSION == 2
-    assert native.EXPECTED_LAYOUT == (14, 5, 6, 5, 72)
+    # ABI 3 added triangulation and the ground plane, which an older core does
+    # not export at all. ABI 4 grew the pose by the two ground tilts, and that
+    # one is the dangerous kind: a short pose gives the core a ground plane
+    # tilted by whatever was next in memory.
+    assert native.ABI_VERSION == 4
+    assert native.EXPECTED_LAYOUT == (16, 5, 6, 5, 72, 8, 8)
     assert native.loaded_from() is not None and native.loaded_from().is_file()
 
 
@@ -291,3 +295,105 @@ def test_the_two_lens_models_agree_on_a_real_calibration():
             seen += 1
         assert seen > 10, f"only {seen} points projected through {pose.lens.describe()}"
         assert worst < 1e-6, f"{pose.lens.describe()}: the two lenses differ by {worst} m"
+
+
+def test_the_two_triangulators_agree_over_a_field_of_geometries():
+    """Both implementations, over pairs that succeed and pairs that are
+    refused, including the refusal itself: a mirror that agrees on the answers
+    and disagrees on which questions have one is not a mirror."""
+    rng = np.random.default_rng(19)
+    agreed = refused = 0
+    for _ in range(400):
+        target = np.array([rng.uniform(-40, 40), rng.uniform(5, 60), rng.uniform(0, 3)])
+        a_o = np.array([rng.uniform(-30, 30), rng.uniform(-5, 5), rng.uniform(2, 9)])
+        b_o = np.array([rng.uniform(-30, 30), rng.uniform(-5, 5), rng.uniform(2, 9)])
+        # Half the pairs get a nudge, so some fail the gap check rather than
+        # every pair meeting exactly.
+        nudge = np.array([rng.normal(0, 2.0), rng.normal(0, 2.0), rng.normal(0, 0.5)])
+        a_d, b_d = target - a_o, target + nudge - b_o
+        rust_code, rust = native.triangulate(a_o, a_d, b_o, b_d, 0.25, native.MIN_PARALLAX_DEG)
+        py_code, py = native._triangulate_numpy(
+            a_o.astype(float), a_d.astype(float), b_o.astype(float), b_d.astype(float),
+            0.25, native.MIN_PARALLAX_DEG, np.zeros(8))
+        assert rust_code == py_code, f"one refused and the other did not: {rust_code} vs {py_code}"
+        if rust_code == 0:
+            assert np.allclose(rust, py, rtol=1e-9, atol=1e-9), f"{rust} vs {py}"
+            agreed += 1
+        else:
+            refused += 1
+    assert agreed > 50 and refused > 20, f"{agreed} agreed, {refused} refused — a thin test"
+
+
+def test_the_two_plane_fits_draw_the_same_plane_including_the_random_draw():
+    """The RANSAC draw is seeded and the generator is written out in both, so
+    the two agree exactly rather than nearly. A library generator would make
+    this test the loosest thing in the suite."""
+    rng = np.random.default_rng(23)
+    for trial in range(12):
+        east, north = rng.uniform(-0.05, 0.05), rng.uniform(-0.05, 0.05)
+        n = 60
+        cloud = np.empty((n, 3))
+        cloud[:, 0] = rng.uniform(-25, 25, n)
+        cloud[:, 1] = rng.uniform(0, 50, n)
+        cloud[:, 2] = east * cloud[:, 0] + north * cloud[:, 1] + rng.normal(0, 0.05, n)
+        # A tenth of the points stand on something that is not the ground.
+        cloud[: n // 10, 2] += 1.4
+        rust = native.fit_plane(cloud, 0.3, 200, 1000 + trial)
+        py = native._fit_plane_numpy(cloud, 0.3, 200, 1000 + trial, np.zeros(8))
+        assert rust is not None and py is not None
+        assert np.allclose(rust, py, rtol=1e-9, atol=1e-9), f"{rust} vs {py}"
+        assert abs(rust[6] - east) < 0.01 and abs(rust[7] - north) < 0.01, (
+            f"tilt came out {rust[6]:.4f},{rust[7]:.4f} against {east:.4f},{north:.4f}")
+        assert rust[4] >= n * 0.8, "the ground should be the majority"
+
+
+def test_a_triangulated_point_beats_flat_ground_when_the_object_is_not_on_it():
+    """The reason this exists. A person standing 1.4 m up on a dock is placed
+    metres past themselves by a flat-ground projection; two rays put them
+    where they are."""
+    truth = np.array([10.0, 35.0, 1.4])
+    a_o, b_o = np.array([-15.0, 0.0, 5.0]), np.array([20.0, -2.0, 4.5])
+    code, values = native.triangulate(a_o, truth - a_o, b_o, truth - b_o, 0.25,
+                                      native.MIN_PARALLAX_DEG)
+    assert code == 0
+    assert np.allclose(values[:3], truth, atol=1e-9)
+
+    # What the flat-ground assumption does with the same ray: it follows it to
+    # z = 0 and lands long.
+    direction = truth - a_o
+    flat = a_o + direction * (a_o[2] / -direction[2])
+    assert abs(flat[2]) < 1e-9
+    error = float(np.linalg.norm(flat[:2] - truth[:2]))
+    assert error > 5.0, f"the flat-ground error here is {error:.2f} m"
+
+
+def test_the_core_and_the_python_agree_on_ground_that_is_not_level():
+    """The tilt has to arrive on both sides of the boundary and mean the same
+    thing. Sixteen values sent where fourteen were read would give the core a
+    plane tilted by whatever was next in memory, and every position from that
+    camera would be quietly, plausibly wrong."""
+    for pose in POSES:
+        for east, north in ((0.0, 0.0), (0.03, -0.02), (-0.05, 0.04), (0.08, 0.08)):
+            tilted = replace(pose, ground_tilt_east=east, ground_tilt_north=north)
+            for u, v in POINTS:
+                mine = project_to_ground(tilted, u, v, enforce_range=False)
+                theirs = native.project_batch(tilted, [(u, v)], 0.75, tilted.uncertainty)
+                if mine is None:
+                    assert theirs[1][0] != 0, "one refused and the other did not"
+                    continue
+                assert theirs[1][0] == 0, f"the core refused {u},{v} that Python projected"
+                assert distance_meters(mine.position, LatLon(theirs[0][0][0], theirs[0][0][1])) < 1e-6
+
+
+def test_zero_tilt_reproduces_the_level_plane_exactly_on_both_sides():
+    """The guarantee every uncalibrated camera depends on: the ground tilt
+    arriving in the projection must not move one existing answer."""
+    for pose in POSES:
+        explicit = replace(pose, ground_tilt_east=0.0, ground_tilt_north=0.0)
+        for u, v in POINTS:
+            a = project_to_ground(pose, u, v, enforce_range=False)
+            b = project_to_ground(explicit, u, v, enforce_range=False)
+            assert (a is None) == (b is None)
+            if a is not None:
+                assert a.position.lat == b.position.lat and a.position.lon == b.position.lon
+                assert a.ground_distance_meters == b.ground_distance_meters

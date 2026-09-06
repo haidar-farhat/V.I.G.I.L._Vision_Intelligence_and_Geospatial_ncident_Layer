@@ -180,6 +180,11 @@ pub struct CameraPose {
     pub range_meters: f64,
     /// What the lens does to a straight line. Default is a perfect one.
     pub lens: Distortion,
+    /// Rise per metre east and per metre north of the ground this camera
+    /// projects onto. Zero is the level plane every projection assumed
+    /// before the ground could be solved, and reproduces it exactly.
+    pub ground_tilt_east: f64,
+    pub ground_tilt_north: f64,
 }
 
 /// How well each input to a projection is known, 1-sigma.
@@ -239,6 +244,9 @@ pub struct CameraBasis {
     pub intrinsics: Intrinsics,
     pub mount_height: f64,
     pub lens: Distortion,
+    /// The ground's rise per metre east and north. See [`CameraBasis::ground_offset`].
+    pub tilt_east: f64,
+    pub tilt_north: f64,
 }
 
 impl CameraBasis {
@@ -251,6 +259,7 @@ impl CameraBasis {
             pose.mount_height,
             pose.lens,
         )
+        .with_ground_tilt(pose.ground_tilt_east, pose.ground_tilt_north)
     }
 
     /// The basis from angles rather than from a pose, so that the Jacobian
@@ -295,7 +304,17 @@ impl CameraBasis {
             intrinsics,
             mount_height,
             lens,
+            tilt_east: 0.0,
+            tilt_north: 0.0,
         }
+    }
+
+    /// The same basis over ground that is not level. `build_with_lens` is
+    /// this with a level plane, which is what an unsolved site has.
+    pub fn with_ground_tilt(mut self, tilt_east: f64, tilt_north: f64) -> Self {
+        self.tilt_east = tilt_east;
+        self.tilt_north = tilt_north;
+        self
     }
 
     /// The unnormalised world-frame direction through a normalised image
@@ -327,12 +346,23 @@ impl CameraBasis {
     ///
     /// This is the whole projection: `t = h / -d_up`, and the horizontal part
     /// of `t*d`. No `tan`, no case analysis, no decoupled axes.
+    /// Where a ray meets the ground, as (east, north) metres from the camera.
+    ///
+    /// The plane is `z = -h + a*x + b*y`, so `t = h / (a*dx + b*dy - dz)`. At
+    /// zero tilt that is `h / -dz` identically, not approximately, which is
+    /// why an uncalibrated camera's answers do not move at all. The horizon
+    /// test moves with the plane and has to: on ground falling away from the
+    /// camera a ray a fraction above level still meets it.
     pub fn ground_offset(&self, u: f64, v: f64) -> Option<(f64, f64)> {
         let d = self.ray(u, v);
-        if !(d.z < 0.0) || !d.z.is_finite() {
+        if !d.z.is_finite() {
             return None;
         }
-        let t = self.mount_height / -d.z;
+        let into_ground = self.tilt_east * d.x + self.tilt_north * d.y - d.z;
+        if !(into_ground > 0.0) || !into_ground.is_finite() {
+            return None;
+        }
+        let t = self.mount_height / into_ground;
         if !t.is_finite() || t <= 0.0 {
             return None;
         }
@@ -721,6 +751,74 @@ pub fn bearing_in_view(pose: &CameraPose, bearing_deg: f64) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_level_plane_is_reproduced_bit_for_bit_by_zero_tilt() {
+        // The guarantee an uncalibrated camera relies on: adding the ground
+        // tilt to the projection must not move a single existing answer.
+        let level = CameraBasis::build(37.0, -22.0, 3.0, Intrinsics::from_fov(62.0, 36.0), 4.0);
+        let tilted = level.with_ground_tilt(0.0, 0.0);
+        for i in 1..9 {
+            for j in 5..10 {
+                let (u, v) = (i as f64 / 9.0, j as f64 / 10.0);
+                match (level.ground_offset(u, v), tilted.ground_offset(u, v)) {
+                    (Some(a), Some(b)) => {
+                        assert_eq!(a.0.to_bits(), b.0.to_bits());
+                        assert_eq!(a.1.to_bits(), b.1.to_bits());
+                    }
+                    (None, None) => {}
+                    (a, b) => panic!("one refused and the other did not: {a:?} vs {b:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ground_that_falls_away_puts_a_contact_further_off() {
+        // A 3% fall over a 4 m mast looking 25 degrees down. The bias is
+        // along the line of sight and grows with range, which is exactly the
+        // shape `PoseUncertainty::terrain_slope` could only ever widen an
+        // error bar around.
+        let level = CameraBasis::build(0.0, -25.0, 0.0, Intrinsics::from_fov(62.0, 36.0), 4.0);
+        let falling = level.with_ground_tilt(0.0, -0.03);
+        let (_, near_level) = level.ground_offset(0.5, 0.95).unwrap();
+        let (_, near_fall) = falling.ground_offset(0.5, 0.95).unwrap();
+        let (_, far_level) = level.ground_offset(0.5, 0.6).unwrap();
+        let (_, far_fall) = falling.ground_offset(0.5, 0.6).unwrap();
+        assert!(near_fall > near_level && far_fall > far_level);
+        assert!(
+            (far_fall - far_level) > (near_fall - near_level),
+            "the bias must grow with range: {} at range against {} near",
+            far_fall - far_level,
+            near_fall - near_level
+        );
+    }
+
+    #[test]
+    fn the_horizon_moves_with_the_ground_rather_than_staying_level() {
+        // Two claims, and the sign of the tilt is the difference between
+        // them. Ground *rising* in front of the camera intercepts a ray that
+        // points slightly above level -- a hill is in the way, and a
+        // level-plane test refuses a projection onto ground that is really
+        // there. Ground *falling* away does the opposite: it diverges from a
+        // rising ray and they never meet, so the same ray must be refused.
+        let up = CameraBasis::build(0.0, -0.2, 0.0, Intrinsics::from_fov(62.0, 36.0), 4.0);
+        let d = up.ray(0.5, 0.45);
+        assert!(d.z > 0.0, "this ray points above level: {}", d.z);
+        assert!(up.ground_offset(0.5, 0.45).is_none(), "level ground is not met by it");
+
+        let rising = up.with_ground_tilt(0.0, 0.05);
+        let (_, north) = rising
+            .ground_offset(0.5, 0.45)
+            .expect("ground rising at 5% is in the way of a ray rising at less");
+        assert!(north > 0.0);
+
+        let falling = up.with_ground_tilt(0.0, -0.05);
+        assert!(
+            falling.ground_offset(0.5, 0.45).is_none(),
+            "a rising ray and falling ground diverge; they must not be intersected behind the camera"
+        );
+    }
     use super::*;
 
     fn reference() -> CameraPose {
@@ -734,6 +832,8 @@ mod tests {
             vertical_fov: 36.0,
             range_meters: 60.0,
             lens: Distortion::default(),
+            ground_tilt_east: 0.0,
+            ground_tilt_north: 0.0,
         }
     }
 

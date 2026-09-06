@@ -9,7 +9,8 @@ is the one that knows.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, replace
 from typing import Sequence
 
 from ..adapters.decode import is_live_source, redacted, split_password
@@ -39,6 +40,12 @@ class Camera:
     credentials_ref: str | None
     pose: CameraPose | None
     record: bool
+    #: When the pose was last measured rather than typed, and what that
+    #: measurement was worth. `None` throughout means the pose's uncertainty
+    #: is the stated assumption, not a measurement.
+    calibrated_at: int | None = None
+    calibration_rms: float | None = None
+    calibration_points: int | None = None
 
     @property
     def live(self) -> bool:
@@ -47,6 +54,10 @@ class Camera:
     @property
     def placed(self) -> bool:
         return self.pose is not None
+
+    @property
+    def calibrated(self) -> bool:
+        return self.calibrated_at is not None
 
 
 class SiteService:
@@ -112,6 +123,53 @@ class SiteService:
         self._store.audit(by.actor, "camera.placed", camera_id, f"{pose.position.lat:.6f},{pose.position.lon:.6f} heading {pose.heading:.0f}",
                           before=_pose_dict(current.pose), after=_pose_dict(pose))
         return self.camera(camera_id, by)
+
+    def calibrate_camera(self, camera_id: str, points: Sequence, *, solve_position: bool = False,
+                         lens=None, by: Principal):
+        """Measure a placed camera's pose from marked ground points.
+
+        Returns `(camera, calibration)`. Refuses, without saving, a fit that
+        does not beat the uncertainty it would replace: a calibration that
+        makes the pose *less* certain is not a calibration, and storing it
+        would degrade every position this camera produces while looking like
+        an improvement because somebody did the work.
+
+        `lens` replaces the distortion coefficients if given, and the pose is
+        fitted with it in place — the two are not independent, and refining
+        the pose against a lens the camera does not have puts the lens's error
+        into the pose.
+        """
+        from .calibration import CalibrationError, calibrate_pose
+
+        by.require(SITE_CONFIGURE)
+        current = self.camera(camera_id, by)
+        if current.pose is None:
+            raise SiteError(f"{camera_id} has no placement to refine; `cameras place` it first, "
+                            f"roughly, and this will measure it properly")
+        start = current.pose if lens is None else replace(current.pose, lens=lens)
+        start.validate()
+        try:
+            result = calibrate_pose(start, points, solve_position=solve_position)
+        except CalibrationError as error:
+            raise SiteError(str(error)) from error
+        result.pose.validate()
+        if not result.better_than(current.pose.uncertainty):
+            raise SiteError(
+                f"this calibration is worse than what {camera_id} already assumes and has not been "
+                f"saved:\n{result.describe()}\nSpread the points wider across the frame and the "
+                f"range, or check for a mis-clicked one -- the worst was point "
+                f"{result.worst_index + 1}"
+            )
+        self._store.save_camera(camera_id, current.name, current.source,
+                                credentials_ref=current.credentials_ref, pose=result.pose,
+                                record=current.record,
+                                calibration=(int(time.time()), result.rms, len(points)))
+        self._store.audit(by.actor, "camera.calibrated", camera_id,
+                          f"{len(points)} points, {result.rms * 100:.2f}% RMS, "
+                          f"heading +/- {result.uncertainty.heading_deg:.3f} deg",
+                          before=_pose_dict(current.pose), after=_pose_dict(result.pose))
+        _log.info("%s calibrated: %s", camera_id, result.describe().replace("\n", " | "))
+        return self.camera(camera_id, by), result
 
     def set_recording(self, camera_id: str, on: bool, *, by: Principal) -> Camera:
         by.require(SITE_CONFIGURE)
@@ -274,20 +332,28 @@ class SiteService:
         return DetectionSettings.from_site(self._store.site())
 
     def set_detection(self, labels, confidence: float | None, *, by: Principal,
-                      detect_every: int | None = None):
-        """Store the watch list, the threshold and how often to look."""
+                      detect_every: int | None = None, tile=KEEP):
+        """Store the watch list, the threshold, how often to look, and whether
+        to look closely at the far ground.
+
+        `tile` defaults to `KEEP` rather than to `None`, because `None` is a
+        meaningful value for it -- "decide from the provider" -- and an edit to
+        the watch list must not silently turn that into a fixed choice.
+        """
         from .detection import DetectionSettings
 
         by.require(SITE_CONFIGURE)
         before = self.detection()
         after = DetectionSettings.checked(
-            labels, confidence, before.detect_every if detect_every is None else detect_every)
-        self._store.set_detection(sorted(after.labels or ()), after.confidence, after.detect_every)
+            labels, confidence, before.detect_every if detect_every is None else detect_every,
+            before.tile if tile is KEEP else tile)
+        self._store.set_detection(sorted(after.labels or ()), after.confidence, after.detect_every,
+                                  after.tile)
         self._store.audit(by.actor, "site.detection_changed", None, after.describe(),
                           before={"labels": sorted(before.labels or ()), "confidence": before.confidence,
-                                  "detect_every": before.detect_every},
+                                  "detect_every": before.detect_every, "tile": before.tile},
                           after={"labels": sorted(after.labels or ()), "confidence": after.confidence,
-                                 "detect_every": after.detect_every})
+                                 "detect_every": after.detect_every, "tile": after.tile})
         return after
 
     def name_site(self, name: str, timezone_name: str, *, by: Principal) -> None:
@@ -306,7 +372,8 @@ def _valid_id(value: str) -> str:
 
 
 def _camera(row: dict) -> Camera:
-    return Camera(row["id"], row["name"], row["source"], row["credentials_ref"], row["pose"], row["record"])
+    return Camera(row["id"], row["name"], row["source"], row["credentials_ref"], row["pose"], row["record"],
+                  row.get("calibrated_at"), row.get("calibration_rms"), row.get("calibration_points"))
 
 
 def _zone_dict(zone: Zone) -> dict:
@@ -317,7 +384,20 @@ def _zone_dict(zone: Zone) -> dict:
 
 
 def _pose_dict(pose: CameraPose | None) -> dict | None:
+    """The pose as the audit records it.
+
+    Roll, the sigmas and the lens are here because a calibration changes
+    little else: an audit row whose before and after are identical is a record
+    that something happened and no record of what.
+    """
     if pose is None:
         return None
-    return {"lat": pose.position.lat, "lon": pose.position.lon, "height": pose.mount_height, "heading": pose.heading,
-            "pitch": pose.pitch, "hfov": pose.horizontal_fov, "vfov": pose.vertical_fov, "range": pose.range_meters}
+    u = pose.uncertainty
+    row = {"lat": pose.position.lat, "lon": pose.position.lon, "height": pose.mount_height,
+           "heading": pose.heading, "pitch": pose.pitch, "roll": pose.roll,
+           "hfov": pose.horizontal_fov, "vfov": pose.vertical_fov, "range": pose.range_meters,
+           "sigma_heading": u.heading_deg, "sigma_pitch": u.pitch_deg, "sigma_roll": u.roll_deg,
+           "sigma_height": u.mount_height_m}
+    if not pose.lens.is_identity:
+        row["lens"] = [pose.lens.k1, pose.lens.k2, pose.lens.p1, pose.lens.p2, pose.lens.k3]
+    return row

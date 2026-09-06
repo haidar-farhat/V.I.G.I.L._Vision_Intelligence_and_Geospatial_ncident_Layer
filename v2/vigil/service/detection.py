@@ -52,15 +52,21 @@ class DetectionSettings:
     #: Run the detector on one frame in this many, and track through the rest.
     #: 1 is every frame.
     detect_every: int = 1
+    #: Also run it over crops of the far ground. `None` decides from the
+    #: provider: worth it where inference is cheap, ruinous on CPU.
+    tile: bool | None = None
 
     @classmethod
     def from_site(cls, site: dict) -> "DetectionSettings":
         labels = frozenset(site.get("watch_labels") or ()) or None
-        return cls(labels, site.get("min_confidence"), int(site.get("detect_every") or 1))
+        tile = site.get("tile_far")
+        return cls(labels, site.get("min_confidence"), int(site.get("detect_every") or 1),
+                   None if tile is None else bool(tile))
 
     @classmethod
     def checked(cls, labels, confidence: float | None,
-                detect_every: int | None = None) -> "DetectionSettings":
+                detect_every: int | None = None,
+                tile: bool | None = None) -> "DetectionSettings":
         """The settings, or a `DetectionError` saying which value is wrong.
 
         Checked when it is typed. A watch list nobody can satisfy is only
@@ -82,7 +88,7 @@ class DetectionSettings:
                 f"running person is extrapolated for long enough that the boxes on screen are a "
                 f"guess rather than a measurement"
             )
-        return cls(frozenset(cleaned) or None, confidence, every)
+        return cls(frozenset(cleaned) or None, confidence, every, tile)
 
     def classes(self) -> frozenset[str]:
         """The labels a model is asked for, including the built-in default."""
@@ -94,17 +100,20 @@ class DetectionSettings:
         sure = "the detector's own threshold" if self.confidence is None else f"{self.confidence:.2f}"
         often = ("" if self.detect_every <= 1
                  else f"; detecting every {self.detect_every} frames and tracking between")
-        return f"watching {watch}; confidence at least {sure}{often}"
+        tiled = {True: "; tiling the far ground", False: "; whole frame only",
+                 None: ""}[self.tile]
+        return f"watching {watch}; confidence at least {sure}{often}{tiled}"
 
     def override(self, labels, confidence: float | None,
-                 detect_every: int | None = None) -> "DetectionSettings":
+                 detect_every: int | None = None, tile: bool | None = None) -> "DetectionSettings":
         """This run's flags on top of the stored setting; absent flags keep it."""
-        if labels is None and confidence is None and detect_every is None:
+        if labels is None and confidence is None and detect_every is None and tile is None:
             return self
         return DetectionSettings.checked(
             self.labels if labels is None else labels,
             self.confidence if confidence is None else confidence,
             self.detect_every if detect_every is None else detect_every,
+            self.tile if tile is None else tile,
         )
 
 
@@ -120,14 +129,48 @@ class DetectorFactory:
         self.model = model
         self.settings = settings
 
+    def tiling_wanted(self, detector) -> bool:
+        """Whether to spend `1 + tiles` inferences a frame on this machine.
+
+        The setting when there is one, and otherwise the provider. On a GPU
+        the extra passes are affordable — measured at 4.5 ms against 38.5 ms
+        for the session alone, so four tiles still cost less than one whole
+        frame did on CPU. On CPU a whole frame is already 38 ms, and five
+        would put one camera under 6 fps: the recall would be bought with the
+        frame rate, which on a security camera is the wrong trade and is not
+        made silently.
+        """
+        if self.settings.tile is not None:
+            return self.settings.tile
+        provider = (getattr(detector.info, "provider", "") or "").lower()
+        return bool(provider) and "cpu" not in provider
+
     def __call__(self) -> Detector:
-        classes = self.settings.classes() if self.model is not None else None
-        return detector_for(self.model, classes=classes, confidence=self.settings.confidence)
+        """A detector that reports **everything its model knows**.
+
+        The watch list is not passed down any more. It used to restrict the
+        detector's own vocabulary, which meant a trailer, a dog or a ladder
+        against a fence was invisible to the tracker, the plan and the map,
+        because the one thing that could have seen it had been told not to
+        look. The list now governs what raises an event, in `CameraWorker`,
+        and everything found is still tracked and drawn.
+        """
+        detector = detector_for(self.model, classes=None, confidence=self.settings.confidence)
+        if self.model is not None and self.tiling_wanted(detector):
+            from ..adapters.tiling import TiledDetector
+
+            return TiledDetector(detector)
+        return detector
+
+    def watch(self) -> frozenset[str] | None:
+        """Labels this site raises events for. `None` means the built-in list."""
+        return self.settings.classes()
 
     def describe(self) -> str:
         if self.model is None:
             return "motion only: it does not classify, so no watch list applies"
-        return f"{self.model.name}, {self.settings.describe()}"
+        return (f"{self.model.name}, detecting every class it knows; "
+                f"{self.settings.describe()}")
 
 
 def detector_factory(model, settings: DetectionSettings) -> DetectorFactory:

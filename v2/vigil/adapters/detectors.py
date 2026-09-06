@@ -35,8 +35,6 @@ is mostly a descriptor of the background. See `vigil.domain.appearance`.
 
 from __future__ import annotations
 
-import hashlib
-import os
 import threading
 from pathlib import Path
 from typing import Iterable, Protocol
@@ -45,6 +43,7 @@ import cv2
 import numpy as np
 
 from ..domain.detection import UNCLASSIFIED, BoundingBox, Detection, DetectorInfo
+from ..kernel import onnx as _onnx
 from ..domain.geo import Vec2
 from ..logs import get as _get_logger
 
@@ -53,19 +52,39 @@ _log = _get_logger(__name__)
 #: The classes a security site watches unless told otherwise. A bottle on a
 #: shelf is not an intruder; v1 learned that from an operator's screenshot.
 WATCHED_LABELS = frozenset({"person", "bicycle", "car", "motorcycle", "bus", "truck"})
-DEFAULT_CONFIDENCE = 0.5
 
-#: Execution providers to prefer, best first. Only those the installed runtime
-#: reports are used, and the one chosen is recorded in `DetectorInfo`.
-#: `AzureExecutionProvider` is deliberately absent: it is a remote endpoint,
-#: and this product does not reach the Internet.
-PREFERRED_PROVIDERS = (
-    "TensorrtExecutionProvider",
-    "CUDAExecutionProvider",
-    "DmlExecutionProvider",
-    "CoreMLExecutionProvider",
-    "CPUExecutionProvider",
-)
+#: The floor below which a single frame's detection is not even proposed.
+#:
+#: 0.25, down from 0.5. The tracker this feeds was rebuilt around cumulative
+#: confirmation, a weak-detection recovery pass and re-identification across a
+#: gap, so a thing seen once at 0.3 and never again is never confirmed and
+#: never reaches a rule. Lowering the floor therefore buys recall — a person
+#: at 40 m, or side-on, or half behind a van, scores in the thirties — without
+#: buying false alarms, because what an operator sees is decided by the
+#: *track*, not by one frame. Raising it back is a site setting.
+DEFAULT_CONFIDENCE = 0.25
+
+#: The old floor, kept because it is what the reporting threshold used to be
+#: and the comparison is worth being able to make.
+LEGACY_CONFIDENCE = 0.5
+
+#: Gaussian width for soft-NMS. At 0.5, a box overlapping 0.9 keeps 6% of its
+#: score and a genuine neighbour at 0.55 keeps 45%.
+SOFT_NMS_SIGMA = 0.5
+
+#: Score below which a soft-decayed box is dropped. Same as the detection
+#: floor: a box the decay has pushed under what a fresh detection needs is not
+#: worth proposing.
+SOFT_NMS_FLOOR = 0.2
+
+#: The providers, and the thread knob, both live in `kernel.onnx` now so that
+#: faces and plates use the same ones. Bound here rather than re-declared:
+#: `vigil doctor`, the console and the tests all read them from this module,
+#: and a second copy of a preference order is a second answer waiting to
+#: differ from the one the sessions are actually opened with.
+PREFERRED_PROVIDERS = _onnx.PREFERRED_PROVIDERS
+DEFAULT_INTRA_OP_THREADS = _onnx.DEFAULT_INTRA_OP_THREADS
+THREADS_VARIABLE = _onnx.THREADS_VARIABLE
 
 #: Threads per session for the CPU provider.
 #:
@@ -74,8 +93,6 @@ PREFERRED_PROVIDERS = (
 #: they spend their time descheduling each other. Two is enough to use the
 #: model's own parallelism without the sessions fighting; a single-camera
 #: deployment gets more from `VIGIL_ORT_THREADS`.
-DEFAULT_INTRA_OP_THREADS = 2
-THREADS_VARIABLE = "VIGIL_ORT_THREADS"
 
 #: Size the kept mask is downsampled to before it leaves the detector, in
 #: (width, height). An appearance descriptor bins a few hundred pixels; a
@@ -142,19 +159,15 @@ _MODEL_INFO: dict[tuple[str, int, int], DetectorInfo] = {}
 _OUTPUT_COUNTS: dict[tuple[str, int, int], int] = {}
 
 
-def _silence_telemetry() -> None:
-    os.environ.setdefault("ORT_DISABLE_TELEMETRY", "1")
-
-
-def _model_key(path: str | Path) -> tuple[str, int, int]:
-    resolved = Path(path).resolve()
-    if not resolved.is_file():
-        raise DetectionError(f"no model at {resolved}; models are supplied by the operator, nothing is downloaded")
-    stat = resolved.stat()
-    return (str(resolved), stat.st_size, stat.st_mtime_ns)
+# Loading, provider selection, telemetry and digests live in `kernel.onnx`,
+# because `perception`'s face and plate models need exactly the same rules and
+# `perception` may not import `adapters`. Duplicating them was the alternative,
+# and these are rules that rot when duplicated: the one that matters most —
+# read the provider back rather than assuming it — is invisible when wrong.
 
 
 def forget_models() -> None:
+    _onnx.forget()
     with _MODEL_LOCK:
         _MODEL_INFO.clear()
         _OUTPUT_COUNTS.clear()
@@ -163,61 +176,30 @@ def forget_models() -> None:
 def available_providers() -> list[str]:
     """The providers the installed runtime offers, best first.
 
-    Reported by `vigil doctor` because "why is this slow" is answered by this
-    list far more often than by anything in this file: an operator who
-    installed `onnxruntime` rather than `onnxruntime-gpu` has a CPU-only
-    runtime and no indication of it.
+    Re-exported rather than moved: `vigil doctor` and the console both read it
+    from here, and "why is this slow" is answered by this list far more often
+    than by anything else — an operator who installed `onnxruntime` rather
+    than `onnxruntime-directml` has a CPU-only runtime and no sign of it.
     """
-    _silence_telemetry()
+    return _onnx.available_providers()
+
+
+def _model_key(path: str | Path) -> tuple[str, int, int]:
     try:
-        import onnxruntime as ort
-    except ImportError:
-        return []
-    offered = set(ort.get_available_providers())
-    return [p for p in PREFERRED_PROVIDERS if p in offered]
-
-
-def _threads() -> int:
-    raw = os.environ.get(THREADS_VARIABLE, "").strip()
-    if raw.isdigit() and int(raw) > 0:
-        return int(raw)
-    return DEFAULT_INTRA_OP_THREADS
+        return _onnx.model_key(path)
+    except _onnx.ModelError as error:
+        raise DetectionError(str(error)) from error
 
 
 def _session(path: Path) -> tuple[object, str]:
-    """The session and the provider it actually got.
-
-    "Actually" is the point: onnxruntime silently falls back when a requested
-    provider cannot initialise — a CUDA build with the wrong driver runs on
-    the CPU and says nothing — so the provider is read back off the session
-    rather than assumed from what was asked for.
-    """
-    _silence_telemetry()
-    import onnxruntime as ort
-
     try:
-        ort.disable_telemetry_events()
-    except Exception:  # noqa: BLE001 - older runtimes have no such call
-        pass
-    options = ort.SessionOptions()
-    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    options.intra_op_num_threads = _threads()
-    options.inter_op_num_threads = 1
-    providers = available_providers() or ["CPUExecutionProvider"]
-    try:
-        session = ort.InferenceSession(str(path), sess_options=options, providers=providers)
-    except Exception as error:
-        raise DetectionError(f"could not load the model at {path}: {error}") from error
-    active = session.get_providers()
-    return session, (active[0] if active else "unknown")
+        return _onnx.open_session(path)
+    except _onnx.ModelError as error:
+        raise DetectionError(str(error)) from error
 
 
 def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1 << 20), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    return _onnx.digest(path)
 
 
 def _names_from_metadata(session) -> dict[int, str]:
@@ -274,7 +256,7 @@ class OnnxDetector:
     """YOLO-family ONNX: one input NCHW, one output (boxes) or two (boxes + mask protos)."""
 
     def __init__(self, model_path: str | Path, *, confidence: float = DEFAULT_CONFIDENCE, iou: float = 0.45,
-                 classes: Iterable[str] | None = None):
+                 classes: Iterable[str] | None = None, soft_nms: bool = True):
         path = Path(model_path).resolve()
         key = _model_key(path)
         self._session, provider = _session(path)
@@ -296,6 +278,7 @@ class OnnxDetector:
         names, self._watched = restrict_vocabulary(names, classes)
         self._confidence = confidence
         self._iou = iou
+        self._soft = soft_nms
         self._info = DetectorInfo(
             kind="onnx-segment" if self._segments else "onnx-detect", name=path.stem, model_path=str(path),
             model_sha256=_sha256(path), input_size=self._size, class_names=names, classifies=True,
@@ -334,7 +317,7 @@ class OnnxDetector:
             return []
         xyxy = np.stack([boxes[:, 0] - boxes[:, 2] / 2, boxes[:, 1] - boxes[:, 3] / 2,
                          boxes[:, 0] + boxes[:, 2] / 2, boxes[:, 1] + boxes[:, 3] / 2], axis=1)
-        order = _nms_per_class(xyxy, confidences, class_ids, self._iou)
+        order = _nms_per_class(xyxy, confidences, class_ids, self._iou, soft=self._soft)
         h, w = image.shape[:2]
         out = []
         for i in order:
@@ -387,8 +370,51 @@ def _nms(xyxy: np.ndarray, scores: np.ndarray, iou_threshold: float) -> list[int
     return keep
 
 
+def _soft_nms(xyxy: np.ndarray, scores: np.ndarray, iou_threshold: float,
+              sigma: float = SOFT_NMS_SIGMA, floor: float = SOFT_NMS_FLOOR) -> list[int]:
+    """Decay an overlapping box's score instead of deleting it.
+
+    Hard NMS assumes that two boxes overlapping past a threshold are two
+    proposals for one object. In a queue of people or a row of parked cars
+    that is false, and the second real object is deleted with no trace
+    anywhere — the failure this whole module is most careful about, because a
+    suppressed detection leaves nothing for anybody to notice.
+
+    Gaussian soft-NMS multiplies the score by `exp(-iou^2 / sigma)` instead.
+    A genuine duplicate at 0.9 overlap keeps 6% of its score and falls under
+    the floor; a real neighbour at 0.55 keeps 45% and survives. The score it
+    survives with is honestly lower, and the tracker's cumulative confirmation
+    is what turns "seen weakly, repeatedly, in the same place" into a track.
+    """
+    order = list(scores.argsort()[::-1])
+    working = scores.astype(np.float64).copy()
+    areas = (xyxy[:, 2] - xyxy[:, 0]) * (xyxy[:, 3] - xyxy[:, 1])
+    keep: list[int] = []
+    while order:
+        order.sort(key=lambda idx: -working[idx])
+        i = order.pop(0)
+        if working[i] < floor:
+            break
+        keep.append(int(i))
+        if not order:
+            break
+        rest = np.asarray(order, dtype=np.int64)
+        xx1 = np.maximum(xyxy[i, 0], xyxy[rest, 0])
+        yy1 = np.maximum(xyxy[i, 1], xyxy[rest, 1])
+        xx2 = np.minimum(xyxy[i, 2], xyxy[rest, 2])
+        yy2 = np.minimum(xyxy[i, 3], xyxy[rest, 3])
+        inter = np.maximum(0, xx2 - xx1) * np.maximum(0, yy2 - yy1)
+        iou = inter / (areas[i] + areas[rest] - inter + 1e-9)
+        # Only boxes that actually overlap are touched, so a distant one keeps
+        # its score exactly rather than being multiplied by something near one.
+        decayed = iou > iou_threshold
+        working[rest[decayed]] *= np.exp(-(iou[decayed] ** 2) / sigma)
+        order = [int(j) for j in rest if working[j] >= floor]
+    return keep
+
+
 def _nms_per_class(xyxy: np.ndarray, scores: np.ndarray, class_ids: np.ndarray,
-                   iou_threshold: float) -> list[int]:
+                   iou_threshold: float, *, soft: bool = False) -> list[int]:
     """Suppress within each class, never across them.
 
     One pass over every box in the frame lets a person standing in front of a
@@ -397,10 +423,11 @@ def _nms_per_class(xyxy: np.ndarray, scores: np.ndarray, class_ids: np.ndarray,
     module did, and it is the more expensive mistake: a suppressed detection
     leaves no trace anywhere for anybody to notice.
     """
+    suppress = _soft_nms if soft else _nms
     keep: list[int] = []
     for class_id in np.unique(class_ids):
         members = np.flatnonzero(class_ids == class_id)
-        for local in _nms(xyxy[members], scores[members], iou_threshold):
+        for local in suppress(xyxy[members], scores[members], iou_threshold):
             keep.append(int(members[local]))
     # Back into confidence order, which is what a caller reading the first few
     # detections expects.

@@ -35,27 +35,41 @@ use core::ffi::c_void;
 
 use crate::assign;
 use crate::camera::{
-    self, CameraPose, PoseUncertainty, ProjectionFailure,
+    self, CameraPose, PoseUncertainty, ProjectionFailure, Vec3,
 };
 use crate::geodesy::{self, LatLon};
 use crate::ortho::{self, CellStats, GroundGrid, GroundSample, MedianAccumulator};
 use crate::track::KalmanBox;
+use crate::triangulate::{self, Ray};
 
 /// Version of this ABI. Python checks it on load and refuses a mismatch
 /// rather than calling functions whose meaning may have moved.
 ///
-/// **2** since the pose grew its lens. A binding built for ABI 1 would hand
+/// **2** was the pose growing its lens. A binding built for ABI 1 would hand
 /// over nine values where fourteen are read, and the five it did not send
 /// would be whatever was next in memory — a lens made of stack garbage,
-/// applied to every ray. Refusing the load is the only safe answer.
-pub const ABI_VERSION: u32 = 2;
+/// applied to every ray.
+///
+/// **3** added triangulation and the ground-plane fit. Those were new symbols
+/// rather than changed ones, so an old *binding* against a new library would
+/// in fact have worked — but a new binding against an old library would
+/// resolve `vigil_triangulate` to nothing and fail at the call, and the
+/// version is what turns that into one clear refusal at load instead.
+///
+/// **4** grew the pose again, by the two ground tilts. This is the dangerous
+/// kind: a binding sending fourteen values where sixteen are read would have
+/// a ground plane tilted by whatever was next in memory, and every position
+/// from that camera would be quietly, plausibly wrong.
+pub const ABI_VERSION: u32 = 4;
 
 /// `[lat, lon, mount_height, heading, pitch, roll, hfov, vfov, range,
-/// k1, k2, p1, p2, k3]`.
+/// k1, k2, p1, p2, k3, ground_tilt_east, ground_tilt_north]`.
 ///
 /// The five lens coefficients are all-zero for an uncalibrated camera, which
-/// is every camera until `vigil cameras calibrate` has been run on it.
-pub const POSE_VALUES: u32 = 14;
+/// is every camera until `vigil cameras calibrate` has been run on it, and
+/// the two ground tilts are zero until `service.triangulation` has solved a
+/// plane. Zero is the exact identity in both cases.
+pub const POSE_VALUES: u32 = 16;
 /// `[heading, pitch, roll, mount_height, terrain_slope]`, all 1-sigma.
 pub const SIGMA_VALUES: u32 = 5;
 /// `[lat, lon, ground_distance, bearing, along_sigma, across_sigma]`.
@@ -64,6 +78,10 @@ pub const PROJECTION_VALUES: u32 = 6;
 pub const GRID_VALUES: u32 = 5;
 /// 8 mean + 64 covariance.
 pub const KALMAN_VALUES: u32 = 72;
+/// `[x, y, z, parallax_deg, gap_m, range_a, range_b, sigma_m]`.
+pub const TRIANGULATION_VALUES: u32 = 8;
+/// `[nx, ny, nz, offset, inliers, rms, tilt_east, tilt_north]`.
+pub const PLANE_VALUES: u32 = 8;
 
 #[no_mangle]
 pub extern "C" fn vigil_abi_version() -> u32 {
@@ -71,8 +89,8 @@ pub extern "C" fn vigil_abi_version() -> u32 {
 }
 
 /// The array lengths this ABI expects, in the order
-/// `[POSE, SIGMA, PROJECTION, GRID, KALMAN]`. A binding checks these rather
-/// than assuming they have stayed put.
+/// `[POSE, SIGMA, PROJECTION, GRID, KALMAN, TRIANGULATION, PLANE]`. A binding
+/// checks these rather than assuming they have stayed put.
 ///
 /// Returns the number written, or -1 on a null or undersized buffer.
 ///
@@ -80,7 +98,7 @@ pub extern "C" fn vigil_abi_version() -> u32 {
 /// `out` must be null or point to `capacity` writable `u32`.
 #[no_mangle]
 pub unsafe extern "C" fn vigil_layout(out: *mut u32, capacity: u32) -> i32 {
-    const COUNT: usize = 5;
+    const COUNT: usize = 7;
     if out.is_null() || (capacity as usize) < COUNT {
         return -1;
     }
@@ -90,6 +108,8 @@ pub unsafe extern "C" fn vigil_layout(out: *mut u32, capacity: u32) -> i32 {
         PROJECTION_VALUES,
         GRID_VALUES,
         KALMAN_VALUES,
+        TRIANGULATION_VALUES,
+        PLANE_VALUES,
     ];
     for (i, v) in values.iter().enumerate() {
         *out.add(i) = *v;
@@ -158,6 +178,8 @@ unsafe fn read_pose(pose: *const f64) -> Option<CameraPose> {
             p2: v[12],
             k3: v[13],
         },
+        ground_tilt_east: v[14],
+        ground_tilt_north: v[15],
     })
 }
 
@@ -711,12 +733,141 @@ pub unsafe extern "C" fn vigil_median_result(
     filled as i64
 }
 
+// ------------------------------------------------------------ triangulation
+
+/// Two rays in the local ENU frame, intersected.
+///
+/// Writes [`TRIANGULATION_VALUES`] `f64`:
+/// `[x, y, z, parallax_deg, gap_m, range_a, range_b, sigma_m]`.
+///
+/// Returns 0 on success, or a negative refusal the caller can name:
+/// -1 a null or undersized buffer, -2 the rays are parallel, -3 too little
+/// parallax, -4 the meeting point is behind a camera, -5 the rays passed
+/// further apart than one object can be.
+///
+/// # Safety
+/// `out` must be null or point to [`TRIANGULATION_VALUES`] writable `f64`.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn vigil_triangulate(
+    a_origin: *const f64,
+    a_direction: *const f64,
+    b_origin: *const f64,
+    b_direction: *const f64,
+    angular_sigma_deg: f64,
+    min_parallax_deg: f64,
+    out: *mut f64,
+) -> i32 {
+    if out.is_null()
+        || a_origin.is_null()
+        || a_direction.is_null()
+        || b_origin.is_null()
+        || b_direction.is_null()
+    {
+        return -1;
+    }
+    let read = |p: *const f64| {
+        let v = core::slice::from_raw_parts(p, 3);
+        if v.iter().any(|x| !x.is_finite()) {
+            None
+        } else {
+            Some(Vec3::new(v[0], v[1], v[2]))
+        }
+    };
+    let (Some(ao), Some(ad), Some(bo), Some(bd)) = (
+        read(a_origin),
+        read(a_direction),
+        read(b_origin),
+        read(b_direction),
+    ) else {
+        return -1;
+    };
+    let (Some(a), Some(b)) = (Ray::new(ao, ad), Ray::new(bo, bd)) else {
+        return -1;
+    };
+    match triangulate::triangulate(a, b, angular_sigma_deg, min_parallax_deg) {
+        Ok(t) => {
+            let values = [
+                t.point.x,
+                t.point.y,
+                t.point.z,
+                t.parallax_deg,
+                t.gap_m,
+                t.range_a,
+                t.range_b,
+                t.sigma_m,
+            ];
+            for (i, v) in values.iter().enumerate() {
+                *out.add(i) = *v;
+            }
+            0
+        }
+        Err(triangulate::Refusal::Parallel) => -2,
+        Err(triangulate::Refusal::TooLittleParallax) => -3,
+        Err(triangulate::Refusal::Behind) => -4,
+        Err(triangulate::Refusal::TooFarApart) => -5,
+    }
+}
+
+/// RANSAC ground plane through `count` points of `[x, y, z]`.
+///
+/// Writes [`PLANE_VALUES`] `f64`:
+/// `[nx, ny, nz, offset, inliers, rms, tilt_east, tilt_north]`.
+///
+/// Returns 0, -1 on a null or undersized buffer, or -2 when no plane could be
+/// fitted — fewer than three points, or nothing that a plane explains.
+///
+/// # Safety
+/// `points` must point to `3 * count` readable `f64`; `out` to
+/// [`PLANE_VALUES`] writable `f64`.
+#[no_mangle]
+pub unsafe extern "C" fn vigil_fit_plane(
+    points: *const f64,
+    count: u32,
+    threshold_m: f64,
+    iterations: u32,
+    seed: u64,
+    out: *mut f64,
+) -> i32 {
+    if points.is_null() || out.is_null() || count == 0 {
+        return -1;
+    }
+    let raw = core::slice::from_raw_parts(points, count as usize * 3);
+    if raw.iter().any(|x| !x.is_finite()) {
+        return -1;
+    }
+    let cloud: Vec<Vec3> = raw
+        .chunks_exact(3)
+        .map(|c| Vec3::new(c[0], c[1], c[2]))
+        .collect();
+    let Some(fit) = triangulate::fit_plane(&cloud, threshold_m, iterations, seed) else {
+        return -2;
+    };
+    let values = [
+        fit.plane.normal.x,
+        fit.plane.normal.y,
+        fit.plane.normal.z,
+        fit.plane.offset,
+        fit.inliers as f64,
+        fit.rms,
+        fit.tilt_east,
+        fit.tilt_north,
+    ];
+    for (i, v) in values.iter().enumerate() {
+        *out.add(i) = *v;
+    }
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn pose_values() -> [f64; POSE_VALUES as usize] {
-        [33.8938, 35.5018, 4.0, 0.0, -25.0, 0.0, 62.0, 36.0, 60.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        [
+            33.8938, 35.5018, 4.0, 0.0, -25.0, 0.0, 62.0, 36.0, 60.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0,
+        ]
     }
 
     #[test]
@@ -882,12 +1033,12 @@ mod tests {
 
     #[test]
     fn the_layout_is_what_the_binding_will_check() {
-        let mut out = [0u32; 5];
+        let mut out = [0u32; 7];
         unsafe {
-            assert_eq!(vigil_layout(out.as_mut_ptr(), 5), 5);
+            assert_eq!(vigil_layout(out.as_mut_ptr(), 7), 7);
         }
-        assert_eq!(out, [14, 5, 6, 5, 72]);
+        assert_eq!(out, [16, 5, 6, 5, 72, 8, 8]);
         assert_eq!(vigil_abi_version(), ABI_VERSION);
-        assert_eq!(ABI_VERSION, 2, "the pose grew its lens");
+        assert_eq!(ABI_VERSION, 4, "the pose grew its ground tilt");
     }
 }
