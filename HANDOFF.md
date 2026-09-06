@@ -1032,6 +1032,18 @@ calls and the command line does not.
 domain; the export, the track table and the *Why* panel all call it. It was
 about to be written a third time.
 
+**The toolbar was cutting its own labels, and only a photograph showed it.**
+Adding one button pushed the row past the window, and Qt's answer to that is
+to shrink the buttons and elide the text: the shipped console read "dd
+camera.", "elete zone", "cknowledg", "ort evidenc". Nothing failed and nothing
+was logged. Two things to keep: **the laptop is HiDPI, so a 2560-pixel
+screenshot is a 1280-logical-pixel window** — measure in logical pixels or the
+arithmetic says it fits when it does not; and a fixed row of controls is a
+defect waiting for the next button, so the toolbar is now a wrapping
+`FlowLayout` (`interfaces/console/widgets.py`) that gives every control the
+width it asked for and takes another line instead. A test resizes the window
+to 1280 and asserts no control is narrower than its own label.
+
 ## 7. Hard-won facts worth not rediscovering
 
 - **The recurring defect in this repository is correct, tested code that nothing

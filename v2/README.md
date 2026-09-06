@@ -112,6 +112,13 @@ One measurement, computed in one place (`Evidence.distance_from`), so the
 screen and the evidence cannot disagree. A track the geometry could not place
 says so instead of printing a number.
 
+**The window fits the window.** The toolbar wraps rather than shrinking its
+buttons: Qt's answer to controls that do not fit is to elide their labels, and
+a shipped build read "dd camera." and "ort evidenc" on a 1280-wide screen with
+nothing failing and nothing logged. Every control keeps the width of its own
+label and the toolbar takes another line instead. A test resizes the window to
+1280 and checks exactly that.
+
 **Working the queue.** `vigil incidents` shows what is still waiting on a
 person; an incident is acknowledged or dismissed, and a dismissal needs a
 reason, because "dismissed" with no reason cannot be told from nobody having
@@ -157,8 +164,8 @@ not contain — which has already happened here once, quietly.
 
 | | |
 |---|---|
-| Product code | 9,960 lines of Python, no compiled core |
-| Tests | 202, all green through `python tasks.py check` |
+| Product code | 10,172 lines of Python, no compiled core |
+| Tests | 205, all green through `python tasks.py check` |
 | Capabilities | 27 tested, 2 implemented, 1 planned ([CAPABILITIES.md](CAPABILITIES.md)) |
 | Packaged | 751 MB bundle: one `vigil.exe` that is both the command line and the console |
 
