@@ -45,7 +45,11 @@ Thumbs.db
 apps/desktop/dist/
 
 # Rust build output
-core/target/
+# Any Rust build directory, at any depth. The unanchored form matters: a
+# pattern with a slash in it is anchored to this file's directory, so
+# `core/target/` matched the v1 core and silently did not match `v2/core/target`
+# — which is how 22 MB of compiled output reached a commit.
+**/target/
 
 # Python
 __pycache__/

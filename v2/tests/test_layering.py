@@ -4,10 +4,22 @@ import ast
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent / "vigil"
-LAYERS = {"domain": 0, "adapters": 1, "storage": 1, "service": 2, "interfaces": 3}
+# `kernel` is below the domain, not beside it. The domain must be able to say
+# "predict this track" without knowing a shared library exists, and a kernel
+# that could import the domain would let the arithmetic start depending on
+# what the arithmetic is for.
+#
+# `perception` is beside the adapters: it reads pixels, so it may use OpenCV,
+# and it produces domain types, so it may import the domain. Nothing in the
+# domain may import it back.
+LAYERS = {"kernel": -1, "domain": 0, "adapters": 1, "perception": 1, "storage": 1,
+          "service": 2, "interfaces": 3}
 FORBIDDEN = {
-    "domain": {"adapters", "storage", "service", "interfaces", "cv2", "sqlite3", "threading", "socket", "os"},
-    "adapters": {"service", "interfaces", "storage"},
+    "kernel": {"domain", "adapters", "perception", "storage", "service", "interfaces", "cv2", "sqlite3"},
+    "domain": {"adapters", "perception", "storage", "service", "interfaces", "cv2", "sqlite3",
+               "threading", "socket", "os"},
+    "adapters": {"perception", "service", "interfaces", "storage"},
+    "perception": {"adapters", "service", "interfaces", "storage"},
     "storage": {"service", "interfaces"},
     "service": {"interfaces"},
     "interfaces": {"storage.", "adapters.decode.VideoSource"},

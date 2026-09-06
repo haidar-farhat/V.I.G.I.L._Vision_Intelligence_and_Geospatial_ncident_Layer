@@ -39,26 +39,38 @@
 //! so a dropped frame widens the gate by the right amount instead of by
 //! whatever the frame counter happened to do.
 //!
-//! `q` for the centre is `(ACCEL_OBJECT_HEIGHTS * h)^2`. The units work out:
-//! a real object of height `H` accelerating at `A` metres per second squared
-//! moves in the image at `A * h / H` object-heights per second squared,
-//! because `h` is inversely proportional to range for a fixed real height. A
-//! person is about 1.7 m and can accelerate at about 5 m/s^2 from a standing
-//! start, which is where `3.0` comes from — it is a measurement of people,
-//! not a tuning knob.
+//! `q` for the centre is `ACCEL_PSD_CENTRE * h^2`, and that constant carries
+//! the derivation — including the units error the first version of it made.
 
-/// Image-space acceleration of a tracked object's centre, in multiples of its
-/// own apparent height per second squared. See the module docs: 5 m/s^2 over
-/// a 1.7 m person.
-pub const ACCEL_OBJECT_HEIGHTS: f64 = 3.0;
+/// Acceleration **power spectral density** for the box centre, in squared
+/// object-heights per second cubed. Note the units: this is a PSD, not an
+/// acceleration, and conflating the two is the error this constant was rewritten
+/// to fix.
+///
+/// The first version of this filter set q = (3h)^2, reasoning that a 1.7 m person
+/// can accelerate at about 5 m/s^2 and that h is inversely proportional to range,
+/// so image-space acceleration is 5h/1.7 ~ 3h. The arithmetic is right and the
+/// substitution is not: in a continuous white-noise-acceleration model the
+/// velocity variance grows as q*dt, so q = (3h)^2 lets the estimated velocity
+/// wander by 3h*sqrt(dt) in one frame - 0.155 frames per second at 15 fps - while
+/// the largest change a person can physically produce in that frame is 3h*dt,
+/// which is 0.039. The filter was four times more willing to believe in
+/// acceleration than acceleration exists, so it chased detector jitter and gave
+/// parked cars a velocity.
+///
+/// A PSD needs an acceleration *and a time over which it is held*:
+/// q = (a/H)^2 * tau. A pedestrian sustains about 1 m/s^2 for about half a second
+/// when starting, stopping or turning, which over a 1.7 m frame gives 0.17. A
+/// 5 m/s^2 sprint start is real, lasts a fraction of a second, and arrives as an
+/// innovation the chi-squared gate still accepts - which is where a brief
+/// manoeuvre belongs.
+pub const ACCEL_PSD_CENTRE: f64 = 0.18;
 
-/// The same for apparent height. Scale changes are second order in radial
-/// speed, so this is deliberately smaller than the centre term.
-pub const ACCEL_SCALE: f64 = 1.0;
+/// The same for apparent height, which changes only with range.
+pub const ACCEL_PSD_SCALE: f64 = 0.02;
 
-/// The same for aspect ratio, which is nearly constant for a rigid object and
-/// changes only when one turns.
-pub const ACCEL_ASPECT: f64 = 0.5;
+/// The same for aspect ratio, absolute rather than scaled by `h`.
+pub const ACCEL_PSD_ASPECT: f64 = 0.09;
 
 /// Detector box jitter, 1-sigma, as a fraction of box height. A YOLO box's
 /// edges move by a few percent of the box between consecutive frames of a
@@ -156,10 +168,10 @@ impl KalmanBox {
         }
         let h = self.mean[3].abs().max(1e-4);
         let q = [
-            (ACCEL_OBJECT_HEIGHTS * h).powi(2),
-            (ACCEL_OBJECT_HEIGHTS * h).powi(2),
-            ACCEL_ASPECT.powi(2),
-            (ACCEL_SCALE * h).powi(2),
+            ACCEL_PSD_CENTRE * h * h,
+            ACCEL_PSD_CENTRE * h * h,
+            ACCEL_PSD_ASPECT,
+            ACCEL_PSD_SCALE * h * h,
         ];
         let (t3, t2, t1) = (dt * dt * dt / 3.0, dt * dt / 2.0, dt);
         for i in 0..M {

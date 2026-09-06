@@ -51,8 +51,8 @@ from pathlib import Path
 
 import numpy as np
 
-from ..domain import filtering as _filtering
 from ..logs import get as _get_logger
+from . import filtering as _filtering
 
 _log = _get_logger(__name__)
 

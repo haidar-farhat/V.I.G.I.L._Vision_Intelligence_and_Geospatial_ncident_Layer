@@ -21,11 +21,18 @@ from ..logs import get as _get_logger
 _log = _get_logger(__name__)
 
 CAMERA_DARK = "camera.dark"
+#: A camera that is producing frames nobody could detect anything in:
+#: out of focus, blown out, black, or repeating the same frame. v1 and
+#: v2 both had "dark" — no frames at all — and nothing between that and
+#: "working", so every one of those failed silently while the frame
+#: counter climbed and the fps looked healthy.
+CAMERA_DEGRADED = "camera.degraded"
 RECORDING_STOPPED = "recording.stopped"
 RETENTION_SHORTFALL = "retention.shortfall"
 THREAD_STUCK = "analysis.thread_stuck"
 DISK_LOW = "disk.low"
-KINDS = frozenset({CAMERA_DARK, RECORDING_STOPPED, RETENTION_SHORTFALL, THREAD_STUCK, DISK_LOW})
+KINDS = frozenset({CAMERA_DARK, CAMERA_DEGRADED, RECORDING_STOPPED, RETENTION_SHORTFALL,
+                  THREAD_STUCK, DISK_LOW})
 SINK_TIMEOUT_SECONDS = 10.0
 
 

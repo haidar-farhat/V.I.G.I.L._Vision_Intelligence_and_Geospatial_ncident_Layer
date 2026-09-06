@@ -27,12 +27,8 @@ did:
     Q_block = q * [[dt^3/3, dt^2/2],
                    [dt^2/2, dt    ]]
 
-`q` for the centre is `(ACCEL_OBJECT_HEIGHTS * h)^2`. The units work out: a
-real object of height `H` accelerating at `A` m/s^2 moves in the image at
-`A * h / H` object-heights per second squared, because `h` is inversely
-proportional to range for a fixed real height. A person is about 1.7 m and can
-accelerate at about 5 m/s^2 from standing, which is where 3.0 comes from. It
-is a measurement of people, not a tuning knob.
+`q` for the centre is `ACCEL_PSD_CENTRE * h^2`, and that constant carries the
+derivation - including the units error the first version of it made.
 
 # What this replaced
 
@@ -48,13 +44,35 @@ from __future__ import annotations
 
 import numpy as np
 
-#: Image-space acceleration of a tracked object's centre, in multiples of its
-#: own apparent height per second squared. 5 m/s^2 over a 1.7 m person.
-ACCEL_OBJECT_HEIGHTS = 3.0
-#: The same for apparent height. Scale change is second order in radial speed.
-ACCEL_SCALE = 1.0
-#: The same for aspect ratio, near-constant for a rigid object.
-ACCEL_ASPECT = 0.5
+#: Acceleration **power spectral density** for the box centre, in squared
+#: object-heights per second cubed. Note the units: this is a PSD, not an
+#: acceleration, and conflating the two is the error this constant was rewritten
+#: to fix.
+#:
+#: The first version of this filter set q = (3h)^2, reasoning that a 1.7 m person
+#: can accelerate at about 5 m/s^2 and that h is inversely proportional to range,
+#: so image-space acceleration is 5h/1.7 ~ 3h. The arithmetic is right and the
+#: substitution is not: in a continuous white-noise-acceleration model the
+#: velocity variance grows as q*dt, so q = (3h)^2 lets the estimated velocity
+#: wander by 3h*sqrt(dt) in one frame - 0.155 frames per second at 15 fps - while
+#: the largest change a person can physically produce in that frame is 3h*dt,
+#: which is 0.039. The filter was four times more willing to believe in
+#: acceleration than acceleration exists, so it chased detector jitter and gave
+#: parked cars a velocity.
+#:
+#: A PSD needs an acceleration *and a time over which it is held*:
+#: q = (a/H)^2 * tau. A pedestrian sustains about 1 m/s^2 for about half a second
+#: when starting, stopping or turning, which over a 1.7 m frame gives 0.17. A
+#: 5 m/s^2 sprint start is real, lasts a fraction of a second, and arrives as an
+#: innovation the chi-squared gate still accepts - which is where a brief
+#: manoeuvre belongs.
+ACCEL_PSD_CENTRE = 0.18
+#: The same for apparent height, which changes only with range - second order
+#: in the speed the centre term already covers.
+ACCEL_PSD_SCALE = 0.02
+#: The same for aspect ratio, absolute rather than scaled by h: a person
+#: turning changes it by about 0.3 over about a second.
+ACCEL_PSD_ASPECT = 0.09
 #: Detector box jitter, 1-sigma, as a fraction of box height.
 MEASURE_STD_FRACTION = 0.05
 #: Jitter of the aspect ratio, absolute.
@@ -105,10 +123,10 @@ def _transition(dt: float) -> np.ndarray:
 def _process_noise(height: float, dt: float) -> np.ndarray:
     h = max(abs(height), 1e-4)
     q = np.array([
-        (ACCEL_OBJECT_HEIGHTS * h) ** 2,
-        (ACCEL_OBJECT_HEIGHTS * h) ** 2,
-        ACCEL_ASPECT ** 2,
-        (ACCEL_SCALE * h) ** 2,
+        ACCEL_PSD_CENTRE * h * h,
+        ACCEL_PSD_CENTRE * h * h,
+        ACCEL_PSD_ASPECT,
+        ACCEL_PSD_SCALE * h * h,
     ])
     noise = np.zeros((_N, _N))
     index = np.arange(_M)

@@ -15,8 +15,9 @@ def square(centre: LatLon, half: float = 5.0) -> tuple[LatLon, ...]:
 
 
 def track(track_id: int, point: LatLon, *, class_id: int = 0, radius: float = 0.5, speed=None) -> Track:
-    t = Track(track_id, class_id, 0, 0, 0, BoundingBox(0.4, 0.5, 0.1, 0.2), Vec2(0.45, 0.7), confidence=0.9, confirmed=True,
-              position=PositionEstimate(point, radius, PositionSource.GROUND_PROJECTION))
+    t = Track.observing(track_id, class_id, BoundingBox(0.4, 0.5, 0.1, 0.2), contact=Vec2(0.45, 0.7),
+                        confidence=0.9,
+                        position=PositionEstimate(point, radius, PositionSource.GROUND_PROJECTION))
     t.speed_mps = speed
     return t
 
@@ -161,7 +162,6 @@ def _approaching(distance_m: float, zone: Zone, *, class_id: int = 0, confidence
     """A track that far outside the zone, and the relation saying it is closing."""
     from vigil.domain.relations import Relation, RelationKind
 
-    point = destination_point(zone.ring[0], 0.0, 0.0)  # placeholder, replaced below
     centre = LatLon(33.8938, 35.5018)
     point = destination_point(centre, 0.0, 7.07 + distance_m)
     subject = track(1, point, class_id=class_id)

@@ -24,6 +24,13 @@ vigil-console = "vigil.interfaces.console.main:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "pyinstaller>=6.0"]
+# `vigil coverage` only. Union and difference over polygons with holes,
+# degenerate rings and near-tangent edges is genuinely difficult and its bugs
+# are invisible until one arrangement of cameras produces a wrong answer;
+# a maintained computational-geometry library is better at it than anything
+# written here. Optional because every other part of the product works
+# without it, and the one that does not says so rather than crashing.
+coverage = ["shapely>=2.0"]
 
 [build-system]
 requires = ["setuptools>=70"]

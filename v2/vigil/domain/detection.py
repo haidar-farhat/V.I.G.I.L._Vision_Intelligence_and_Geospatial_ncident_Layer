@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 from .geo import Vec2
 
@@ -60,6 +61,19 @@ class Detection:
     #: Where the object meets the ground, in normalised image coordinates.
     #: The bottom-centre of the box unless a mask measured better.
     contact: Vec2 | None = None
+    #: The segmentation mask over the box, as a small 0/1 array, when the
+    #: model produced one.
+    #:
+    #: Carried because an appearance descriptor taken over the whole box is
+    #: mostly a descriptor of the *background* — the corners of a box around a
+    #: person are whatever they are standing in front of, which every box in
+    #: that part of the frame shares. That is how a colour descriptor comes to
+    #: link two different people who walked past the same wall.
+    #:
+    #: Excluded from equality: an array does not compare to a bool, and two
+    #: detections are the same detection when their box, class and confidence
+    #: are the same.
+    mask: Any = field(default=None, compare=False)
 
     @property
     def ground_contact(self) -> Vec2:
@@ -77,6 +91,14 @@ class DetectorInfo:
     input_size: tuple[int, int] | None = None
     class_names: dict[int, str] = field(default_factory=dict)
     classifies: bool = False
+    #: The onnxruntime execution provider the session actually got.
+    #:
+    #: Read back off the session rather than assumed from what was requested:
+    #: onnxruntime falls back silently when a provider will not initialise, so
+    #: a CUDA build with the wrong driver runs on the CPU and says nothing.
+    #: "Why is this slow" is answered by this field more often than by
+    #: anything in the model.
+    provider: str | None = None
 
     def label_for(self, class_id: int) -> str | None:
         """The label, or ``None`` when this detector cannot say. A blob is not a person."""

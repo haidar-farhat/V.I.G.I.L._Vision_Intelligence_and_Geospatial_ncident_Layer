@@ -25,6 +25,7 @@ from ..service.maintenance import StoreError, backup, open_store, restore_backup
 from ..service.runtime import RetentionPolicy, apply_retention
 from ..version import build_info, describe
 
+from .map_commands import add_arguments as _add_map_arguments
 from .site_commands import _cameras, _pose, _read_secret, _site, _users, _where, _zones
 from .work_commands import (
     _alerts, _audit, _backup, _doctor, _events, _export, _health, _incidents, _restore, _retention,
@@ -241,6 +242,7 @@ def build_parser() -> argparse.ArgumentParser:
     bk = commands.add_parser("backup", help="copy the database with a checksum"); bk.add_argument("--to"); bk.set_defaults(handler=_backup)
     rs = commands.add_parser("restore", help="replace the database with a verified backup"); rs.add_argument("backup"); rs.set_defaults(handler=_restore)
     commands.add_parser("health", help="every camera's state").set_defaults(handler=_health)
+    _add_map_arguments(commands)
     doctor = commands.add_parser("doctor", help="check this installation before leaving site")
     doctor.add_argument("--probe", action="store_true", help="also open every camera, which is slow")
     doctor.set_defaults(handler=_doctor)

@@ -1,7 +1,9 @@
 """The task runner. `python tasks.py <task>`.
 
+    core           build the Rust engine core (cargo, release)
     test           every suite
-    check          offline audit, then every suite (what CI runs)
+    check          the core, the offline audit, then every suite (what CI runs)
+    bench          measure the pipeline end to end and print the numbers
     capabilities   regenerate CAPABILITIES.md from the manifest
     package        build dist/vigil/vigil.exe with PyInstaller
     exetest        run the packaged executable on device:0 for a while and judge the run
@@ -26,16 +28,57 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(errors="replace")
 
 
-def _run(argv: list[str], **kwargs) -> int:
+def _run(argv: list[str], *, cwd: Path | None = None, **kwargs) -> int:
     print(">>", " ".join(argv), flush=True)
-    return subprocess.call(argv, cwd=str(ROOT), **kwargs)
+    return subprocess.call(argv, cwd=str(cwd or ROOT), **kwargs)
+
+
+def core() -> int:
+    """Build the Rust engine core.
+
+    Not required to run the tests — the kernel has NumPy paths for everything
+    but the ground rasteriser, and `tests/test_native.py` skips itself when
+    the library is absent. It *is* required for `vigil map`, and it is what
+    makes association and rasterisation fast enough to matter.
+    """
+    if shutil.which("cargo") is None:
+        # No URL, deliberately: `tools/offline_audit.py` fails the build on any
+        # address in the source tree, and it is right to — an address in a
+        # help string is one nobody notices becoming an address in a request.
+        print("cargo is not installed; install the Rust toolchain to build the engine core. "
+              "The product runs without it — more slowly, and without `vigil map` — "
+              "and `vigil doctor` says so.")
+        return 1
+    crate = ROOT / "core"
+    if _run(["cargo", "test", "--lib", "--release"], cwd=crate) != 0:
+        return 1
+    if _run(["cargo", "build", "--release"], cwd=crate) != 0:
+        return 1
+    sys.path.insert(0, str(ROOT))
+    from vigil.kernel import native
+
+    native.forget()
+    if not native.available():
+        print(f"the core built but will not load: {native.fault()}")
+        return 1
+    print(f"engine core ready: {native.loaded_from()}, ABI {native.ABI_VERSION}")
+    return 0
 
 
 def test() -> int:
     return _run([sys.executable, "-m", "pytest", "tests", "-q", "-p", "no:cacheprovider"])
 
 
+def bench() -> int:
+    return _run([sys.executable, str(ROOT / "tools" / "benchmark.py")])
+
+
 def check() -> int:
+    # The core first: a suite that runs without it silently skips the
+    # cross-validation between the two implementations, which is the test that
+    # makes having two of them safe.
+    if shutil.which("cargo") is not None and core() != 0:
+        return 1
     for step in ((sys.executable, str(ROOT / "tools" / "offline_audit.py")),):
         if _run(list(step)) != 0:
             return 1
@@ -79,6 +122,10 @@ def package() -> int:
     # to read. Anything edited while it runs will differ from this, which is
     # exactly the state `exetest` must refuse.
     sources = source_digests()
+    library = _core_library()
+    if library is None:
+        print("the engine core is not built, so the package will have no `vigil map` and no fast "
+              "paths. Build it first with `python tasks.py core`.")
     code = _run([sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "--name", "vigil", "--distpath", str(ROOT / "dist"),
                  "--workpath", str(ROOT / "build"), "--specpath", str(ROOT / "build"), "--collect-all", "onnxruntime", "--collect-data", "tzdata",
                  "--hidden-import", "keyring.backends.Windows", "--hidden-import", "keyring.backends.macOS",
@@ -89,6 +136,7 @@ def package() -> int:
                  "--exclude-module", "PySide6.QtQml", "--exclude-module", "PySide6.QtMultimedia",
                  "--exclude-module", "matplotlib", "--exclude-module", "pytest", "--exclude-module", "onnx",
                  "--paths", str(ROOT),
+                 *(["--add-binary", f"{library}{os.pathsep}."] if library else []),
                  str(ROOT / "packaging" / "entry.py")])
     if code != 0:
         return code
@@ -98,8 +146,23 @@ def package() -> int:
     models = ROOT / "models"
     if models.is_dir():
         shutil.copytree(models, DIST / "models", dirs_exist_ok=True)
+    if library is not None:
+        # Beside the executable as well as inside `_internal`: the loader
+        # looks in both, and a deployment that unpacks only what it can see
+        # should still get the fast paths.
+        shutil.copy2(library, DIST / library.name)
     print(f"packaged to {DIST}")
     return 0
+
+
+def _core_library() -> Path | None:
+    """The built engine core, or `None`. Named here rather than in the loader
+    because packaging is the only caller that needs a *path* rather than a
+    loaded library."""
+    names = {"win32": "vigil_core.dll", "darwin": "libvigil_core.dylib"}
+    name = names.get(sys.platform, "libvigil_core.so")
+    candidate = ROOT / "core" / "target" / "release" / name
+    return candidate if candidate.is_file() else None
 
 
 def source_digests() -> dict[str, str]:
@@ -219,7 +282,8 @@ def exetest() -> int:
     return 0 if not problems else 1
 
 
-TASKS = {"test": test, "check": check, "capabilities": capabilities, "package": package, "exetest": exetest}
+TASKS = {"core": core, "test": test, "bench": bench, "check": check, "capabilities": capabilities,
+         "package": package, "exetest": exetest}
 
 if __name__ == "__main__":
     if len(sys.argv) < 2 or sys.argv[1] not in TASKS:

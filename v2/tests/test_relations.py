@@ -25,7 +25,7 @@ def track(track_id: int, box: BoundingBox, class_id: int = 0, *, point: LatLon |
     position = None
     if point is not None:
         position = PositionEstimate(point, radius, PositionSource.GROUND_PROJECTION)
-    return Track(track_id, class_id, 0, 0, 0, box, box.bottom_center, confidence=0.9, confirmed=True, position=position)
+    return Track.observing(track_id, class_id, box, confidence=0.9, position=position)
 
 
 def _hold(tracker: RelationTracker, tracks, *, frames: int = 6, step: int = 200, zones=()):

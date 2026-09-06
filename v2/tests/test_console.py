@@ -706,9 +706,9 @@ def test_the_track_table_says_how_far_away_and_what_the_track_is_doing(console, 
     where = destination_point(pose.position, 0.0, 12.0)
 
     def made(track_id, class_id):
-        return Track(track_id, class_id, 0, 0, 0, BoundingBox(0.4, 0.5, 0.1, 0.2), Vec2(0.45, 0.7),
-                     confidence=0.8, confirmed=True,
-                     position=PositionEstimate(where, 1.5, PositionSource.GROUND_PROJECTION))
+        return Track.observing(track_id, class_id, BoundingBox(0.4, 0.5, 0.1, 0.2), contact=Vec2(0.45, 0.7),
+                               confidence=0.8,
+                               position=PositionEstimate(where, 1.5, PositionSource.GROUND_PROJECTION))
 
     carried = Relation(RelationKind.CARRIED, 1, 2, confidence=0.7,
                        conditions=("58% of the backpack's box lay within the person's",))
@@ -723,7 +723,7 @@ def test_the_track_table_says_how_far_away_and_what_the_track_is_doing(console, 
     assert console.tracks.tree.topLevelItem(1).text(6) == ""
 
     # A track with no ground position says so rather than printing a number.
-    nowhere = Track(3, 0, 0, 0, 0, BoundingBox(0.1, 0.1, 0.1, 0.1), Vec2(0.15, 0.2), confidence=0.5, confirmed=True)
+    nowhere = Track.observing(3, 0, BoundingBox(0.1, 0.1, 0.1, 0.1), contact=Vec2(0.15, 0.2), confidence=0.5)
     console.tracks.show_tracks([("gate", nowhere, info, pose, ())])
     assert console.tracks.tree.topLevelItem(0).text(5) == "—"
     assert "not placed on the ground" in console.tracks.tree.topLevelItem(0).toolTip(5)
@@ -742,9 +742,9 @@ def test_the_track_table_counts_who_is_apparently_in_the_car(qt_app, pose):
     where = destination_point(pose.position, 0.0, 12.0)
 
     def made(track_id, class_id):
-        return Track(track_id, class_id, 0, 0, 0, BoundingBox(0.4, 0.5, 0.1, 0.2), Vec2(0.45, 0.7),
-                     confidence=0.8, confirmed=True,
-                     position=PositionEstimate(where, 1.5, PositionSource.GROUND_PROJECTION))
+        return Track.observing(track_id, class_id, BoundingBox(0.4, 0.5, 0.1, 0.2), contact=Vec2(0.45, 0.7),
+                               confidence=0.8,
+                               position=PositionEstimate(where, 1.5, PositionSource.GROUND_PROJECTION))
 
     inside = tuple(Relation(RelationKind.INSIDE, subject, 9, confidence=0.6,
                             conditions=("72% of the person's box lay within the car's",))
@@ -832,8 +832,9 @@ def test_the_plan_links_two_tracks_a_relation_joins(qt_app, pose):
 
     def somewhere(track_id, bearing):
         point = destination_point(pose.position, bearing, 8.0)
-        return Track(track_id, 0, 0, 0, 0, BoundingBox(0.4, 0.5, 0.1, 0.2), Vec2(0.45, 0.7), confidence=0.8,
-                     confirmed=True, position=PositionEstimate(point, 0.6, PositionSource.GROUND_PROJECTION))
+        return Track.observing(track_id, 0, BoundingBox(0.4, 0.5, 0.1, 0.2), contact=Vec2(0.45, 0.7),
+                               confidence=0.8,
+                               position=PositionEstimate(point, 0.6, PositionSource.GROUND_PROJECTION))
 
     plan = PlanView()
     plan.resize(400, 400)

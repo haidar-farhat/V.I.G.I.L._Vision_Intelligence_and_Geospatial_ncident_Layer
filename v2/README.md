@@ -34,6 +34,17 @@ python -m vigil export inc-…     # report, clips, and a manifest that verifies
 python -m vigil audit            # who changed what, and when
 ```
 
+The site's own geometry, from the cameras that watch it:
+
+```bash
+python tasks.py core             # build the Rust engine core (needs cargo)
+python -m vigil coverage         # what these cameras reach, and what they miss
+python -m vigil map build --seconds 60 --png yard.png
+python -m vigil map show         # and how much of it is worth believing
+python tasks.py bench            # what the pipeline costs and what it recovers
+python tools/camera_check.py     # the whole pipeline against a real camera
+```
+
 **Accounts.** `python -m vigil users add root --role ADMIN`. After the first
 account exists every command runs as `--as NAME` (password prompted, or on
 standard input with `--password-stdin`) and the console asks for a sign-in. A
@@ -164,22 +175,32 @@ not contain — which has already happened here once, quietly.
 
 | | |
 |---|---|
-| Product code | 10,172 lines of Python, no compiled core |
-| Tests | 205, all green through `python tasks.py check` |
-| Capabilities | 27 tested, 2 implemented, 1 planned ([CAPABILITIES.md](CAPABILITIES.md)) |
-| Packaged | 751 MB bundle: one `vigil.exe` that is both the command line and the console |
+| Product code | 14,218 lines of Python, 2,683 lines of Rust behind a C ABI |
+| Tests | 298 Python + 53 Rust, all green through `python tasks.py check` |
+| Capabilities | 33 tested, 2 implemented, 1 planned ([CAPABILITIES.md](CAPABILITIES.md)) |
+| Packaged | one `vigil.exe` that is both the command line and the console, with the core beside it |
+
+The engine core is **optional but not decorative**. Without it the product
+still analyses, tracks and raises events — the NumPy paths are the same
+algorithms and `tests/test_native.py` holds them to the same answers — but
+`vigil map` is unavailable and association runs an order of magnitude slower.
+`vigil doctor` says which you have.
 
 Not built, and not pretended: faces, plates and a subject register
-(DECISIONS.md D-08); appearance re-identification, so cross-camera identity
-rests on time and place alone and says so; installers and code signing, which
-need a certificate; and **a model that can name a weapon**, which is the
-operator's to supply — the mechanism is here and tested, the weights are not.
-[ROADMAP.md](ROADMAP.md) says what each of those needs.
+(DECISIONS.md D-08); **any training or labelling pipeline** — the model is an
+ONNX file the operator supplies and the shipped one is stock COCO weights,
+which have never seen this site; installers and code signing, which need a
+certificate; and **a model that can name a weapon**, which is the operator's
+to supply — the mechanism is here and tested, the weights are not.
+[PRODUCTION_READINESS.md](PRODUCTION_READINESS.md) is the honest account of
+what is measured and what is not; [ROADMAP.md](ROADMAP.md) says what each of
+those needs.
 
 ## Camera runs on this machine
 
 | When (UTC) | What ran | Result |
 |---|---|---|
+| 2026-09-06 16:56 | `tools/camera_check.py --seconds 25 --map` on `device:0` — **the rebuilt pipeline, end to end** | 356 frames in 25.3 s = **14.1 fps** with `yolov8n-seg` on the CPU. Detection 64.5 ms/frame; the three new perception stages cost **3.5 ms together** (quality 0.6, camera motion 2.9, appearance ~0). 0 unusable frames, 0 stale, the camera correctly reported still on 99% of frames. A ground map built from the same run: 95 m² usable of 160 m² seen, 0.05 m per source pixel — and, pointed at a room rather than a yard, it correctly marked 41% unusable, because a wall projected onto the ground plane is a smear and the confidence layer says so. |
 | 2026-09-05 22:55 | packaged `vigil.exe`, `exetest --seconds 20 --record` | **PASS** in 21 s: 191 frames at 10 fps through the segmentation model, one clip written and indexed, exit 0, no traceback. The room was dark, so 0 detections. |
 | 2026-09-06 05:44 | the console on `device:0`, 22 s, recording | **The whole chain, on a real camera.** A person detected and classified at 0.84, tracked, projected to ±0.1 m, entering a restricted zone; two zone-entry events; one HIGH incident at risk 0.46; a 384-frame clip; the exported package verifies against its manifest and carries the clip. |
 | 2026-09-06 05:55 | packaged `vigil.exe`, `exetest --seconds 20 --record --console` | **PASS** in 22 s: the window drove the camera at 19 fps through the segmentation model, tracked a person, recorded, and photographed all six panels. |

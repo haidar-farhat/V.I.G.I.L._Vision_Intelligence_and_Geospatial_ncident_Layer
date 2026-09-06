@@ -206,6 +206,52 @@ def _detection(settings, store) -> Check:
     return Check("detection", State.OK, chosen.describe())
 
 
+def _engine_core() -> Check:
+    """Is the Rust core loaded, and is it the right one?
+
+    A WARN rather than a FAIL, and the distinction is the point: without the
+    core the product still analyses, tracks and raises events — the NumPy
+    paths are the same algorithms and `tests/test_native.py` holds them to the
+    same answers — but it cannot build a map at all, and it does the
+    association arithmetic an order of magnitude more slowly. That is a
+    degraded installation, not a broken one, and calling it either of the
+    other two things would be wrong.
+    """
+    from ..kernel import native
+
+    name = "engine core"
+    if native.available():
+        return Check(name, State.OK,
+                     f"loaded from {native.loaded_from()}, ABI {native.ABI_VERSION}")
+    return Check(name, State.WARN,
+                 f"not loaded, so `vigil map` is unavailable and tracking runs on the slower "
+                 f"NumPy path: {native.fault()}",
+                 "build it with `python tasks.py core`, or set VIGIL_CORE_PATH")
+
+
+def _inference(settings) -> Check:
+    """Which execution provider inference will actually get.
+
+    "Why is this slow" is answered here more often than by anything in the
+    model. onnxruntime falls back silently when a provider will not
+    initialise, so a machine with a GPU, a CUDA build and the wrong driver
+    runs on the CPU and says nothing at all.
+    """
+    from ..adapters.detectors import available_providers
+
+    name = "inference"
+    providers = available_providers()
+    if not providers:
+        return Check(name, State.FAIL, "onnxruntime is not importable, so no model can run",
+                     "install onnxruntime, or onnxruntime-gpu for a machine with a GPU")
+    if providers[0] == "CPUExecutionProvider":
+        return Check(name, State.WARN,
+                     "the installed onnxruntime offers only the CPU, so inference will use it",
+                     "on a machine with a GPU, install onnxruntime-gpu (or onnxruntime-directml "
+                     "on Windows) for a large speed-up; on a CPU-only appliance this is expected")
+    return Check(name, State.OK, f"{providers[0]} available (then {', '.join(providers[1:])})")
+
+
 def _alerts(settings) -> Check:
     from .alerts import Alerts
 
@@ -244,6 +290,8 @@ def run_checks(settings, store, keychain, *, probe: bool = False) -> list[Check]
         lambda: _database(store),
         lambda: _clock(store),
         lambda: _model(settings),
+        lambda: _engine_core(),
+        lambda: _inference(settings),
         lambda: _keychain(keychain),
         lambda: _disk(settings),
         lambda: _accounts(store),

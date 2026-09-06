@@ -31,11 +31,88 @@ class Capability:
 
 
 MANIFEST: tuple[Capability, ...] = (
-    Capability("geo", "Ground projection with honest uncertainty and fallback", State.TESTED,
-               ("vigil.domain.geo.project_to_ground", "vigil.domain.geo.project_point", "vigil.domain.geo.field_of_view", "vigil.domain.geo.image_coordinates"),
-               ("tests/test_geo.py",)),
-    Capability("tracking", "Multi-object tracking with cumulative confirmation and coasting", State.TESTED,
-               ("vigil.domain.tracking.Tracker",), ("tests/test_tracking.py",)),
+    Capability("geo", "A pinhole camera on one Earth, with the error propagated through it", State.TESTED,
+               ("vigil.domain.geo.project_to_ground", "vigil.domain.geo.project_point",
+                "vigil.domain.geo.field_of_view", "vigil.domain.geo.image_coordinates",
+                "vigil.domain.geo.PoseUncertainty", "vigil.domain.geo.ProjectionFailure"),
+               ("tests/test_geo.py", "tests/test_native.py"),
+               "Two defects fixed. v1 and v2 both decoupled yaw from elevation and called it "
+               "rectilinear: that is a cylindrical sensor, and at the corner of the reference pose it "
+               "was 4.8 degrees out in elevation, which is 21% of the distance to whatever stood there. "
+               "`roll` had existed since v1 and was read by nothing. And distances between tracks went "
+               "through a spherical haversine while zones went through a WGS84 tangent plane — two "
+               "Earths 0.248% apart. Uncertainty is now a Jacobian over the pose, the mount height, "
+               "the contact point and the terrain, reported as an ellipse because a shallow ray is "
+               "vague along its own direction and sharp across it"),
+    Capability("tracking", "Kalman tracking with optimal association and appearance re-identification", State.TESTED,
+               ("vigil.domain.tracking.Tracker", "vigil.domain.tracking.TrackState",
+                "vigil.kernel.filtering.predict", "vigil.kernel.native.assign"),
+               ("tests/test_tracking.py", "tests/test_native.py"),
+               "Replaces the greedy IoU pass v1 and v2 shared, which swapped two people's identities "
+               "whenever they crossed, and the EMA velocity, which had no uncertainty to gate on and "
+               "gave stationary objects a drift. Association is a globally optimal assignment over a "
+               "cost that combines appearance and overlap, gated by the filter's own Mahalanobis "
+               "distance; a second pass offers weak detections to tracks that have nothing, which is "
+               "what recovers an object through an occlusion; a third re-identifies a lost track by "
+               "appearance, which is what stops one person becoming eleven objects. Confirmation stays "
+               "cumulative and a coasted box is still never recorded as a measurement"),
+    Capability("appearance", "What a tracked thing looks like, during association rather than after it", State.TESTED,
+               ("vigil.domain.appearance.Appearance", "vigil.domain.appearance.Gallery",
+                "vigil.perception.appearance.describe"),
+               ("tests/test_perception.py", "tests/test_tracking.py"),
+               "A masked HSV histogram, migrated from v1's `reid.py` and moved to where it can prevent "
+               "a fragment instead of reconciling one an hour later. A gallery of recent looks rather "
+               "than v1's single moving average, because the mean of a person's front and their back "
+               "is a person who does not exist. Colour is all it has, so similarity never links on its "
+               "own: time and place are conditions, not tie-breakers"),
+    Capability("camera-motion", "Whether the camera moved, told apart from whether the scene did", State.TESTED,
+               ("vigil.perception.motion.CameraMotionEstimator", "vigil.perception.motion.CameraMotion"),
+               ("tests/test_perception.py", "tests/test_tracking.py"),
+               "Sparse optical flow with a forward-backward check and a RANSAC partial affine, applied "
+               "to every track's filter — covariance included — before prediction. Neither v1 nor v2 "
+               "measured this, so a gust on a mast read as every object accelerating at once. A fit "
+               "explaining a minority of the frame is a lorry crossing it and is refused; so is a shift "
+               "larger than shake produces"),
+    Capability("frame-quality", "A camera that is producing frames nobody could detect anything in", State.TESTED,
+               ("vigil.perception.quality.FrameQualityMonitor", "vigil.service.alerts.CAMERA_DEGRADED"),
+               ("tests/test_perception.py", "tests/test_runtime.py"),
+               "v1 and v2 both had `camera.dark` — no frames at all — and nothing between that and "
+               "working, so an unfocused lens, a blown-out frame and a decoder repeating its last frame "
+               "all failed silently while the frame counter climbed. Measured per frame, alerted on when "
+               "sustained, and reported in `vigil health`"),
+    Capability("mapping", "The site's ground map and texture, built by the cameras that watch it", State.TESTED,
+               ("vigil.service.mapping.MapBuilder", "vigil.service.mapping.build_from_cameras",
+                "vigil.service.mapping.save_map", "vigil.service.mapping.load_map",
+                "vigil.service.mapping.confidence_of"),
+               ("tests/test_mapping.py", "tests/test_native.py"),
+               "Migrated from v1's `orthophoto.py` and `basemap.py`, which v2 dropped entirely. A "
+               "per-cell median over many frames removes whoever walked through; a confidence layer "
+               "made of sample count, disturbance, ground resolution and projection error says which "
+               "cells are a measurement of the ground and which are a picture of something over it. "
+               "Ground nobody looked at stays empty and is drawn as empty. The raster is in Rust: v1 "
+               "measured the NumPy version at 79 ms per frame per camera and sampled four frames a "
+               "second because of it"),
+    Capability("coverage", "Which ground the cameras reach, and — the useful half — which they do not", State.TESTED,
+               ("vigil.service.coverage.analyse", "vigil.service.coverage.Gap",
+                "vigil.service.coverage.Band", "vigil.service.coverage.boundary_from_cameras"),
+               ("tests/test_coverage.py",),
+               "Migrated from v1, which v2 dropped, and rebuilt on the corrected footprint: v1's "
+               "numbers inherited the decoupled camera model's error and ignored roll entirely. "
+               "`vigil coverage`. Gaps are invisible on a plan view — six wedges look thorough and "
+               "the four-metre corridor between two of them looks like nothing until somebody walks "
+               "down it. Reported in error bands as well as area, because \"covered\" and \"covered "
+               "well enough to say which side of a line somebody was on\" are different questions. "
+               "Every figure is an upper bound and says so: nothing here models occlusion or "
+               "resolution, and both would make coverage smaller"),
+    Capability("engine-core", "The arithmetic that runs per pixel, in Rust behind a C ABI", State.TESTED,
+               ("vigil.kernel.native.load", "vigil.kernel.native.ortho_sample",
+                "vigil.kernel.native.assign", "vigil.kernel.native.kalman_predict"),
+               ("tests/test_native.py", "tests/test_diagnostics.py"),
+               "Ground rasterisation, optimal assignment and the box filter. ABI-versioned and "
+               "layout-checked on load, so a signature that moved produces a refusal rather than "
+               "plausible wrong geometry. `vigil doctor` reports whether it is loaded and from where; "
+               "`tests/test_native.py` holds it to the NumPy mirrors it can fall back to, and to the "
+               "independent exact inverse where it has none"),
     Capability("distance", "Distances that carry their own error, and never one without the other", State.TESTED,
                ("vigil.domain.geo.Distance", "vigil.domain.geo.separation", "vigil.domain.geo.distance_from_camera",
                 "vigil.domain.zones.Zone.distance_from"),

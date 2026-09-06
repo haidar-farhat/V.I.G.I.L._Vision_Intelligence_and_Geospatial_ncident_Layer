@@ -8,9 +8,14 @@ from vigil.adapters.detectors import MotionDetector
 from vigil.domain.events import EventType
 from vigil.domain.geo import CameraPose, LatLon, destination_point, project_to_ground
 from vigil.domain.zones import ZoneKind
-from vigil.service.alerts import CAMERA_DARK, DISK_LOW, RECORDING_STOPPED, RETENTION_SHORTFALL, THREAD_STUCK, Alerts
+from vigil.service.alerts import (
+    CAMERA_DARK, CAMERA_DEGRADED, DISK_LOW, RECORDING_STOPPED, RETENTION_SHORTFALL, THREAD_STUCK,
+    Alerts,
+)
 from vigil.service.auth import Forbidden, Principal, Role
-from vigil.service.runtime import DARK_AFTER_SECONDS, CameraWorker, RetentionPolicy, Runtime
+from vigil.service.runtime import (
+    DARK_AFTER_SECONDS, DEGRADED_AFTER_FRAMES, CameraWorker, RetentionPolicy, Runtime,
+)
 from vigil.service.site import SiteService
 from vigil.storage.store import Store
 
@@ -296,7 +301,9 @@ def test_relations_reach_the_rules_and_the_frame_result(tmp_path, keychain, monk
     source = inspect.getsource(runtime_module.CameraWorker._process)
     assert "relations.update(" in source, "the worker never measures a relation"
     assert "_for(found," in source, "a rule is never given the relations for its track"
-    assert "frame.image if self._keep_images else None, found)" in source, "the frame result drops them"
+    assert "frame.image if self._keep_images else None, found, measured, motion)" in source, (
+        "the frame result drops them"
+    )
     signature = inspect.signature(runtime_module.FrameResult.__init__)
     assert "relations" in signature.parameters
 
@@ -311,3 +318,47 @@ def test_the_worker_offers_every_relation_to_the_rules(tmp_path, keychain):
     assert "rule.on_relation(relation, context)" in source
     assert source.index("on_relation") < source.index("for p in presence.presences()"), \
         "an approach must be offered before presence, which happens after the fact"
+
+
+def test_a_camera_producing_frames_nobody_could_detect_in_is_reported_as_degraded(tmp_path, keychain, pose):
+    """The gap between `camera.dark` and "working" that v1 and v2 both had.
+
+    This camera is healthy by every measure the old product had: it is
+    connected, its frame counter climbs, its fps is fine. Its lens is out of
+    focus, so it will never detect anything, and nothing before this noticed.
+    """
+    import cv2
+    import numpy as np
+
+    path = tmp_path / "blurred.mp4"
+    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), 15.0, (320, 240))
+    assert writer.isOpened()
+    rng = np.random.default_rng(2)
+    for _ in range(DEGRADED_AFTER_FRAMES + 30):
+        scene = rng.integers(0, 255, (240, 320, 3), dtype=np.uint8)
+        writer.write(cv2.GaussianBlur(scene, (0, 0), 14))
+    writer.release()
+
+    with Store(tmp_path / "d.db") as store:
+        site = SiteService(store, keychain)
+        site.add_camera("gate", str(path), pose=pose, by=OPERATOR)
+        runtime = Runtime(site, detector_factory=MotionDetector, alerts=Alerts(synchronous=True))
+        runtime.start(OPERATOR)
+        try:
+            _pump(runtime, 12.0)
+            worker = runtime._workers["gate"]
+            deadline = time.monotonic() + 20.0
+            while worker.stats.unusable_frames < DEGRADED_AFTER_FRAMES and time.monotonic() < deadline:
+                runtime.poll()
+                time.sleep(0.05)
+            assert worker.stats.unusable_frames >= DEGRADED_AFTER_FRAMES, (
+                f"only {worker.stats.unusable_frames} unusable frames were seen"
+            )
+            health = runtime.health()["gate"]
+            assert health.degraded and "focus" in health.degraded
+            assert health.quality is not None and health.quality < 0.2
+            assert "focus" in health.describe()
+            runtime.poll()
+            assert (CAMERA_DEGRADED, "gate") in {a.key for a in runtime.alerts.active()}
+        finally:
+            runtime.stop(OPERATOR)

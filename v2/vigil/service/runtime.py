@@ -27,14 +27,24 @@ from ..domain.relations import RelationTracker
 from ..domain.tracking import Track, Tracker, TrackerConfig
 from ..domain.zones import PresenceTracker, Zone
 from ..logs import get as _get_logger
+from ..perception.appearance import describe
+from ..perception.motion import CameraMotion, CameraMotionEstimator
+from ..perception.quality import FrameQuality, FrameQualityMonitor
 from ..storage.store import Store
-from .alerts import CAMERA_DARK, DISK_LOW, RECORDING_STOPPED, RETENTION_SHORTFALL, THREAD_STUCK, Alerts
+from .alerts import (
+    CAMERA_DARK, CAMERA_DEGRADED, DISK_LOW, RECORDING_STOPPED, RETENTION_SHORTFALL,
+    THREAD_STUCK, Alerts,
+)
 from .auth import ANALYSIS_CONTROL, Principal
 from .site import Camera, SiteService
 
 _log = _get_logger(__name__)
 
 DARK_AFTER_SECONDS = 30.0
+#: Consecutive unusable frames before a camera is called degraded. Ten
+#: seconds at 15 fps: one bad frame is a bad frame, a hundred and fifty is
+#: a lens somebody has to go and clean.
+DEGRADED_AFTER_FRAMES = 150
 STOP_TIMEOUT_SECONDS = 8.0
 DISK_WATERMARK_BYTES = 2 * 1024**3
 OUTBOX_EVENTS = 1000
@@ -59,6 +69,11 @@ class FrameResult:
     #: What those tracks are doing with each other, as far as one camera can
     #: tell. Inferred, never observed; see `vigil.domain.relations`.
     relations: tuple = ()
+    #: What the frame itself was worth. A console that draws boxes over a
+    #: frame nothing could be detected in should say so.
+    quality: object = None
+    #: How the camera moved into this frame, when it could be measured.
+    camera_motion: object = None
 
 
 @dataclass
@@ -68,6 +83,14 @@ class WorkerStats:
     events: int = 0
     dropped_results: int = 0
     analysis_fps: float = 0.0
+    #: Rolling frame quality, 0..1, or `None` before the first frame.
+    quality: float | None = None
+    #: Why the most recent frame was unusable, or `None`.
+    quality_fault: str | None = None
+    #: Consecutive unusable frames.
+    unusable_frames: int = 0
+    #: Frames on which the camera itself measurably moved.
+    moved_frames: int = 0
     last_frame_at: float | None = None
     started_at: float | None = None
     fault: str | None = None
@@ -168,6 +191,8 @@ class CameraWorker:
             tracker = Tracker(TrackerConfig(), self.camera.pose)
             presence = PresenceTracker(self._zones)
             relations = RelationTracker()
+            quality = FrameQualityMonitor()
+            camera_motion = CameraMotionEstimator()
             info = source.open()
             if self._record_to is not None and (self.camera.record or self._record_anyway):
                 recorder = Recorder(self.camera.id, self._record_to, fps=info.nominal_fps or 15.0, segment_seconds=self._segment_seconds)
@@ -189,7 +214,8 @@ class CameraWorker:
                             raise DecodeError(reader.fault)
                         continue
                     break  # a file ended
-                self._process(frame, detector, tracker, presence, relations, recorder)
+                self._process(frame, detector, tracker, presence, relations, recorder,
+                              quality, camera_motion)
                 if frame_interval:
                     remaining = frame_interval - (time.monotonic() - started)
                     if remaining > 0:
@@ -219,16 +245,44 @@ class CameraWorker:
                       self.stats.frames, self.stats.detections, self.stats.events)
 
     def _process(self, frame: Frame, detector: Detector, tracker: Tracker, presence: PresenceTracker,
-                 relations: RelationTracker, recorder: Recorder | None) -> None:
+                 relations: RelationTracker, recorder: Recorder | None,
+                 quality: FrameQualityMonitor, camera_motion: CameraMotionEstimator) -> None:
         now = time.monotonic()
         self.stats.frames += 1
         self.stats.last_frame_at = now
         self._recent = [t for t in self._recent if now - t <= 1.0] + [now]
         self.stats.analysis_fps = float(len(self._recent))
 
+        # What this frame is worth, before anything is asked of it. A
+        # detector reports how sure it is *given the pixels it was shown*
+        # and has no way to say the lens is dirty.
+        measured = quality.measure(frame.image)
+        self.stats.quality = quality.recent_score
+        # Either kind of degradation counts here: an unusable image and a
+        # frozen stream are both cameras that will never report anything, and
+        # both were invisible to a frame counter.
+        self.stats.quality_fault = measured.degraded
+        self.stats.unusable_frames = 0 if measured.degraded is None else self.stats.unusable_frames + 1
+
+        # How the camera moved. Not attempted on a frame nothing can be
+        # measured in: optical flow over a blown-out frame returns a
+        # confident transform built from points that matched nothing.
+        motion: CameraMotion | None = None
+        if measured.usable:
+            motion = camera_motion.estimate(frame.image)
+            if motion.measured and not motion.still:
+                self.stats.moved_frames += 1
+        else:
+            camera_motion.reset()
+        warp = motion.warp if (motion is not None and motion.measured and not motion.still) else None
+
         detections = detector.detect(frame.image)
         self.stats.detections += len(detections)
-        update = tracker.update(detections, frame.timestamp_millis)
+        # An appearance per detection: what stops one person becoming
+        # eleven objects the moment the detector blinks.
+        looks = [describe(frame.image, (d.bbox.x, d.bbox.y, d.bbox.width, d.bbox.height), d.mask)
+                 for d in detections]
+        update = tracker.update(detections, frame.timestamp_millis, appearances=looks, warp=warp)
         tracks = tracker.tracks()
         moment = datetime.fromtimestamp(frame.timestamp_millis / 1000, tz=timezone.utc)
         events: list[Event] = []
@@ -293,7 +347,7 @@ class CameraWorker:
                 self.stats.recording_fault = str(error)
                 _log.error("%s: RECORDING STOPPED EARLY - %s", self.camera.id, error)
         result = FrameResult(self.camera.id, frame.index, frame.timestamp_millis, tuple(tracks), len(detections),
-                             frame.image if self._keep_images else None, found)
+                             frame.image if self._keep_images else None, found, measured, motion)
         with self._latest_lock:
             if self._latest is not None:
                 self.stats.dropped_results += 1
@@ -313,6 +367,11 @@ class CameraHealth:
     recording: bool
     recording_fault: str | None
     clips: int
+    #: Rolling frame quality, 0..1, or `None` before the first frame.
+    quality: float | None = None
+    #: Why the camera's frames are unusable, when they have been for long
+    #: enough to be a fault rather than a moment.
+    degraded: str | None = None
 
     def describe(self) -> str:
         parts = [self.state]
@@ -320,6 +379,8 @@ class CameraHealth:
             parts.append(f"{self.analysis_fps:.0f} fps")
         if self.state == "DARK" and self.seconds_since_frame is not None:
             parts.append(f"no frame for {self.seconds_since_frame:.0f} s")
+        if self.degraded:
+            parts.append(self.degraded)
         if self.fault:
             parts.append(self.fault)
         if self.recording:
@@ -564,7 +625,8 @@ class Runtime:
     @staticmethod
     def _health_for(camera: dict, worker: CameraWorker | None) -> CameraHealth:
         if worker is None:
-            return CameraHealth(camera["id"], "STOPPED", False, camera["pose"] is not None, 0.0, 0, None, None, False, None, 0)
+            return CameraHealth(camera["id"], "STOPPED", False, camera["pose"] is not None,
+                                0.0, 0, None, None, False, None, 0)
         running = worker.alive
         since_frame = worker.seconds_since_frame()
         since_start = worker.seconds_since_started()
@@ -584,8 +646,14 @@ class Runtime:
         fps = worker.stats.analysis_fps if running and since_frame is not None and since_frame <= 1.0 else 0.0
         recording = ((camera["record"] or worker._record_anyway) and running
                      and worker.stats.recording_fault is None and worker._record_to is not None)
+        # One bad frame is a bad frame; a hundred and fifty is a lens somebody
+        # has to go and clean. A camera in this state is producing frames at a
+        # healthy rate, which is why nothing before this noticed.
+        degraded = (worker.stats.quality_fault
+                    if worker.stats.unusable_frames >= DEGRADED_AFTER_FRAMES else None)
         return CameraHealth(camera["id"], state, running, camera["pose"] is not None, fps, worker.stats.frames, fault,
-                            since_frame, bool(recording), worker.stats.recording_fault, worker.stats.clips)
+                            since_frame, bool(recording), worker.stats.recording_fault, worker.stats.clips,
+                            worker.stats.quality, degraded)
 
     def _watch_for_alerts(self) -> None:
         for camera_id, health in self.health().items():
@@ -593,6 +661,10 @@ class Runtime:
                 self.alerts.raise_(CAMERA_DARK, camera_id, health.describe())
             elif health.state in ("LIVE", "STOPPED"):
                 self.alerts.clear(CAMERA_DARK, camera_id)
+            if health.degraded:
+                self.alerts.raise_(CAMERA_DEGRADED, camera_id, health.degraded)
+            elif health.state in ("LIVE", "STOPPED"):
+                self.alerts.clear(CAMERA_DEGRADED, camera_id)
             if health.recording_fault:
                 self.alerts.raise_(RECORDING_STOPPED, camera_id, health.recording_fault)
             elif health.recording:
