@@ -75,6 +75,18 @@ class Zone:
             return Membership.UNCERTAIN
         return Membership.INSIDE if inside else Membership.OUTSIDE
 
+    def distance_from(self, position) -> "Distance":
+        """From a position to this zone's nearest edge, negative when inside.
+
+        Signed on purpose: "two metres inside" and "two metres outside" are
+        different situations and a bare magnitude cannot tell them apart.
+        """
+        from .geo import Distance
+
+        edge = distance_to_ring_edge(self.ring, position.point)
+        inside = point_in_ring(self.ring, position.point)
+        return Distance(-edge if inside else edge, position.radius_meters)
+
     def admits(self, membership: Membership) -> bool:
         order = {Membership.INSIDE: 2, Membership.UNCERTAIN: 1, Membership.OUTSIDE: 0}
         return order[membership] >= order[self.min_membership]

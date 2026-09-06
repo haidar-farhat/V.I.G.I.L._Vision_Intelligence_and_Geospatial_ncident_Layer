@@ -5,7 +5,8 @@ number of reviewable incidents out, with the evidence that produced each one,
 and no route to the Internet at any point.
 
 Read [REVIEW_OF_V1.md](REVIEW_OF_V1.md) for why this exists and what v1
-taught, [ARCHITECTURE.md](ARCHITECTURE.md) for the shape,
+taught, [ROADMAP.md](ROADMAP.md) for what comes next and what each step
+refuses to claim, [ARCHITECTURE.md](ARCHITECTURE.md) for the shape,
 [DECISIONS.md](DECISIONS.md) for what is and is not decided, and
 [CAPABILITIES.md](CAPABILITIES.md) — generated from the manifest, never
 hand-edited — for what exists and how well it is tested.
@@ -54,6 +55,39 @@ answer a question about last Tuesday without reading the whole list. A time is
 than quietly widened to everything. A severity means that one *and worse*. The
 console has the same filters above its incident list.
 
+**What things are doing together.** Beyond "a person entered the yard", the
+system measures relations between tracks and says how sure it can be: somebody
+*probably in* a vehicle, *appearing to carry* something, *with* somebody else,
+*moving towards* a zone. Every one is inferred, never observed — one camera
+cannot tell being inside a car from walking in front of it — so each carries
+the overlap, the distance and the frames it held, and a zone entry that quotes
+one repeats those conditions in its evidence. Distances are always given with
+their error: `11.2 ± 2.4 m`, never a bare eleven.
+
+**Dangerous things, and what this refuses to claim.** A site names the labels
+it treats as dangerous: `vigil site threats --set knife --suggest`. Nothing is
+a threat by default, because the shipped model names `knife` and `scissors`
+and a kitchen raising a critical alert every evening teaches an operator to
+ignore the word. A threat claim needs a higher confidence and several frames
+than an ordinary detection, it records the weights that made it, and when a
+relation says somebody is carrying it the sentence says so and the severity
+rises a step. `vigil doctor` **fails** when a configured label is one the
+installed model can never produce, so a site is never told it is protected
+when it is not.
+
+**A warning before the breach.** When somebody is closing on a restricted or
+perimeter zone and is already within ten metres, the system says so — once,
+at `MEDIUM`, with the distance and its error — rather than waiting for the
+entry. That is a rule acting on a *relation*, which is the only way a rule can
+hear about something that has not arrived yet.
+
+**Seen on screen and in the evidence.** The track table says how far each
+object is from its camera, always with the error — `12.0 ± 1.5 m` — and what
+it is doing, with the reasons one hover away. The exported report carries the
+same distance for every event, because "eleven metres from the gate" is the
+kind of thing somebody asks months later. A track the geometry could not place
+says so instead of printing a number.
+
 **Working the queue.** `vigil incidents` shows what is still waiting on a
 person; an incident is acknowledged or dismissed, and a dismissal needs a
 reason, because "dismissed" with no reason cannot be told from nobody having
@@ -96,15 +130,17 @@ judges the run; `--console` drives the window instead and photographs it.
 
 | | |
 |---|---|
-| Product code | 8,727 lines of Python, no compiled core |
-| Tests | 151, all green through `python tasks.py check` |
-| Capabilities | 23 tested, 2 implemented, 1 planned ([CAPABILITIES.md](CAPABILITIES.md)) |
+| Product code | 9,592 lines of Python, no compiled core |
+| Tests | 190, all green through `python tasks.py check` |
+| Capabilities | 26 tested, 2 implemented, 1 planned ([CAPABILITIES.md](CAPABILITIES.md)) |
 | Packaged | 751 MB bundle: one `vigil.exe` that is both the command line and the console |
 
 Not built, and not pretended: faces, plates and a subject register
 (DECISIONS.md D-08); appearance re-identification, so cross-camera identity
 rests on time and place alone and says so; installers and code signing, which
-need a certificate.
+need a certificate; and **a model that can name a weapon**, which is the
+operator's to supply — the mechanism is here and tested, the weights are not.
+[ROADMAP.md](ROADMAP.md) says what each of those needs.
 
 ## Camera runs on this machine
 
@@ -116,6 +152,8 @@ need a certificate.
 | 2026-09-06 06:13 | the console with **two** cameras, the laptop and a file, both placed | Two workers, two wedges on the plan, per-camera health (one LIVE, one STOPPED when its file ended), and an incident from the live one. |
 | 2026-09-06 06:16 | **ten-minute unattended soak**, `run --for 600 --record` | **Stable.** 602 s for a 600 s request, exit 0, no traceback. 8,565 frames — 14.3 fps average, 16 fps at the end — with the segmentation model on one CPU camera. Ten one-minute clips. Memory started at 45 MiB, peaked at 221 MiB while the model loaded, settled at 64 MiB and stayed flat for the last four minutes. |
 
+| 2026-09-06 11:20 | the whole chain on a generated walk, through the real pipeline | A block walking towards the camera produced **"An object is approaching the Doorstep, 0.5 ± 0.2 m away"** at `MEDIUM`, then **"An object entered the Doorstep"** at `HIGH`, correlated into one incident. Warning first, breach second — which is the point. (Camera runs remain the product check; this one needed a known path.) |
+| 2026-09-06 10:44 | the console on `device:0` with the new columns | The track table read **3.1 ± 0.1 m** for a bottle in front of the camera — the distance and its error, measured live. "Doing" was empty because a relation needs two tracks and only one was in view. |
 | 2026-09-06 09:25 | packaged `vigil.exe`, `exetest --console` after the CLI split | **PASS** in 23 s. The shipped console carries the incident filter bar, and the split into parser, site commands and work commands changed nothing an operator can see. |
 | 2026-09-06 09:02 | packaged `vigil.exe`: `site name Depot --timezone Asia/Beirut`, then `doctor`, then `exetest --console` | The bundle carries the IANA time zone database, so the site clock is read as `Asia/Beirut` rather than silently falling back to UTC. `doctor` passed with nothing failing; the console test passed in 23 s. |
 | 2026-09-06 07:37 | the queue, end to end on the camera | A live incident raised on `device:0`, a dismissal **refused** for having no reason, then acknowledged with a note. The judgement shows in the console's State column, in `vigil incidents`, and in the audit trail under the person who made it. |

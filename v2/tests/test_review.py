@@ -84,6 +84,8 @@ def test_the_review_migration_carries_a_way_back(tmp_path):
     with Store(tmp_path / "r.db") as store:
         assert store.applied_versions() == [m.version for m in MIGRATIONS]
         undone = store.rollback()
+        while undone is not None and undone.name != "incident_review":
+            undone = store.rollback()
         assert undone is not None and undone.name == "incident_review"
         assert "state" not in store.column_names("incidents"), "the column survived its own down"
         assert "incidents" in store.table_names(), "the incidents themselves must survive"

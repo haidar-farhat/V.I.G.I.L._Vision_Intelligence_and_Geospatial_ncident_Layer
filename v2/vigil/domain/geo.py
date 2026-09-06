@@ -147,6 +147,59 @@ class PositionEstimate:
 
 
 @dataclass(frozen=True, slots=True)
+class Distance:
+    """A distance and how well it is known. Never one without the other.
+
+    Two positions each known to ±1.4 m are eleven metres apart *give or take
+    about two*, and a plain "11 m" invites somebody to act on a precision
+    nobody measured.
+    """
+
+    meters: float
+    error_meters: float
+
+    def describe(self) -> str:
+        return f"{self.meters:.1f} ± {self.error_meters:.1f} m"
+
+    @property
+    def at_most(self) -> float:
+        return self.meters + self.error_meters
+
+    @property
+    def at_least(self) -> float:
+        return max(0.0, self.meters - self.error_meters)
+
+    def within(self, limit: float) -> bool:
+        """True only when it is within ``limit`` even at its worst."""
+        return self.at_most <= limit
+
+    def beyond(self, limit: float) -> bool:
+        """True only when it is past ``limit`` even at its best."""
+        return self.at_least > limit
+
+
+def separation(a: PositionEstimate, b: PositionEstimate) -> Distance:
+    """How far apart two estimated positions are, with the two errors combined.
+
+    In quadrature, because the two projections are independent measurements:
+    adding them would claim the errors always conspire, and ignoring one
+    would claim it does not exist.
+    """
+    return Distance(haversine_distance(a.point, b.point), math.hypot(a.radius_meters, b.radius_meters))
+
+
+def distance_from_camera(pose: CameraPose, position: PositionEstimate) -> Distance:
+    """From the mast to the object.
+
+    The camera's own position is taken as given — an operator typed it — so
+    the error here is the projection's alone. If the placement is wrong,
+    every distance from this camera is wrong by the same amount, which is a
+    different problem and a visible one.
+    """
+    return Distance(haversine_distance(pose.position, position.point), position.radius_meters)
+
+
+@dataclass(frozen=True, slots=True)
 class GroundProjection:
     position: LatLon
     ground_distance_meters: float

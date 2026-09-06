@@ -286,39 +286,69 @@ class TrackTable(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         self.tree = QTreeWidget()
-        self.tree.setColumnCount(6)
-        self.tree.setHeaderLabels(["Camera", "Track", "Class", "Conf.", "Speed", "Position"])
+        self.tree.setColumnCount(7)
+        self.tree.setHeaderLabels(["Camera", "Track", "Class", "Conf.", "Speed", "From camera", "Doing"])
         self.tree.setRootIsDecorated(False)
         self.tree.setAlternatingRowColors(True)
+        self.tree.setTextElideMode(Qt.TextElideMode.ElideRight)
         header = self.tree.header()
         header.setStretchLastSection(False)
-        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
-        for column, width in ((0, 96), (1, 52), (2, 92), (3, 52), (4, 68)):
+        header.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
+        for column, width in ((0, 96), (1, 52), (2, 92), (3, 52), (4, 68), (5, 110)):
             self.tree.setColumnWidth(column, width)
         layout.addWidget(self.tree)
 
     def show_tracks(self, rows: Sequence[tuple]) -> None:
-        """``rows`` is (camera_id, track, detector_info)."""
+        """``rows`` is (camera_id, track, detector_info, pose, relations)."""
+        from ...domain.geo import distance_from_camera
+
         self.tree.clear()
-        for camera_id, track, info in rows:
+        for camera_id, track, info, pose, relations in rows:
             label = info.label_for(track.class_id) if info is not None else None
-            position = "—"
+            away, position = "—", "not placed on the ground"
             if track.position is not None:
                 if track.position.is_projected:
-                    position = f"{track.position.point.lat:.6f}, {track.position.point.lon:.6f}  ±{track.position.radius_meters:.1f} m"
+                    position = (f"{track.position.point.lat:.6f}, {track.position.point.lon:.6f} "
+                                f"±{track.position.radius_meters:.1f} m")
+                    if pose is not None:
+                        # Always with its error: a bare "11 m" invites somebody
+                        # to act on a precision nobody measured.
+                        away = distance_from_camera(pose, track.position).describe()
                 else:
                     # Never a number pretending to be a fix: the camera's own
                     # position with the whole field of view as its error.
                     position = f"at the camera (not projected, ±{track.position.radius_meters:.0f} m)"
+            doing = "; ".join(r.describe(_namer(rows, info)) for r in relations)
             item = QTreeWidgetItem([
                 camera_id, str(track.id), label or "unclassified" if info and info.classifies else label or "—",
-                f"{track.confidence:.2f}", "—" if track.speed_mps is None else f"{track.speed_mps:.1f} m/s", position,
+                f"{track.confidence:.2f}", "—" if track.speed_mps is None else f"{track.speed_mps:.1f} m/s",
+                away, doing,
             ])
             item.setForeground(1, theme.track_colour(track.id))
+            item.setToolTip(5, position)
+            if relations:
+                # Every relation is inferred; the reasons must be one hover away.
+                item.setToolTip(6, "\n\n".join(
+                    r.describe(_namer(rows, info)) + "\n  " + "\n  ".join(r.conditions) for r in relations))
+                item.setForeground(6, theme.STALE)
             if track.coasting:
                 item.setToolTip(1, "Coasting: the detector cannot see it and the tracker is extrapolating.")
                 item.setForeground(0, theme.TEXT_FAINT)
             self.tree.addTopLevelItem(item)
+
+
+def _namer(rows: Sequence[tuple], info):
+    """How a track reads in a relation's sentence: its label, or its id."""
+    labels = {}
+    for row in rows:
+        track, row_info = row[1], row[2]
+        name = row_info.label_for(track.class_id) if row_info is not None else None
+        labels[track.id] = name or f"track {track.id}"
+
+    def name_of(track_id: int) -> str:
+        return labels.get(track_id, f"track {track_id}")
+
+    return name_of
 
 
 class AuditView(QWidget):

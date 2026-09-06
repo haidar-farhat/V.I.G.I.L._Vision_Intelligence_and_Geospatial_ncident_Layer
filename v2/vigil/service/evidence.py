@@ -39,6 +39,12 @@ def export_incident(store: Store, incident: Incident, destination: Path, *, by: 
         },
         "events": [_event_dict(e) for e in incident.events],
     }
+    # How far each event was from the camera that saw it. In the package
+    # rather than only on screen, because "eleven metres from the gate" is
+    # the kind of thing somebody asks months later.
+    poses = {c["id"]: c["pose"] for c in store.cameras()}
+    for entry, event in zip(report["events"], incident.events):
+        entry["evidence"]["from_camera"] = _from_camera(poses.get(event.evidence.camera_id), event)
     (folder / "report.json").write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
     files["report.json"] = _sha256(folder / "report.json")
 
@@ -63,7 +69,9 @@ def export_incident(store: Store, incident: Incident, destination: Path, *, by: 
              f"Opened {report['incident']['opened_at']}, closed {report['incident']['closed_at']}",
              f"{incident.distinct_objects} distinct object(s); cameras {', '.join(incident.cameras)}", "", "Events:"]
     for e in incident.events:
-        lines.append(f"  {e.occurred_at.isoformat()} [{e.severity.value}] {e.summary} (rule {e.rule_id}, confidence {e.confidence:.2f})")
+        away = _from_camera(poses.get(e.evidence.camera_id), e)
+        lines.append(f"  {e.occurred_at.isoformat()} [{e.severity.value}] {e.summary} (rule {e.rule_id}, "
+                     f"confidence {e.confidence:.2f}{'' if away is None else f', {away} from {e.evidence.camera_id}'})")
         for c in e.evidence.conditions:
             lines.append(f"      - {c}")
     lines += ["", f"Clips: {len(clips)}"] + [f"  {c['file']} ({c['camera']})" for c in clips]
@@ -101,6 +109,18 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1 << 20), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _from_camera(pose, event) -> str | None:
+    """The distance with its error, or ``None`` when it cannot be measured."""
+    from ..domain.geo import LatLon, PositionEstimate, PositionSource, distance_from_camera
+
+    if pose is None or event.evidence.latitude is None:
+        return None
+    estimate = PositionEstimate(LatLon(event.evidence.latitude, event.evidence.longitude),
+                                event.evidence.position_uncertainty_meters or 0.0,
+                                PositionSource.GROUND_PROJECTION)
+    return distance_from_camera(pose, estimate).describe()
 
 
 def _event_dict(e) -> dict:

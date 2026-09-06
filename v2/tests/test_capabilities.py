@@ -46,6 +46,23 @@ def test_every_symbol_in_the_manifest_exists_and_its_tests_reference_it():
             assert not capability.symbols, f"{capability.id} is PLAN but names symbols"
 
 
+def test_every_domain_symbol_claimed_tested_is_used_outside_its_own_module():
+    """A measurement nothing reads is the v1 defect: correct, tested, and dead.
+
+    `distance_from_camera` was exactly that until the track table and the
+    evidence report started using it.
+    """
+    sources = {path: path.read_text(encoding="utf-8") for path in (ROOT / "vigil").rglob("*.py")}
+    for capability in MANIFEST:
+        if capability.state is not State.TESTED:
+            continue
+        for dotted in capability.symbols:
+            module_path = ROOT / (dotted.rsplit(".", 1)[0].replace(".", "/") + ".py")
+            name = dotted.rpartition(".")[2]
+            elsewhere = [p for p, text in sources.items() if p != module_path and name in text]
+            assert elsewhere, f"{dotted} is claimed TESTED but nothing outside {module_path.name} uses it"
+
+
 def test_every_public_service_method_is_called_by_an_interface():
     """A service method no interface calls is the recurring v1 defect. Interfaces: the CLI (and tests do not count)."""
     from vigil.service import evidence, runtime, site

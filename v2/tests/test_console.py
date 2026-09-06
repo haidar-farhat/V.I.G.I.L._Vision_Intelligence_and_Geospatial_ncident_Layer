@@ -635,3 +635,67 @@ def test_the_incident_filters_narrow_the_list_and_say_what_was_asked(console, qt
     picker.setCurrentIndex(picker.findData("loading-bay"))
     console.refresh_site()
     assert picker.currentData() == "loading-bay"
+
+
+def test_the_track_table_says_how_far_away_and_what_the_track_is_doing(console, qt_app, pose):
+    from vigil.domain.detection import BoundingBox, DetectorInfo
+    from vigil.domain.geo import PositionEstimate, PositionSource, Vec2, destination_point
+    from vigil.domain.relations import Relation, RelationKind
+    from vigil.domain.tracking import Track
+
+    info = DetectorInfo("onnx-detect", "w", class_names={0: "person", 2: "backpack"}, classifies=True)
+    where = destination_point(pose.position, 0.0, 12.0)
+
+    def made(track_id, class_id):
+        return Track(track_id, class_id, 0, 0, 0, BoundingBox(0.4, 0.5, 0.1, 0.2), Vec2(0.45, 0.7),
+                     confidence=0.8, confirmed=True,
+                     position=PositionEstimate(where, 1.5, PositionSource.GROUND_PROJECTION))
+
+    carried = Relation(RelationKind.CARRIED, 1, 2, confidence=0.7,
+                       conditions=("58% of the backpack's box lay within the person's",))
+    rows = [("gate", made(1, 0), info, pose, (carried,)), ("gate", made(2, 2), info, pose, ())]
+    console.tracks.show_tracks(rows)
+
+    first = console.tracks.tree.topLevelItem(0)
+    assert first.text(5) == "12.0 ± 1.5 m", first.text(5)
+    assert first.text(6) == "person appears to be carrying backpack"
+    assert "58% of the backpack's box" in first.toolTip(6), "the reasons must be one hover away"
+    assert "±1.5 m" in first.toolTip(5)
+    assert console.tracks.tree.topLevelItem(1).text(6) == ""
+
+    # A track with no ground position says so rather than printing a number.
+    nowhere = Track(3, 0, 0, 0, 0, BoundingBox(0.1, 0.1, 0.1, 0.1), Vec2(0.15, 0.2), confidence=0.5, confirmed=True)
+    console.tracks.show_tracks([("gate", nowhere, info, pose, ())])
+    assert console.tracks.tree.topLevelItem(0).text(5) == "—"
+    assert "not placed on the ground" in console.tracks.tree.topLevelItem(0).toolTip(5)
+
+
+def test_the_plan_links_two_tracks_a_relation_joins(qt_app, pose):
+    from vigil.domain.detection import BoundingBox
+    from vigil.domain.geo import PositionEstimate, PositionSource, Vec2, destination_point
+    from vigil.domain.relations import Relation, RelationKind
+    from vigil.domain.tracking import Track
+    from vigil.interfaces.console.plan import PlanView
+
+    def somewhere(track_id, bearing):
+        point = destination_point(pose.position, bearing, 8.0)
+        return Track(track_id, 0, 0, 0, 0, BoundingBox(0.4, 0.5, 0.1, 0.2), Vec2(0.45, 0.7), confidence=0.8,
+                     confirmed=True, position=PositionEstimate(point, 0.6, PositionSource.GROUND_PROJECTION))
+
+    plan = PlanView()
+    plan.resize(400, 400)
+    plan.set_cameras({"gate": pose})
+    together = Relation(RelationKind.NEAR, 1, 2, confidence=0.8)
+    plan.set_tracks("gate", [somewhere(1, 0.0), somewhere(2, 20.0)], [together])
+    drawn = []
+    plan._draw_links = lambda painter, camera_id: drawn.append(camera_id)
+    plan.grab()
+    assert drawn == ["gate"]
+
+    # A relation whose other end is not on the ground draws nothing and does
+    # not crash the paint.
+    plan.set_tracks("gate", [somewhere(1, 0.0)], [together])
+    plan.grab()
+    plan.clear_tracks()
+    plan.grab()
+    plan.deleteLater()

@@ -244,3 +244,17 @@ def test_incidents_and_events_can_be_searched_from_the_command_line(data, capsys
     assert main(["events", "--camera", "loading-bay", "--contains", "entered"]) == 0
     only = capsys.readouterr().out
     assert "loading-bay" in only and "north-gate" not in only
+
+
+def test_the_threat_vocabulary_is_read_set_and_cleared_from_the_command_line(data, capsys):
+    assert main(["site", "threats"]) == 0
+    assert "no label is treated as a threat" in capsys.readouterr().out
+    assert main(["site", "threats", "--suggest"]) == 0
+    offered = capsys.readouterr().out
+    assert "a starting point" in offered.lower() and "knife" in offered and "CRITICAL" in offered
+    assert main(["site", "threats", "--set", "knife"]) == 0
+    assert "a knife (HIGH)" in capsys.readouterr().out
+    assert main(["site", "threats"]) == 0
+    assert "a knife (HIGH)" in capsys.readouterr().out
+    assert main(["site", "threats", "--clear"]) == 0
+    assert "no label is treated as a threat" in capsys.readouterr().out

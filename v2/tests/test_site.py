@@ -17,8 +17,8 @@ def test_every_mutating_method_takes_a_principal_and_writes_an_audit_row(keychai
         site = SiteService(store, keychain)
         for name, method in inspect.getmembers(SiteService, inspect.isfunction):
             # `known_timezone` is a pure validator that changes nothing.
-            if name.startswith("_") or name in ("cameras", "camera", "zones", "source_with_credentials", "store",
-                                                "known_timezone"):
+            if name.startswith("_") or name in ("cameras", "camera", "zones", "threats", "source_with_credentials",
+                                                "store", "known_timezone"):
                 continue
             assert "by" in inspect.signature(method).parameters, f"{name} takes no principal"
         camera = site.add_camera("gate", "rtsp" + "://admin:s3cret@10.0.0.9/s", pose=pose, by=OPERATOR)
@@ -137,3 +137,24 @@ def test_a_zone_can_be_changed_without_losing_the_ring_somebody_drew(keychain):
             site.edit_zone("nothing", name="x", by=OPERATOR)
         with pytest.raises(Forbidden):
             site.edit_zone("yard", name="x", by=VIEWER)
+
+
+def test_a_site_names_what_it_treats_as_dangerous_and_the_change_is_audited(keychain):
+    from vigil.domain.events import Severity
+
+    with Store(":memory:") as store:
+        site = SiteService(store, keychain)
+        assert not site.threats(), "nothing is a threat until a site says so"
+        vocabulary = site.set_threats(["Knife", " gun ", ""], by=OPERATOR)
+        assert vocabulary.labels == ("gun", "knife")
+        assert vocabulary.of("knife").severity is Severity.HIGH
+        assert site.threats().labels == ("gun", "knife"), "it must survive a re-read"
+        row = [r for r in store.audit_trail() if r["action"] == "site.threats_changed"][0]
+        assert '"labels": []' in row["before"] and "knife" in row["after"]
+
+        # Naming or re-clocking the site must not quietly drop them.
+        site.name_site("Depot", "UTC", by=OPERATOR)
+        assert site.threats().labels == ("gun", "knife")
+        assert site.set_threats([], by=OPERATOR).labels == ()
+        with pytest.raises(Forbidden):
+            site.set_threats(["knife"], by=VIEWER)

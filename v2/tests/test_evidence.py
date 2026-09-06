@@ -35,3 +35,41 @@ def test_an_export_carries_the_report_the_clips_and_a_manifest_that_verifies(tmp
         assert verify_package(folder) == ["report.txt: digest differs"]
         with pytest.raises(Forbidden):
             export_incident(store, incident, tmp_path / "e2", by=VIEWER)
+
+
+def test_the_package_says_how_far_each_event_was_from_the_camera_that_saw_it(tmp_path, pose):
+    """"Eleven metres from the gate" is the kind of thing somebody asks months later."""
+    import json
+
+    from vigil.domain.incidents import Correlator
+
+    with Store(":memory:") as store:
+        store.save_camera("a", "Gate", "clip.mp4", pose=pose)
+        events = [event("a", 1, 10_000), event("a", 2, 12_000)]
+        store.save_events(events)
+        incident = Correlator().correlate(events)[0]
+        store.save_incidents([incident])
+        folder = export_incident(store, incident, tmp_path / "evidence", by=ANALYST)
+
+        report = json.loads((folder / "report.json").read_text(encoding="utf-8"))
+        away = report["events"][0]["evidence"]["from_camera"]
+        assert away and away.endswith(" m") and "±" in away, away
+        assert away in (folder / "report.txt").read_text(encoding="utf-8")
+        assert "from a" in (folder / "report.txt").read_text(encoding="utf-8")
+        assert verify_package(folder) == []
+
+
+def test_an_event_from_a_camera_nobody_placed_reports_no_distance(tmp_path):
+    import json
+
+    from vigil.domain.incidents import Correlator
+
+    with Store(":memory:") as store:
+        store.save_camera("a", "Gate", "clip.mp4")  # no pose
+        events = [event("a", 1, 10_000)]
+        store.save_events(events)
+        incident = Correlator().correlate(events)[0]
+        store.save_incidents([incident])
+        folder = export_incident(store, incident, tmp_path / "evidence", by=ANALYST)
+        report = json.loads((folder / "report.json").read_text(encoding="utf-8"))
+        assert report["events"][0]["evidence"]["from_camera"] is None, "a distance was invented"

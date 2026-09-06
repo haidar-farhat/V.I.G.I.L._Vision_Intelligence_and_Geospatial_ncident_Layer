@@ -154,6 +154,32 @@ def _zones(store) -> Check:
     return Check("zones", State.OK, f"{len(zones)} zone(s)")
 
 
+def _threats(settings, store) -> Check:
+    """Whether the site's threat labels mean anything against the model it has."""
+    from ..domain.threats import ThreatVocabulary
+
+    vocabulary = ThreatVocabulary.from_labels(store.site().get("threat_labels") or [])
+    if not vocabulary:
+        return Check("threat labels", State.OK, "none, so nothing is called a threat here",
+                     "If this site needs them: `vigil site threats --set knife,gun` (a model that names them is required).")
+    model = settings.default_model()
+    if model is None:
+        return Check("threat labels", State.FAIL, f"{len(vocabulary)} configured but there is no model to name them",
+                     "Install a model, or clear them with `vigil site threats --clear`.")
+    try:
+        from ..adapters.detectors import model_info
+
+        names = list(model_info(model).class_names.values())
+    except Exception as error:  # noqa: BLE001
+        return Check("threat labels", State.WARN, f"cannot be checked: {error}")
+    missing = vocabulary.unknown_to(names)
+    if missing:
+        return Check("threat labels", State.FAIL,
+                     f"{', '.join(missing)} cannot be produced by {model.name}, so nothing will ever raise them",
+                     "Use a model trained on those classes, or drop them from the list.")
+    return Check("threat labels", State.OK, vocabulary.describe())
+
+
 def _alerts(settings) -> Check:
     from .alerts import Alerts
 
@@ -197,6 +223,7 @@ def run_checks(settings, store, keychain, *, probe: bool = False) -> list[Check]
         lambda: _accounts(store),
         lambda: _site(store),
         lambda: _zones(store),
+        lambda: _threats(settings, store),
         lambda: _alerts(settings),
         lambda: _sources(store, probe),
     ]

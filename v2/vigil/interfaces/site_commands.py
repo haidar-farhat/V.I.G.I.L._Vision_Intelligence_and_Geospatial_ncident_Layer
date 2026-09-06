@@ -182,6 +182,27 @@ def _zones(ctx: _Context) -> int:
     return 0
 
 def _site(ctx: _Context) -> int:
+    if ctx.args.site_command == "threats":
+        from ..domain.threats import ThreatVocabulary
+
+        try:
+            if ctx.args.suggest:
+                print("A starting point, not a default. Adopt only what applies to this site, and only "
+                      "for a model that can name it:")
+                for threat in sorted(ThreatVocabulary.suggested()._by_label.values(), key=lambda t: t.label):
+                    print(f"  {threat.label:<14} {threat.severity}")
+                return 0
+            if ctx.args.clear:
+                vocabulary = ctx.site.set_threats([], by=ctx.principal)
+            elif ctx.args.set is not None:
+                vocabulary = ctx.site.set_threats([l for l in ctx.args.set.split(",") if l.strip()], by=ctx.principal)
+            else:
+                vocabulary = ctx.site.threats()
+        except (SiteError, AuthError) as error:
+            print(f"error: {error}", file=sys.stderr)
+            return 1
+        print(vocabulary.describe())
+        return 0
     if ctx.args.site_command == "name":
         try:
             ctx.site.name_site(ctx.args.name, ctx.args.timezone, by=ctx.principal)

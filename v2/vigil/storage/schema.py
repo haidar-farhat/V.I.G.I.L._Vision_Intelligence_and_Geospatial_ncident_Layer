@@ -163,6 +163,21 @@ MIGRATIONS: tuple[Migration, ...] = (
         ALTER TABLE incidents DROP COLUMN state;
         """,
     ),
+    Migration(
+        version=3,
+        name="site_threats",
+        up="""
+        -- Which labels this site treats as dangerous. Empty by default and
+        -- deliberately so: the shipped model names `knife` and `scissors`,
+        -- and a kitchen raising a critical alert every evening teaches an
+        -- operator to ignore the word within a week.
+        ALTER TABLE site ADD COLUMN threat_labels TEXT NOT NULL DEFAULT '[]';
+        """,
+        down="""
+        -- A build without it treats nothing as a threat, which is what it did.
+        ALTER TABLE site DROP COLUMN threat_labels;
+        """,
+    ),
 )
 
 SCHEMA_VERSION = MIGRATIONS[-1].version

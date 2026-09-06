@@ -249,6 +249,24 @@ class SiteService:
         except (ValueError, KeyError) as error:
             raise SiteError(f"{name!r} is not a time zone name: {error}") from error
 
+    def threats(self):
+        """What this site treats as dangerous. Empty until somebody says otherwise."""
+        from ..domain.threats import ThreatVocabulary
+
+        return ThreatVocabulary.from_labels(self._store.site().get("threat_labels") or [])
+
+    def set_threats(self, labels: Sequence[str], *, by: Principal):
+        """Name the labels this site calls dangerous, or clear them with an empty list."""
+        from ..domain.threats import ThreatVocabulary
+
+        by.require(SITE_CONFIGURE)
+        before = self.threats()
+        self._store.set_threat_labels(list(labels))
+        after = ThreatVocabulary.from_labels(self._store.site().get("threat_labels") or [])
+        self._store.audit(by.actor, "site.threats_changed", None, after.describe(),
+                          before={"labels": list(before.labels)}, after={"labels": list(after.labels)})
+        return after
+
     def name_site(self, name: str, timezone_name: str, *, by: Principal) -> None:
         by.require(SITE_CONFIGURE)
         self.known_timezone(timezone_name)

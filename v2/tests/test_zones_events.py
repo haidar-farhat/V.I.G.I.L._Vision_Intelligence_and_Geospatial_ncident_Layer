@@ -93,3 +93,94 @@ def test_after_hours_reads_the_site_clock():
 
 def test_default_rules_cover_every_event_type():
     assert {r.event_type for r in default_rules()} == set(EventType)
+
+
+def test_a_zone_entry_says_what_they_were_carrying_and_shows_its_working():
+    """The relation is inferred, so the event that quotes it must carry its conditions."""
+    from vigil.domain.detection import BoundingBox
+    from vigil.domain.relations import Relation, RelationKind
+
+    centre = LatLon(33.8938, 35.5018)
+    zone = Zone("z", "Yard", ZoneKind.RESTRICTED, square(centre), enter_after_millis=0)
+    presence = PresenceTracker([zone])
+    presence.update([track(1, centre)], 0)
+    change = presence.update([track(1, centre)], 100)[0]
+    carried = Relation(RelationKind.CARRIED, 1, 9, confidence=0.7,
+                       conditions=("62% of the backpack's box lay within the person's",))
+    context = RuleContext("node", "cam", zone, track(1, centre), change.presence, 100,
+                          datetime.now(timezone.utc), CLASSIFYING, 3, None, (carried,), {1: "person", 9: "backpack"})
+    events = ZoneEntryRule().on_presence_change(change, context)
+    assert len(events) == 1
+    assert events[0].summary == "A person entered Yard carrying backpack"
+    assert any("62% of the backpack's box" in c for c in events[0].evidence.conditions)
+
+    # With nothing carried the sentence is unchanged from before.
+    plain = RuleContext("node", "cam", zone, track(1, centre), change.presence, 100,
+                        datetime.now(timezone.utc), CLASSIFYING, 3)
+    assert ZoneEntryRule().on_presence_change(change, plain)[0].summary == "A person entered Yard"
+    assert plain.carrying() == () and plain.name_of(4) == "track 4"
+
+
+def _approaching(distance_m: float, zone: Zone, *, class_id: int = 0, confidence: float = 0.8):
+    """A track that far outside the zone, and the relation saying it is closing."""
+    from vigil.domain.relations import Relation, RelationKind
+
+    point = destination_point(zone.ring[0], 0.0, 0.0)  # placeholder, replaced below
+    centre = LatLon(33.8938, 35.5018)
+    point = destination_point(centre, 0.0, 7.07 + distance_m)
+    subject = track(1, point, class_id=class_id)
+    subject.confidence = confidence
+    relation = Relation(RelationKind.APPROACHING, 1, None, zone.id, confidence=0.6, observations=8,
+                        conditions=("the gap to the Yard closed 4.2 m in 2.1 s",))
+    context = RuleContext("node", "cam", zone, subject, None, 1000, datetime.now(timezone.utc), CLASSIFYING, 5,
+                          None, (relation,), {1: "person"})
+    return relation, context
+
+
+def test_an_approach_to_a_restricted_zone_warns_before_the_breach():
+    from vigil.domain.events import ApproachRule
+
+    centre = LatLon(33.8938, 35.5018)
+    zone = Zone("z", "Yard", ZoneKind.RESTRICTED, square(centre))
+    rule = ApproachRule()
+    relation, context = _approaching(4.0, zone)
+    events = rule.on_relation(relation, context)
+    assert len(events) == 1
+    assert events[0].type is EventType.APPROACHING and events[0].severity is Severity.MEDIUM
+    assert events[0].summary.startswith("A person is approaching Yard, ")
+    assert "±" in events[0].summary, "a distance without its error"
+    assert any("closed 4.2 m in 2.1 s" in c for c in events[0].evidence.conditions)
+    assert any("inside the 10 m this rule watches" in c for c in events[0].evidence.conditions)
+    assert rule.on_relation(relation, context) == [], "a warning repeats every frame otherwise"
+    rule.forget(1)
+    assert rule.on_relation(relation, context), "a new track of the same id starts again"
+
+
+def test_an_approach_from_far_away_or_to_an_ordinary_zone_says_nothing():
+    from vigil.domain.events import ApproachRule
+    from vigil.domain.relations import RelationKind
+
+    centre = LatLon(33.8938, 35.5018)
+    restricted = Zone("z", "Yard", ZoneKind.RESTRICTED, square(centre))
+    relation, far = _approaching(40.0, restricted)
+    assert ApproachRule().on_relation(relation, far) == [], "walking towards it from forty metres is walking"
+
+    interest = Zone("z", "Yard", ZoneKind.INTEREST, square(centre))
+    relation, close = _approaching(4.0, interest)
+    assert ApproachRule().on_relation(relation, close) == [], "an interest zone is not a place to warn about"
+
+    # A relation of another kind, or for another zone, is not this rule's business.
+    other, close = _approaching(4.0, restricted)
+    from dataclasses import replace
+
+    assert ApproachRule().on_relation(replace(other, kind=RelationKind.NEAR), close) == []
+    assert ApproachRule().on_relation(replace(other, zone_id="somewhere-else"), close) == []
+
+
+def test_a_zone_watch_list_silences_an_approach_too():
+    from vigil.domain.events import ApproachRule
+
+    centre = LatLon(33.8938, 35.5018)
+    zone = Zone("z", "Yard", ZoneKind.RESTRICTED, square(centre), watch=frozenset({"vehicle"}))
+    relation, context = _approaching(4.0, zone)
+    assert ApproachRule().on_relation(relation, context) == [], "a person approached a vehicle-only zone"

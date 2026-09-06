@@ -37,6 +37,9 @@ class PlanView(QWidget):
         self._cameras: dict[str, CameraPose] = {}
         self._zones: list = []
         self._tracks: dict[str, tuple] = {}
+        #: Per camera, what its tracks are doing together. Drawn as a link so
+        #: a group reads as a group and not as three unrelated dots.
+        self._relations: dict[str, tuple] = {}
         self._draft: list[LatLon] = []
         self._drawing = False
         self._selected: str | None = None
@@ -57,12 +60,14 @@ class PlanView(QWidget):
         self._reframe()
         self.update()
 
-    def set_tracks(self, camera_id: str, tracks: Sequence) -> None:
+    def set_tracks(self, camera_id: str, tracks: Sequence, relations: Sequence = ()) -> None:
         self._tracks[camera_id] = tuple(tracks)
+        self._relations[camera_id] = tuple(relations)
         self.update()
 
     def clear_tracks(self) -> None:
         self._tracks.clear()
+        self._relations.clear()
         self.update()
 
     def select(self, camera_id: str | None) -> None:
@@ -276,9 +281,31 @@ class PlanView(QWidget):
                     length = 8 + min(24, track.speed_mps * 4)
                     painter.drawLine(centre, QPointF(centre.x() + math.sin(heading) * length,
                                                      centre.y() - math.cos(heading) * length))
+            self._draw_links(painter, camera_id)
             if unprojected:
                 self._draw_unprojected(painter, camera_id, unprojected)
         painter.setBrush(Qt.BrushStyle.NoBrush)
+
+    def _draw_links(self, painter: QPainter, camera_id: str) -> None:
+        """A thin line between two tracks a relation joins, and what it says.
+
+        Dashed and faint on purpose: the relation is inferred, and a solid
+        line between two dots reads as a fact about the ground.
+        """
+        placed = {t.id: t.position.point for t in self._tracks.get(camera_id, ())
+                  if t.position is not None and t.position.is_projected}
+        for relation in self._relations.get(camera_id, ()):
+            if relation.object is None:
+                continue
+            here, there = placed.get(relation.subject), placed.get(relation.object)
+            if here is None or there is None:
+                continue
+            a, b = self._to_screen(here), self._to_screen(there)
+            painter.setPen(QPen(theme.STALE, 1, Qt.PenStyle.DotLine))
+            painter.drawLine(a, b)
+            painter.setPen(theme.STALE)
+            middle = QPointF((a.x() + b.x()) / 2, (a.y() + b.y()) / 2 - 3)
+            painter.drawText(middle, str(relation.kind).lower())
 
     def _draw_unprojected(self, painter: QPainter, camera_id: str, count: int) -> None:
         """Something is at this camera that the geometry could not place.

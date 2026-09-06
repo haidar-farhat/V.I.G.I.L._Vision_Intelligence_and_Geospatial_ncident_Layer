@@ -914,6 +914,48 @@ password follows; a zone's meaning changes while the ring somebody drew
 stays. `vigil doctor` checks an installation the way an installer would
 before leaving site, and exits non-zero on any failure.
 
+**Distance, relations and a threat vocabulary — with `v2/ROADMAP.md`.** The
+user asked for distance estimates, identification of dangerous items, and
+associations between objects (people in a car, a person holding something).
+The roadmap splits that into what can be built now and what needs weights an
+operator supplies, and the first three stages are built:
+
+- **Distance** (`geo.Distance`) is never given without its error, errors
+  combine in quadrature, and `within`/`beyond` are deliberately not each
+  other's negation, so a question the measurement cannot answer is answered
+  neither way. A zone's distance is signed: inside reads negative.
+- **Relations** (`domain/relations.py`) measure INSIDE, CARRIED, NEAR and
+  APPROACHING with a hold, and every one is *inferred* and worded as such:
+  one camera cannot tell being inside a car from walking in front of it. They
+  reach the rules, so a zone entry now says what the person was carrying and
+  repeats the overlap that led to it.
+- **Threats** (`domain/threats.py`) are **empty by default**, which is the
+  whole design: the shipped model names `knife` and `scissors`, and a kitchen
+  raising a critical alert nightly teaches an operator to ignore the word.
+  A claim needs a higher confidence and several frames, and `vigil doctor`
+  **fails** when a configured label is one the model can never produce —
+  verified live: configuring `gun` against the COCO weights is reported as
+  "nothing will ever raise them" rather than accepted in silence.
+
+Then the measurements were **surfaced**, which mattered: `distance_from_camera`
+had no caller outside its own module — the v1 defect, again. The track table
+now shows the distance with its error and what each track is doing, the plan
+links joined tracks with a dotted line (a solid one would read as a fact about
+the ground), and every exported event records how far it was from its camera.
+The reachability test was widened to catch exactly that: a domain symbol
+claimed TESTED must be used outside its own module, and `distance_from_camera`
+failed it an hour before.
+
+Finally a rule that acts on a **relation** rather than on presence, because
+presence happens after the fact. `ApproachRule` warns once, at MEDIUM, when
+somebody is closing on a restricted zone and is already within ten metres.
+Demonstrated through the real pipeline on a generated walk: *"An object is
+approaching the Doorstep, 0.5 ± 0.2 m away"* then *"An object entered the
+Doorstep"*, correlated into one incident. Warning first, breach second.
+
+Two bugs this found: `INSERT INTO site VALUES (…)` broke the moment the table
+grew a column (columns are named now), and the reachability gap above.
+
 **Search, and a split before it was needed.** `Search` finds incidents and
 events by camera, zone, severity, time, review state or text, with every
 filter applied in SQL — a search must not read a month of history into

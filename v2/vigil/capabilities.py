@@ -36,14 +36,34 @@ MANIFEST: tuple[Capability, ...] = (
                ("tests/test_geo.py",)),
     Capability("tracking", "Multi-object tracking with cumulative confirmation and coasting", State.TESTED,
                ("vigil.domain.tracking.Tracker",), ("tests/test_tracking.py",)),
+    Capability("distance", "Distances that carry their own error, and never one without the other", State.TESTED,
+               ("vigil.domain.geo.Distance", "vigil.domain.geo.separation", "vigil.domain.geo.distance_from_camera",
+                "vigil.domain.zones.Zone.distance_from"),
+               ("tests/test_geo.py",),
+               "Errors combine in quadrature; `within` and `beyond` are not each other's negation, so a question the "
+               "measurement cannot answer is answered neither way. A zone's distance is signed: inside reads negative"),
+    Capability("relations", "What tracked things are doing together: inside, carried, with, approaching", State.TESTED,
+               ("vigil.domain.relations.RelationTracker", "vigil.domain.relations.Relation"),
+               ("tests/test_relations.py", "tests/test_runtime.py", "tests/test_zones_events.py"),
+               "Every relation is inferred and worded as such — one camera cannot tell inside from in front of — and "
+               "carries the overlap, the distance and the frames it held. A zone entry says what the person was "
+               "carrying, quoting those conditions; the plan links two joined tracks with a dotted line, because a "
+               "solid one would read as a fact about the ground"),
+    Capability("threats", "Labels a site treats as dangerous, and what it refuses to claim", State.TESTED,
+               ("vigil.domain.threats.ThreatVocabulary", "vigil.domain.threats.ThreatRule"),
+               ("tests/test_threats.py", "tests/test_site.py", "tests/test_diagnostics.py", "tests/test_cli.py"),
+               "Empty by default: the shipped model names `knife` and `scissors`, and a kitchen raising a critical "
+               "alert nightly teaches an operator to ignore the word. A claim needs a higher confidence and several "
+               "frames, and `vigil doctor` fails when a configured label is one the model cannot produce"),
     Capability("zones", "Zones with membership hysteresis and a watch list", State.TESTED,
                ("vigil.domain.zones.Zone", "vigil.domain.zones.PresenceTracker"), ("tests/test_zones_events.py",)),
-    Capability("rules", "Zone entry, loitering and after-hours rules with evidence", State.TESTED,
+    Capability("rules", "Zone entry, loitering, after-hours and approach, each with its evidence", State.TESTED,
                ("vigil.domain.events.ZoneEntryRule", "vigil.domain.events.LoiteringRule", "vigil.domain.events.AfterHoursRule",
-                "vigil.service.runtime.Runtime.site_timezone"),
+                "vigil.domain.events.ApproachRule", "vigil.service.runtime.Runtime.site_timezone"),
                ("tests/test_zones_events.py", "tests/test_runtime.py"),
                "A schedule is read in the site's own clock, which the workers are given at start; the IANA database "
-               "ships with the product because Windows has none, and an unknown zone is refused where it is typed"),
+               "ships with the product because Windows has none, and an unknown zone is refused where it is typed. "
+               "`ApproachRule` acts on a relation rather than on presence, so a warning comes before the breach"),
     Capability("incidents", "Time-and-place correlation into incidents with risk", State.TESTED,
                ("vigil.domain.incidents.Correlator", "vigil.domain.incidents.associate", "vigil.domain.incidents.score_risk",
                 "vigil.domain.incidents.link_same_camera_fragments"),

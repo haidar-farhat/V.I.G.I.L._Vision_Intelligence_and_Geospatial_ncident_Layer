@@ -23,6 +23,7 @@ from ..adapters.recorder import Recorder, Segment
 from ..domain.detection import DetectorInfo
 from ..domain.events import Event, Rule, RuleContext, default_rules
 from ..domain.incidents import Correlator, Incident
+from ..domain.relations import RelationTracker
 from ..domain.tracking import Track, Tracker, TrackerConfig
 from ..domain.zones import PresenceTracker, Zone
 from ..logs import get as _get_logger
@@ -55,6 +56,9 @@ class FrameResult:
     tracks: tuple[Track, ...]
     detections: int
     image: object | None = None
+    #: What those tracks are doing with each other, as far as one camera can
+    #: tell. Inferred, never observed; see `vigil.domain.relations`.
+    relations: tuple = ()
 
 
 @dataclass
@@ -163,6 +167,7 @@ class CameraWorker:
             self.detector_info = detector.info
             tracker = Tracker(TrackerConfig(), self.camera.pose)
             presence = PresenceTracker(self._zones)
+            relations = RelationTracker()
             info = source.open()
             if self._record_to is not None and (self.camera.record or self._record_anyway):
                 recorder = Recorder(self.camera.id, self._record_to, fps=info.nominal_fps or 15.0, segment_seconds=self._segment_seconds)
@@ -184,7 +189,7 @@ class CameraWorker:
                             raise DecodeError(reader.fault)
                         continue
                     break  # a file ended
-                self._process(frame, detector, tracker, presence, recorder)
+                self._process(frame, detector, tracker, presence, relations, recorder)
                 if frame_interval:
                     remaining = frame_interval - (time.monotonic() - started)
                     if remaining > 0:
@@ -213,7 +218,8 @@ class CameraWorker:
             _log.info("%s: analysis finished: %d frames, %d detections, %d events", self.camera.id,
                       self.stats.frames, self.stats.detections, self.stats.events)
 
-    def _process(self, frame: Frame, detector: Detector, tracker: Tracker, presence: PresenceTracker, recorder: Recorder | None) -> None:
+    def _process(self, frame: Frame, detector: Detector, tracker: Tracker, presence: PresenceTracker,
+                 relations: RelationTracker, recorder: Recorder | None) -> None:
         now = time.monotonic()
         self.stats.frames += 1
         self.stats.last_frame_at = now
@@ -231,25 +237,44 @@ class CameraWorker:
             # A track that ended has left every zone it was in; see above for
             # why the departures are not turned into events.
             presence.forget_track(ended, frame.timestamp_millis)
+            relations.forget_track(ended)
             for rule in self._rules:
                 forget = getattr(rule, "forget", None)
                 if forget:
                     forget(ended)
         by_id = {t.id: t for t in tracks}
         zones = presence.zones
+        # What the tracks are doing with each other, before any rule looks at
+        # them: a rule may say "carrying" only if this measured it.
+        found = tuple(relations.update(tracks, frame.timestamp_millis, label_of=info.label_for,
+                                       zones=list(zones.values())))
+        names = {t.id: info.label_for(t.class_id) for t in tracks}
         for change in presence.update(tracks, frame.timestamp_millis, label_for=info.label_for):
             zone = zones[change.presence.zone_id]
             track = by_id.get(change.presence.track_id)
             context = RuleContext(self._node_id, self.camera.id, zone, track, change.presence, frame.timestamp_millis,
-                                  moment, info, frame.index, self._site_tz)
+                                  moment, info, frame.index, self._site_tz,
+                                  _for(found, change.presence.track_id), names)
             for rule in self._rules:
                 events.extend(rule.on_presence_change(change, context))
+        # A relation is the only way a rule hears about something that has
+        # not arrived yet, so it is offered before presence is considered.
+        for relation in found:
+            track = by_id.get(relation.subject)
+            if track is None:
+                continue
+            zone = zones.get(relation.zone_id) if relation.zone_id else None
+            context = RuleContext(self._node_id, self.camera.id, zone, track, None, frame.timestamp_millis,
+                                  moment, info, frame.index, self._site_tz, _for(found, relation.subject), names)
+            for rule in self._rules:
+                events.extend(rule.on_relation(relation, context))
+
         for p in presence.presences():
             track = by_id.get(p.track_id)
             if track is None:
                 continue
             context = RuleContext(self._node_id, self.camera.id, zones[p.zone_id], track, p, frame.timestamp_millis,
-                                  moment, info, frame.index, self._site_tz)
+                                  moment, info, frame.index, self._site_tz, _for(found, p.track_id), names)
             for rule in self._rules:
                 events.extend(rule.on_frame(context))
         for event in events:
@@ -268,7 +293,7 @@ class CameraWorker:
                 self.stats.recording_fault = str(error)
                 _log.error("%s: RECORDING STOPPED EARLY - %s", self.camera.id, error)
         result = FrameResult(self.camera.id, frame.index, frame.timestamp_millis, tuple(tracks), len(detections),
-                             frame.image if self._keep_images else None)
+                             frame.image if self._keep_images else None, found)
         with self._latest_lock:
             if self._latest is not None:
                 self.stats.dropped_results += 1
@@ -380,12 +405,13 @@ class Runtime:
             return len(self._workers)
         zones = self.site.zones(by)
         site_tz = self.site_timezone()
+        rules = self._rules_factory() if self._rules_factory else self._default_rules()
         chosen = [c for c in self.site.cameras(by) if cameras is None or c.id in cameras]
         started = 0
         for camera in chosen:
             worker = CameraWorker(
                 camera, self.site.source_with_credentials(camera), self._factory(), zones,
-                self._rules_factory() if self._rules_factory else None, node_id=self.node_id,
+                list(rules), node_id=self.node_id,
                 record_to=self._record_to, realtime=self._realtime, keep_images=self._keep_images,
                 record_anyway=self._record_every_camera, site_tz=site_tz,
             )
@@ -413,6 +439,20 @@ class Runtime:
         if self._running:
             self.stop(by or Principal.system())
         self.store.close()
+
+    def _default_rules(self) -> list[Rule]:
+        """The standard rules, plus the threat rule this site's vocabulary makes.
+
+        Read here rather than baked into `default_rules` because the
+        vocabulary is a site setting, and a rule that cannot see it would
+        quietly treat every site the same.
+        """
+        from ..domain.threats import ThreatRule
+
+        vocabulary = self.site.threats()
+        if vocabulary:
+            _log.info("threat labels for this site: %s", vocabulary.describe())
+        return [*default_rules(), ThreatRule(vocabulary)]
 
     def _factory(self) -> Callable[[], Detector]:
         if self._detector_factory is not None:
@@ -579,6 +619,11 @@ class Runtime:
             self.retention_shortfall = apply_retention(self.store, self._retention, principal=f"node:{self.node_id}")
         except Exception:  # noqa: BLE001
             _log.exception("retention sweep failed")
+
+
+def _for(relations: tuple, track_id: int) -> tuple:
+    """The relations one track takes part in, either end."""
+    return tuple(r for r in relations if r.subject == track_id or r.object == track_id)
 
 
 def apply_retention(store: Store, policy: RetentionPolicy, *, principal: str = "retention",

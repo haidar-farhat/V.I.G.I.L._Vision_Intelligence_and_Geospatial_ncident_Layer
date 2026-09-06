@@ -467,11 +467,28 @@ class Store:
     def site(self) -> dict:
         self._check_thread()
         row = self._connection.execute("SELECT * FROM site WHERE id = 'site'").fetchone()
-        return dict(row) if row else {"id": "site", "name": "Unnamed site", "timezone": "UTC", "updated_at": 0}
+        if row is None:
+            return {"id": "site", "name": "Unnamed site", "timezone": "UTC", "threat_labels": [], "updated_at": 0}
+        site = dict(row)
+        site["threat_labels"] = json.loads(site.get("threat_labels") or "[]")
+        return site
+
+    def set_threat_labels(self, labels: Sequence[str]) -> None:
+        with self.transaction() as c:
+            c.execute("INSERT INTO site (id, name, timezone, threat_labels, updated_at) "
+                      "VALUES ('site', 'Unnamed site', 'UTC', ?, ?) "
+                      "ON CONFLICT(id) DO UPDATE SET threat_labels=excluded.threat_labels, updated_at=excluded.updated_at",
+                      (json.dumps(sorted({str(l).strip().lower() for l in labels if str(l).strip()})), _now()))
 
     def save_site(self, name: str, timezone_name: str) -> None:
         with self.transaction() as c:
-            c.execute("INSERT INTO site VALUES ('site', ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, timezone=excluded.timezone, updated_at=excluded.updated_at",
+            # The columns are named on purpose: `INSERT INTO site VALUES (…)`
+            # broke the moment the table grew a column, and every site row
+            # with it. The threat labels are absent so naming a site cannot
+            # quietly drop them.
+            c.execute("INSERT INTO site (id, name, timezone, updated_at) VALUES ('site', ?, ?, ?) "
+                      "ON CONFLICT(id) DO UPDATE SET name=excluded.name, timezone=excluded.timezone, "
+                      "updated_at=excluded.updated_at",
                       (name, timezone_name, _now()))
 
     # -------------------------------------------------------------- backups

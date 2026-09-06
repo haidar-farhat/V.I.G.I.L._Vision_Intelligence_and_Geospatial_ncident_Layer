@@ -463,17 +463,21 @@ class ConsoleWindow(QMainWindow):
     def _collect(self, final: bool = False) -> None:
         results = self.commands.poll()
         health = self.commands.health()
+        poses = {c.id: c.pose for c in self.commands.cameras()}
         rows = []
         for result in results:
             view = self._views.get(result.camera_id)
             state = health.get(result.camera_id)
             if view is not None:
                 view.show_result(result, state.analysis_fps if state else 0.0)
-            self.plan.set_tracks(result.camera_id, result.tracks)
+            self.plan.set_tracks(result.camera_id, result.tracks, result.relations)
             info = self._detector_info(result.camera_id)
             if view is not None:
                 view.set_detector_info(info)
-            rows.extend((result.camera_id, track, info) for track in result.tracks)
+            pose = poses.get(result.camera_id)
+            rows.extend((result.camera_id, track, info, pose,
+                         tuple(r for r in result.relations if r.subject == track.id))
+                        for track in result.tracks)
         if rows or results:
             self.tracks.show_tracks(rows)
         if results:

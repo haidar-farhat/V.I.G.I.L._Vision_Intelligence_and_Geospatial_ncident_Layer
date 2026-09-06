@@ -89,3 +89,29 @@ def test_a_remedy_never_uses_a_character_a_windows_console_cannot_print():
 
     line = Check("x", State.WARN, "something", "do this").describe()
     assert "->" in line and line.isascii()
+
+
+def test_threat_labels_a_model_cannot_name_are_a_failure_not_a_silence(tmp_path, keychain, monkeypatch):
+    """Configuring `gun` against a vehicle model protects nothing, and nothing would say so."""
+    from vigil.domain.detection import DetectorInfo
+    from vigil.service import diagnostics
+
+    settings = Settings(tmp_path / "data", "", None, None, False)
+    with Store(tmp_path / "d.db") as store:
+        assert _checks(settings, store, keychain)["threat labels"].state is State.OK
+
+        store.set_threat_labels(["knife", "gun"])
+        monkeypatch.setattr(Settings, "default_model", lambda self: None)
+        no_model = _checks(settings, store, keychain)["threat labels"]
+        assert no_model.state is State.FAIL and "no model to name them" in no_model.detail
+
+        monkeypatch.setattr(Settings, "default_model", lambda self: tmp_path / "weights.onnx")
+        monkeypatch.setattr(diagnostics, "_threats", diagnostics._threats)
+        monkeypatch.setattr("vigil.adapters.detectors.model_info",
+                            lambda path, classes=None: DetectorInfo("onnx", "w", class_names={0: "person", 1: "knife"},
+                                                                    classifies=True))
+        partial = _checks(settings, store, keychain)["threat labels"]
+        assert partial.state is State.FAIL and "gun cannot be produced" in partial.detail and partial.remedy
+
+        store.set_threat_labels(["knife"])
+        assert _checks(settings, store, keychain)["threat labels"].state is State.OK

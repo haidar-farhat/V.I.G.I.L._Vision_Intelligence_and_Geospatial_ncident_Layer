@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone, tzinfo
 from enum import StrEnum
 from typing import Sequence
@@ -17,6 +17,8 @@ class EventType(StrEnum):
     ZONE_ENTRY = "ZONE_ENTRY"
     LOITERING = "LOITERING"
     AFTER_HOURS_PRESENCE = "AFTER_HOURS_PRESENCE"
+    #: Somebody is on their way, and has not arrived. A warning, not a breach.
+    APPROACHING = "APPROACHING"
 
 
 class Severity(StrEnum):
@@ -90,6 +92,21 @@ class RuleContext:
     detector: DetectorInfo
     frame_index: int
     site_tz: tzinfo | None = None
+    #: What this track is doing with other tracks, as far as one camera can
+    #: tell. Every one is inferred; see `vigil.domain.relations`.
+    relations: tuple = ()
+    #: Track id to label, for the tracks a relation mentions. Without it a
+    #: sentence would have to say "track 7" where it means "a backpack".
+    _labels: dict = field(default_factory=dict)
+
+    def carrying(self) -> tuple:
+        from .relations import RelationKind
+
+        return tuple(r for r in self.relations if r.kind is RelationKind.CARRIED and r.subject == self._track_id)
+
+    @property
+    def _track_id(self) -> int:
+        return self.track.id if self.track is not None else -1
 
     @property
     def local_moment(self) -> datetime:
@@ -100,6 +117,11 @@ class RuleContext:
         if self.track is None:
             return None
         return self.detector.label_for(self.track.class_id)
+
+    def name_of(self, track_id: int) -> str:
+        """How a track reads in a sentence: its label if the detector has one."""
+        label = self._labels.get(track_id)
+        return label if label else f"track {track_id}"
 
 
 class Rule:
@@ -112,6 +134,15 @@ class Rule:
         return []
 
     def on_frame(self, context: RuleContext) -> list[Event]:
+        return []
+
+    def on_relation(self, relation, context: RuleContext) -> list[Event]:
+        """Called for each relation, with a context built around its subject.
+
+        The hook exists so a rule can act on what two tracks are doing
+        together — approaching a zone, carrying something — rather than only
+        on presence, which by definition happens after the fact.
+        """
         return []
 
     def _build(self, context: RuleContext, *, summary: str, conditions: Sequence[str],
@@ -166,9 +197,17 @@ class ZoneEntryRule(Rule):
         if change.kind != "ENTERED" or zone is None or zone.kind not in self._kinds:
             return []
         severity = Severity.HIGH if zone.kind is ZoneKind.RESTRICTED else Severity.MEDIUM
+        conditions = [f"membership held for {zone.enter_after_millis} ms", f"zone kind is {zone.kind}"]
+        # What they were carrying, if anything, in the words the relation
+        # itself used — hedged, because one camera inferred it.
+        carrying = context.carrying()
+        carried = ""
+        if carrying:
+            carried = " " + " and ".join(r.describe(context.name_of).split("appears to be ")[-1] for r in carrying)
+            conditions.extend(c for relation in carrying for c in relation.conditions)
         return [self._build(
-            context, summary=f"{_subject(context)} entered {zone.name}",
-            conditions=(f"membership held for {zone.enter_after_millis} ms", f"zone kind is {zone.kind}"),
+            context, summary=f"{_subject(context)} entered {zone.name}{carried}",
+            conditions=tuple(conditions),
             confidence=change.presence.confidence, observations=change.presence.observations, severity=severity,
         )]
 
@@ -229,8 +268,61 @@ class AfterHoursRule(Rule):
         )]
 
 
+class ApproachRule(Rule):
+    """Somebody is walking towards a zone that should not be entered.
+
+    The point of a security system is to say something before the breach,
+    not after it. This is deliberately a warning: `MEDIUM`, once per track
+    per zone, and only when the relation has already measured a real closing
+    — the gap must have shrunk by more than either position's error, which
+    `RelationTracker` establishes before this rule is ever called.
+    """
+
+    id = "approach"
+    description = "An object is moving towards a zone it should not enter."
+    event_type = EventType.APPROACHING
+    severity = Severity.MEDIUM
+
+    def __init__(self, kinds=(ZoneKind.RESTRICTED, ZoneKind.PERIMETER), within_meters: float = 10.0):
+        self._kinds = frozenset(kinds)
+        #: How close it must already be. Somebody closing the gap eighty
+        #: metres away is walking, not approaching anything in particular.
+        self.within_meters = within_meters
+        self._raised: set[tuple[str, int]] = set()
+
+    def on_relation(self, relation, context: RuleContext) -> list[Event]:
+        from .relations import RelationKind
+
+        zone = context.zone
+        if relation.kind is not RelationKind.APPROACHING or zone is None or relation.zone_id != zone.id:
+            return []
+        if zone.kind not in self._kinds or context.track is None:
+            return []
+        if not zone.watches(context.class_label):
+            return []
+        position = context.track.position
+        if position is None or not position.is_projected:
+            return []
+        gap = zone.distance_from(position)
+        if gap.meters > self.within_meters:
+            return []
+        key = (zone.id, context.track.id)
+        if key in self._raised:
+            return []
+        self._raised.add(key)
+        return [self._build(
+            context, summary=f"{_subject(context)} is approaching {zone.name}, {gap.describe()} away",
+            conditions=(*relation.conditions, f"it is {gap.describe()} from the edge, inside the "
+                                              f"{self.within_meters:.0f} m this rule watches"),
+            confidence=relation.confidence, observations=relation.observations,
+        )]
+
+    def forget(self, track_id: int) -> None:
+        self._raised = {k for k in self._raised if k[1] != track_id}
+
+
 def default_rules() -> list[Rule]:
-    return [ZoneEntryRule(), LoiteringRule(), AfterHoursRule()]
+    return [ZoneEntryRule(), LoiteringRule(), AfterHoursRule(), ApproachRule()]
 
 
 def utc(millis: int) -> datetime:

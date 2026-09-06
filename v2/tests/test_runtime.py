@@ -285,3 +285,29 @@ def test_the_workers_are_given_the_sites_clock(tmp_path, reference_video, keycha
             assert runtime._workers["gate"]._site_tz == ZoneInfo("Asia/Beirut"), "the rules would read the wrong clock"
         finally:
             runtime.stop(OPERATOR)
+
+
+def test_relations_reach_the_rules_and_the_frame_result(tmp_path, keychain, monkeypatch):
+    """Tested-but-unused was v1's recurring defect; a relation nothing reads is that."""
+    import inspect
+
+    from vigil.service import runtime as runtime_module
+
+    source = inspect.getsource(runtime_module.CameraWorker._process)
+    assert "relations.update(" in source, "the worker never measures a relation"
+    assert "_for(found," in source, "a rule is never given the relations for its track"
+    assert "frame.image if self._keep_images else None, found)" in source, "the frame result drops them"
+    signature = inspect.signature(runtime_module.FrameResult.__init__)
+    assert "relations" in signature.parameters
+
+
+def test_the_worker_offers_every_relation_to_the_rules(tmp_path, keychain):
+    """A relation is the only way a rule hears about something that has not arrived."""
+    import inspect
+
+    from vigil.service import runtime as runtime_module
+
+    source = inspect.getsource(runtime_module.CameraWorker._process)
+    assert "rule.on_relation(relation, context)" in source
+    assert source.index("on_relation") < source.index("for p in presence.presences()"), \
+        "an approach must be offered before presence, which happens after the fact"
