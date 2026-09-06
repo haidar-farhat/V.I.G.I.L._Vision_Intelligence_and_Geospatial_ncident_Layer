@@ -69,3 +69,13 @@ media/*
 evidence/*
 !evidence/README.md
 dist/screenshots/
+
+# The double-clickable application, built by `python v2/tasks.py app` into the
+# repository root so it is the first thing in the folder. `_internal` is the
+# 340 MiB PyInstaller tree that has to sit beside the executable; both are
+# build output and neither belongs in history — 22 MiB of `core/target` once
+# reached a commit through an anchored pattern that missed a subdirectory.
+/VIGIL.exe
+/_internal/
+/vigil_core.dll
+/build.json

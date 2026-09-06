@@ -49,6 +49,36 @@ def stylesheet() -> str:
     QPushButton:hover:enabled {{ border-color: {ACCENT.name()}; }}
     QPushButton:disabled {{ color: {TEXT_FAINT.name()}; background: {PANEL.name()}; }}
     QPushButton:checked {{ background: {ACCENT.name()}; color: {BACKGROUND.name()}; font-weight: 600; }}
+    /* The one control an operator presses most, and the only one that is
+       loud. Everything else on screen is grey on grey on purpose: a window
+       where three things shout is a window where nothing does. */
+    QPushButton#Primary {{ background: {LIVE.name()}; color: {BACKGROUND.name()}; font-weight: 700;
+        border: 1px solid {LIVE.name()}; padding: 6px 20px; }}
+    QPushButton#Primary:hover:enabled {{ background: {LIVE.lighter(112).name()}; }}
+    QPushButton#Primary:disabled {{ background: {PANEL.name()}; color: {TEXT_FAINT.name()};
+        border-color: {BORDER.name()}; font-weight: 600; }}
+    QPushButton#Stop {{ background: {FAULT.name()}; color: {BACKGROUND.name()}; font-weight: 700;
+        border: 1px solid {FAULT.name()}; padding: 6px 20px; }}
+    QPushButton#Stop:hover:enabled {{ background: {FAULT.lighter(112).name()}; }}
+    QPushButton#Stop:disabled {{ background: {PANEL.name()}; color: {TEXT_FAINT.name()};
+        border-color: {BORDER.name()}; font-weight: 600; }}
+    /* The verbs that sit under the thing they act on. Quieter than a normal
+       button, because a panel with six loud buttons under it reads as six
+       decisions rather than as a list with some things you can do to it. */
+    QWidget#ActionBar {{ background: transparent; }}
+    QWidget#ActionBar QPushButton {{ background: transparent; border: 1px solid transparent;
+        padding: 4px 9px; color: {TEXT_MUTED.name()}; }}
+    QWidget#ActionBar QPushButton:hover:enabled {{ background: {PANEL_RAISED.name()};
+        border-color: {BORDER.name()}; color: {TEXT.name()}; }}
+    QWidget#ActionBar QPushButton:disabled {{ color: {TEXT_FAINT.name()}; background: transparent; }}
+    QWidget#ActionBar QPushButton:checked {{ background: {ACCENT.name()}; color: {BACKGROUND.name()}; }}
+    QMenuBar {{ background: {BACKGROUND.name()}; color: {TEXT_MUTED.name()}; }}
+    QMenuBar::item:selected {{ background: {PANEL_RAISED.name()}; color: {TEXT.name()}; }}
+    QMenu {{ background: {PANEL.name()}; border: 1px solid {BORDER.name()}; }}
+    QMenu::item:selected {{ background: {ACCENT.name()}; color: {BACKGROUND.name()}; }}
+    QMenu::item:disabled {{ color: {TEXT_FAINT.name()}; }}
+    QMenu::separator {{ height: 1px; background: {BORDER.name()}; margin: 4px 8px; }}
+    QLabel#PanelDetail {{ color: {TEXT_MUTED.name()}; font-size: 11px; padding: 6px 8px 2px 8px; }}
     QTreeWidget, QTableWidget, QTextEdit, QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {{
         background: {PANEL.name()}; border: 1px solid {BORDER.name()}; border-radius: 3px; }}
     /* A muted wash, and deliberately no `selection-color`: a row carries the

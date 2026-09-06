@@ -330,6 +330,105 @@ def exetest() -> int:
     return 0 if not problems else 1
 
 
+#: Where the double-clickable application is put: the repository root, so
+#: `VIGIL.exe` is the first thing in the folder rather than four levels down
+#: in `v2/dist/vigil/`.
+APP_ROOT = ROOT.parent
+APP_NAME = "VIGIL"
+
+
+def app() -> int:
+    """Build VIGIL.exe — the window only, no command line — in the repo root.
+
+    # Why a second build and not just the windowed twin from `package`
+
+    `package` produces a pair that share one `_internal`: a console-subsystem
+    `vigil.exe` for the command line and a GUI-subsystem `vigil-console.exe`
+    beside it. That pair is right for an installed site, and wrong for
+    somebody who wants to open the thing: it puts two executables in front of
+    them, one of which flashes a black terminal and exits.
+
+    This is the window and nothing else. One executable, GUI-subsystem, with
+    its `_internal` beside it, at the top of the repository.
+
+    The command line is not *removed* — every service is still reachable, and
+    `vigil identity enable` still needs a terminal. It is simply not what this
+    build hands to whoever opens the folder.
+    """
+    if shutil.which("pyinstaller") is None and _run([sys.executable, "-c", "import PyInstaller"]) != 0:
+        print("PyInstaller is not installed: pip install pyinstaller")
+        return 1
+    staging = ROOT / "build" / "app"
+    if staging.exists():
+        shutil.rmtree(staging)
+    sources = source_digests()
+    library = _core_library()
+    if library is None:
+        print("the engine core is not built, so the app will have no `map` and no fast paths. "
+              "Build it first with `python tasks.py core`.")
+
+    argv = _pyinstaller(library, windowed=True)
+    # Same flags, different name and destination. Rebuilt from the argument
+    # list rather than duplicated, so a flag added for the packaged build --
+    # a hidden import, an excluded module -- cannot be forgotten here.
+    argv[argv.index("--name") + 1] = APP_NAME
+    argv[argv.index("--distpath") + 1] = str(staging)
+    if "--clean" not in argv:
+        argv.insert(4, "--clean")
+    code = _run(argv)
+    if code != 0:
+        return code
+
+    built = staging / APP_NAME
+    if not (built / f"{APP_NAME}.exe").is_file():
+        print(f"PyInstaller did not produce {built / (APP_NAME + '.exe')}")
+        return 1
+    models = ROOT / "models"
+    if models.is_dir():
+        shutil.copytree(models, built / "models", dirs_exist_ok=True)
+    if library is not None:
+        # Beside the executable as well as inside `_internal`: the loader
+        # looks in both, and a deployment that unpacks only what it can see
+        # should still get the fast paths.
+        shutil.copy2(library, built / library.name)
+    (built / "build.json").write_text(json.dumps({
+        "commit": _commit(), "sources": sources, "app": APP_NAME,
+        "built_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }), encoding="utf-8")
+
+    # Into the root. The executable and `_internal` move together and are
+    # replaced together: an `_internal` from one build beside an executable
+    # from another is the exact state `exetest` had to be taught to refuse,
+    # and here it would be silent.
+    for name in (f"{APP_NAME}.exe", "_internal", "build.json", library.name if library else ""):
+        if not name:
+            continue
+        target = APP_ROOT / name
+        if target.is_dir():
+            shutil.rmtree(target, ignore_errors=True)
+        elif target.exists():
+            target.unlink()
+        source = built / name
+        if source.is_dir():
+            shutil.copytree(source, target)
+        elif source.exists():
+            shutil.copy2(source, target)
+    # `models/` is **merged**, never replaced. It is a tracked folder of this
+    # repository holding a README and whatever weights an operator has put
+    # there, and an earlier version of this task deleted it and copied v2's
+    # over the top — which silently removed two files that were in git.
+    # Build output may add to a tracked folder; it may not own one.
+    if (built / "models").is_dir():
+        shutil.copytree(built / "models", APP_ROOT / "models", dirs_exist_ok=True)
+    shutil.rmtree(staging, ignore_errors=True)
+    exe = APP_ROOT / f"{APP_NAME}.exe"
+    size = sum(f.stat().st_size for f in APP_ROOT.joinpath("_internal").rglob("*") if f.is_file())
+    print(f"{exe}")
+    print(f"  the window only — no command line, no terminal behind it")
+    print(f"  {size / 1024**2:.0f} MiB in _internal beside it; both are gitignored")
+    return 0
+
+
 #: The installer script, generated rather than kept as a file.
 #:
 #: Kept in the task that builds it so the version, the file list and the
@@ -439,7 +538,7 @@ def installer() -> int:
 
 
 TASKS = {"core": core, "test": test, "bench": bench, "check": check, "capabilities": capabilities,
-         "installer": installer,
+         "app": app, "installer": installer,
          "package": package, "exetest": exetest}
 
 def _usage() -> str:

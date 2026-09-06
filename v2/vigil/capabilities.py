@@ -327,13 +327,27 @@ MANIFEST: tuple[Capability, ...] = (
                ("vigil.adapters.keychain.Keychain",), ("tests/test_site.py",)),
     Capability("cli", "One command for every service method", State.TESTED,
                ("vigil.interfaces.cli.main",), ("tests/test_cli.py",)),
-    Capability("console", "Desktop console: a thin view over the service, with the lock and the plan", State.TESTED,
+    Capability("console", "Desktop console: every verb under the thing it acts on", State.TESTED,
                ("vigil.interfaces.console.window.ConsoleWindow", "vigil.interfaces.console.commands.Commands",
+                "vigil.interfaces.console.commands.Site", "vigil.interfaces.console.widgets.Panel",
                 "vigil.interfaces.console.plan.PlanView", "vigil.interfaces.console.dialogs.ask"),
                ("tests/test_console.py",),
-               "`vigil console`. No domain state in the view; every change through Commands with the principal. "
-               "Structural tests hold the three v1 Qt rules: no lambda over self in a connection, no WA_DeleteOnClose, "
-               "a greyed control answers a click"),
+               "`vigil console`, and `VIGIL.exe` at the repository root for the window on its own. No domain state "
+               "in the view; every change through Commands with the principal. Structural tests hold the three v1 "
+               "Qt rules: no lambda over self in a connection, no WA_DeleteOnClose, a greyed control answers a "
+               "click. **Reworked**, and each change fixes something a photograph showed. Seventeen buttons sat in "
+               "one row across the top at equal weight, five of them acting on a selection at the far side of the "
+               "window -- so the commonest outcome of pressing one was the sentence \"Select a camera to place\", "
+               "the interface asking for something it could see. The verbs now sit under their nouns and that error "
+               "is unreachable; a control greyed for want of a selection says **that**, not \"Locked\", because a "
+               "reason that does not match the cause sends somebody to press a button already pressed. The status "
+               "bar carried seven permanent labels at eleven per cent of its width each and rendered them "
+               "\"MONITOR - site locked; press...\" and \"yolov8n-seg - watching 80 cl...\"; it carries three now "
+               "and the other four moved into the heading of the panel they describe. One control is loud -- Start, "
+               "or Stop while running -- because a window where three things shout is one where nothing does. The "
+               "window reads the service **once** per repaint through `Commands.snapshot()` rather than asking it "
+               "five separate questions, so every panel is drawn from one moment: a camera removed between two of "
+               "those calls used to appear in one panel and not the next"),
     Capability("identity", "Faces, plates and a subject register behind one identity switch",
                State.TESTED,
                ("vigil.domain.identity.Register", "vigil.domain.identity.Verdict",

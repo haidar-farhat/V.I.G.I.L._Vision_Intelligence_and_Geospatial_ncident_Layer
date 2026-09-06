@@ -21,6 +21,19 @@ python -m vigil console          # the operator window
 python -m vigil where            # paths, principal, alert sinks
 ```
 
+Or build the window on its own — one executable, no command line, no terminal
+behind it — into the top of the repository:
+
+```bash
+python v2/tasks.py app           # -> VIGIL.exe in the repository root
+```
+
+`VIGIL.exe` and the `_internal` folder beside it are build output and are
+gitignored. The command line is not removed by this build; it is simply not
+what the folder hands to whoever opens it. Some things still need it —
+`vigil identity enable` takes a written reason and a retention limit, and a
+dialog with two boxes would invite treating that as a preference.
+
 From the command line, without the window:
 
 ```bash
@@ -232,6 +245,7 @@ those needs.
 
 | When (UTC) | What ran | Result |
 |---|---|---|
+| 2026-09-06 21:53 | `VIGIL.exe` from the repository root, 20 s on `device:0`, after the console was reworked | **PASS**, exit 0. The window only — no command line, no terminal behind it. Every verb now sits under the thing it acts on, and every panel heading reads in full: *1 of 1 placed*, *yolov8n-seg — watching 80 classes with masks · f828ccfa4b69*, *no map yet — 61 frame(s) folded in*. Two eliding bugs were found by photographing it and fixed: a right-aligned heading label given a cap wider than itself is clipped by Qt **from the left**, so the wall read *"olov8n-seg — watching 80 classes with …"* — correctly ellipsised at the end and missing its first letter; and a stretch spacer beside a stretching label split the heading between them, eliding a sentence that had room to be read. |
 | 2026-09-06 21:20 | packaged `vigil.exe`, `exetest --seconds 20 --record --console`, after the identity, suppression-kernel and evaluation work | **PASS in 24 s**, with migrations 6 to 9 applied inside the packaged build. Faces and plates ship **off**: `vigil identity show` reads "faces and plates are OFF: no face is embedded, no plate is read, and no biometric row is written". |
 | 2026-09-06 21:05 | the four Phase 8 candidates, measured before any was rewritten | The measurement decided what to write **and what not to**. NumPy soft-NMS on 300 proposals: **4.92 ms**, against about 12.5 ms for the detection itself — and tiling runs it once per tile. In Rust: **0.044 ms, 138x**, returning identical indices including ties. Two candidates on the same list were left alone after measuring: the assignment cost matrix at **5 microseconds** and mask decode at 0.9 ms. The appearance descriptor got neither — `cv2.calcHist` with a mask is 3.5x faster than indexing the pixels out and counting them in NumPy, with identical results over 300 randomised crops, so 12 detections went **3.61 ms to 1.49 ms** with no new implementation of a colour space to keep in step. |
 | 2026-09-06 20:19 | packaged `vigil.exe`, `exetest --seconds 20 --record --console`, after the pose calibration, triangulation, cross-camera, live-map and detection work | **PASS in 23 s.** The window carries the new *Measure pose…* control, and the status bar reads **watching 80 classes** rather than six. It detected and tracked a **cell phone** — a class the old frozen watch list made invisible to the detector, the tracker, the plan and the map — drew it, inferred `carried` between it and the person, and raised **no event** for it, which is the whole point of splitting what is detected from what is alerted on. Migrations 6, 7 and 8 applied inside the packaged build. |

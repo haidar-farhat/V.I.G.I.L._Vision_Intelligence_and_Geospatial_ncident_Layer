@@ -122,11 +122,31 @@ def test_the_site_is_locked_until_configure_and_the_lock_says_so(console):
         assert not control.isEnabled() and control.toolTip() == LOCKED_REASON
     console.configure_button.setChecked(True)
     assert console._configuring and "CONFIGURE" in console.lock_label.text()
-    assert all(c.isEnabled() for c in console._configure_only())
+    # Two gates, not one. The lock enables the verbs that act on the *site*;
+    # the ones that act on a *camera* also need a camera selected, and there
+    # is none yet. Before, all six lit up and five of them could only answer
+    # "Select a camera to place."
+    site_verbs = [c for c in console._configure_only() if c not in console._needs_a_camera()]
+    assert all(c.isEnabled() for c in site_verbs)
+    assert not any(c.isEnabled() for c in console._needs_a_camera())
     actions = [r["action"] for r in console.commands.audit_rows()]
     assert "console.configure.entered" in actions
     console.configure_button.setChecked(False)
     assert "console.configure.left" in [r["action"] for r in console.commands.audit_rows()]
+
+
+def test_a_greyed_camera_button_says_it_needs_a_camera_not_that_it_is_locked(console, qt_app):
+    """The reason has to match the cause. "Locked" beside an unlocked window
+    sends somebody to press Configure, which is already pressed."""
+    console.configure_button.setChecked(True)
+    button = console.place_button
+    assert not button.isEnabled(), "nothing is selected, so there is nothing to place"
+    event = QMouseEvent(QEvent.Type.MouseButtonPress, button.rect().center().toPointF(),
+                        Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+                        Qt.KeyboardModifier.NoModifier)
+    assert console.eventFilter(button, event)
+    assert "Select a camera" in console.status.currentMessage()
+    assert LOCKED_REASON not in console.status.currentMessage()
 
 
 def test_a_greyed_button_still_answers_a_click(console, qt_app):
@@ -202,7 +222,9 @@ def test_the_place_dialog_validates_and_places(console, qt_app, reference_video,
     monkeypatch.setattr(dialogs, "ask", lambda d: (d.deleteLater(), (True, pose))[1])
     console._place_camera()
     assert console.commands.cameras()[0].placed
-    assert console.placement_label.text() == "1 of 1 camera(s) placed"
+    assert console.placement_label.text() == "1 of 1 placed"
+    assert console.camera_panel.detail.text() == "1 of 1 placed", (
+        "the line belongs in the panel it describes, not on the status bar")
     assert console.plan._cameras, "the plan did not learn about the placement"
 
 
@@ -339,13 +361,31 @@ def test_a_viewer_cannot_export(console, qt_app, monkeypatch):
 
 
 def test_the_status_message_keeps_its_room_and_the_labels_elide(console, qt_app):
+    """Three labels on the bar, not seven, and each with room to be read.
+
+    The bar used to carry site, principal, lock, placement, ground, detector
+    and alert at eleven per cent each, which rendered them "MONITOR — site
+    locked; press…" and "yolov8n-seg — watching 80 cl…". A sentence nobody can
+    read is not on screen. The four that describe a panel moved into that
+    panel's heading; these three are about the whole window.
+    """
     long = "yolov8n-seg — watching bicycle, bus, car, motorcycle, person, truck with masks, 0123456789ab"
     console.detector_label.setText(long)
     qt_app.processEvents()
     assert console.detector_label.text() == long, "text() must return the whole text"
-    assert console.detector_label.elided and console.detector_label.toolTip() == long
-    taken = sum(l.sizeHint().width() for l in (console.user_label, console.lock_label, console.detector_label, console.alert_label))
+
+    on_the_bar = console._permanent_labels()
+    assert len(on_the_bar) == 3
+    assert console.detector_label not in on_the_bar and console.placement_label not in on_the_bar
+    taken = sum(l.sizeHint().width() for l in on_the_bar)
     assert taken <= console.status.width() * 0.66, f"the permanent labels took {taken} of {console.status.width()}"
+
+    # And the ones that moved still elide where they now live, rather than
+    # widening the panel that holds them.
+    console.wall_panel.say(long)
+    qt_app.processEvents()
+    assert console.wall_panel.detail.text() == long
+    assert console.wall_panel.detail.elided, "a long line in a heading must shorten itself"
 
 
 def test_the_camera_list_shows_all_five_columns_without_a_scrollbar(console, qt_app, reference_video):
@@ -445,9 +485,11 @@ def test_the_bar_says_what_is_drawing_the_conclusions_and_what_it_cannot_do(cons
     motion = DetectorInfo("motion", "MOG2 background subtraction", classifies=False)
     classifier = DetectorInfo("onnx-segment", "yolov8n-seg", model_sha256="ab" * 32,
                               class_names={0: "person", 2: "car"}, classifies=True)
+    # Stubbed on `Commands`, which is where "what is actually running" is
+    # answered now. The window used to walk its own view dictionary and call
+    # `detector_info` twice per camera to build the same answer.
     seen = {"info": motion}
-    console._detector_info = lambda camera_id: seen["info"]
-    console._views["gate"] = console._views.get("gate") or object()
+    console.commands.detector = lambda: seen["info"]
     console._show_detector()
     assert "does not classify" in console.detector_label.text()
     assert "cannot see a stationary object" in console.detector_label.text()
@@ -455,7 +497,7 @@ def test_the_bar_says_what_is_drawing_the_conclusions_and_what_it_cannot_do(cons
     console._show_detector()
     text = console.detector_label.text()
     assert text.startswith("yolov8n-seg — watching car, person") and "with masks" in text and "abababababab" in text
-    console._views.pop("gate", None)
+    assert console.wall_panel.detail.text() == text, "the wall's heading says what drew its boxes"
 
 
 def test_selecting_an_incident_shows_why_it_was_raised(console, qt_app):
@@ -808,19 +850,24 @@ def test_the_toolbar_stays_readable_on_the_narrowest_window_it_claims(console, q
     console.resize(console.NARROWEST_WINDOW, 800)
     console.show()
     qt_app.processEvents()
-    toolbar = console.toolbar
-    for index in range(toolbar.count()):
-        widget = toolbar.itemAt(index).widget()
-        assert widget.width() >= widget.sizeHint().width(),             f"{widget.text()!r} is narrower than its own label and would be cut"
-        assert widget.x() + widget.width() <= console.NARROWEST_WINDOW, f"{widget.text()!r} is off the window"
-    assert toolbar.rows() >= 1
+    placed = console.action_widgets()
+    for widget in placed:
+        assert widget.width() >= widget.sizeHint().width(), (
+            f"{widget.text()!r} is narrower than its own label and would be cut")
+        corner = widget.mapTo(console, widget.rect().topRight())
+        assert corner.x() <= console.NARROWEST_WINDOW, f"{widget.text()!r} is off the window"
+    assert console.toolbar.rows() == 1, "the top strip is three controls and should never wrap"
 
-    # Every button an operator can press is in the toolbar: a control that
-    # exists but sits in no layout is worse than one that is missing.
-    placed = {toolbar.itemAt(i).widget() for i in range(toolbar.count())}
-    buttons = [w for w in console.findChildren(QPushButton) if w.parent() is console]
-    assert set(buttons) <= placed, "a button was built and never added to the toolbar"
-    assert set(console._configure_only()) <= placed
+    # Every button an operator can press is in *some* bar. A control that
+    # exists but sits in no layout is worse than one that is missing, because
+    # it is unreachable and nothing says so. The buttons are spread over four
+    # bars now — the top strip and one under each of cameras, ground and
+    # incidents — so the check is against all of them rather than one row.
+    reachable = set(placed)
+    loose = [w for w in console.findChildren(QPushButton)
+             if w.parent() is console and w not in reachable]
+    assert not loose, f"built and never placed: {[w.text() for w in loose]}"
+    assert set(console._configure_only()) <= reachable | {console.detection_button}
 
 
 def test_the_plan_links_two_tracks_a_relation_joins(qt_app, pose):
@@ -1026,3 +1073,128 @@ def _in_frame(view, u: float, v: float):
     """Widget pixels for a point at frame fraction (u, v)."""
     rect = view._frame_rect()
     return rect.x() + u * rect.width(), rect.y() + v * rect.height()
+
+
+def test_a_panel_heading_elides_from_the_right_and_never_clips_its_start(console, qt_app):
+    """The bug this pins: a right-aligned label given a cap wider than itself
+    is clipped by Qt from the **left**, so the wall's heading read "hing 80
+    classes with masks" — the end of a sentence whose beginning was gone. An
+    ellipsis is a missing end; a missing beginning just looks wrong.
+    """
+    console.resize(console.NARROWEST_WINDOW, 800)
+    console.show()
+    qt_app.processEvents()
+    long = "yolov8n-seg — watching 80 classes with masks · f828ccfa4b69"
+    for panel in (console.camera_panel, console.wall_panel, console.plan_panel):
+        panel.say(long)
+        qt_app.processEvents()
+        detail = panel.detail
+        assert detail.width() > panel.width() * 0.35, (
+            f"{panel.title.text()}: the heading label got {detail.width()} of {panel.width()} and "
+            f"is eliding a line that had room to be read")
+        assert detail.text() == long, "text() must still return the whole line"
+        shown = detail.__class__.__mro__[1].text(detail)  # what is actually painted
+        if shown != long:
+            assert shown.endswith("…"), f"{panel.title.text()}: cut off as {shown!r}"
+            assert long.startswith(shown[:-1]), (
+                f"{panel.title.text()}: shows the end, not the start: {shown!r}")
+        # The *contents* rect: a stylesheet padding is inside the widget and
+        # outside the text, and eliding to the full width left the string
+        # sixteen pixels too long for the space it is painted in.
+        assert detail.fontMetrics().horizontalAdvance(shown) <= detail.contentsRect().width(), (
+            f"{panel.title.text()}: {shown!r} is wider than the space it paints in")
+        assert detail.toolTip() == long or shown == long
+
+
+def test_a_panel_detail_never_makes_its_panel_wider(console, qt_app):
+    """A sentence about a panel must not decide how wide the panel is.
+
+    An uncapped heading label pushed the wall's minimum width up and squeezed
+    the camera list until its Status column lost eighteen pixels.
+    """
+    console.resize(console.NARROWEST_WINDOW, 800)
+    console.show()
+    qt_app.processEvents()
+    before = console.camera_panel.width()
+    console.wall_panel.say("y" * 400)
+    qt_app.processEvents()
+    assert console.camera_panel.width() == before, "a long heading squeezed the camera list"
+
+
+def test_a_panel_carries_a_title_a_body_a_detail_line_and_its_verbs(qt_app):
+    """The box every part of the window is made of."""
+    from PySide6.QtWidgets import QLabel, QPushButton
+
+    from vigil.interfaces.console.widgets import ActionBar, Panel
+
+    body = QLabel("body")
+    bar = ActionBar()
+    first, second = QPushButton("Do"), QPushButton("Undo")
+    bar.add(first, second)
+    panel = Panel("CAMERAS", body, detail=True, actions=bar)
+    panel.resize(400, 300)
+    panel.show()
+    qt_app.processEvents()
+
+    assert panel.title.text() == "CAMERAS"
+    assert bar.widgets() == [first, second]
+    panel.say("1 of 2 placed")
+    assert panel.detail.text() == "1 of 2 placed"
+
+    # A panel without a detail line ignores `say` rather than raising: not
+    # every panel has something to report about itself.
+    plain = Panel("WALL", QLabel("x"))
+    assert plain.detail is None
+    plain.say("ignored")
+    panel.deleteLater()
+    plain.deleteLater()
+
+
+def test_the_window_reads_the_service_once_per_repaint(console, qt_app, reference_video):
+    """Every panel drawn from one moment.
+
+    The window used to ask the service for the cameras, their health, the
+    zones, the map and the solved ground separately, and again per camera for
+    its detector. A camera removed between the first call and the third
+    appeared in one panel and not the next.
+    """
+    from vigil.interfaces.console.commands import Site
+
+    console.configure_button.setChecked(True)
+    console.commands.add_camera("gate", str(reference_video))
+    console.commands.add_camera("yard", str(reference_video))
+
+    site = console.commands.snapshot()
+    assert isinstance(site, Site)
+    assert {c.id for c in site.cameras} == {"gate", "yard"}
+    assert site.camera("gate") is not None and site.camera("nope") is None
+    assert site.camera(None) is None
+    assert site.placement() == "nothing placed — no position can be computed"
+    assert site.placed == ()
+
+    calls = {"n": 0}
+    real = console.commands.cameras
+
+    def counted():
+        calls["n"] += 1
+        return real()
+
+    console.commands.cameras = counted
+    console.refresh_site()
+    assert calls["n"] <= 2, f"refresh_site asked for the cameras {calls['n']} times"
+    console.commands.cameras = real
+
+
+def test_a_placed_and_measured_camera_is_counted_as_both(console, reference_video, pose):
+    from dataclasses import replace
+
+    from vigil.domain.geo import PoseUncertainty
+
+    console.configure_button.setChecked(True)
+    console.commands.add_camera("gate", str(reference_video), pose=pose)
+    assert console.commands.snapshot().placement() == "1 of 1 placed"
+
+    measured = replace(pose, uncertainty=PoseUncertainty(0.06, 0.24, 0.10, 0.04))
+    console.commands._site.store.save_camera(
+        "gate", "gate", str(reference_video), pose=measured, calibration=(1_757_000_000, 0.002, 15))
+    assert console.commands.snapshot().placement() == "1 of 1 placed, 1 measured"

@@ -11,7 +11,8 @@ from typing import Sequence
 
 from PySide6.QtCore import QPoint, QRect, Qt, Signal
 from PySide6.QtWidgets import (
-    QAbstractItemView, QHeaderView, QLabel, QLayout, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
+    QAbstractItemView, QFrame, QHBoxLayout, QHeaderView, QLabel, QLayout, QSizePolicy,
+    QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from . import theme
@@ -27,10 +28,20 @@ class ElidingLabel(QLabel):
     `0 tracked no` because five permanent labels took a 2,000-px window.
     """
 
-    def __init__(self, text: str = "", parent: QWidget | None = None):
+    def __init__(self, text: str = "", parent: QWidget | None = None, *, fit: bool = False):
         super().__init__("", parent)
         self._full = ""
         self._cap: int | None = None
+        #: Elide to **this label's own width**, whatever the layout gives it,
+        #: rather than to a number somebody guessed.
+        #:
+        #: A guessed cap is wrong in one direction or the other and the wrong
+        #: direction is invisible: a cap wider than the label leaves Qt to
+        #: clip the text itself, and Qt clips a right-aligned label from the
+        #: **left**, so the wall's heading read "hing 80 classes with masks"
+        #: — the end of a sentence whose beginning had been cut off. An
+        #: ellipsis is a missing end; a missing beginning just looks wrong.
+        self._fit = fit
         self.setObjectName("Caption")
         self.setText(text)
 
@@ -49,13 +60,32 @@ class ElidingLabel(QLabel):
     def elided(self) -> bool:
         return super().text() != self._full
 
+    def _width(self) -> int | None:
+        if self._fit:
+            # `contentsRect`, not `width`. A stylesheet padding — this label
+            # carries `padding: 6px 8px` — is inside the widget and outside
+            # the text, so eliding to the full width leaves the string
+            # sixteen pixels too long and Qt trims a right-aligned label from
+            # the **left**: the wall's heading read "olov8n-seg — watching 80
+            # classes with …", correctly ellipsised at the end and missing
+            # its first letter.
+            available = self.contentsRect().width() - 2
+            return max(24, available) if available > 24 else None
+        return self._cap
+
     def _repaint(self) -> None:
         shown = self._full
-        if self._cap is not None and self._full:
-            shown = self.fontMetrics().elidedText(self._full, Qt.TextElideMode.ElideRight, self._cap)
+        limit = self._width()
+        if limit is not None and self._full:
+            shown = self.fontMetrics().elidedText(self._full, Qt.TextElideMode.ElideRight, limit)
         super().setText(shown)
         if shown != self._full:
             self.setToolTip(self._full)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt's name
+        super().resizeEvent(event)
+        if self._fit:
+            self._repaint()
 
 
 class CameraList(QWidget):
@@ -92,8 +122,10 @@ class CameraList(QWidget):
         # box behind a scrollbar at the default split.
         header.setSectionResizeMode(SOURCE_COLUMN, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(STATUS_COLUMN, QHeaderView.ResizeMode.Stretch)
-        self.tree.setColumnWidth(CAMERA_COLUMN, 96)
-        self.tree.setColumnWidth(PLACED_COLUMN, 62)
+        self.tree.setColumnWidth(CAMERA_COLUMN, 88)
+        # "yes" or a dash needs no more room than its own heading; the eight
+        # pixels go to Status, which is a sentence and was reading "LIVE | 10 f…".
+        self.tree.setColumnWidth(PLACED_COLUMN, 54)
         self.tree.setColumnWidth(RECORD_COLUMN, 44)
         self.tree.setMinimumWidth(340)
         self.tree.itemSelectionChanged.connect(self._selection_changed)
@@ -555,3 +587,105 @@ class IncidentDetail(QWidget):
 
 def _escape(text) -> str:
     return (str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
+class ActionBar(QWidget):
+    """The verbs that belong to one panel, under the thing they act on.
+
+    # Why this exists
+
+    Every control used to live in one row across the top of the window:
+    seventeen buttons, camera actions beside zone actions beside run control
+    beside About, all at the same weight. Two costs, and the second is the
+    expensive one:
+
+    * an operator had to read the whole row to find one thing; and
+    * five of those buttons acted on "the selected camera" from the other
+      side of the window, so the common outcome of pressing one was the
+      sentence *"Select a camera to place."* — the interface asking for
+      something it could have known.
+
+    A verb under its noun cannot have that problem: the list is right there,
+    with the row highlighted, and the button beside it.
+
+    It lays out with `FlowLayout` for the same reason the toolbar did — Qt's
+    answer to a row that will not fit is to cut the words in half.
+    """
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setObjectName("ActionBar")
+        self.flow = FlowLayout(spacing=4)
+        self.flow.setContentsMargins(4, 2, 4, 4)
+        self.setLayout(self.flow)
+        self._widgets: list[QWidget] = []
+
+    def add(self, *widgets: QWidget) -> None:
+        for widget in widgets:
+            self.flow.addWidget(widget)
+            self._widgets.append(widget)
+
+    def widgets(self) -> list[QWidget]:
+        return list(self._widgets)
+
+
+class Panel(QFrame):
+    """A titled box: a heading, a body, an optional detail line and actions.
+
+    The detail line is right-aligned in the heading and is where a panel says
+    what it is currently worth — how many cameras are placed, what model is
+    drawing the boxes, what the ground was measured at. Those sentences used
+    to be permanent labels on the status bar, seven of them sharing its width
+    at eleven per cent each, where they were elided to *"yolov8n-seg —
+    watching 80 cl…"* and *"MONITOR — site locked; press…"*. A sentence
+    nobody can read is not on screen.
+    """
+
+    def __init__(self, title: str, body: QWidget, *, detail: bool = False,
+                 actions: "ActionBar | None" = None, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setObjectName("Panel")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(1, 1, 1, 1)
+        layout.setSpacing(0)
+
+        heading = QWidget()
+        row = QHBoxLayout(heading)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+        self.title = QLabel(title)
+        self.title.setObjectName("PanelTitle")
+        row.addWidget(self.title)
+        self.detail = None
+        if detail:
+            self.detail = ElidingLabel("", fit=True)
+            self.detail.setObjectName("PanelDetail")
+            self.detail.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            # Takes what is left and demands nothing. Without this the label's
+            # own width becomes the panel's minimum, and a long detector line
+            # in the wall's heading squeezed the camera list until its Status
+            # column lost eighteen pixels -- a sentence about the panel
+            # deciding how wide the panel is.
+            self.detail.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+            self.detail.setMinimumWidth(0)
+            # All of the remaining width, not half of it. A stretch spacer
+            # beside a stretching label splits the room between them, and the
+            # label then elided a sentence that had space to be read.
+            row.addWidget(self.detail, 1)
+        else:
+            row.addStretch(1)
+        layout.addWidget(heading)
+        layout.addWidget(body, 1)
+        self.actions = actions
+        if actions is not None:
+            layout.addWidget(actions)
+
+    def say(self, text: str) -> None:
+        """Set the detail line. Ignored when the panel has none.
+
+        No cap is passed: the label elides to its own width, which the layout
+        decides and re-decides on every resize. A cap computed here would be a
+        second opinion about how wide the label is, and the two disagreed.
+        """
+        if self.detail is not None:
+            self.detail.setText(text)

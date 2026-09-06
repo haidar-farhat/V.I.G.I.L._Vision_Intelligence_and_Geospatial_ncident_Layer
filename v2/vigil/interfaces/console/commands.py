@@ -29,6 +29,55 @@ _log = _get_logger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
+class Site:
+    """One consistent read of everything the window draws between frames.
+
+    # Why this exists
+
+    The window used to ask the service five separate questions per repaint —
+    the cameras, their health, the zones, the map, the solved ground — and
+    then a sixth per camera for its detector. Two problems, and the second is
+    the one that matters:
+
+    * it was a linear search per camera per tick, several times over; and
+    * the panels were drawn from **different moments**. A camera removed
+      between the first call and the third appeared in one panel and not the
+      next, and the plan could draw a wedge for a camera the list had already
+      forgotten.
+
+    One read, one moment, every panel agreeing. The window asks for this once
+    and hands pieces of it to each panel.
+    """
+
+    cameras: tuple
+    health: dict
+    zones: tuple
+    ground: object = None
+    plane: object = None
+    map_state: str = "no map"
+
+    def camera(self, camera_id: str | None):
+        """One camera by id, or `None`. The search the window did by hand."""
+        if camera_id is None:
+            return None
+        return next((c for c in self.cameras if c.id == camera_id), None)
+
+    @property
+    def placed(self) -> tuple:
+        return tuple(c for c in self.cameras if c.placed)
+
+    def placement(self) -> str:
+        """How much of this site can locate anything, in a phrase."""
+        if not self.cameras:
+            return "no camera yet"
+        if not self.placed:
+            return "nothing placed — no position can be computed"
+        calibrated = sum(1 for c in self.placed if getattr(c, "calibrated", False))
+        measured = f", {calibrated} measured" if calibrated else ""
+        return f"{len(self.placed)} of {len(self.cameras)} placed{measured}"
+
+
+@dataclass(frozen=True, slots=True)
 class Outcome:
     """What happened, in a sentence a person can read, and the thing if any."""
 
@@ -110,6 +159,49 @@ class Commands:
 
     def health(self):
         return self._runtime.health()
+
+    def snapshot(self) -> Site:
+        """Everything the window draws, read once. See `Site`."""
+        return Site(
+            cameras=tuple(self.cameras()),
+            health=self.health(),
+            zones=tuple(self.zones()),
+            ground=self.ground(),
+            plane=self.ground_plane(),
+            map_state=self.map_state(),
+        )
+
+    def camera(self, camera_id: str | None):
+        """One camera by id, or `None`."""
+        if camera_id is None:
+            return None
+        return next((c for c in self.cameras() if c.id == camera_id), None)
+
+    def detector(self):
+        """What is drawing the conclusions, from whichever camera is running.
+
+        `None` before a run. The window used to build this with a generator
+        that called `detector_info` **twice per camera** — once to test and
+        once to take — which is the shape a comprehension takes when it is
+        written in a hurry, and it is a service call each time.
+        """
+        for camera in self.cameras():
+            info = self._runtime.detector_info(camera.id)
+            if info is not None:
+                return info
+        return None
+
+    def labels(self) -> list[str]:
+        """Every class the running detector can name, sorted; empty if none.
+
+        Used to offer a zone's watch list. Empty means either nothing is
+        running or the detector does not classify, and the caller must not
+        read it as "this model knows no classes".
+        """
+        info = self.detector()
+        if info is None or not info.classifies:
+            return []
+        return sorted(set(info.class_names.values()))
 
     def ground(self):
         """The site's ground map, if one has been built and still verifies.
