@@ -27,5 +27,6 @@ pub mod assign;
 pub mod camera;
 pub mod ffi;
 pub mod geodesy;
+pub mod lens;
 pub mod ortho;
 pub mod track;

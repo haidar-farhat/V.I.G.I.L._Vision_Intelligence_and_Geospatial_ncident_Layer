@@ -196,31 +196,51 @@ def site_lattice(origin: LatLon, cell_size_m: float, pose: CameraPose, *,
     return Grid(corner, cell_size_m, rows, cols, west_cell, south_cell)
 
 
+#: Columns sampled across the frame when building the uncertainty curve.
+#:
+#: An earlier version sampled the centre column only and said so as a known
+#: approximation: the error also varies *across* the frame, by up to about 15%
+#: at the corners of a wide lens, because the ray to a corner is longer and
+#: strikes at a shallower angle than the ray to the middle of the same row.
+#: Five columns costs five times almost nothing and removes the approximation.
+UNCERTAINTY_COLUMNS = (0.02, 0.25, 0.5, 0.75, 0.98)
+
+
 def uncertainty_over(pose: CameraPose, distances: np.ndarray) -> np.ndarray:
     """1-sigma position error at each ground distance, metres.
 
-    Sampled down the frame's centre column and interpolated by distance, which
-    is an approximation and worth naming as one: the error also varies
-    *across* the frame, by up to about 15% at the corners of a wide lens. The
-    range term dominates it by an order of magnitude — error grows as the
-    square of range through the depression angle — and the alternative is a
-    finite-difference Jacobian per cell, which is 230 000 of them.
+    Sampled across the whole frame — several columns, not just the centre —
+    and reduced to a curve in *range*, because range is what a grid cell
+    knows about itself. Where two columns disagree at the same distance the
+    **worse** one is kept: a cell at 20 m might have been seen down the middle
+    of the frame or out at its corner, this cannot tell which, and quoting the
+    better of the two would understate the error on half the map.
+
+    A per-cell Jacobian would be exact and is 230 000 of them per camera.
     """
     samples: list[tuple[float, float]] = []
-    for i in range(65):
-        v = 1.0 - i / 64.0
-        projection = project_to_ground(pose, 0.5, v, enforce_range=False)
-        if projection is not None:
-            samples.append((projection.ground_distance_meters, projection.uncertainty.radius_meters))
+    for u in UNCERTAINTY_COLUMNS:
+        for i in range(33):
+            v = 1.0 - i / 32.0
+            projection = project_to_ground(pose, u, v, enforce_range=False)
+            if projection is not None:
+                samples.append((projection.ground_distance_meters,
+                                projection.uncertainty.radius_meters))
     if not samples:
         return np.full(distances.shape, np.inf)
     samples.sort()
     xs = np.array([s[0] for s in samples])
     ys = np.array([s[1] for s in samples])
+    # `np.interp` needs a single-valued function of x, and several columns
+    # give several errors at nearly the same distance. A running maximum over
+    # the distance-sorted samples makes the curve the worst case seen at that
+    # range or nearer — monotone, which the interpolation needs, and
+    # conservative, which is the direction to err in.
+    ys = np.maximum.accumulate(ys)
+    out = np.interp(distances, xs, ys)
     # Outside the sampled span the answer is "worse than the worst measured",
     # not the nearest value: `np.interp` clamps, and a clamp here would report
     # the far edge's error for ground twice as far away.
-    out = np.interp(distances, xs, ys)
     out[distances > xs[-1]] = np.inf
     return out
 

@@ -1,4 +1,10 @@
-"""Geodesy and camera geometry.
+"""The camera model: where a thing in a picture is on the ground.
+
+Geodesy — latitude, longitude, metres and rings — moved to `geodesy` when this
+module outgrew its line budget, along the same seam the Rust core already
+uses: `core/src/geodesy.rs` and `core/src/camera.rs`. Every name from there is
+re-exported below, so `from .geo import LatLon` still works and no caller had
+to change.
 
 Everything here is a pure function of its arguments. A position is never
 returned without a statement of how it was obtained and how well it is known:
@@ -10,7 +16,7 @@ because the map builder projects a thousand points per frame and cannot cross
 a language boundary to do it; `tests/test_native.py` drives both over a grid
 of poses and holds them to 1e-9. This is the copy to read.
 
-# Two defects this replaced
+# The defect this replaced
 
 **The camera model was not a pinhole.** v1's Rust core and v2's port of it
 both computed `yaw = atan(dx*tan(hfov/2))` and `elevation = pitch +
@@ -26,14 +32,8 @@ pitch. At this product's own reference pose — 4 m mast, 25 degrees down, 62 by
 nothing read it, so a camera clamped a few degrees off level folded that error
 into every position it produced.
 
-**There were two Earths.** Distances between tracks went through a haversine
-on a sphere; zone tests and the ground grid went through a tangent plane from
-the WGS84 latitude series. They disagree by 0.248% — 25 cm per 100 m. A zone
-edge and a track measured from the same camera were on different planets.
-Everything is the tangent plane now, so `distance_meters`, `bearing_degrees`
-and `destination_point` are exact inverses of each other instead of being
-approximately consistent. `spherical_distance` is kept, called by nothing, and
-tested as the reference that says how far apart the two models are.
+**There were two Earths**, 0.248% apart. That one is described where it now
+lives, in `geodesy`.
 
 # Conventions, stated once
 
@@ -61,6 +61,17 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Sequence
 
+from .lens import Distortion
+from .measure import (  # noqa: F401 - re-exported; callers import these from `geo`
+    Bearing, Distance, ProjectionUncertainty, Speed, motion_of, principal_axes,
+)
+from .geodesy import (  # noqa: F401 - re-exported so no caller had to change
+    EARTH_RADIUS_M, LatLon, LocalFrame, Vec2, angle_difference, bearing_degrees,
+    destination_point, distance_meters, distance_to_ring_edge, meters_per_degree_latitude,
+    meters_per_degree_longitude, normalize_degrees, normalize_longitude, point_in_polygon,
+    point_in_ring, spherical_distance,
+)
+
 #: Below this depression angle a ray is refused rather than projected. At 2
 #: degrees a 6 m mast reaches 172 m and one pixel of contact error is worth
 #: 3 m of range: the answer is not wrong so much as meaningless.
@@ -70,125 +81,6 @@ MIN_DEPRESSION_ANGLE_DEG = 2.0
 #: of a degree is about 13 px on a 1080-line frame at 36 degrees vertical:
 #: roughly what a box's bottom edge is worth against a real foot.
 DEFAULT_ANGULAR_UNCERTAINTY_DEG = 0.75
-
-#: Mean Earth radius, IUGG. Used only by `spherical_distance`.
-EARTH_RADIUS_M = 6_371_008.8
-
-
-@dataclass(frozen=True, slots=True)
-class LatLon:
-    lat: float
-    lon: float
-
-    def is_valid(self) -> bool:
-        return (
-            math.isfinite(self.lat) and math.isfinite(self.lon)
-            and -90.0 <= self.lat <= 90.0 and -180.0 <= self.lon <= 180.0
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class Vec2:
-    x: float
-    y: float
-
-
-# ------------------------------------------------------------------ geodesy
-
-
-def meters_per_degree_latitude(latitude_deg: float) -> float:
-    lat = math.radians(latitude_deg)
-    return 111132.92 - 559.82 * math.cos(2 * lat) + 1.175 * math.cos(4 * lat)
-
-
-def meters_per_degree_longitude(latitude_deg: float) -> float:
-    lat = math.radians(latitude_deg)
-    return 111412.84 * math.cos(lat) - 93.5 * math.cos(3 * lat) + 0.118 * math.cos(5 * lat)
-
-
-def normalize_degrees(deg: float) -> float:
-    return deg % 360.0
-
-
-def normalize_longitude(deg: float) -> float:
-    return ((deg + 180.0) % 360.0) - 180.0
-
-
-def angle_difference(a: float, b: float) -> float:
-    """Signed smallest difference a - b in (-180, 180]."""
-    d = (a - b + 180.0) % 360.0 - 180.0
-    return 180.0 if d == -180.0 else d
-
-
-class LocalFrame:
-    """East/north metres around an origin.
-
-    Construct once and reuse. Two *different* frames disagree by the
-    convergence of meridians, `D*d*tan(lat)/R` for origins `D` apart and a
-    point `d` from one of them: 0.6 mm for frames 60 m apart over a 100 m
-    span here, and metres across a country. Building a second frame for a job
-    that already has one is how two screens come to disagree about where a
-    zone is.
-    """
-
-    __slots__ = ("origin", "_m_lat", "_m_lon")
-
-    def __init__(self, origin: LatLon):
-        self.origin = origin
-        # A frame at a pole has no east. Clamped rather than left to divide by
-        # zero: a NaN reaching a polygon test is worse than a useless frame.
-        self._m_lat = max(1.0, meters_per_degree_latitude(origin.lat))
-        self._m_lon = max(1.0, meters_per_degree_longitude(origin.lat))
-
-    def to_local(self, point: LatLon) -> Vec2:
-        return Vec2(normalize_longitude(point.lon - self.origin.lon) * self._m_lon,
-                    (point.lat - self.origin.lat) * self._m_lat)
-
-    def to_lat_lon(self, local: Vec2) -> LatLon:
-        return LatLon(self.origin.lat + local.y / self._m_lat,
-                      normalize_longitude(self.origin.lon + local.x / self._m_lon))
-
-
-def distance_meters(a: LatLon, b: LatLon) -> float:
-    """Metres between two points, on the tangent plane at `a`.
-
-    This is the product's distance. It is not a haversine; see the module
-    docstring for the 0.248% that cost.
-    """
-    local = LocalFrame(a).to_local(b)
-    return math.hypot(local.x, local.y)
-
-
-def bearing_degrees(a: LatLon, b: LatLon) -> float:
-    """Degrees clockwise from true north, on the tangent plane at `a`."""
-    local = LocalFrame(a).to_local(b)
-    if local.x == 0.0 and local.y == 0.0:
-        return 0.0
-    return normalize_degrees(math.degrees(math.atan2(local.x, local.y)))
-
-
-def destination_point(origin: LatLon, bearing_deg: float, distance_meters: float) -> LatLon:
-    """The exact inverse of `distance_meters` and `bearing_degrees` from the
-    same origin."""
-    theta = math.radians(bearing_deg)
-    return LocalFrame(origin).to_lat_lon(
-        Vec2(distance_meters * math.sin(theta), distance_meters * math.cos(theta))
-    )
-
-
-def spherical_distance(a: LatLon, b: LatLon) -> float:
-    """Great-circle distance on a sphere.
-
-    Kept for reference and for the test that measures how far it is from
-    `distance_meters`. The product does not use it: mixing the two is the
-    defect this module was rewritten to remove.
-    """
-    phi1, phi2 = math.radians(a.lat), math.radians(b.lat)
-    dphi = phi2 - phi1
-    dlambda = math.radians(normalize_longitude(b.lon - a.lon))
-    h = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
-    return 2 * EARTH_RADIUS_M * math.asin(min(1.0, math.sqrt(h)))
-
 
 # ------------------------------------------------------------------- camera
 
@@ -241,6 +133,10 @@ class CameraPose:
     range_meters: float = 60.0
     #: How well the eight numbers above are known.
     uncertainty: PoseUncertainty = field(default_factory=PoseUncertainty)
+    #: What the lens does to a straight line. All-zero — the default — is an
+    #: uncalibrated camera assumed rectilinear, which is what every camera was
+    #: before `vigil cameras calibrate` existed.
+    lens: Distortion = field(default_factory=Distortion)
 
     def validate(self) -> None:
         if not self.position.is_valid():
@@ -255,6 +151,25 @@ class CameraPose:
             raise ValueError("roll is between -180° and 180°")
         if self.range_meters <= 0:
             raise ValueError("range must be positive")
+        if not self.lens.is_identity:
+            # A lens is only usable if it can be *inverted* over the frame it
+            # covers, and that is not guaranteed: Brown-Conrady is a
+            # polynomial with no closed-form inverse, solved by iteration, and
+            # at a wide enough angle with a strong enough barrel it diverges.
+            # Measured: a 110-degree lens with k1=-0.28 fails outright at any
+            # iteration count. Checked at the **raw image corner**, because
+            # that is the coordinate `ray` actually undistorts — checking a
+            # distorted-then-undistorted point instead tests a smaller radius
+            # than the one that fails, and passes a lens that does not work.
+            corner_x = math.tan(math.radians(self.horizontal_fov / 2))
+            corner_y = math.tan(math.radians(self.vertical_fov / 2))
+            if not self.lens.converges(corner_x, corner_y):
+                raise ValueError(
+                    f"this lens correction cannot be inverted at the corner of a "
+                    f"{self.horizontal_fov:.0f}x{self.vertical_fov:.0f} frame, so a detection there "
+                    f"would be placed anywhere. Re-calibrate, or use a fisheye model this product "
+                    f"does not have"
+                )
 
 
 @dataclass(frozen=True, slots=True)
@@ -273,12 +188,27 @@ class _Basis:
     tan_half_h: float
     tan_half_v: float
     mount_height: float
+    lens: Distortion = Distortion()
 
     def ray(self, u: float, v: float) -> tuple[float, float, float]:
         """The unnormalised world direction through a normalised image point.
-        Its length is arbitrary and is never used as a distance."""
+        Its length is arbitrary and is never used as a distance.
+
+        The pixel handed in has already been bent by the lens, so it is
+        **undistorted** first: the ray belongs to the ideal coordinate, not to
+        where the sensor recorded it. With no calibration this is the identity
+        and costs one comparison.
+
+        The correction happens in **normalised camera coordinates** — `x/z`,
+        `y/z` — which is the space Brown-Conrady is defined in and which
+        `(2u-1)*tan(hfov/2)` already is. Applying it in the `[-1, 1]` frame
+        coordinate instead is a different function of a differently scaled
+        argument, and the two directions then stop inverting each other.
+        """
         x = (2.0 * u - 1.0) * self.tan_half_h
         y = (1.0 - 2.0 * v) * self.tan_half_v
+        if not self.lens.is_identity:
+            x, y = self.lens.undistort(x, y)
         return (
             self.right[0] * x + self.up[0] * y + self.forward[0],
             self.right[1] * x + self.up[1] * y + self.forward[1],
@@ -305,7 +235,8 @@ class _Basis:
 
 
 def _basis(heading: float, pitch: float, roll: float, tan_half_h: float,
-           tan_half_v: float, mount_height: float) -> _Basis:
+           tan_half_v: float, mount_height: float,
+           lens: Distortion = Distortion()) -> _Basis:
     psi, theta, phi = math.radians(heading), math.radians(pitch), math.radians(roll)
     sin_psi, cos_psi = math.sin(psi), math.cos(psi)
     sin_th, cos_th = math.sin(theta), math.cos(theta)
@@ -317,7 +248,7 @@ def _basis(heading: float, pitch: float, roll: float, tan_half_h: float,
     up0 = (-sin_th * sin_psi, -sin_th * cos_psi, cos_th)
     right = tuple(right0[i] * cos_ph - up0[i] * sin_ph for i in range(3))
     up = tuple(right0[i] * sin_ph + up0[i] * cos_ph for i in range(3))
-    return _Basis(right, up, forward, tan_half_h, tan_half_v, mount_height)  # type: ignore[arg-type]
+    return _Basis(right, up, forward, tan_half_h, tan_half_v, mount_height, lens)  # type: ignore[arg-type]
 
 
 def basis_for(pose: CameraPose) -> _Basis:
@@ -327,7 +258,7 @@ def basis_for(pose: CameraPose) -> _Basis:
         pose.heading, pose.pitch, pose.roll,
         math.tan(math.radians(pose.horizontal_fov / 2)),
         math.tan(math.radians(pose.vertical_fov / 2)),
-        pose.mount_height,
+        pose.mount_height, pose.lens,
     )
 
 
@@ -353,36 +284,6 @@ class ProjectionFailure(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
-class ProjectionUncertainty:
-    """The error ellipse of a projected position, on the ground, in metres.
-
-    An ellipse and not a radius because the two are genuinely different: a
-    shallow ray is sharp across its own direction and vague along it, and a
-    camera 40 m away reporting "plus or minus 6 m" as a circle claims a
-    sideways error it does not have.
-    """
-
-    #: 1-sigma along the line of sight.
-    along_meters: float
-    #: 1-sigma across it.
-    across_meters: float
-    #: Bearing of the along-axis, degrees.
-    orientation_deg: float
-
-    @property
-    def radius_meters(self) -> float:
-        """The conservative single number: the semi-major axis. A circle
-        fitted inside the ellipse would understate the error in the direction
-        it actually points."""
-        return max(self.along_meters, self.across_meters)
-
-    @property
-    def rms_meters(self) -> float:
-        """For combining errors rather than for drawing them."""
-        return math.sqrt((self.along_meters ** 2 + self.across_meters ** 2) / 2)
-
-
-@dataclass(frozen=True, slots=True)
 class PositionEstimate:
     point: LatLon
     #: 1-sigma horizontal uncertainty, metres: the ellipse's semi-major axis.
@@ -395,38 +296,6 @@ class PositionEstimate:
     @property
     def is_projected(self) -> bool:
         return self.source is PositionSource.GROUND_PROJECTION
-
-
-@dataclass(frozen=True, slots=True)
-class Distance:
-    """A distance and how well it is known. Never one without the other.
-
-    Two positions each known to ±1.4 m are eleven metres apart *give or take
-    about two*, and a plain "11 m" invites somebody to act on a precision
-    nobody measured.
-    """
-
-    meters: float
-    error_meters: float
-
-    def describe(self) -> str:
-        return f"{self.meters:.1f} ± {self.error_meters:.1f} m"
-
-    @property
-    def at_most(self) -> float:
-        return self.meters + self.error_meters
-
-    @property
-    def at_least(self) -> float:
-        return max(0.0, self.meters - self.error_meters)
-
-    def within(self, limit: float) -> bool:
-        """True only when it is within `limit` even at its worst."""
-        return self.at_most <= limit
-
-    def beyond(self, limit: float) -> bool:
-        """True only when it is past `limit` even at its best."""
-        return self.at_least > limit
 
 
 def separation(a: PositionEstimate, b: PositionEstimate) -> Distance:
@@ -554,7 +423,8 @@ def _ground_uncertainty(pose: CameraPose, u: float, v: float, contact_sigma_deg:
     tan_half_v = math.tan(math.radians(pose.vertical_fov / 2))
 
     def at(heading, pitch, roll, height, du, dv) -> Vec2 | None:
-        return _basis(heading, pitch, roll, tan_half_h, tan_half_v, height).ground_offset(u + du, v + dv)
+        return _basis(heading, pitch, roll, tan_half_h, tan_half_v, height,
+                      pose.lens).ground_offset(u + du, v + dv)
 
     # The contact point's angular error, in the image coordinates it is
     # measured in. The vertical axis carries the range error and the two
@@ -609,10 +479,21 @@ def _ground_uncertainty(pose: CameraPose, u: float, v: float, contact_sigma_deg:
         depression = math.atan2(pose.mount_height, distance)
         terrain = min(distance, distance * sigma.terrain_slope / max(1e-6, math.tan(depression)))
 
+    # The terrain term acts along the line of sight, so it is added to the
+    # covariance in that frame before the eigendecomposition rather than to
+    # one axis afterwards — otherwise the principal axes would be of a
+    # different matrix than the one reported.
+    if terrain > 0:
+        cov[0][0] += (terrain * ux) ** 2
+        cov[1][1] += (terrain * uy) ** 2
+        cov[0][1] += terrain * terrain * ux * uy
+        cov[1][0] = cov[0][1]
+    major, minor, bearing = principal_axes(cov)
     return ProjectionUncertainty(
         along_meters=math.sqrt(max(0.0, along_var) + terrain * terrain),
         across_meters=math.sqrt(max(0.0, across_var)),
         orientation_deg=normalize_degrees(math.degrees(math.atan2(offset.x, offset.y))),
+        semi_major_meters=major, semi_minor_meters=minor, major_bearing_deg=bearing,
     )
 
 
@@ -702,7 +583,14 @@ def image_coordinates(pose: CameraPose, point: LatLon) -> Vec2 | None:
         return None
     x = sum(offset[i] * basis.right[i] for i in range(3))
     y = sum(offset[i] * basis.up[i] for i in range(3))
-    return Vec2((x / depth / basis.tan_half_h + 1) / 2, (1 - y / depth / basis.tan_half_v) / 2)
+    # Normalised camera coordinates, which is the space the lens model is
+    # defined in. Bend the ideal point to where the sensor actually records
+    # it, so this stays the exact inverse of `ray`, which unbends it.
+    camera_x, camera_y = x / depth, y / depth
+    if not basis.lens.is_identity:
+        camera_x, camera_y = basis.lens.distort(camera_x, camera_y)
+    return Vec2((camera_x / basis.tan_half_h + 1) / 2,
+                (1 - camera_y / basis.tan_half_v) / 2)
 
 
 def camera_sees(pose: CameraPose, point: LatLon) -> bool:
@@ -711,51 +599,3 @@ def camera_sees(pose: CameraPose, point: LatLon) -> bool:
         return False
     return distance_meters(pose.position, point) <= pose.range_meters
 
-
-# ---------------------------------------------------------------- polygons
-
-
-def point_in_polygon(point: Vec2, ring: Sequence[Vec2]) -> bool:
-    """Even-odd rule. A ring with fewer than three points contains nothing."""
-    if len(ring) < 3:
-        return False
-    inside = False
-    j = len(ring) - 1
-    for i in range(len(ring)):
-        a, b = ring[i], ring[j]
-        if (a.y > point.y) != (b.y > point.y):
-            x = (b.x - a.x) * (point.y - a.y) / (b.y - a.y) + a.x
-            if point.x < x:
-                inside = not inside
-        j = i
-    return inside
-
-
-def point_in_ring(ring: Sequence[LatLon], point: LatLon) -> bool:
-    if len(ring) < 3:
-        return False
-    frame = LocalFrame(ring[0])
-    return point_in_polygon(frame.to_local(point), [frame.to_local(p) for p in ring])
-
-
-def distance_to_ring_edge(ring: Sequence[LatLon], point: LatLon) -> float:
-    """Metres from a point to the nearest edge of the ring."""
-    if len(ring) < 2:
-        return math.inf
-    frame = LocalFrame(ring[0])
-    p = frame.to_local(point)
-    local = [frame.to_local(v) for v in ring]
-    best = math.inf
-    for i in range(len(local)):
-        a, b = local[i], local[(i + 1) % len(local)]
-        best = min(best, _segment_distance(p, a, b))
-    return best
-
-
-def _segment_distance(p: Vec2, a: Vec2, b: Vec2) -> float:
-    abx, aby = b.x - a.x, b.y - a.y
-    length_sq = abx * abx + aby * aby
-    if length_sq == 0:
-        return math.hypot(p.x - a.x, p.y - a.y)
-    t = max(0.0, min(1.0, ((p.x - a.x) * abx + (p.y - a.y) * aby) / length_sq))
-    return math.hypot(p.x - (a.x + t * abx), p.y - (a.y + t * aby))

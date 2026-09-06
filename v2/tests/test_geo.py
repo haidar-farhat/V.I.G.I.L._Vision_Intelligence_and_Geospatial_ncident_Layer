@@ -349,3 +349,151 @@ def test_a_zone_says_how_far_a_position_is_from_its_edge_and_which_side(pose):
     assert zone.distance_from(outside).meters > 0
     assert abs(zone.distance_from(outside).meters - 15.0) < 0.5
     assert zone.distance_from(outside).error_meters == 0.5
+
+
+# ------------------------------------------------------- speed and heading
+
+
+def test_a_speed_carries_its_error_and_refuses_to_be_read_without_one():
+    """The track table printed `1.4 m/s` beside `12.0 ± 1.5 m` on the same
+    row — the distance carrying its error and the speed, computed from two of
+    those same distances, carrying none."""
+    from vigil.domain.geo import Speed
+
+    walking = Speed(1.4, 0.2)
+    assert walking.describe() == "1.4 ± 0.2 m/s"
+    assert walking.meaningful
+    assert walking.faster_than(1.0) and not walking.faster_than(1.3)
+    assert walking.slower_than(1.7) and not walking.slower_than(1.5)
+
+    # `faster_than` and `slower_than` are not each other's negation: between
+    # 1.2 and 1.6 m/s, a 1.5 m/s question has no answer this can give.
+    assert not walking.faster_than(1.5) and not walking.slower_than(1.5)
+
+    noise = Speed(0.4, 0.9)
+    assert not noise.meaningful, "an error larger than the measurement is no measurement"
+
+
+def test_a_heading_says_when_it_could_be_any_direction():
+    from vigil.domain.geo import Bearing
+
+    assert Bearing(90.0, 10.0).meaningful
+    assert not Bearing(90.0, 60.0).meaningful, "a quadrant is not a direction"
+
+
+def test_motion_inherits_the_position_error_and_nothing_else():
+    """Speed is a distance over a time. The clock is good to a millisecond and
+    the positions are good to metres, so the error is the distance's."""
+    from vigil.domain.geo import motion_of
+
+    here = SITE
+    there = destination_point(here, 90.0, 3.0)
+    speed, heading = motion_of(here, there, 2.0, 1.5)
+    assert abs(speed.mps - 1.5) < 1e-6
+    assert abs(speed.error_mps - 0.75) < 1e-6, "sigma_v = sigma_d / dt"
+    assert abs(heading.degrees - 90.0) < 1e-6
+    # atan(1.5 / 3.0) = 26.6 degrees
+    assert abs(heading.error_degrees - 26.565) < 0.01
+
+    # Something that has barely moved does not know which way it is going.
+    _, nowhere = motion_of(here, destination_point(here, 90.0, 0.2), 2.0, 1.5)
+    assert not nowhere.meaningful and nowhere.error_degrees > 80
+
+    # And a zero span is refused rather than dividing by it.
+    stopped, unknown = motion_of(here, there, 0.0, 1.5)
+    assert not math.isfinite(stopped.error_mps) and not unknown.meaningful
+
+
+def test_a_track_reports_no_speed_rather_than_one_it_cannot_support(pose):
+    """`speed_mps` reads back `None` when the error swamps the measurement:
+    0.4 ± 0.9 m/s is not a slow walk, and printing it invites somebody to read
+    "walking pace" off noise."""
+    from vigil.domain.geo import Bearing, Speed
+    from vigil.domain.tracking import Track
+    from vigil.domain.detection import BoundingBox
+
+    track = Track.observing(1, 0, BoundingBox(0.4, 0.5, 0.1, 0.2))
+    track.speed = Speed(0.4, 0.9)
+    track.heading = Bearing(90.0, 70.0)
+    assert track.speed_mps is None and track.heading_degrees is None
+
+    track.speed = Speed(1.4, 0.2)
+    track.heading = Bearing(90.0, 10.0)
+    assert track.speed_mps == 1.4 and track.heading_degrees == 90.0
+
+
+# ---------------------------------------------------------------- the lens
+
+
+def test_no_calibration_reproduces_the_undistorted_model_exactly(pose):
+    """All-zero coefficients must be the identity bit for bit, or every
+    uncalibrated camera moves the day this module appears."""
+    from dataclasses import replace
+
+    from vigil.domain.lens import Distortion
+
+    perfect = replace(pose, lens=Distortion())
+    assert perfect.lens.is_identity
+    for u, v in ((0.5, 0.7), (0.05, 0.95), (0.95, 0.6), (0.2, 0.55)):
+        a = project_to_ground(pose, u, v, enforce_range=False)
+        b = project_to_ground(perfect, u, v, enforce_range=False)
+        assert a is not None and b is not None
+        assert a.position == b.position
+        assert a.ground_distance_meters == b.ground_distance_meters
+    assert "uncalibrated" in Distortion().describe()
+
+
+def test_a_real_lens_moves_a_corner_and_the_two_directions_still_invert(pose):
+    """`ray` unbends and `image_coordinates` bends, so they stay exact
+    inverses — which is the property the whole projection rests on."""
+    from dataclasses import replace
+
+    from vigil.domain.lens import Distortion
+
+    # A typical wide security lens. Measured on the reference pose (62x36) the
+    # corner moves 0.47 m; on a 90x50 lens, 2.00 m — which is why this is
+    # worth correcting rather than absorbing into the error budget.
+    lens = Distortion(k1=-0.28, k2=0.09, p1=0.0006, p2=-0.0004, k3=-0.012)
+    for hfov, vfov, least in ((62.0, 36.0, 0.3), (90.0, 50.0, 1.5)):
+        straight_pose = replace(pose, horizontal_fov=hfov, vertical_fov=vfov)
+        bent = replace(straight_pose, lens=lens)
+        bent.validate()
+        moved = 0.0
+        for u, v in ((0.5, 0.7), (0.05, 0.95), (0.95, 0.6), (0.15, 0.9), (0.85, 0.99)):
+            straight = project_to_ground(straight_pose, u, v, enforce_range=False)
+            curved = project_to_ground(bent, u, v, enforce_range=False)
+            assert straight is not None and curved is not None
+            moved = max(moved, distance_meters(straight.position, curved.position))
+            # The round trip has to hold *with* the distortion in it.
+            back = image_coordinates(bent, curved.position)
+            assert back is not None
+            assert abs(back.x - u) < 1e-4 and abs(back.y - v) < 1e-4, f"({u},{v}) -> ({back.x},{back.y})"
+        assert moved > least, f"{hfov:.0f} deg: corner moved only {moved:.2f} m"
+
+
+def test_a_pose_refuses_a_lens_it_cannot_invert(pose):
+    """Brown-Conrady is a polynomial with no closed-form inverse, solved by
+    iteration, and at a wide enough angle with a strong enough barrel it
+    diverges. Measured: a 110-degree frame with k1=-0.28 puts a corner
+    detection 126 frame-widths away. A pose that cannot invert its own lens is
+    refused rather than used."""
+    from dataclasses import replace
+
+    from vigil.domain.lens import Distortion
+
+    lens = Distortion(k1=-0.28, k2=0.09, p1=0.0006, p2=-0.0004, k3=-0.012)
+    replace(pose, horizontal_fov=90.0, vertical_fov=50.0, lens=lens).validate()
+    with pytest.raises(ValueError, match="cannot be inverted"):
+        replace(pose, horizontal_fov=110.0, vertical_fov=70.0, lens=lens).validate()
+
+
+def test_the_lens_says_when_it_cannot_invert_itself():
+    """A set of coefficients that cannot be inverted at the edge of the frame
+    is worse than none, and `vigil cameras calibrate` checks this before
+    accepting one."""
+    from vigil.domain.lens import Distortion
+
+    sane = Distortion(k1=-0.28, k2=0.09)
+    assert sane.converges(*sane.distort(0.62, 0.62))
+    absurd = Distortion(k1=-8.0, k2=40.0)
+    assert not absurd.converges(*absurd.distort(0.6, 0.6))

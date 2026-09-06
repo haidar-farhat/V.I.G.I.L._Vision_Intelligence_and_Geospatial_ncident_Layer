@@ -29,6 +29,19 @@ POSES = [
 ]
 POINTS = [(u / 8, v / 8) for u in range(1, 8) for v in range(4, 9)]
 
+#: The same poses with a real lens fitted. Without these the two
+#: implementations agree only because the distortion is the identity on both
+#: sides, which proves nothing about the code that applies it.
+from dataclasses import replace as _replace  # noqa: E402
+
+from vigil.domain.lens import Distortion  # noqa: E402
+
+LENSED = [
+    _replace(POSES[0], lens=Distortion(k1=-0.28, k2=0.09, p1=0.0006, p2=-0.0004, k3=-0.012)),
+    _replace(POSES[2], lens=Distortion(k1=-0.15, k2=0.02)),
+    _replace(POSES[0], lens=Distortion(p1=0.002, p2=-0.003)),
+]
+
 
 def test_the_core_and_the_python_project_to_the_same_place():
     """The one that matters: `core/src/camera.rs` exists only because the map
@@ -37,7 +50,7 @@ def test_the_core_and_the_python_project_to_the_same_place():
     worst_position = 0.0
     worst_sigma = 0.0
     compared = 0
-    for pose in POSES:
+    for pose in POSES + LENSED:
         results, status = native.project_batch(
             pose, POINTS, 0.75, pose.uncertainty, enforce_range=False
         )
@@ -60,7 +73,7 @@ def test_the_core_and_the_python_project_to_the_same_place():
 
 def test_the_core_and_the_python_invert_the_projection_to_the_same_pixel():
     worst = 0.0
-    for pose in POSES:
+    for pose in POSES + LENSED:
         points = []
         for u, v in POINTS:
             projection = project_to_ground(pose, u, v, enforce_range=False)
@@ -197,8 +210,12 @@ def test_the_rasteriser_agrees_with_the_exact_inverse():
 def test_the_binding_refuses_a_core_that_is_not_the_right_core():
     # The ABI check is the thing standing between a moved signature and
     # plausible, wrong geometry. It is asserted rather than assumed.
-    assert native.ABI_VERSION == 1
-    assert native.EXPECTED_LAYOUT == (9, 5, 6, 5, 72)
+    #
+    # ABI 2 since the pose grew its lens: a core built for ABI 1 would read
+    # fourteen values where nine were sent and invent five from whatever was
+    # next in memory — a lens made of stack garbage, applied to every ray.
+    assert native.ABI_VERSION == 2
+    assert native.EXPECTED_LAYOUT == (14, 5, 6, 5, 72)
     assert native.loaded_from() is not None and native.loaded_from().is_file()
 
 
@@ -249,3 +266,28 @@ def test_the_median_is_what_makes_a_map_out_of_samples():
     # trustworthy. The number that notices the walker is the disturbance.
     assert deviation[0] == 0
     assert disturbed[0] == 18, "2 of 11 samples were blocked"
+
+
+def test_the_two_lens_models_agree_on_a_real_calibration():
+    """The distortion is the identity on both sides until a camera is
+    calibrated, so agreeing without a lens fitted proves nothing about the
+    code that applies one. This fits three and checks the whole path."""
+    for pose in LENSED:
+        assert not pose.lens.is_identity
+        # Rust's `ray` undistorts; Python's does too. Compare where the two
+        # put the ground point, which is the only thing anything downstream
+        # reads.
+        results, status = native.project_batch(pose, POINTS, 0.75, pose.uncertainty,
+                                               enforce_range=False)
+        worst = 0.0
+        seen = 0
+        for (u, v), row, code in zip(POINTS, results, status):
+            reference = project_to_ground(pose, u, v, 0.75, enforce_range=False)
+            if reference is None:
+                assert code != 0
+                continue
+            assert code == 0
+            worst = max(worst, distance_meters(LatLon(row[0], row[1]), reference.position))
+            seen += 1
+        assert seen > 10, f"only {seen} points projected through {pose.lens.describe()}"
+        assert worst < 1e-6, f"{pose.lens.describe()}: the two lenses differ by {worst} m"

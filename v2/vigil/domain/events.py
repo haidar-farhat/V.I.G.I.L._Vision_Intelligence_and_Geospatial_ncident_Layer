@@ -282,13 +282,18 @@ class LoiteringRule(Rule):
         dwell = context.at_millis - presence.entered_millis
         if dwell < self.dwell_millis:
             return []
-        if track.speed_mps is not None and track.speed_mps > self.still_speed_mps:
+        # `faster_than` is true only when it is faster *even at its slowest*.
+        # A track measured at 0.6 +/- 0.4 m/s against a 0.5 m/s threshold has
+        # not been shown to be moving, and treating it as moving is how a
+        # loitering clock silently never starts.
+        if track.speed is not None and track.speed.faster_than(self.still_speed_mps):
             return []
         self._raised.add(key)
         return [self._build(
             context, summary=f"{_subject(context)} loitered in {zone.name} for {dwell // 1000} s",
             conditions=(f"dwell {dwell} ms ≥ {self.dwell_millis} ms",
-                        f"speed {'unknown' if track.speed_mps is None else f'{track.speed_mps:.1f} m/s'} ≤ {self.still_speed_mps} m/s"),
+                        f"speed {'unknown' if track.speed is None else track.speed.describe()} "
+                        f"not shown to exceed {self.still_speed_mps} m/s"),
             confidence=presence.confidence, observations=presence.observations,
         )]
 

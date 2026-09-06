@@ -59,10 +59,15 @@ _log = _get_logger(__name__)
 #: The ABI this binding was written against. A library reporting anything else
 #: is refused rather than called: a signature that moved underneath produces
 #: plausible, wrong geometry rather than a crash.
-ABI_VERSION = 1
+#:
+#: **2** since the pose grew its lens. A core built for ABI 1 would read
+#: fourteen values where nine were sent, and the five it invented would be
+#: whatever was next in memory — a lens made of stack garbage applied to every
+#: ray. Refusing the load is the only safe answer.
+ABI_VERSION = 2
 
 #: Array lengths the ABI promises, `[pose, sigma, projection, grid, kalman]`.
-EXPECTED_LAYOUT = (9, 5, 6, 5, 72)
+EXPECTED_LAYOUT = (14, 5, 6, 5, 72)
 
 POSE_VALUES, SIGMA_VALUES, PROJECTION_VALUES, GRID_VALUES, KALMAN_VALUES = EXPECTED_LAYOUT
 
@@ -271,10 +276,19 @@ def _ptr(array: np.ndarray, kind=ctypes.c_double):
 
 
 def pose_values(pose) -> np.ndarray:
-    """A `CameraPose` as the nine numbers the ABI takes."""
+    """A `CameraPose` as the fourteen numbers the ABI takes.
+
+    The five lens coefficients are all-zero for an uncalibrated camera, which
+    is every camera until `vigil cameras calibrate` has been run on it — and
+    zero is exactly the identity on both sides of the boundary.
+    """
+    lens = getattr(pose, "lens", None)
     return _f64([
         pose.position.lat, pose.position.lon, pose.mount_height, pose.heading,
         pose.pitch, pose.roll, pose.horizontal_fov, pose.vertical_fov, pose.range_meters,
+        0.0 if lens is None else lens.k1, 0.0 if lens is None else lens.k2,
+        0.0 if lens is None else lens.p1, 0.0 if lens is None else lens.p2,
+        0.0 if lens is None else lens.k3,
     ])
 
 

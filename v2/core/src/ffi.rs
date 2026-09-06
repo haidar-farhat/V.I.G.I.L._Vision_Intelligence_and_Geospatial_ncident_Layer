@@ -43,10 +43,19 @@ use crate::track::KalmanBox;
 
 /// Version of this ABI. Python checks it on load and refuses a mismatch
 /// rather than calling functions whose meaning may have moved.
-pub const ABI_VERSION: u32 = 1;
+///
+/// **2** since the pose grew its lens. A binding built for ABI 1 would hand
+/// over nine values where fourteen are read, and the five it did not send
+/// would be whatever was next in memory — a lens made of stack garbage,
+/// applied to every ray. Refusing the load is the only safe answer.
+pub const ABI_VERSION: u32 = 2;
 
-/// `[lat, lon, mount_height, heading, pitch, roll, hfov, vfov, range]`.
-pub const POSE_VALUES: u32 = 9;
+/// `[lat, lon, mount_height, heading, pitch, roll, hfov, vfov, range,
+/// k1, k2, p1, p2, k3]`.
+///
+/// The five lens coefficients are all-zero for an uncalibrated camera, which
+/// is every camera until `vigil cameras calibrate` has been run on it.
+pub const POSE_VALUES: u32 = 14;
 /// `[heading, pitch, roll, mount_height, terrain_slope]`, all 1-sigma.
 pub const SIGMA_VALUES: u32 = 5;
 /// `[lat, lon, ground_distance, bearing, along_sigma, across_sigma]`.
@@ -142,6 +151,13 @@ unsafe fn read_pose(pose: *const f64) -> Option<CameraPose> {
         horizontal_fov: v[6],
         vertical_fov: v[7],
         range_meters: v[8],
+        lens: crate::lens::Distortion {
+            k1: v[9],
+            k2: v[10],
+            p1: v[11],
+            p2: v[12],
+            k3: v[13],
+        },
     })
 }
 
@@ -699,8 +715,8 @@ pub unsafe extern "C" fn vigil_median_result(
 mod tests {
     use super::*;
 
-    fn pose_values() -> [f64; 9] {
-        [33.8938, 35.5018, 4.0, 0.0, -25.0, 0.0, 62.0, 36.0, 60.0]
+    fn pose_values() -> [f64; POSE_VALUES as usize] {
+        [33.8938, 35.5018, 4.0, 0.0, -25.0, 0.0, 62.0, 36.0, 60.0, 0.0, 0.0, 0.0, 0.0, 0.0]
     }
 
     #[test]
@@ -870,7 +886,8 @@ mod tests {
         unsafe {
             assert_eq!(vigil_layout(out.as_mut_ptr(), 5), 5);
         }
-        assert_eq!(out, [9, 5, 6, 5, 72]);
+        assert_eq!(out, [14, 5, 6, 5, 72]);
         assert_eq!(vigil_abi_version(), ABI_VERSION);
+        assert_eq!(ABI_VERSION, 2, "the pose grew its lens");
     }
 }

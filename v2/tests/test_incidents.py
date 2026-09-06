@@ -89,3 +89,35 @@ def test_a_fragment_is_refused_when_it_is_late_far_or_a_different_class():
     assert link_same_camera_fragments([event("a", 1, 0), event("a", 2, 1000, far)]) == [], "too far"
     assert link_same_camera_fragments([event("a", 1, 0), event("a", 2, 1000, near, label="car")]) == [], "another class"
     assert link_same_camera_fragments([event("a", 1, 0), event("b", 2, 1000, near)]) == [], "another camera"
+
+
+def test_two_position_errors_combine_in_quadrature_not_by_addition():
+    """This module used to add them, and `geo.Distance` has always said why
+    that is wrong: "adding them would claim the errors always conspire".
+
+    Two modules disagreed about the same two numbers, and this was the one
+    deciding whether two sightings are the same person. Two errors of 3 m
+    allowed **6 m** of separation when what they justify is **4.24**.
+    """
+    import math
+
+    from vigil.domain.incidents import MAX_UNCERTAINTY_ALLOWANCE_METERS, _allowance
+
+    radius = 10.0
+    got = _allowance(3.0, 3.0, radius)
+    assert abs(got - (radius + math.hypot(3.0, 3.0))) < 1e-9
+    assert abs(got - 14.243) < 0.001
+    assert got < radius + 3.0 + 3.0, "the old rule was more permissive by 1.76 m here"
+
+    # It is the same combination `geo.separation` performs, which is the point.
+    from vigil.domain.geo import LatLon, PositionEstimate, PositionSource, separation
+
+    here = LatLon(33.8938, 35.5018)
+    a = PositionEstimate(here, 3.0, PositionSource.GROUND_PROJECTION)
+    b = PositionEstimate(here, 3.0, PositionSource.GROUND_PROJECTION)
+    assert abs(separation(a, b).error_meters - (got - radius)) < 1e-9
+
+    # One badly placed camera still cannot swallow the site.
+    assert _allowance(500.0, 500.0, radius) == radius + MAX_UNCERTAINTY_ALLOWANCE_METERS
+    # And a missing uncertainty is nothing, not a guess.
+    assert _allowance(None, None, radius) == radius

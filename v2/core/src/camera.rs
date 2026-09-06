@@ -55,6 +55,7 @@
 //! [`Intrinsics::from_fov`] is documented as the fallback for a camera whose
 //! calibration nobody has measured.
 
+use crate::lens::Distortion;
 use crate::geodesy::{
     angle_difference, destination_point, distance_meters, normalize_degrees, LatLon, LocalFrame,
 };
@@ -177,6 +178,8 @@ pub struct CameraPose {
     pub vertical_fov: f64,
     /// Ground distance past which a projection is refused, not clamped.
     pub range_meters: f64,
+    /// What the lens does to a straight line. Default is a perfect one.
+    pub lens: Distortion,
 }
 
 /// How well each input to a projection is known, 1-sigma.
@@ -235,16 +238,18 @@ pub struct CameraBasis {
     pub up: Vec3,
     pub intrinsics: Intrinsics,
     pub mount_height: f64,
+    pub lens: Distortion,
 }
 
 impl CameraBasis {
     pub fn of(pose: &CameraPose) -> Self {
-        Self::build(
+        Self::build_with_lens(
             pose.heading,
             pose.pitch,
             pose.roll,
             Intrinsics::from_fov(pose.horizontal_fov, pose.vertical_fov),
             pose.mount_height,
+            pose.lens,
         )
     }
 
@@ -256,6 +261,18 @@ impl CameraBasis {
         roll: f64,
         intrinsics: Intrinsics,
         mount_height: f64,
+    ) -> Self {
+        Self::build_with_lens(heading, pitch, roll, intrinsics, mount_height, Distortion::default())
+    }
+
+    /// The basis, with a lens. `build` is the same thing for a perfect one.
+    pub fn build_with_lens(
+        heading: f64,
+        pitch: f64,
+        roll: f64,
+        intrinsics: Intrinsics,
+        mount_height: f64,
+        lens: Distortion,
     ) -> Self {
         let (psi, theta, phi) = (heading.to_radians(), pitch.to_radians(), roll.to_radians());
         let (sin_psi, cos_psi) = (psi.sin(), psi.cos());
@@ -277,6 +294,7 @@ impl CameraBasis {
             up,
             intrinsics,
             mount_height,
+            lens,
         }
     }
 
@@ -285,6 +303,11 @@ impl CameraBasis {
     pub fn ray(&self, u: f64, v: f64) -> Vec3 {
         let x = (2.0 * u - 1.0) * self.intrinsics.tan_half_h;
         let y = (1.0 - 2.0 * v) * self.intrinsics.tan_half_v;
+        // The pixel has already been bent by the lens, so undo that first: the
+        // ray belongs to the ideal coordinate, not to where the sensor
+        // recorded it. In normalised camera coordinates, which is the space
+        // the model is defined in — see `lens`.
+        let (x, y) = self.lens.undistort(x, y);
         self.right.scale(x).add(self.up.scale(y)).add(self.forward)
     }
 
@@ -469,7 +492,8 @@ fn ground_covariance(
 ) -> ProjectionUncertainty {
     let intrinsics = Intrinsics::from_fov(pose.horizontal_fov, pose.vertical_fov);
     let at = |heading: f64, pitch: f64, roll: f64, height: f64, du: f64, dv: f64| {
-        CameraBasis::build(heading, pitch, roll, intrinsics, height).ground_offset(u + du, v + dv)
+        CameraBasis::build_with_lens(heading, pitch, roll, intrinsics, height, pose.lens)
+            .ground_offset(u + du, v + dv)
     };
 
     // A contact point's angular error, expressed in the image coordinates it
@@ -596,8 +620,11 @@ pub fn image_coordinates(pose: &CameraPose, point: LatLon) -> Option<(f64, f64)>
     if !(depth > 1e-9) {
         return None;
     }
-    let u = (x / depth / basis.intrinsics.tan_half_h + 1.0) / 2.0;
-    let v = (1.0 - y / depth / basis.intrinsics.tan_half_v) / 2.0;
+    // Normalised camera coordinates, then bent to where the sensor records
+    // them, so this stays the exact inverse of `ray`, which unbends.
+    let (camera_x, camera_y) = basis.lens.distort(x / depth, y / depth);
+    let u = (camera_x / basis.intrinsics.tan_half_h + 1.0) / 2.0;
+    let v = (1.0 - camera_y / basis.intrinsics.tan_half_v) / 2.0;
     Some((u, v))
 }
 
@@ -706,6 +733,7 @@ mod tests {
             horizontal_fov: 62.0,
             vertical_fov: 36.0,
             range_meters: 60.0,
+            lens: Distortion::default(),
         }
     }
 

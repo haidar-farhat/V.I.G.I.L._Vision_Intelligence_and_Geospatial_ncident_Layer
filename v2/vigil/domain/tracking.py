@@ -83,7 +83,7 @@ from .appearance import (
 )
 from .detection import BoundingBox, Detection
 from .geo import (
-    CameraPose, LatLon, PositionEstimate, Vec2, bearing_degrees, distance_meters, project_point,
+    Bearing, CameraPose, LatLon, PositionEstimate, Speed, Vec2, motion_of, project_point,
 )
 
 
@@ -173,9 +173,15 @@ class Track:
     gallery: Gallery = field(default_factory=Gallery)
     contact: Vec2 = Vec2(0.5, 1.0)
     position: PositionEstimate | None = None
-    ground_history: list[tuple[int, LatLon]] = field(default_factory=list)
-    speed_mps: float | None = None
-    heading_degrees: float | None = None
+    #: `(millis, point, sigma)` per observation. The sigma travels with the
+    #: point because a speed computed from two positions inherits their error,
+    #: and looking it up later would mean using the *current* uncertainty for a
+    #: position measured three seconds ago at a different range.
+    ground_history: list[tuple[int, LatLon, float]] = field(default_factory=list)
+    #: Speed over the ground, with its error. `None` until enough span.
+    speed: Speed | None = None
+    #: Direction of travel, with its error.
+    heading: Bearing | None = None
     #: Ids this track absorbed by re-identification. Kept because an incident
     #: exported for evidence has to be able to say that "track 3" and "track
     #: 11" were judged the same object, and on what basis.
@@ -201,8 +207,28 @@ class Track:
                 *to_measurement(bbox.x, bbox.y, bbox.width, bbox.height)),
             state=state, confidence=confidence,
             contact=contact if contact is not None else bbox.bottom_center,
-            position=position, speed_mps=speed_mps, heading_degrees=heading_degrees,
+            position=position,
+            # A caller handing over a bare number is stating a measurement it
+            # has no error for; zero is the only honest reading of that, and
+            # it keeps `observing` usable from a test or a replay.
+            speed=None if speed_mps is None else Speed(speed_mps, 0.0),
+            heading=None if heading_degrees is None else Bearing(heading_degrees, 0.0),
         )
+
+    @property
+    def speed_mps(self) -> float | None:
+        """The plain number, or `None` when the measurement does not support one.
+
+        `None` rather than a figure whose error exceeds it: 0.4 +/- 0.9 m/s is
+        not a slow walk, it is no measurement, and printing it invites somebody
+        to read "walking pace" off noise.
+        """
+        return self.speed.mps if self.speed is not None and self.speed.meaningful else None
+
+    @property
+    def heading_degrees(self) -> float | None:
+        """The plain bearing, or `None` when it could be any of a quadrant."""
+        return self.heading.degrees if self.heading is not None and self.heading.meaningful else None
 
     @property
     def bbox(self) -> BoundingBox:
@@ -741,18 +767,21 @@ class Tracker:
         track.position = project_point(self._pose, track.contact)
         if track.position is None or not track.position.is_projected:
             return
-        track.ground_history.append((at_millis, track.position.point))
+        track.ground_history.append(
+            (at_millis, track.position.point, track.position.radius_meters))
         oldest = at_millis - self.config.motion_window_millis
-        track.ground_history = [(t, p) for t, p in track.ground_history if t >= oldest]
-        first_t, first_p = track.ground_history[0]
+        track.ground_history = [e for e in track.ground_history if e[0] >= oldest]
+        first_t, first_p, first_sigma = track.ground_history[0]
         span = at_millis - first_t
         if span < self.config.min_motion_span_millis:
-            track.speed_mps = None
-            track.heading_degrees = None
+            track.speed = None
+            track.heading = None
             return
-        travelled = distance_meters(first_p, track.position.point)
-        track.speed_mps = travelled / (span / 1000.0)
-        track.heading_degrees = bearing_degrees(first_p, track.position.point) if travelled > 0.25 else None
+        # The two endpoint errors in quadrature — the same rule `separation`
+        # uses, because it is the same question asked of the same two points.
+        sigma = math.hypot(first_sigma, track.position.radius_meters)
+        track.speed, track.heading = motion_of(
+            first_p, track.position.point, span / 1000.0, sigma)
 
 
 __all__ = [

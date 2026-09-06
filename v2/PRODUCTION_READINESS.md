@@ -443,25 +443,35 @@ shipped two-thread setting.
 
 | Option | Measured | Cost | Status |
 |---|---|---|---|
-| **GPU via DirectML** | 38.5 → **4.5 ms**, **8.6x** | one `pip install onnxruntime-directml`; it *replaces* the `onnxruntime` package | **measured, not adopted** — see below |
+| **GPU via DirectML** | end to end **67.6 → 11.4 ms, 5.9x** (session alone 38.5 → 4.5 ms, 8.6x) | replaces the `onnxruntime` package | **ADOPTED** — every suite green on it |
 | **Threads 2 → 8** | 88.1 → **49.1 ms**, **1.8x** | none for one camera; worse for many, which is why the default is 2 | **available now**: `VIGIL_ORT_THREADS=8` |
 | **Detect every 3rd frame, track between** | 67.6 → **22.5 ms**, **3.0x** | position lag **0.003 box heights median, 0.008 p95** — under a centimetre on a person, against a projection error over a metre at range | **built**: `vigil site detection --detect-every 3` |
 | INT8 dynamic quantisation | 67.6 → **70.2 ms**, **0.96x — slower** | model 13.9 → 3.8 MB, 96% agreement | **do not bother** |
 
-**DirectML is the answer, and it was measured in an isolated virtualenv so
-this machine's environment was not touched.** The integrated GPU runs the
+**DirectML is adopted.** The integrated GPU runs the
 shipped `yolov8n-seg` session in **4.5 ms against the CPU's 38.5 ms** — 220
 raw inferences a second. Two caveats before anyone quotes it:
 
-- That is the **session alone**. Letterboxing, non-maximum suppression and
-  mask decoding still happen in Python, so end-to-end `detect()` would be
-  perhaps 10-12 ms rather than 4.5. The bottleneck moves from the model to
-  the pre- and post-processing, which is a different and much better problem.
-- `onnxruntime-directml` **replaces** `onnxruntime`. That is a change to the
-  deployment's dependency set and it has not been made here; the provider
-  selection and the `vigil doctor` report that would tell an operator which
-  one they got are both already in place, so adopting it is one install and
-  one `doctor` run.
+The prediction held: the session alone is 4.5 ms, and end to end `detect()`
+came out at **11.4 ms** against a predicted 10-12, because letterboxing,
+non-maximum suppression and mask decoding are still Python. **The bottleneck
+has moved from the model to the pre- and post-processing**, which is a
+different and much better problem — and it is what Phase 8 moves to Rust.
+
+One camera now runs detection at 87.9 fps rather than 14.8.
+
+**Rollback to CPU-only**, if DirectML misbehaves on a deployment machine:
+
+```bash
+pip uninstall -y onnxruntime-directml
+pip install onnxruntime==1.29.0
+python -m vigil doctor      # confirms the provider it actually got
+```
+
+Nothing in the product changes: `adapters/detectors.py` prefers whatever the
+installed runtime offers and reads the active provider back off the session,
+because onnxruntime falls back silently and a CUDA build with the wrong driver
+runs on the CPU without saying so.
 
 Three things worth saying about that table.
 

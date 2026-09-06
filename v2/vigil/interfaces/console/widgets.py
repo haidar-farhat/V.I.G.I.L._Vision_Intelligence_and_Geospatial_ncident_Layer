@@ -329,7 +329,8 @@ class TrackTable(QWidget):
             doing = "; ".join(said)
             item = QTreeWidgetItem([
                 camera_id, str(track.id), label or "unclassified" if info and info.classifies else label or "—",
-                f"{track.confidence:.2f}", "—" if track.speed_mps is None else f"{track.speed_mps:.1f} m/s",
+                f"{track.confidence:.2f}", "—" if track.speed is None or not track.speed.meaningful
+                else track.speed.describe(),
                 away, doing,
             ])
             item.setForeground(1, theme.track_colour(track.id))

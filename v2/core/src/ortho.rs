@@ -495,6 +495,7 @@ mod tests {
             horizontal_fov: 62.0,
             vertical_fov: 36.0,
             range_meters: 60.0,
+            lens: crate::lens::Distortion::default(),
         }
     }
 

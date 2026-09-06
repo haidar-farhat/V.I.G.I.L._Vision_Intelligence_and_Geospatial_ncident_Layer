@@ -9,6 +9,7 @@ the strength of a motion blob.
 from __future__ import annotations
 
 import hashlib
+import math
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
@@ -21,6 +22,25 @@ from .zones import ZoneKind
 DEFAULT_WINDOW_MILLIS = 120_000
 DEFAULT_RADIUS_METERS = 15.0
 MAX_UNCERTAINTY_ALLOWANCE_METERS = 20.0
+
+
+def _allowance(first_sigma: float | None, second_sigma: float | None, radius: float) -> float:
+    """How far apart two sightings may be and still be one object.
+
+    The two position errors combine **in quadrature**, not by addition.
+
+    This module used to add them. `geo.Distance` has always said why that is
+    wrong — "adding them would claim the errors always conspire" — and the two
+    modules disagreed about the same two numbers while this one was the one
+    deciding whether two sightings are the same person. Two errors of 3 m
+    allowed 6 m of separation when what they justify is 4.24.
+
+    The cap stays: one badly placed camera must not be able to swallow the
+    site by claiming a huge uncertainty.
+    """
+    a = first_sigma or 0.0
+    b = second_sigma or 0.0
+    return radius + min(MAX_UNCERTAINTY_ALLOWANCE_METERS, math.hypot(a, b))
 
 
 class ObjectIdentity:
@@ -87,9 +107,8 @@ def associate(events: Sequence[Event], *, window_millis: int = DEFAULT_WINDOW_MI
             if pa is None or pb is None:
                 continue
             separation = distance_meters(pa, pb)
-            slack = min(MAX_UNCERTAINTY_ALLOWANCE_METERS,
-                        (first.evidence.position_uncertainty_meters or 0.0) + (second.evidence.position_uncertainty_meters or 0.0))
-            allowance = radius_meters + slack
+            allowance = _allowance(first.evidence.position_uncertainty_meters,
+                                   second.evidence.position_uncertainty_meters, radius_meters)
             if separation > allowance:
                 continue
             score = time_and_place_score(1 - separation / allowance, 1 - gap / window_millis)
@@ -152,9 +171,9 @@ def link_same_camera_fragments(events: Sequence[Event], *, radius_meters: float 
             if point_a is None or point_b is None:
                 continue
             separation = distance_meters(point_a, point_b)
-            slack = min(MAX_UNCERTAINTY_ALLOWANCE_METERS,
-                        (last.evidence.position_uncertainty_meters or 0.0) + (first.evidence.position_uncertainty_meters or 0.0))
-            allowance = (radius_meters + slack) * FRAGMENT_ALLOWANCE_FRACTION
+            allowance = _allowance(last.evidence.position_uncertainty_meters,
+                                   first.evidence.position_uncertainty_meters,
+                                   radius_meters) * FRAGMENT_ALLOWANCE_FRACTION
             if separation > allowance:
                 continue
             score = time_and_place_score(1 - separation / allowance, 1 - gap / FRAGMENT_MAX_GAP_MILLIS)
@@ -327,9 +346,10 @@ class Correlator:
                 if event.evidence.camera_id == other.evidence.camera_id:
                     return True
                 continue
-            slack = min(MAX_UNCERTAINTY_ALLOWANCE_METERS,
-                        (event.evidence.position_uncertainty_meters or 0.0) + (other.evidence.position_uncertainty_meters or 0.0))
-            if distance_meters(position, other_position) <= self._radius + slack:
+            if distance_meters(position, other_position) <= _allowance(
+                event.evidence.position_uncertainty_meters,
+                other.evidence.position_uncertainty_meters, self._radius,
+            ):
                 return True
         return False
 

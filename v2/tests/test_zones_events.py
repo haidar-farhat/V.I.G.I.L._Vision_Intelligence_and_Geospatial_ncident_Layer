@@ -15,11 +15,12 @@ def square(centre: LatLon, half: float = 5.0) -> tuple[LatLon, ...]:
 
 
 def track(track_id: int, point: LatLon, *, class_id: int = 0, radius: float = 0.5, speed=None) -> Track:
-    t = Track.observing(track_id, class_id, BoundingBox(0.4, 0.5, 0.1, 0.2), contact=Vec2(0.45, 0.7),
-                        confidence=0.9,
-                        position=PositionEstimate(point, radius, PositionSource.GROUND_PROJECTION))
-    t.speed_mps = speed
-    return t
+    # `speed_mps` reads back as `None` when the error swamps the measurement,
+    # so a synthetic track states its speed with no error rather than assigning
+    # the read-only property.
+    return Track.observing(track_id, class_id, BoundingBox(0.4, 0.5, 0.1, 0.2),
+                           contact=Vec2(0.45, 0.7), confidence=0.9, speed_mps=speed,
+                           position=PositionEstimate(point, radius, PositionSource.GROUND_PROJECTION))
 
 
 def test_membership_is_uncertain_near_the_edge_and_the_watch_list_filters():
