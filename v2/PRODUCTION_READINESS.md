@@ -7,10 +7,17 @@ real camera, or a test that fails when the claim stops being true.
 
 **The short version.** The perception, geometry and mapping half of this
 system is now sound and measured. The half that decides whether it is
-*useful* — the detection model and the data behind it — has not been touched
-and cannot be, because there is no dataset and no labelling pipeline in this
-repository. See [Remaining limitations](#remaining-limitations); that section
-is the reason this document does not say "production ready".
+*useful* — the detection model and the data behind it — is untouched, because
+there is no dataset and no labelling pipeline in this repository. Section 6 is
+the reason this document does not say "production ready".
+
+Section 8 is what to do about it, and it corrects one thing section 6 gets
+wrong: "nothing can be measured without labels" is false. Four of this
+system's constants have ground truth that comes from the structure of the
+problem rather than from a person, `tools/calibrate.py` reads them off
+unlabelled video, and the first run of it **contradicted two shipped
+constants**. Both findings are in section 8; neither has been acted on yet,
+because one twenty-second clip is not grounds for moving a core constant.
 
 ---
 
@@ -339,7 +346,178 @@ error with range.
 
 ---
 
-## 8. How to check any of this
+## 8. What to do about the blocking items
+
+Recommendations, in the order they pay off. Every number here was measured on
+this machine on 2026-09-06 with `tools/detector_options.py` and
+`tools/calibrate.py`; both ship with the product, so the measurements can be
+repeated on the site's own footage — which is the only place they mean
+anything.
+
+### A. Data, labelling and evaluation
+
+**A0. Measure what needs no labels — this week, at no cost.**
+
+Section 6 was too pessimistic, and the correction matters: "nothing measures
+precision or recall because there is nothing to measure against" is true of
+*precision and recall* and false of nearly everything else. Four constants
+this system runs on have ground truth that comes from the **structure of the
+problem** rather than from a person, and `tools/calibrate.py` reads all four
+off unlabelled video:
+
+- Two detections **in the same frame** are certainly different objects — one
+  object cannot be in two places.
+- Two appearances of the **same continuously-detected track** are almost
+  certainly one object.
+- A track whose **position is not moving** is measuring the detector's own box
+  jitter and nothing else.
+- A confirmed track whose **class flips** is a model guessing.
+
+Run on one 573-frame clip it already found two problems (C and D below). Run
+it on a night's footage from each camera before doing anything else.
+
+**A1. Harvest the corpus the product already writes.**
+
+Do not start a labelling project. Start by reading what running the product
+has already produced:
+
+- Timestamped MP4 clips with SHA-256 digests, indexed in the store.
+- Events carrying camera, zone, track, class, confidence and time.
+- **Every dismissal carries a mandatory human-written reason.** `review
+  dismiss` refuses without one. That is a free, human-authored label on the
+  system's own false positives, it has been accumulating since the queue was
+  built, and **nothing reads it**.
+
+An incident-level precision figure is available from data already on disk.
+What is missing is a `vigil dataset export` that joins clips to events to
+judgements and writes frames plus pre-labels in COCO or YOLO form. A day or
+two of work, and it belongs before any labelling.
+
+**A2. Then label the minimum that matters, and label it correctly.**
+
+- **Stratify; do not sample uniformly.** By hour, by weather, by camera, and
+  deliberately oversample dawn, dusk, rain and headlights. A thousand frames
+  of a sunny afternoon measures a sunny afternoon.
+- **Split by day, never at random.** Consecutive frames are near-duplicates; a
+  random split leaks almost perfectly and produces a number that means
+  nothing. Hold out whole days, and hold out days that look *different*.
+- **Correct pre-labels rather than drawing from scratch** — three to five
+  times faster.
+- **Label only the watch list.** COCO has eighty classes; this site cares
+  about six.
+- 500–1000 frames per camera is enough for *domain adaptation*. It is not
+  enough for a new class and not enough to certify anything.
+- Tooling: CVAT or Label Studio. Both install and run offline, which this
+  product requires.
+
+**A3. Build the evaluation harness before fine-tuning anything.**
+
+Precision and recall per class, per camera, per hour band, on the held-out
+days. Fine-tuning without this is not engineering, it is hoping — and the
+harness is worth more than the training run, because it is what tells you
+whether the training run helped.
+
+**A4. Fine-tune only if the evaluation says to — and the first evidence says
+maybe not.**
+
+On the clip measured here the model was confident (89% of detections above
+0.80, strongly bimodal) and no track ever changed class. That is the shape of
+a model *inside* its domain, and it is evidence against urgently retraining
+for `person` at close range. The real risk is elsewhere, and A3 is what finds
+it: small and distant objects, night and IR, weather, and the classes nobody
+has exercised at all.
+
+### B. Throughput: 5.4x is available on this machine today, measured
+
+Baseline on a real 640x480 clip: **67.6 ms** per frame (14.8 fps) at the
+shipped two-thread setting.
+
+| Option | Measured | Cost | Status |
+|---|---|---|---|
+| **Threads 2 → 8** | 88.1 → **49.1 ms**, **1.8x** | none for one camera; worse for many, which is why the default is 2 | **available now**: `VIGIL_ORT_THREADS=8` |
+| **Detect every 3rd frame, track between** | 67.6 → **22.5 ms**, **3.0x** | position lag **0.003 box heights median, 0.008 p95** — under a centimetre on a person, against a projection error over a metre at range | needs a config knob; **not built** |
+| INT8 dynamic quantisation | 67.6 → **70.2 ms**, **0.96x — slower** | model 13.9 → 3.8 MB, 96% agreement | **do not bother** |
+| GPU / NPU via DirectML | not measured | one `pip install onnxruntime-directml` | **untested; likely the largest single win** |
+
+Three things worth saying about that table.
+
+**The quantisation result is a useful negative.** Dynamic quantisation helps
+matrix-multiply-heavy networks; this one is convolutions, and on this CPU it
+came out slightly *slower* while shrinking the file to a quarter. The version
+that might work is static QDQ quantisation with a calibration set — which
+needs site footage, so it belongs after A1 rather than before it.
+
+**The detection-interval result is the big one, and it is only safe because of
+the tracker rewrite.** Skipping detections on the old EMA tracker would have
+been reckless. With a Kalman filter that predicts properly, a second
+association pass that recovers an object from a weak detection, and
+re-identification across a gap, the measured cost of detecting a third as
+often is negligible. **Caveat, and it matters:** the clip had one track and
+little motion. Re-measure on footage with people walking and vehicles moving
+before choosing an interval — the lag scales with speed.
+
+**Combining the two available options** gives roughly 16 ms of detection per
+frame: about four cameras at 15 fps on this CPU rather than one at twelve,
+without a GPU and without touching the model.
+
+### C. The appearance thresholds — and a result that contradicts them
+
+`tools/calibrate.py` exists to answer this, and the first real measurement
+**disagrees with the shipped values**:
+
+```
+same object (continuous tracks)     n=8911  p05=0.001  median=0.017  p95=0.068
+different objects (same frame)      n=144   p05=0.011  median=0.105  p95=0.262
+separation p95(same) → p05(different)       -0.057   ← they OVERLAP
+```
+
+The synthetic scenes separated two coats at a cosine distance of 0.56, which
+is where `MAX_REIDENTIFY_DISTANCE = 0.35` came from. On real footage the
+*different-object* median is **0.105** — so a gate at 0.35 admits essentially
+everything, and would merge two objects rather than tell them apart. There is
+no value that works here: the distributions overlap, so any threshold both
+splits one object and merges two.
+
+**This is the risk named in section 7, now confirmed with evidence.** The
+honest reading is that a masked colour histogram may not carry enough
+information to re-identify on real footage. What that leaves, in order:
+
+1. **Re-measure on real site footage before concluding.** The clip used is a
+   static indoor webcam scene with few objects of similar colour — close to
+   the worst case for a colour descriptor, and nothing like a security site.
+   Run `tools/calibrate.py` on a night from each camera. First thing to do,
+   and it costs nothing.
+2. **If it holds, a learned re-identification embedding is the answer** — a
+   small OSNet or similar, exported to ONNX. It is a *download*, which this
+   product forbids, so it takes the route the detector already takes: the
+   operator supplies the file and its digest travels with the evidence. The
+   interface in `domain/appearance.py` is already the right shape; only
+   `perception/appearance.py` would change.
+3. **Until then, prefer the split to the merge.** A fragment is visible — an
+   operator sees two boxes on one person. A merge is invisible and reports two
+   people as one. If a threshold has to be guessed, guess tight.
+
+### D. And one more thing the calibration found
+
+```
+detector box jitter, measured 1-sigma    0.0042 of a box height
+MEASURE_STD_FRACTION, assumed            0.05
+```
+
+The Kalman filter is being told the detector is **twelve times noisier than it
+measurably is**, so it distrusts every measurement and lags real motion. That
+constant is documented as "5%, measured on the shipped model", and nothing
+held it there.
+
+It has **not been changed**, deliberately: one twenty-second indoor clip of a
+nearly-static scene is not grounds for moving a core constant, and jitter on a
+distant moving object will be far worse than on a near stationary one. Run
+`tools/calibrate.py` across several cameras and several hours first. If it
+holds, lowering it is a free improvement in tracking responsiveness.
+
+---
+
+## 9. How to check any of this
 
 ```bash
 python tasks.py core           # build and test the Rust core (53 tests)

@@ -45,6 +45,14 @@ python tasks.py bench            # what the pipeline costs and what it recovers
 python tools/camera_check.py     # the whole pipeline against a real camera
 ```
 
+Before trusting any of it on a new site — both read **unlabelled** footage, so
+they can be run the day the cameras go up:
+
+```bash
+python tools/calibrate.py CLIP.mp4        # what real video says about the constants
+python tools/detector_options.py --clip CLIP.mp4   # how to make detection affordable
+```
+
 **Accounts.** `python -m vigil users add root --role ADMIN`. After the first
 account exists every command runs as `--as NAME` (password prompted, or on
 standard input with `--password-stdin`) and the console asks for a sign-in. A
