@@ -1,3 +1,5 @@
+> **This is the v1 README, kept as reference.** The product is now the rewrite in [`v2/`](../v2/README.md); the repository's front page is [README.md](../README.md).
+
 # Sentinel Vision
 
 **Local-first AI multi-camera security & situational awareness platform.**
@@ -63,7 +65,7 @@ no rule.
   packages are allowed and are chosen on exactly that criterion, so anything that
   downloads a model or a tile on first use is disqualified however good it is. An
   air-gapped site installs from a wheelhouse carried in on a disk; see
-  [docs/SECURITY.md](docs/SECURITY.md#dependencies).
+  [docs/SECURITY.md](SECURITY.md#dependencies).
   *Enforced by:* **three checks at three different times.** `python tasks.py
   audit` — the first CI job, before any toolchain runs — scans the shipped source
   for cloud SDKs, telemetry packages and hard-coded external hosts, *and reads
@@ -71,7 +73,7 @@ no rule.
   scan cannot see. That second guard exists because onnxruntime — shipped here
   from the beginning — turned out to carry a Microsoft telemetry uploader in
   its Linux and macOS wheels, on by default; it is now disarmed before the
-  library loads, and [docs/SECURITY.md](docs/SECURITY.md#dependencies) says
+  library loads, and [docs/SECURITY.md](SECURITY.md#dependencies) says
   exactly what remains. The CI
   offline job drops all outbound traffic, *proves* the drop took effect, and then
   runs every suite. At runtime, every address a camera host resolves to must be
@@ -116,7 +118,7 @@ no rule.
 
 ## Current state
 
-See **[STATUS.md](STATUS.md)** for a per-capability breakdown, honestly stated.
+See **[STATUS.md](../STATUS.md)** for a per-capability breakdown, honestly stated.
 In short:
 
 **The whole spine runs, end to end, on real video today.**
@@ -202,7 +204,7 @@ would test it.
 **One node handles 16 cameras** at the 15 fps a camera delivers, with headroom.
 What limits that is not the GIL, not Python and not the Rust boundary — it is the
 background model's per-pixel state, measured and written up in
-[docs/OVERVIEW.md §15](docs/OVERVIEW.md). The Rust core is 0.4% of a frame.
+[docs/OVERVIEW.md §15](OVERVIEW.md). The Rust core is 0.4% of a frame.
 
 ### Not yet true, and stated as such
 
@@ -220,9 +222,9 @@ finds the object that *stops moving* only 49% of the time — the loitering case
 the one a security system most needs.
 
 Every known failure is bounded by a test so it cannot quietly get worse, and
-recorded in [STATUS.md](STATUS.md). A visual walk-through of the whole system,
+recorded in [STATUS.md](../STATUS.md). A visual walk-through of the whole system,
 with the measurements behind each claim, is in
-[docs/OVERVIEW.md](docs/OVERVIEW.md).
+[docs/OVERVIEW.md](OVERVIEW.md).
 
 ---
 
@@ -276,7 +278,7 @@ terminal and verbose logging — because a packaged Qt application on Windows ha
 nowhere to print, and *"it just closes"* is the least actionable bug report there
 is), and `sentinel` (the headless analyser).
 
-**Start with [docs/USAGE.md](docs/USAGE.md)** — install, first five minutes,
+**Start with [docs/USAGE.md](USAGE.md)** — install, first five minutes,
 every command, how to read what it tells you, and what to do when it is wrong.
 
 ### See it work
@@ -390,21 +392,21 @@ list is part of the attack surface, and everything in it is arithmetic.
 
 | Document | Covers |
 |---|---|
-| [FEATURES.md](FEATURES.md) | **The product definition.** Every capability Sentinel Vision is meant to have — 356 of them — each carrying the state it is actually in |
-| [docs/USAGE.md](docs/USAGE.md) | **How to use it.** Install, first run, the console screen by screen, every command-line option, Docker, cameras, logs, and a troubleshooting table |
-| [ROADMAP.md](ROADMAP.md) | What is left between today and a system worth putting in front of a real site, in the order it should be built, with the reasoning |
-| [docs/OVERVIEW.md](docs/OVERVIEW.md) | **Start here.** Diagrams of every layer, the spine, the boundary, threading, zones, projection, correlation, risk, persistence, export and test topology — with the measurements behind each |
-| [ARCHITECTURE.md](ARCHITECTURE.md) | Components, processes, ERD, protocol, security model, data flow, AI and map architecture |
-| [STATUS.md](STATUS.md) | What is actually built, per capability |
-| [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) | Working on the codebase |
-| [docs/SECURITY.md](docs/SECURITY.md) | Threat model and controls |
-| [docs/CAMERAS.md](docs/CAMERAS.md) | Discovery, ONVIF, RTSP, and diagnosing a camera that will not add |
-| [docs/PROTOCOL.md](docs/PROTOCOL.md) | Wire format between nodes |
-| [docs/DATABASE.md](docs/DATABASE.md) | Schema and migration policy |
-| [docs/AI.md](docs/AI.md) | Model pipeline and analyst guardrails |
-| [docs/MAPS.md](docs/MAPS.md) | Offline map architecture |
-| [docs/TESTING.md](docs/TESTING.md) | Testing strategy |
-| [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | Packaging and deployment |
+| [FEATURES.md](../FEATURES.md) | **The product definition.** Every capability Sentinel Vision is meant to have — 356 of them — each carrying the state it is actually in |
+| [docs/USAGE.md](USAGE.md) | **How to use it.** Install, first run, the console screen by screen, every command-line option, Docker, cameras, logs, and a troubleshooting table |
+| [ROADMAP.md](../ROADMAP.md) | What is left between today and a system worth putting in front of a real site, in the order it should be built, with the reasoning |
+| [docs/OVERVIEW.md](OVERVIEW.md) | **Start here.** Diagrams of every layer, the spine, the boundary, threading, zones, projection, correlation, risk, persistence, export and test topology — with the measurements behind each |
+| [ARCHITECTURE.md](../ARCHITECTURE.md) | Components, processes, ERD, protocol, security model, data flow, AI and map architecture |
+| [STATUS.md](../STATUS.md) | What is actually built, per capability |
+| [docs/DEVELOPMENT.md](DEVELOPMENT.md) | Working on the codebase |
+| [docs/SECURITY.md](SECURITY.md) | Threat model and controls |
+| [docs/CAMERAS.md](CAMERAS.md) | Discovery, ONVIF, RTSP, and diagnosing a camera that will not add |
+| [docs/PROTOCOL.md](PROTOCOL.md) | Wire format between nodes |
+| [docs/DATABASE.md](DATABASE.md) | Schema and migration policy |
+| [docs/AI.md](AI.md) | Model pipeline and analyst guardrails |
+| [docs/MAPS.md](MAPS.md) | Offline map architecture |
+| [docs/TESTING.md](TESTING.md) | Testing strategy |
+| [docs/DEPLOYMENT.md](DEPLOYMENT.md) | Packaging and deployment |
 
 ---
 
