@@ -22,18 +22,42 @@ the presence ends. Without that hysteresis one person produces forty events.
 
 **Time is part of the condition.** The same person in the same place is
 unremarkable at 14:00 and worth waking somebody for at 03:00. A zone carries a
-schedule, and the schedule is evaluated in the site's local time, because that is
+schedule, and the schedule is evaluated in the site's clock — today the machine's
+own zone, passed in as ``site_tz``; UTC when none is given — because that is
 what "after hours" means to the person being woken.
+
+**What the thing is, is part of the condition.** A restricted area used to fire
+on any class the detector named — on a real camera, "1 couch in Room (HIGH,
+risk 55)" and "A bottle entered Room" — and an operator who has seen a sofa
+raise a HIGH incident stops believing incidents. A zone therefore carries a
+class filter, :attr:`Zone.classes`, and the rules ask :meth:`Zone.watches`
+before acting on a presence. The filter is by the detector's own label string,
+because that is the only vocabulary a site has: the classes are whatever the
+operator's model file names, and nothing here can know them in advance. Empty
+means any, which is what every zone meant before the filter existed.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, time, timezone
+from datetime import datetime, time, timezone, tzinfo
 from enum import Enum
 from typing import Iterable, Sequence
 
-from .core import LatLon, Track, ZoneMembership, zone_membership
+from .core import LatLon, Track, ZoneMembership, haversine_distance, zone_membership
+
+#: How long after a stay's track was last supported by a detection a new id
+#: appearing nearby may inherit the stay, and how far away it may appear. The
+#: tracker gives a lost object two seconds before it issues a new id; the
+#: linker in `reid` allows five. Three, with two metres plus a plausible walk,
+#: covers a split without reaching the next person along. Measured before this
+#: existed: one seated person held one id for 19 s on the laptop camera, but
+#: three objects over 30 s became 7, 13 and 3 tracks — and every split inside a
+#: zone was a fresh ENTERED after the entry delay, with a loiter timer back at
+#: nothing.
+HANDOFF_GAP_MILLIS = 3000
+HANDOFF_BASE_METERS = 2.0
+HANDOFF_SPEED_MPS = 4.0
 
 
 class ZoneKind(str, Enum):
@@ -95,6 +119,160 @@ class Schedule:
 ALWAYS = None
 
 
+def ring_problem(ring) -> str | None:
+    """Why a ring is not a usable area, or ``None`` if it is.
+
+    A self-intersecting outline (a figure of eight drawn by a slip of the
+    mouse) has no inside — point-in-polygon gives a different answer depending
+    on which lobe the point is in and which way the test happens to count —
+    so a zone built on one would raise or suppress events at random. Shapely
+    decides validity; that geometry is hard and its bugs are invisible until
+    one arrangement of vertices produces a wrong answer.
+    """
+    if len(ring) < 3:
+        return f"{len(ring)} points: two points are a line, not an area"
+    from shapely.geometry import Polygon
+    from shapely.validation import explain_validity
+
+    polygon = Polygon([(p.lon, p.lat) for p in ring])
+    # The hull, not the polygon: a figure of eight has two lobes whose signed
+    # areas cancel to nothing, and would otherwise be reported as a line.
+    # Collinear points have a hull that is a line, whose area is zero up to
+    # rounding — 1e-13 square degrees is about a hand's breadth squared.
+    if polygon.convex_hull.area < 1e-13:
+        return "the points lie on a line and enclose no area"
+    if not polygon.is_valid:
+        # Shapely's text names the problem and roughly where, e.g.
+        # "Self-intersection[35.5018 33.8938]". Plain enough to show an operator.
+        return explain_validity(polygon).split("[")[0].strip().lower() or "invalid outline"
+    return None
+
+
+def zone_warnings(
+    zone: "Zone",
+    report,
+    others: Sequence["Zone"] = (),
+    *,
+    labels: Iterable[str] | None = None,
+) -> tuple[str, ...]:
+    """Everything wrong with this zone that the geometry can prove.
+
+    Warnings, never refusals. An operator who draws a zone somewhere no camera
+    looks has made a mistake worth telling them about immediately — a zone that
+    can never fire is the most dangerous object in the system, because it looks
+    exactly like protection — but they may be about to place the camera that
+    fixes it, and a tool that refuses the zone makes that impossible.
+
+    ``report`` is anything carrying ``covered_fraction``, ``confident_fraction``
+    and ``area_m2``; :class:`sentinel.coverage.ZoneReport` is what the console
+    passes. Duck-typed on purpose, so that neither the tests nor a future
+    caller has to build a full coverage report to ask this question.
+
+    ``labels`` is the vocabulary of the detector watching this zone — the
+    values of ``DetectorInfo.class_names`` — and it is the same kind of
+    question as coverage: a filter naming a class the detector never emits is
+    a zone that can never fire, and it reads on screen as a zone that filters.
+    An empty vocabulary is a detector that labels nothing, under which any
+    filter at all is dead. ``None`` means the caller does not know what
+    detector will run, and the filter is not judged.
+    """
+    from shapely.geometry import Polygon
+
+    messages: list[str] = []
+
+    if zone.classes and labels is not None:
+        known = frozenset(labels)
+        if not known:
+            messages.append(
+                f"watches only {', '.join(sorted(zone.classes))}, but the detector "
+                "labels nothing — it can never fire"
+            )
+        else:
+            unknown = sorted(zone.classes - known)
+            if len(unknown) == len(zone.classes):
+                messages.append(
+                    f"watches only {', '.join(unknown)}, which the detector never "
+                    "names — it can never fire"
+                )
+            elif unknown:
+                messages.append(
+                    f"watches {', '.join(unknown)}, which the detector never names"
+                )
+
+    if report.covered_fraction <= 0.0:
+        messages.append("no camera can see this zone — it can never fire")
+    elif report.confident_fraction < 0.5 and not zone.accept_uncertain:
+        # A zone whose own width is smaller than the error over it cannot say
+        # which side of its line somebody is on. It will still raise
+        # memberships; they will be UNCERTAIN, and a restricted area does not
+        # act on those — so it is armed and silent, which is the worst state.
+        beyond = round((1.0 - report.confident_fraction) * 100)
+        messages.append(
+            f"{beyond}% of this zone is beyond confident range "
+            "(σ larger than half its width) — it will mostly report UNCERTAIN"
+        )
+
+    frame = _metric_frame(zone.ring[0])
+    mine = Polygon([frame(point) for point in zone.ring])
+    if not mine.is_valid:
+        mine = mine.buffer(0)
+
+    for other in others:
+        if other.id == zone.id or len(other.ring) < 3:
+            continue
+        theirs = Polygon([frame(point) for point in other.ring])
+        if not theirs.is_valid:
+            theirs = theirs.buffer(0)
+        shared = mine.intersection(theirs)
+        if shared.is_empty or shared.area <= 0.0:
+            continue
+
+        if other.kind is zone.kind:
+            # Two zones of one kind over the same ground raise two events for
+            # one person, and the correlator has no way to know they were the
+            # same fence drawn twice.
+            messages.append(
+                f"overlaps {other.name} ({other.kind.value}), {shared.area:.0f} m²"
+            )
+        elif other.kind is ZoneKind.EXCLUSION and zone.kind in (
+            ZoneKind.RESTRICTED, ZoneKind.PERIMETER
+        ):
+            # An exclusion zone is "deliberately ignore this". Laid over an
+            # alarm zone it silences it there, and nothing else on screen says
+            # so: both are drawn, both look armed.
+            messages.append(f"inside exclusion {other.name}: silenced there")
+
+    schedule = zone.schedule
+    if schedule is not None and schedule.start == schedule.end:
+        # Not "all day": `covers` asks ``start <= now < end``, which no moment
+        # satisfies when they are equal. The zone is disarmed permanently, and
+        # it reads on screen as a zone with a schedule.
+        messages.append(
+            f"schedule {schedule.start:%H:%M}–{schedule.end:%H:%M} covers no time"
+        )
+
+    if report.area_m2 < 1.0:
+        # Smaller than the ground a person stands on, and far smaller than the
+        # position error anywhere on a real site.
+        messages.append(f"area {report.area_m2:.1f} m² is under 1 m²")
+
+    return tuple(messages)
+
+
+def _metric_frame(origin: LatLon):
+    """Metres east and north of ``origin``, for planar geometry.
+
+    Areas in degrees are wrong by the cosine of the latitude, and an overlap
+    reported as "0 m²" because of that is a warning nobody sees. Borrowed from
+    `sentinel.coverage`, which owns this conversion, rather than copied —
+    two tangent planes that came to differ would be a bug nobody could find.
+    """
+    from .coverage import _Frame
+
+    frame = _Frame(origin)
+    return frame.to_xy
+
+
 @dataclass(frozen=True, slots=True)
 class Zone:
     """A named area on the ground.
@@ -119,6 +297,16 @@ class Zone:
     exit_after_millis: int = 2000
     #: Whether an uncertain position may count as being in the zone.
     accept_uncertain: bool = False
+    #: Which detector labels this zone acts on. EMPTY MEANS ANY.
+    #:
+    #: The labels are the detector's own strings — ``"person"`` here is
+    #: whatever the operator's model calls ``"person"``, matched exactly —
+    #: because a model file's names are the only vocabulary a site has, and a
+    #: list fixed in this code would be a guess about weights it has never
+    #: seen. Empty is the default because it is what every zone written before
+    #: this field existed meant, and an outline that went quiet on upgrade
+    #: would read on screen as protection.
+    classes: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
         if len(self.ring) < 3:
@@ -127,9 +315,38 @@ class Zone:
                 "line, not an area, and a half-drawn zone must not start "
                 "producing intrusion events."
             )
+        problem = ring_problem(self.ring)
+        if problem is not None:
+            raise ValueError(f"Zone {self.id!r}: {problem}")
+        if not isinstance(self.classes, frozenset):
+            # A caller that hands over a list or a set has said what it meant.
+            # Held as a frozenset so the zone stays hashable and so two zones
+            # with the same filter written in a different order compare equal
+            # — the audit diff compares sets whole, and would otherwise report
+            # an edit that changed nothing.
+            object.__setattr__(self, "classes", frozenset(self.classes))
 
     def is_active(self, moment: datetime) -> bool:
         return self.schedule is None or self.schedule.covers(moment)
+
+    def watches(self, label: str | None) -> bool:
+        """Whether a presence the detector calls ``label`` is this zone's business.
+
+        ``label`` is the detector's word for the object, or ``None`` when the
+        detector cannot say — a motion detector finds movement and names
+        nothing. The two answers for ``None`` are the whole point:
+
+        - An **empty** filter watches everything, so it fires for a blob the
+          detector could not name. That is what every zone did before the
+          filter existed and what a motion-only site relies on.
+        - A **non-empty** filter never fires for ``None``. A blob that cannot
+          be named cannot be said to be a person, and a person-only zone that
+          fired on it anyway would be the sofa incident again, this time with
+          the word "person" on it.
+        """
+        if not self.classes:
+            return True
+        return label is not None and label in self.classes
 
     def accepts(self, membership: ZoneMembership) -> bool:
         if membership is ZoneMembership.INSIDE:
@@ -170,6 +387,23 @@ class Presence:
     uncertain_observations: int = 0
     #: Set when the presence closes.
     ended_millis: int | None = None
+    #: What the track was, and where and when it was last supported by a
+    #: detection — enough for a new id appearing where this one went quiet to
+    #: be recognised as the same stay. See `ZoneEvaluator._adopt`.
+    class_id: int | None = None
+    last_point: LatLon | None = None
+    last_supported_millis: int | None = None
+    #: The id of the track that opened this stay. Stable across a hand-off,
+    #: so a rule that fires once per stay has something to key on.
+    origin_track_id: int | None = None
+    #: How many track ids this stay has been carried across. Zero for most.
+    handoffs: int = 0
+
+    @property
+    def identity(self) -> tuple[str, int, int]:
+        """What makes this stay this stay, whichever track id carries it now."""
+        origin = self.origin_track_id if self.origin_track_id is not None else self.track_id
+        return (self.zone_id, origin, self.started_millis)
 
     @property
     def duration_millis(self) -> int:
@@ -206,13 +440,29 @@ class ZoneEvaluator:
     observation. Feed it every frame's tracks; it reports only the transitions.
     """
 
-    __slots__ = ("_zones", "_open", "_last_seen")
+    __slots__ = ("_zones", "_open", "_last_seen", "_site_tz", "_hits", "_superseded")
 
-    def __init__(self, zones: Iterable[Zone]):
+    def __init__(self, zones: Iterable[Zone], *, site_tz: tzinfo | None = None):
+        """
+        ``site_tz`` is the clock schedules are written in. Without it the
+        moment is used as given, which for the pipeline means UTC — and a
+        schedule of 18:00–06:00 typed by someone in Beirut would arm at 21:00
+        their time. The pipeline and the node pass the machine's zone.
+        """
         self._zones = {zone.id: zone for zone in zones}
+        self._site_tz = site_tz
         #: (zone_id, track_id) -> Presence
         self._open: dict[tuple[str, int], Presence] = {}
         self._last_seen: dict[tuple[str, int], int] = {}
+        #: Each live track's hit count last frame. A track whose count rose is
+        #: supported by a detection this frame; one whose count did not is
+        #: coasting on prediction. `last_seen_millis` cannot tell the two
+        #: apart — the tracker advances it while coasting too.
+        self._hits: dict[int, int] = {}
+        #: Track ids whose stay was handed to a newer id, and when. A coasting
+        #: box the tracker has not yet given up on must not reopen the stay it
+        #: just passed on; lifted the moment a detection supports it again.
+        self._superseded: dict[int, int] = {}
 
     @property
     def zones(self) -> tuple[Zone, ...]:
@@ -226,8 +476,21 @@ class ZoneEvaluator:
     ) -> list[PresenceChange]:
         """Feed one frame's tracks. Returns presences that started or ended."""
         when = moment or datetime.now(timezone.utc)
+        if self._site_tz is not None:
+            when = when.astimezone(self._site_tz)
         changes: list[PresenceChange] = []
         live = {track.id for track in tracks}
+        supported = {
+            track.id for track in tracks if track.hits > self._hits.get(track.id, 0)
+        }
+        self._hits = {track.id: track.hits for track in tracks}
+        # A superseded id the tracker has dropped needs no guard; one a
+        # detection supports again is a track in its own right once more.
+        self._superseded = {
+            id: since
+            for id, since in self._superseded.items()
+            if id in live and id not in supported
+        }
 
         for zone in self._zones.values():
             if not zone.is_active(when):
@@ -238,12 +501,18 @@ class ZoneEvaluator:
                 continue
 
             for track in tracks:
+                if track.id in self._superseded:
+                    continue
                 key = (zone.id, track.id)
                 membership = zone.membership_of(track)
 
                 if zone.accepts(membership):
+                    if key not in self._open:
+                        self._adopt(zone, track, supported, at_millis)
                     self._last_seen[key] = at_millis
-                    change = self._observe(zone, track, membership, at_millis)
+                    change = self._observe(
+                        zone, track, membership, at_millis, supported=track.id in supported
+                    )
                     if change is not None:
                         changes.append(change)
 
@@ -251,8 +520,66 @@ class ZoneEvaluator:
 
         return changes
 
+    def _adopt(
+        self, zone: Zone, track: Track, supported: set[int], at_millis: int
+    ) -> Presence | None:
+        """Hand a stay whose track went quiet to a track that just appeared there.
+
+        The tracker splits: a detection fails to associate with its own
+        track's prediction, a new id is issued, and the old one coasts and
+        dies. Keyed by track id, that was a new stay — a second ENTERED after
+        the entry delay for a person who had not moved, and a loiter timer
+        back at zero, so a loiterer whose track split every few seconds was
+        never reported at all.
+
+        A stay is handed on only when everything a split looks like holds at
+        once: the new track is young, the stay's own track has no detection
+        supporting it this frame, the gap since it last had one is short, the
+        classes agree, and the new track is within a plausible walk of where
+        the stay was last seen. Any of these failing is two objects, and two
+        objects are two stays.
+        """
+        if track.position is None:
+            return None
+        if at_millis - track.first_seen_millis > HANDOFF_GAP_MILLIS:
+            return None
+
+        best: tuple[float, tuple[str, int], Presence] | None = None
+        for key, presence in self._open.items():
+            if key[0] != zone.id or presence.track_id in supported:
+                continue
+            if presence.class_id is not None and presence.class_id != track.class_id:
+                continue
+            if presence.last_point is None or presence.last_supported_millis is None:
+                continue
+            gap = at_millis - presence.last_supported_millis
+            if gap < 0 or gap > HANDOFF_GAP_MILLIS:
+                continue
+            separation = haversine_distance(presence.last_point, track.position.point)
+            if separation > HANDOFF_BASE_METERS + HANDOFF_SPEED_MPS * gap / 1000.0:
+                continue
+            if best is None or separation < best[0]:
+                best = (separation, key, presence)
+
+        if best is None:
+            return None
+        _, old_key, presence = best
+        del self._open[old_key]
+        self._last_seen.pop(old_key, None)
+        self._superseded[presence.track_id] = at_millis
+        presence.track_id = track.id
+        presence.handoffs += 1
+        self._open[(zone.id, track.id)] = presence
+        return presence
+
     def _observe(
-        self, zone: Zone, track: Track, membership: ZoneMembership, at_millis: int
+        self,
+        zone: Zone,
+        track: Track,
+        membership: ZoneMembership,
+        at_millis: int,
+        *,
+        supported: bool = True,
     ) -> PresenceChange | None:
         key = (zone.id, track.id)
         presence = self._open.get(key)
@@ -263,11 +590,17 @@ class ZoneEvaluator:
                 track_id=track.id,
                 started_millis=at_millis,
                 last_present_millis=at_millis,
+                class_id=track.class_id,
+                origin_track_id=track.id,
             )
             self._open[key] = presence
 
         presence.last_present_millis = at_millis
         presence.observations += 1
+        if track.position is not None:
+            presence.last_point = track.position.point
+        if supported:
+            presence.last_supported_millis = at_millis
         if membership is ZoneMembership.UNCERTAIN:
             presence.uncertain_observations += 1
 
@@ -289,10 +622,12 @@ class ZoneEvaluator:
             presence = self._open[key]
             gone_for = at_millis - self._last_seen.get(key, presence.last_present_millis)
 
-            # A track the tracker has dropped entirely cannot come back under the
-            # same id, so there is nothing to wait for.
-            track_gone = presence.track_id not in live
-            if gone_for < zone.exit_after_millis and not track_gone:
+            # A track the tracker has dropped cannot come back under the same
+            # id — but the object can come back under a new one, and for the
+            # exit delay the stay waits for that (`_adopt`). It used to close
+            # the moment the id died, which made every split a LEFT and an
+            # ENTERED for somebody who had not moved.
+            if gone_for < zone.exit_after_millis:
                 continue
 
             del self._open[key]

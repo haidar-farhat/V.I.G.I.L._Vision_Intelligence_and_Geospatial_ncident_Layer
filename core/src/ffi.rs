@@ -23,7 +23,7 @@ use crate::tracking::{Detection, Tracker, TrackerConfig};
 
 /// Version of this ABI. Python checks it on load and refuses a mismatch rather
 /// than calling functions whose signatures may have moved.
-pub const ABI_VERSION: u32 = 5;
+pub const ABI_VERSION: u32 = 6;
 
 #[no_mangle]
 pub extern "C" fn sentinel_abi_version() -> u32 {
@@ -104,6 +104,14 @@ impl CPose {
     }
 }
 
+/// A detection as it crosses the boundary.
+///
+/// `has_contact` is a flag, not an `Option`: an absent ground contact is the
+/// normal state for any detector that produces boxes only. When it is 0 the
+/// contact is the box's bottom-centre, which is what every position was
+/// projected from before masks existed. When it is 1, `contact_x` /
+/// `contact_y` are where the object actually meets the ground — measured from
+/// its silhouette — and that point, not the box, is what gets projected.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct CDetection {
@@ -113,8 +121,39 @@ pub struct CDetection {
     pub h: f64,
     pub confidence: f64,
     pub class_id: u32,
-    /// Explicit padding so the layout is identical under every alignment rule.
-    pub _pad: u32,
+    /// 1 when `contact_x` / `contact_y` carry a measured point (ABI 6).
+    pub has_contact: u32,
+    pub contact_x: f64,
+    pub contact_y: f64,
+}
+
+impl CDetection {
+    fn to_detection(self) -> Detection {
+        let bbox = BoundingBox {
+            x: self.x,
+            y: self.y,
+            w: self.w,
+            h: self.h,
+        };
+        // A flag set beside a non-finite value is a caller's bug, and the
+        // defined response is the answer the box would have given — not a NaN
+        // that projects to a NaN latitude and is drawn nowhere without a word.
+        let measured =
+            self.has_contact != 0 && self.contact_x.is_finite() && self.contact_y.is_finite();
+        Detection {
+            bbox,
+            confidence: self.confidence,
+            class_id: self.class_id,
+            contact: if measured {
+                Vec2 {
+                    x: self.contact_x,
+                    y: self.contact_y,
+                }
+            } else {
+                bbox.ground_contact()
+            },
+        }
+    }
 }
 
 /// A track as it crosses the boundary.
@@ -152,6 +191,12 @@ pub struct CTrack {
     pub _pad2: u32,
     pub speed_mps: f64,
     pub heading_degrees: f64,
+    /// Where this track last met the ground, in normalised image coordinates
+    /// (ABI 6). Always set: measured when the detector could see the shape,
+    /// the box's bottom-centre when it could not. It is the point the map
+    /// position was projected from, so a viewer can draw exactly that.
+    pub contact_x: f64,
+    pub contact_y: f64,
 }
 
 #[repr(C)]
@@ -650,16 +695,7 @@ pub unsafe extern "C" fn sentinel_tracker_update(
     } else {
         unsafe { std::slice::from_raw_parts(detections, count as usize) }
             .iter()
-            .map(|d| Detection {
-                bbox: BoundingBox {
-                    x: d.x,
-                    y: d.y,
-                    w: d.w,
-                    h: d.h,
-                },
-                confidence: d.confidence,
-                class_id: d.class_id,
-            })
+            .map(|d| d.to_detection())
             .collect()
     };
 
@@ -693,6 +729,8 @@ pub unsafe extern "C" fn sentinel_tracker_update(
             _pad2: 0,
             speed_mps: track.speed_mps.unwrap_or(0.0),
             heading_degrees: track.heading_degrees.unwrap_or(0.0),
+            contact_x: track.contact.x,
+            contact_y: track.contact.y,
         });
     }
 
@@ -805,6 +843,8 @@ mod tests {
             _pad2: 0,
             speed_mps: 0.0,
             heading_degrees: 0.0,
+            contact_x: 0.0,
+            contact_y: 0.0,
         }
     }
 
@@ -882,6 +922,57 @@ mod tests {
     }
 
     #[test]
+    fn a_measured_contact_crosses_the_boundary_and_comes_back() {
+        unsafe {
+            let handle = sentinel_tracker_create(&pose(), 0.2, 2.5, 2000, 1);
+            assert!(!handle.is_null());
+
+            let with_contact = CDetection {
+                x: 0.4,
+                y: 0.5,
+                w: 0.2,
+                h: 0.3,
+                confidence: 0.9,
+                class_id: 0,
+                has_contact: 1,
+                contact_x: 0.42,
+                contact_y: 0.78,
+            };
+            assert_eq!(sentinel_tracker_update(handle, &with_contact, 1, 0), 1);
+
+            let mut out = [blank_track()];
+            assert_eq!(sentinel_tracker_tracks(handle, out.as_mut_ptr(), 1), 1);
+            assert_eq!((out[0].contact_x, out[0].contact_y), (0.42, 0.78));
+
+            // Flag clear: the values beside it are ignored and the box answers.
+            let without = CDetection {
+                has_contact: 0,
+                contact_x: 123.0,
+                contact_y: 456.0,
+                ..with_contact
+            };
+            assert_eq!(sentinel_tracker_update(handle, &without, 1, 200), 1);
+            assert_eq!(sentinel_tracker_tracks(handle, out.as_mut_ptr(), 1), 1);
+            assert_eq!((out[0].contact_x, out[0].contact_y), (0.5, 0.8));
+
+            // Flag set beside a NaN is a caller's bug; the defined answer is
+            // the box's, not a NaN latitude.
+            let broken = CDetection {
+                has_contact: 1,
+                contact_x: f64::NAN,
+                ..with_contact
+            };
+            assert_eq!(sentinel_tracker_update(handle, &broken, 1, 400), 1);
+            assert_eq!(sentinel_tracker_tracks(handle, out.as_mut_ptr(), 1), 1);
+            assert_eq!((out[0].contact_x, out[0].contact_y), (0.5, 0.8));
+            assert_eq!(out[0].has_position, 1);
+            assert!(out[0].lat.is_finite());
+
+            sentinel_tracker_destroy(handle);
+        }
+    }
+
+    #[test]
     fn standing_still_is_distinguishable_from_not_knowing() {
         // Every call below crosses the C ABI, which is what this test is for.
         unsafe {
@@ -896,7 +987,9 @@ mod tests {
                 h: 0.12,
                 confidence: 0.9,
                 class_id: 0,
-                _pad: 0,
+                has_contact: 0,
+                contact_x: 0.0,
+                contact_y: 0.0,
             };
 
             let mut out = [blank_track(); 4];
@@ -1126,7 +1219,9 @@ mod tests {
                 h: 0.2,
                 confidence: 0.9,
                 class_id: 0,
-                _pad: 0,
+                has_contact: 0,
+                contact_x: 0.0,
+                contact_y: 0.0,
             }];
 
             assert_eq!(

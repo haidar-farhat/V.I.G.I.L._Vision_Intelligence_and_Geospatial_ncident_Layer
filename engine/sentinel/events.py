@@ -24,13 +24,21 @@ designed in rather than added later.
 One person loitering for four minutes is one event, not two hundred and forty.
 Rules debounce, presences persist across dropouts, and a rule that fires
 repeatedly for an ongoing condition is a defect rather than a feature.
+
+**A zone's class filter is honoured by every rule that acts on a presence.**
+A restricted area used to fire on whatever the detector named — a couch, a
+bottle — and an operator who sees a sofa raise a HIGH incident stops believing
+incidents. Each such rule asks :meth:`~sentinel.zones.Zone.watches` with
+:attr:`RuleContext.class_label`, the one place the detector's word for a track
+is read, so a rule cannot reach the label by a second route and disagree with
+the first about what a motion detector can say (nothing).
 """
 
 from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone, tzinfo
 from enum import Enum
 from typing import Iterable, Sequence
 
@@ -226,9 +234,33 @@ class RuleContext:
     track: Track | None
     presence: Presence | None
     at_millis: int
+    #: When, in UTC. What `Event.occurred_at` records.
     moment: datetime
     detector: DetectorInfo
     frame_index: int
+    #: The clock schedules are written in, for anything a rule *says* about
+    #: the time. ``None`` means UTC.
+    site_tz: tzinfo | None = None
+
+    @property
+    def local_moment(self) -> datetime:
+        """The moment in the site's clock, for text a person reads."""
+        return self.moment.astimezone(self.site_tz) if self.site_tz else self.moment
+
+    @property
+    def class_label(self) -> str | None:
+        """What the detector calls this track, or ``None`` when it cannot say.
+
+        ``None`` rather than ``"unclassified"`` under a motion detector, and
+        that difference is load-bearing: a zone filtered to ``person`` is asked
+        with this value, and a detector that classifies nothing must never
+        satisfy it — a blob is not a person, however confidently it moved. The
+        string ``"unclassified"`` is reserved for a classifying detector that
+        looked and could not decide, which a filter may legitimately name.
+        """
+        if self.track is None or not self.detector.classifies:
+            return None
+        return self.detector.label_for(self.track.class_id)
 
 
 class Rule:
@@ -253,6 +285,19 @@ class Rule:
         return []
 
     # -------------------------------------------------------------- helpers
+
+    @staticmethod
+    def _watched(context: RuleContext) -> bool:
+        """Whether the zone in this context acts on this track's class at all.
+
+        The check every rule about a presence makes before anything else, so
+        that a filter set on a zone silences all of them together. A rule that
+        skipped it would raise "loitering" for the couch the entry rule had
+        just declined to announce, and the operator would be back to
+        disbelieving the screen. A context with no zone is not filtered: there
+        is no filter to consult.
+        """
+        return context.zone is None or context.zone.watches(context.class_label)
 
     def _build(
         self,
@@ -311,6 +356,20 @@ class Rule:
         )
 
 
+def _subject(context: "RuleContext") -> str:
+    """"A person" when the detector said so, "An object" when it could not.
+
+    One phrasing for every rule. The entry rule named the class and the
+    loitering and after-hours rules said "An object" whatever the detector knew,
+    so a person-only zone produced "A person entered" beside "An object
+    remained" for the same person — and a reader takes the second to mean the
+    system was not sure. The label is the detector's, never a guess: under a
+    motion detector every rule says "An object".
+    """
+    label = context.class_label
+    return "An object" if label is None else f"A {label.replace('_', ' ')}"
+
+
 class ZoneEntryRule(Rule):
     """Something entered a zone that should not have anything in it."""
 
@@ -328,6 +387,10 @@ class ZoneEntryRule(Rule):
         zone = context.zone
         if change.kind != "ENTERED" or zone is None or zone.kind not in self._kinds:
             return []
+        if not self._watched(context):
+            # A couch in a person-only zone. Nothing to say, and saying it
+            # anyway is the incident this filter exists to stop.
+            return []
 
         presence = change.presence
         severity = (
@@ -336,12 +399,8 @@ class ZoneEntryRule(Rule):
 
         # The summary says what the detector can support and no more. Under a
         # motion detector this reads "An object entered", not "A person entered".
-        subject = (
-            context.detector.label_for(context.track.class_id).replace("_", " ")
-            if context.detector.classifies and context.track is not None
-            else "An object"
-        )
-        subject = subject if subject == "An object" else f"A {subject}"
+        label = context.class_label
+        subject = "An object" if label is None else f"A {label.replace('_', ' ')}"
 
         return [
             self._build(
@@ -374,14 +433,22 @@ class LoiteringRule(Rule):
     def __init__(self, dwell_millis: int = 30_000, still_speed_mps: float = 0.5):
         self._dwell = dwell_millis
         self._still = still_speed_mps
-        self._fired: set[tuple[str, int]] = set()
+        self._fired: set[tuple[str, int, int]] = set()
 
     def on_frame(self, context: RuleContext) -> list[Event]:
         presence, zone, track = context.presence, context.zone, context.track
         if presence is None or zone is None or track is None:
             return []
+        if not self._watched(context):
+            # Before the dwell test and before `_fired`, so an unwatched class
+            # neither raises nor uses up the one firing this presence gets.
+            return []
 
-        key = (zone.id, track.id)
+        # Keyed by the stay, not by the track id carrying it. A stay handed
+        # across a track split keeps its identity (see `Presence.identity`),
+        # so a loiter already reported is not reported again under the new
+        # id — and a loiterer whose track splits is still one loiterer.
+        key = presence.identity
         if key in self._fired:
             return []
         if presence.duration_millis < self._dwell:
@@ -405,7 +472,7 @@ class LoiteringRule(Rule):
             self._build(
                 context,
                 summary=(
-                    f"An object remained in {zone.name} for "
+                    f"{_subject(context)} remained in {zone.name} for "
                     f"{presence.duration_millis / 1000:.0f} seconds"
                 ),
                 conditions=conditions,
@@ -414,8 +481,8 @@ class LoiteringRule(Rule):
             )
         ]
 
-    def forget(self, zone_id: str, track_id: int) -> None:
-        self._fired.discard((zone_id, track_id))
+    def forget(self, identity: tuple[str, int, int]) -> None:
+        self._fired.discard(identity)
 
 
 class AfterHoursRule(Rule):
@@ -438,13 +505,20 @@ class AfterHoursRule(Rule):
         zone = context.zone
         if change.kind != "ENTERED" or zone is None or zone.schedule is None:
             return []
+        if not self._watched(context):
+            # The hour makes a person worth waking somebody for; it does not
+            # make a couch one.
+            return []
 
         return [
             self._build(
                 context,
-                summary=f"An object was in {zone.name} outside permitted hours",
+                summary=f"{_subject(context)} was in {zone.name} outside permitted hours",
                 conditions=[
-                    f"{context.moment:%H:%M} falls within {zone.schedule.describe()}",
+                    # The site's clock, with its offset, because the schedule
+                    # was written in it and the reader will check it against a
+                    # wall clock — and `occurred_at` stays UTC beside it.
+                    f"{context.local_moment:%H:%M UTC%z} falls within {zone.schedule.describe()}",
                     f"presence confirmed after {zone.enter_after_millis} ms",
                 ],
                 confidence=change.presence.confidence,
@@ -460,6 +534,12 @@ class RapidMovementRule(Rule):
     pixel is metres. So this rule requires a *confident* position as well as a
     high speed — otherwise it fires on projection error rather than on anything
     that happened, which is the failure mode that makes speed rules distrusted.
+
+    Deliberately not subject to a zone's class filter. This rule is about the
+    track, not about where it is: the zone in its context, when there is one,
+    is incidental, and a thing moving at 12 m/s is worth a LOW event whatever
+    the detector calls it. Asserted in `test_events.py` so the omission cannot
+    be mistaken for an oversight.
     """
 
     id = "rapid-movement"
@@ -500,6 +580,27 @@ class RapidMovementRule(Rule):
         ]
 
 
+def default_rules(zones: Sequence[Zone] = ()) -> list[Rule]:
+    """The rule set a caller gets when it does not choose one.
+
+    Matched to what is actually configured. Without a zone there is nothing to
+    be inside, so the zone rules would be dead weight — and worse, a run would
+    report "0 events" for a reason that has nothing to do with the footage.
+
+    One definition, because there were two: the console and the CLI each had
+    their own copy, and a third was about to appear in the node. Rule sets that
+    drift produce two deployments that disagree about what an incident is.
+    """
+    if not zones:
+        return [RapidMovementRule(speed_mps=6.0)]
+    return [
+        ZoneEntryRule(),
+        AfterHoursRule(),
+        LoiteringRule(dwell_millis=8000),
+        RapidMovementRule(speed_mps=6.0),
+    ]
+
+
 # -------------------------------------------------------------------- engine
 
 
@@ -521,12 +622,16 @@ class EventEngine:
     the thing this codebase is least willing to allow.
     """
 
-    __slots__ = ("_rules", "_node_id", "_camera_id", "_seen", "stats")
+    __slots__ = ("_rules", "_node_id", "_camera_id", "_seen", "stats", "_site_tz",)
 
-    def __init__(self, rules: Sequence[Rule], *, node_id: str, camera_id: str):
+    def __init__(
+        self, rules: Sequence[Rule], *, node_id: str, camera_id: str,
+        site_tz: tzinfo | None = None,
+    ):
         self._rules = list(rules)
         self._node_id = node_id
         self._camera_id = camera_id
+        self._site_tz = site_tz
         self._seen: set[str] = set()
         self.stats = EventEngineStats()
 
@@ -561,6 +666,7 @@ class EventEngine:
                 presence=change.presence,
                 at_millis=at_millis,
                 moment=moment,
+                site_tz=self._site_tz,
                 detector=detector,
                 frame_index=frame_index,
             )
@@ -595,6 +701,7 @@ class EventEngine:
                 presence=presence,
                 at_millis=at_millis,
                 moment=moment,
+                site_tz=self._site_tz,
                 detector=detector,
                 frame_index=frame_index,
             )
@@ -614,6 +721,7 @@ class EventEngine:
                 presence=None,
                 at_millis=at_millis,
                 moment=moment,
+                site_tz=self._site_tz,
                 detector=detector,
                 frame_index=frame_index,
             )

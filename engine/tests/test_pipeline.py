@@ -19,17 +19,28 @@ and names it, rather than asserting what it ought to do and being skipped.
 
 from __future__ import annotations
 
+import contextlib
+import logging
+import time
 from collections import defaultdict
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 import onnx_fixture
 import scene
-from sentinel.core import CameraPose, haversine_distance
-from sentinel.decode import VideoSource
-from sentinel.detect import UNCLASSIFIED, MotionDetector, OnnxDetector
-from sentinel.pipeline import Pipeline
+from sentinel.core import BoundingBox, CameraPose, Detection, haversine_distance
+from sentinel.decode import Frame, SourceInfo, VideoSource
+from sentinel.detect import UNCLASSIFIED, DetectorInfo, MotionDetector, OnnxDetector
+from sentinel.pipeline import (
+    MAX_PLATE_READS_PER_TRACK,
+    PLATE_READS_PER_SECOND,
+    VEHICLE_LABELS,
+    Pipeline,
+    TrackPlate,
+)
+from sentinel.plates import CONFIDENT_AGREEMENT, PlateModels, PlateReader
 
 #: Objects genuinely present in the reference scene.
 TRUE_OBJECT_COUNT = len(scene.WALKERS)
@@ -170,7 +181,7 @@ def test_tracks_land_on_the_map_with_uncertainty(run_over_reference):
 
     for track in placed:
         assert track.position.radius_meters > 0.0, "a position without uncertainty is a lie"
-        assert track.position.source in ("GROUND_PROJECTION", "CAMERA_FALLBACK")
+        assert track.position.source in ("GROUND_PROJECTION", "FRAME_EDGE", "CAMERA_FALLBACK")
 
 
 def test_projected_positions_are_within_the_camera_range(
@@ -197,7 +208,10 @@ def test_uncertainty_grows_with_distance_from_the_camera(
         (haversine_distance(reference_pose.position, t.position.point), t.position.radius_meters)
         for r in results
         for t in r.tracks
-        if t.position is not None
+        # The projection's own property. A FRAME_EDGE position is a bound —
+        # wide by construction, centred short of the edge — and would say
+        # nothing about how a projection degrades with range.
+        if t.position is not None and t.position.source == "GROUND_PROJECTION"
     ]
     assert len(samples) > 100
 
@@ -593,3 +607,728 @@ def test_a_live_track_is_never_trimmed_out_from_under_itself(
     assert stats.observations[loiterer] == _MAX_TRACKED_DETAIL * 2
     # The loiterer plus one new object per frame, each counted exactly once.
     assert stats.distinct_objects == _MAX_TRACKED_DETAIL * 2 + 1
+
+
+# ------------------------------------------- a camera does not end, it stops
+
+
+class _FlakyLiveSource:
+    """A live camera: paced frames, one failed read in the middle, no end.
+
+    `VideoSource.read` returns ``None`` both at the end of a file *and* on a
+    single failed read, and the pipeline used to iterate a live source exactly
+    the way it iterated a file — so one dropped frame ended the run, and the log
+    reported "analysis finished", which is what a file does when it runs out.
+    A security camera that stops watching must never be reported the same way as
+    a file that finished.
+
+    Paced deliberately: `LiveStream` keeps only the newest frame and drops the
+    rest, so a source that returns instantly would have most of its frames
+    discarded and the test would be measuring the queue rather than the
+    reconnect.
+    """
+
+    is_live = True
+    source_id = "flaky"
+    display_url = "device:test"
+
+    def __init__(self, fail_at: int | None = 5, quiet_after: int | None = None):
+        self._fail_at = fail_at
+        self._quiet_after = quiet_after
+        self._index = 0
+        self._failed = False
+        self.opens = 0
+
+    def open(self):
+        self.opens += 1
+        return SourceInfo(
+            width=64, height=48, fps=15.0, frame_count=None, is_live=True,
+            display_url=self.display_url,
+        )
+
+    @property
+    def info(self):
+        return self.open()
+
+    def read(self):
+        if self._index == self._fail_at and not self._failed:
+            self._failed = True
+            return None  # the glitch, indistinguishable from an ending
+        if self._quiet_after is not None and self._index >= self._quiet_after:
+            # A camera that has gone quiet without dying: it neither returns a
+            # frame nor reports an error, which is the case that makes shutdown
+            # hard.
+            time.sleep(0.05)
+            return None
+        time.sleep(0.02)
+        frame = Frame(
+            image=np.zeros((48, 64, 3), dtype=np.uint8),
+            timestamp_millis=int(time.time() * 1000),
+            index=self._index,
+            source_id=self.source_id,
+        )
+        self._index += 1
+        return frame
+
+    def close(self):
+        pass
+
+
+def test_a_live_camera_survives_a_dropped_frame():
+    source = _FlakyLiveSource(fail_at=5)
+    pipeline = Pipeline(source, MotionDetector())
+
+    seen = 0
+    for _ in pipeline.run():
+        seen += 1
+        if seen >= 10:
+            pipeline.ask_to_stop()
+    pipeline.close()
+
+    # Before the fix the run ended at the glitch, having called itself finished.
+    assert seen >= 10, f"the run ended after {seen} frame(s)"
+    assert source.opens >= 2, "the stream was never reconnected"
+
+
+def test_a_live_run_stops_when_asked_even_while_the_camera_is_silent():
+    # The stop flag alone is only checked between frames, and a silent camera
+    # delivers no frames to be between. A shutdown that waits for the next frame
+    # from a camera that has stopped sending is a shutdown that never happens —
+    # and the console signals every camera and then waits.
+    source = _FlakyLiveSource(fail_at=None, quiet_after=2)
+    pipeline = Pipeline(source, MotionDetector())
+
+    results = pipeline.run()
+    next(results)
+
+    pipeline.ask_to_stop()
+    started = time.perf_counter()
+    with pytest.raises(StopIteration):
+        next(results)
+    elapsed = time.perf_counter() - started
+    pipeline.close()
+
+    assert elapsed < 5.0, f"shutdown took {elapsed:.1f}s waiting on a dead camera"
+
+
+# --------------------------------------------- plates, and only inside vehicles
+
+#: Where the vehicle sits in every frame below: 100x50 pixels of a 400x200
+#: frame. Big enough that the reader's own minimum-pixel refusals are not what
+#: these tests are measuring.
+VEHICLE_BOX = BoundingBox(0.25, 0.5, 0.25, 0.25)
+VEHICLE_CROP_SHAPE = (50, 100, 3)
+WHOLE_FRAME_SHAPE = (200, 400, 3)
+
+
+class _StillVehicleSource:
+    """A short file with one thing parked in the same place in every frame.
+
+    Synthetic on purpose: what is under test is which boxes reach the plate
+    reader, not whether a detector can find a car. Frames are 40 ms apart so a
+    track's gap budget can be reasoned about in whole frames.
+    """
+
+    is_live = False
+    source_id = "cam-plate"
+    display_url = "memory:one-vehicle"
+
+    def __init__(self, frames: int = 8):
+        self.frames = frames
+
+    def open(self) -> SourceInfo:
+        return SourceInfo(
+            width=400, height=200, fps=25.0, frame_count=self.frames,
+            display_url=self.display_url, is_live=False,
+        )
+
+    @property
+    def info(self) -> SourceInfo:
+        return self.open()
+
+    def __iter__(self):
+        for index in range(self.frames):
+            image = np.zeros((200, 400, 3), dtype=np.uint8)
+            # Only the vehicle is lit, so a crop of it is distinguishable from
+            # the frame it came out of by its contents as well as its shape.
+            image[100:150, 100:200] = 200
+            yield Frame(image, index * 40, index, self.source_id)
+
+    def close(self) -> None:
+        pass
+
+
+class _LabellingDetector:
+    """A detector that classifies, and puts one labelled box in the same place.
+
+    ``present_for`` is how many frames it reports the box at all; after that it
+    finds nothing, which is how a vehicle leaves.
+    """
+
+    def __init__(
+        self, label: str = "car", class_id: int = 2, present_for: int | None = None
+    ):
+        self._class_id = class_id
+        self._present_for = present_for
+        self._frames = 0
+        self.info = DetectorInfo(
+            kind="fake", name="one-labelled-box",
+            class_names={class_id: label}, classifies=True,
+        )
+
+    def detect(self, image: np.ndarray) -> list[Detection]:
+        self._frames += 1
+        if self._present_for is not None and self._frames > self._present_for:
+            return []
+        return [Detection(bbox=VEHICLE_BOX, confidence=0.9, class_id=self._class_id)]
+
+
+class _AlwaysAPlate:
+    """A plate detector that finds one plate, and records every image it saw.
+
+    The recording is the whole point: it is what proves the reader was handed a
+    vehicle crop and never the frame the vehicle was in.
+    """
+
+    def __init__(self, box: BoundingBox = BoundingBox(0.1, 0.4, 0.7, 0.4)):
+        self._box = box
+        self.seen: list[tuple[int, ...]] = []
+
+    def find(self, image: np.ndarray):
+        self.seen.append(tuple(image.shape))
+        return [(self._box, 0.9)]
+
+
+class _DictatedText:
+    """A recogniser that reads what a test dictated, with dictated confidences."""
+
+    def __init__(self, text: str, confidences: tuple[float, ...] | None = None):
+        self.text = text
+        self.confidences = (
+            confidences if confidences is not None else (0.9,) * len(text)
+        )
+        self.calls = 0
+
+    def read_text(self, image: np.ndarray):
+        self.calls += 1
+        return self.text, self.confidences
+
+
+@pytest.fixture()
+def plate_models(tmp_path: Path) -> PlateModels:
+    """Three files standing where the operator's plate models would be.
+
+    Nothing reads their contents but the digest and the charset loader, because
+    both model calls are injected. They exist so the presence check runs exactly
+    as it would in an installation: a fake must never stand in for a model an
+    installation is missing.
+    """
+    detector = tmp_path / "plate-detector.onnx"
+    recogniser = tmp_path / "plate-crnn.onnx"
+    charset = tmp_path / "charset-uk.txt"
+    detector.write_bytes(b"not a model, and never fetched")
+    recogniser.write_bytes(b"not a model either")
+    charset.write_text(
+        "\n".join("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"), encoding="utf-8"
+    )
+    return PlateModels(detector, recogniser, charset)
+
+
+def _reader(models: PlateModels, finder, text_reader) -> PlateReader:
+    return PlateReader(models, country="UK", box_finder=finder, text_reader=text_reader)
+
+
+def test_without_a_plate_reader_nothing_changes_and_nothing_is_read(plate_models):
+    # Off unless the operator supplied models. A camera watching a footpath must
+    # not pay a crop and two model calls per vehicle per frame for a feature
+    # aimed at a car park, and it must produce exactly what it produced before.
+    def run(reader):
+        pipeline = Pipeline(
+            _StillVehicleSource(8), _LabellingDetector(), plate_reader=reader
+        )
+        return list(pipeline.run()), pipeline
+
+    finder = _AlwaysAPlate()
+    with_reader, on = run(_reader(plate_models, finder, _DictatedText("AB12CDE")))
+    without, off = run(None)
+
+    assert off._plates == {}, "an accumulator was made for a pipeline with no reader"
+    assert finder.seen, "the reader that was supplied was never used either"
+    assert all(r.plates == () for r in without)
+    assert off.stats.plate_reads == 0
+
+    # And the tracking is untouched: reading a plate must not move a box or
+    # renumber an object.
+    def spine(results):
+        return [(r.index, t.id, t.bbox) for r in results for t in r.tracks]
+
+    assert spine(without) == spine(with_reader)
+    on.close()
+    off.close()
+
+
+def test_a_vehicle_track_accumulates_across_frames_into_one_confident_reading(
+    plate_models,
+):
+    """One reading per vehicle, built from several frames of its track.
+
+    The failure this is against is the one `plates.py` was written against: a
+    single frame's seven characters presented as a plate. The first frame that
+    reads anything must not be confident, and the confidence must arrive from
+    agreement across frames rather than from any one of them.
+
+    Sixty-four frames rather than eight because reads are spaced by the clock:
+    at 25 fps this is two and a half seconds of vehicle, and the reading becomes
+    confident inside it.
+    """
+    finder = _AlwaysAPlate()
+    text = _DictatedText("AB12CDE")
+    pipeline = Pipeline(
+        _StillVehicleSource(64),
+        _LabellingDetector(),
+        plate_reader=_reader(plate_models, finder, text),
+    )
+    results = list(pipeline.run())
+    accumulators = len(pipeline._plates)
+    stats = pipeline.stats
+    pipeline.close()
+
+    read = [r for r in results if r.plates]
+    print([(r.index, r.plates[0].display, r.plates[0].is_confident) for r in read])
+
+    frames_with_the_vehicle = sum(1 for r in results if r.tracks)
+    assert frames_with_the_vehicle == 63, "the synthetic track did not persist"
+    # A plate is published on every frame the vehicle is on, including the ones
+    # between reads: an operator watching a box must not see the plate under it
+    # flicker off three frames in four.
+    assert len(read) == frames_with_the_vehicle
+    assert accumulators == 1, "one accumulator per track, not one per frame"
+    assert stats.plate_reads == text.calls, "a read that never voted was counted"
+
+    first, last = read[0].plates[0], read[-1].plates[0]
+    assert isinstance(last, TrackPlate)
+    assert first.is_confident is False, "one frame was called a confident plate"
+    assert first.reads == 1
+
+    assert last.track_id == results[-1].tracks[0].id
+    assert last.display == "AB12CDE"
+    assert last.text == "AB12CDE"
+    assert last.is_confident is True
+    assert last.country == "UK"
+    assert last.reads >= CONFIDENT_AGREEMENT
+    assert last.agreement >= CONFIDENT_AGREEMENT
+
+
+def test_the_reader_is_shown_a_vehicle_crop_and_never_the_whole_frame(plate_models):
+    # A plate reader pointed at the frame is a plate reader pointed at the
+    # street outside the site boundary. Only this stage knows which boxes are
+    # vehicles, so this is where that promise is kept or broken.
+    finder = _AlwaysAPlate()
+    pipeline = Pipeline(
+        _StillVehicleSource(8),
+        _LabellingDetector(),
+        plate_reader=_reader(plate_models, finder, _DictatedText("AB12CDE")),
+    )
+    list(pipeline.run())
+    pipeline.close()
+
+    print(set(finder.seen))
+    assert finder.seen, "the plate detector was never called at all"
+    assert set(finder.seen) == {VEHICLE_CROP_SHAPE}
+    assert WHOLE_FRAME_SHAPE not in finder.seen
+
+
+def test_a_track_that_is_not_a_vehicle_is_never_read(plate_models):
+    # The detector finds a person, in the same place, with the same box. Nothing
+    # about it is cropped, so there is no text lifted off a shirt or a sign for
+    # an accumulator to vote on.
+    finder = _AlwaysAPlate()
+    text = _DictatedText("AB12CDE")
+    pipeline = Pipeline(
+        _StillVehicleSource(8),
+        _LabellingDetector(label="person", class_id=0),
+        plate_reader=_reader(plate_models, finder, text),
+    )
+    results = list(pipeline.run())
+    accumulators = len(pipeline._plates)
+    stats = pipeline.stats
+    pipeline.close()
+
+    assert any(r.tracks for r in results), "there was no track to decline to read"
+    assert finder.seen == [], "a person was cropped and handed to a plate detector"
+    assert text.calls == 0
+    assert accumulators == 0
+    assert stats.plate_reads == 0
+    assert all(r.plates == () for r in results)
+
+
+def test_the_accumulator_for_an_ended_track_is_dropped(plate_models):
+    # One accumulator per live vehicle is bounded by what is on screen. One per
+    # vehicle ever seen is the growth the per-track statistics above were
+    # trimmed to stop, and each of these holds a track's reads with it, so a
+    # gate camera would end the week holding every plate that passed it.
+    pipeline = Pipeline(
+        _StillVehicleSource(8),
+        _LabellingDetector(present_for=5),
+        max_gap_millis=100,
+        plate_reader=_reader(plate_models, _AlwaysAPlate(), _DictatedText("AB12CDE")),
+    )
+
+    held: list[tuple[int, int, tuple[int, ...]]] = []
+    for result in pipeline.run():
+        held.append((result.index, len(pipeline._plates), result.ended))
+    print(held)
+
+    kept_while_present = [count for _, count, _ in held if count]
+    ended_on = [index for index, _, ended in held if ended]
+
+    assert kept_while_present == [1] * len(kept_while_present)
+    assert kept_while_present, "the vehicle's plate was never accumulated"
+    assert ended_on, "the track never ended, so nothing was there to drop"
+    # Dropped on the frame the track closed on, not merely by the end of the
+    # run: a live camera has no end of run to be tidied up at.
+    assert [count for index, count, _ in held if index >= ended_on[0]] == [0] * (
+        len(held) - ended_on[0]
+    )
+    assert pipeline._plates == {}, "the accumulator outlived the track"
+    pipeline.close()
+
+
+def test_an_unresolved_character_reaches_the_operator_as_a_question_mark(plate_models):
+    """A character nobody could read stays unread all the way to the result.
+
+    The last character comes back at a confidence below the bar to vote at all,
+    so no amount of agreement resolves it. What must survive to the top is the
+    ``?``, and the absence of any completed string beside it: `AB12CD?` matched
+    or exported as `AB12CDE` is a watchlist hit against somebody else's car.
+    """
+    weak_last_character = (0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.2)
+    pipeline = Pipeline(
+        _StillVehicleSource(40),
+        _LabellingDetector(),
+        plate_reader=_reader(
+            plate_models,
+            _AlwaysAPlate(),
+            _DictatedText("AB12CDE", weak_last_character),
+        ),
+    )
+    results = list(pipeline.run())
+    pipeline.close()
+
+    plate = results[-1].plates[0]
+    print(plate)
+
+    assert plate.display == "AB12CD?"
+    assert plate.text is None, "a half-read plate was completed into a whole one"
+    assert plate.is_confident is False
+    assert plate.agreement == 0, "an unresolved character claimed agreement"
+    assert plate.reads == 5
+
+
+# ------------------------------------ what a vehicle that stays in shot costs
+
+
+#: A plate too blurred for any character to be believed: every read is taken by
+#: the accumulator and none of them votes, because each character is under
+#: `plates.MIN_CHARACTER_CONFIDENCE`. This is the track that never becomes
+#: confident and so never stops being asked — the one the ceiling exists for.
+NOTHING_BELIEVABLE = (0.2,) * 7
+
+
+class _ARecogniserThatBreaks:
+    """A model that raises, the way an operator's own ONNX file can."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def read_text(self, image: np.ndarray):
+        self.calls += 1
+        raise RuntimeError("the recogniser fell over on this crop")
+
+
+@contextlib.contextmanager
+def _listening_to_the_pipeline(level: int = logging.WARNING):
+    """Everything `pipeline.py` logs, at or above ``level``.
+
+    `caplog` cannot be used: `logs.configure` sets ``propagate=False`` on the
+    `sentinel` tree, deliberately, so the handler has to go on the logger that
+    actually emits.
+    """
+    said: list[logging.LogRecord] = []
+
+    class Collect(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            said.append(record)
+
+    logger = logging.getLogger("sentinel.pipeline")
+    handler = Collect()
+    handler.setLevel(level)
+    was = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(min(was, level) if was else level)
+    try:
+        yield said
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(was)
+
+
+def test_a_vehicle_that_stays_in_shot_is_not_read_on_every_frame(plate_models):
+    """A parked car costs a fixed amount, not an accumulating one.
+
+    Reading every vehicle on every frame was quadratic, not linear: each read
+    was appended to that track's accumulator and every read already in it was
+    re-tallied on the next frame. Measured here before this bound existed, one
+    stationary vehicle and no-op models: 200 frames cost 0.03s, 1600 cost 1.58s,
+    6400 cost 40.3s, and the accumulator held one read per frame throughout. A
+    car parked in front of a gate camera for four minutes is the ordinary case.
+
+    Two floors under it, and the second is the one that matters: the reader is
+    not called on most frames, and it stops being called at all once the reading
+    has cleared the bar `plates.py` sets for acting on a plate. The fortieth
+    read of a stationary plate buys nothing the fourth did not.
+    """
+    frames = 400
+    finder = _AlwaysAPlate()
+    text = _DictatedText("AB12CDE")
+    pipeline = Pipeline(
+        _StillVehicleSource(frames),
+        _LabellingDetector(),
+        plate_reader=_reader(plate_models, finder, text),
+    )
+
+    started = time.perf_counter()
+    results = list(pipeline.run())
+    elapsed = time.perf_counter() - started
+    held = [len(accumulator) for accumulator in pipeline._plates.values()]
+    print(f"{frames} frames in {elapsed:.3f}s, {text.calls} read(s), held {held}")
+    pipeline.close()
+
+    frames_with_the_vehicle = sum(1 for r in results if r.tracks)
+    assert frames_with_the_vehicle > frames * 0.9, "the vehicle did not stay in shot"
+
+    # Confident on the fourth read, and never read again: measured at 4 calls
+    # over 400 frames, which is 1% of the frames the vehicle was in shot for.
+    assert text.calls == CONFIDENT_AGREEMENT, "a confident plate was read again"
+    assert len(finder.seen) == text.calls, "a crop was taken and then not read"
+    assert held == [CONFIDENT_AGREEMENT]
+    assert pipeline.stats.plate_reads == CONFIDENT_AGREEMENT
+
+    # And the plate is still published under the box on every one of those
+    # frames. Reading less often must not make the plate flicker.
+    published = [r.plates[0] for r in results if r.plates]
+    assert len(published) == frames_with_the_vehicle
+    assert published[-1].display == "AB12CDE"
+    assert published[-1].is_confident is True
+    # No wall-clock floor here: 400 frames is short enough that the old
+    # per-frame cost (about 0.1s) and this one (0.011s measured) are both fast,
+    # and a bound either would pass tests nothing. The call count above is what
+    # holds, and the length at which the difference is unmistakable is measured
+    # in the next test.
+
+
+def test_a_plate_that_never_agrees_stops_at_a_ceiling_of_reads(plate_models):
+    """The track that never resolves is the one that would grow forever.
+
+    Stopping when a reading is confident bounds nothing here: no character in
+    these reads is believed enough to vote, so the reading never becomes
+    confident and the vehicle would be read for as long as it sits there. The
+    accumulator holds what it is allowed to hold and no more — at 387 bytes a
+    read and three reads a second, the alternative is 4 MB an hour for one
+    parked car, and a ``resolve()`` over every byte of it on every frame.
+    """
+    frames = 3200
+    finder = _AlwaysAPlate()
+    text = _DictatedText("AB12CDE", NOTHING_BELIEVABLE)
+    pipeline = Pipeline(
+        _StillVehicleSource(frames),
+        _LabellingDetector(),
+        plate_reader=_reader(plate_models, finder, text),
+    )
+
+    # Which frames were read on, taken from the statistic rather than from the
+    # fakes, because the spacing is the behaviour under test and the statistic
+    # is what an operator would see it through.
+    results: list = []
+    read_on: list[int] = []
+    counted = 0
+    started = time.perf_counter()
+    for result in pipeline.run():
+        results.append(result)
+        if pipeline.stats.plate_reads > counted:
+            counted = pipeline.stats.plate_reads
+            read_on.append(result.index)
+    elapsed = time.perf_counter() - started
+    held = [len(accumulator) for accumulator in pipeline._plates.values()]
+    print(f"{frames} frames in {elapsed:.3f}s, {text.calls} read(s), held {held}")
+    print(f"read on {read_on[:8]} ... {read_on[-2:]}")
+    pipeline.close()
+
+    frames_with_the_vehicle = sum(1 for r in results if r.tracks)
+    assert frames_with_the_vehicle > frames * 0.9, "the vehicle did not stay in shot"
+
+    # Rate-limited first: at the source's 25 fps and three reads a second that
+    # is one frame in eight, evenly, and not eight reads in a burst.
+    stride = round(25.0 / PLATE_READS_PER_SECOND)
+    assert stride > 1, "the source's frame rate no longer needs limiting"
+    assert {b - a for a, b in zip(read_on, read_on[1:])} == {stride}, read_on[:12]
+
+    # And then the ceiling, which is reached rather than approached: without it
+    # this vehicle would be read once every eight frames for as long as it sat
+    # there, which at this length is 400 reads and rising.
+    rate_limited = int(frames_with_the_vehicle / stride) + 1
+    assert text.calls == MAX_PLATE_READS_PER_TRACK, "the ceiling did not hold"
+    assert text.calls < rate_limited / 4, "the ceiling was never reached to be tested"
+    assert held == [MAX_PLATE_READS_PER_TRACK]
+    assert pipeline.stats.plate_reads == MAX_PLATE_READS_PER_TRACK
+
+    # Nothing resolved, and the last reading is still published every frame:
+    # "we are looking and cannot tell" is a different claim from "no plate".
+    last = results[-1].plates[0]
+    assert last.display == "?" * 7
+    assert last.text is None
+    assert last.is_confident is False
+    # The one wall-clock floor in these tests, and a real discriminator at this
+    # length. Measured on this machine, this test: 0.10s as it stands, and
+    # 11.64s with the three bounds above removed so that every frame is read and
+    # every read re-tallied — the quadratic cost, on one parked car. The ceiling
+    # sits between the two and nearer this one, so it fails on a return to
+    # per-frame reading even on a machine several times slower than this.
+    assert elapsed < 3.0, f"{frames} frames of one parked car took {elapsed:.1f}s"
+
+
+def test_only_the_reads_that_voted_are_counted(plate_models):
+    """A reader lifting nothing but punctuation is not a reader finding plates.
+
+    `PlateAccumulator.add` drops a read whose text normalises to nothing, so
+    counting what the reader returned rather than what the accumulator took
+    reported votes that were never cast — the precise confusion this statistic
+    exists to remove.
+    """
+    finder = _AlwaysAPlate()
+    text = _DictatedText("---")
+    reader = _reader(plate_models, finder, text)
+
+    # The reader does return a read: what is under test is a statistic that
+    # disagreed with its source, not a reader that found nothing.
+    frame = np.zeros((200, 400, 3), dtype=np.uint8)
+    returned = reader.read(frame, VEHICLE_BOX, frame_index=0)
+    print(returned)
+    assert len(returned) == 1
+    assert returned[0].raw_text == "---"
+    assert returned[0].text == ""
+
+    pipeline = Pipeline(
+        _StillVehicleSource(40), _LabellingDetector(), plate_reader=reader
+    )
+    results = list(pipeline.run())
+    stats = pipeline.stats
+    held = [len(accumulator) for accumulator in pipeline._plates.values()]
+    pipeline.close()
+
+    assert text.calls > 1, "the recogniser was never asked"
+    assert stats.plate_reads == 0, "a read that never voted was counted as one"
+    assert held == [0]
+    # And nothing is published: an empty reading beside the box would read as
+    # "no plate" when the truth is "nothing readable yet".
+    assert all(r.plates == () for r in results)
+
+
+def test_a_detector_that_names_no_vehicle_says_so_once(plate_models):
+    """The warning is the only thing that distinguishes this from a quiet car park.
+
+    Models loaded, reader running, not one plate ever read, and nothing said
+    why. It is said once, when the pipeline is built, rather than per frame:
+    guidance repeated 25 times a second is not guidance.
+    """
+    with _listening_to_the_pipeline(logging.WARNING) as said:
+        pipeline = Pipeline(
+            _StillVehicleSource(8),
+            _LabellingDetector(label="person", class_id=0),
+            plate_reader=_reader(
+                plate_models, _AlwaysAPlate(), _DictatedText("AB12CDE")
+            ),
+        )
+        results = list(pipeline.run())
+        pipeline.close()
+
+    warnings = [r for r in said if r.levelno == logging.WARNING]
+    print([r.getMessage() for r in warnings])
+
+    assert len(warnings) == 1, "the operator was told nothing, or told every frame"
+    message = warnings[0].getMessage()
+    assert any(label in message for label in VEHICLE_LABELS)
+    assert "one-labelled-box" in message, "the detector that cannot was not named"
+    assert all(r.plates == () for r in results)
+
+
+def test_a_plate_model_that_fails_does_not_stop_the_camera(plate_models):
+    """A third-party plate model takes the plates down with it, and nothing else.
+
+    The models are files the operator supplied and their failure modes are not
+    the detector's. A gate camera whose recogniser throws on one malformed crop
+    must not lose its zones, its rules and its recording with it — recording is
+    deliberately isolated from an analysis failure for the same reason.
+
+    Logged once for the run, not once per track and never per frame: a model
+    that throws on one crop is a model, not a crop.
+    """
+    frames = 40
+    text = _ARecogniserThatBreaks()
+    pipeline = Pipeline(
+        _StillVehicleSource(frames),
+        _LabellingDetector(),
+        plate_reader=_reader(plate_models, _AlwaysAPlate(), text),
+    )
+
+    with _listening_to_the_pipeline(logging.ERROR) as said:
+        results = list(pipeline.run())
+    fault = pipeline.plate_fault
+    pipeline.close()
+
+    errors = [r for r in said if r.levelno == logging.ERROR]
+    print(fault, [r.getMessage() for r in errors])
+
+    # The camera ran to the end of the source and kept tracking throughout.
+    assert len(results) == frames
+    assert sum(1 for r in results if r.tracks) == frames - 1
+
+    assert text.calls == 1, "a model that had already failed was called again"
+    assert all(r.plates == () for r in results)
+    assert fault is not None and fault.startswith("RuntimeError:")
+    assert len(errors) == 1, "one fault produced no line, or a line per frame"
+    assert "the recogniser fell over" in errors[0].getMessage()
+
+
+def test_the_summary_names_each_track_and_calls_them_tracks():
+    """"track 1 observed in 344 frames" said nothing about what track 1 was.
+
+    A 60 s run on the laptop camera analysed 970 frames, issued 12 ids and
+    raised nothing, and the summary could not say whether a person had been
+    ignored by a person-only zone or never seen. Every track line carries the
+    detector's label, and the count is called what it is — ids issued — not
+    "distinct objects".
+    """
+    from sentinel.pipeline import PipelineStats
+
+    stats = PipelineStats()
+    stats.frames = 10
+    stats.objects_seen = 2
+    stats.track_ids = {1, 3}
+    stats.observations = {1: 10, 3: 4}
+    stats.spans = {1: (0, 9000), 3: (2000, 5000)}
+    stats.labels = {1: "person", 3: "couch"}
+
+    text = stats.summary()
+    assert "distinct tracks       2" in text
+    assert "distinct objects" not in text
+    assert "track 1   person" in text
+    assert "track 3   couch" in text
+
+
+def test_a_run_labels_its_tracks_from_the_detector(run_over_reference):
+    _, stats = run_over_reference
+    assert stats.labels, "no track was labelled"
+    assert set(stats.labels) == set(stats.track_ids)
+    # The motion detector cannot classify, and says so rather than guessing.
+    assert set(stats.labels.values()) == {"unclassified"}

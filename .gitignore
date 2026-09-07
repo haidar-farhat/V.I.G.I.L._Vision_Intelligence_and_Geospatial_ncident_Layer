@@ -45,7 +45,11 @@ Thumbs.db
 apps/desktop/dist/
 
 # Rust build output
-core/target/
+# Any Rust build directory, at any depth. The unanchored form matters: a
+# pattern with a slash in it is anchored to this file's directory, so
+# `core/target/` matched the v1 core and silently did not match `v2/core/target`
+# — which is how 22 MB of compiled output reached a commit.
+**/target/
 
 # Python
 __pycache__/
@@ -64,3 +68,14 @@ media/*
 !media/README.md
 evidence/*
 !evidence/README.md
+dist/screenshots/
+
+# The double-clickable application, built by `python v2/tasks.py app` into the
+# repository root so it is the first thing in the folder. `_internal` is the
+# 340 MiB PyInstaller tree that has to sit beside the executable; both are
+# build output and neither belongs in history — 22 MiB of `core/target` once
+# reached a commit through an anchored pattern that missed a subdirectory.
+/VIGIL.exe
+/_internal/
+/vigil_core.dll
+/build.json

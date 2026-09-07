@@ -1,0 +1,691 @@
+"""The panels: cameras, incidents, tracks, the audit trail, and a label that elides.
+
+Each is a plain view: it is given data and shows it. None of them reaches the
+service; the window does that through `Commands`.
+"""
+
+from __future__ import annotations
+
+import time
+from typing import Sequence
+
+from PySide6.QtCore import QPoint, QRect, Qt, Signal
+from PySide6.QtWidgets import (
+    QAbstractItemView, QFrame, QHBoxLayout, QHeaderView, QLabel, QLayout, QSizePolicy,
+    QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
+)
+
+from . import theme
+
+CAMERA_COLUMN, SOURCE_COLUMN, PLACED_COLUMN, STATUS_COLUMN, RECORD_COLUMN = range(5)
+
+
+class ElidingLabel(QLabel):
+    """A permanent status label that shortens itself rather than push the message off.
+
+    `text()` still returns the whole text — code and tests read it — and the
+    whole text is in the tooltip. v1's status bar clipped its own message to
+    `0 tracked no` because five permanent labels took a 2,000-px window.
+    """
+
+    def __init__(self, text: str = "", parent: QWidget | None = None, *, fit: bool = False):
+        super().__init__("", parent)
+        self._full = ""
+        self._cap: int | None = None
+        #: Elide to **this label's own width**, whatever the layout gives it,
+        #: rather than to a number somebody guessed.
+        #:
+        #: A guessed cap is wrong in one direction or the other and the wrong
+        #: direction is invisible: a cap wider than the label leaves Qt to
+        #: clip the text itself, and Qt clips a right-aligned label from the
+        #: **left**, so the wall's heading read "hing 80 classes with masks"
+        #: — the end of a sentence whose beginning had been cut off. An
+        #: ellipsis is a missing end; a missing beginning just looks wrong.
+        self._fit = fit
+        self.setObjectName("Caption")
+        self.setText(text)
+
+    def setText(self, text: str) -> None:  # noqa: N802 - Qt's name
+        self._full = text or ""
+        self._repaint()
+
+    def text(self) -> str:
+        return self._full
+
+    def set_cap(self, pixels: int | None) -> None:
+        self._cap = None if pixels is None else max(24, int(pixels))
+        self._repaint()
+
+    @property
+    def elided(self) -> bool:
+        return super().text() != self._full
+
+    def _width(self) -> int | None:
+        if self._fit:
+            # `contentsRect`, not `width`. A stylesheet padding — this label
+            # carries `padding: 6px 8px` — is inside the widget and outside
+            # the text, so eliding to the full width leaves the string
+            # sixteen pixels too long and Qt trims a right-aligned label from
+            # the **left**: the wall's heading read "olov8n-seg — watching 80
+            # classes with …", correctly ellipsised at the end and missing
+            # its first letter.
+            available = self.contentsRect().width() - 2
+            return max(24, available) if available > 24 else None
+        return self._cap
+
+    def _repaint(self) -> None:
+        shown = self._full
+        limit = self._width()
+        if limit is not None and self._full:
+            shown = self.fontMetrics().elidedText(self._full, Qt.TextElideMode.ElideRight, limit)
+        super().setText(shown)
+        if shown != self._full:
+            self.setToolTip(self._full)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt's name
+        super().resizeEvent(event)
+        if self._fit:
+            self._repaint()
+
+
+class CameraList(QWidget):
+    """Every camera, what it is doing, and whether it records.
+
+    The Record box is editable only while the site is unlocked *and* the
+    person may configure; the flag is the operator's, not a live state, so it
+    stays readable when the box is greyed.
+    """
+
+    selected = Signal(object)
+    record_toggled = Signal(str, bool)
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._quiet = False
+        self._editable = False
+        self._selected: str | None = None
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.tree = QTreeWidget()
+        self.tree.setColumnCount(5)
+        self.tree.setHeaderLabels(["Camera", "Source", "Placed", "Status", "Rec"])
+        self.tree.setRootIsDecorated(False)
+        self.tree.setAlternatingRowColors(True)
+        self.tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.tree.setTextElideMode(Qt.TextElideMode.ElideRight)
+        header = self.tree.header()
+        header.setStretchLastSection(False)
+        header.setMinimumSectionSize(44)
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        # Source and Status share what is left; Source is the one an operator
+        # can afford to lose the end of. v1 showed "Stat" and hid the Record
+        # box behind a scrollbar at the default split.
+        header.setSectionResizeMode(SOURCE_COLUMN, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(STATUS_COLUMN, QHeaderView.ResizeMode.Stretch)
+        self.tree.setColumnWidth(CAMERA_COLUMN, 88)
+        # "yes" or a dash needs no more room than its own heading; the eight
+        # pixels go to Status, which is a sentence and was reading "LIVE | 10 f…".
+        self.tree.setColumnWidth(PLACED_COLUMN, 54)
+        self.tree.setColumnWidth(RECORD_COLUMN, 44)
+        self.tree.setMinimumWidth(340)
+        self.tree.itemSelectionChanged.connect(self._selection_changed)
+        self.tree.itemChanged.connect(self._item_changed)
+        layout.addWidget(self.tree)
+
+    def set_recording_editable(self, editable: bool) -> None:
+        self._editable = editable
+        self._quiet = True
+        try:
+            for index in range(self.tree.topLevelItemCount()):
+                self._apply_flags(self.tree.topLevelItem(index))
+        finally:
+            self._quiet = False
+
+    def _apply_flags(self, item: QTreeWidgetItem) -> None:
+        flags = item.flags()
+        if self._editable:
+            item.setFlags(flags | Qt.ItemFlag.ItemIsUserCheckable)
+        else:
+            item.setFlags(flags & ~Qt.ItemFlag.ItemIsUserCheckable)
+
+    def show_cameras(self, cameras: Sequence, health: dict) -> None:
+        self._quiet = True
+        try:
+            self.tree.clear()
+            for camera in cameras:
+                state = health.get(camera.id)
+                item = QTreeWidgetItem([
+                    camera.id, camera.source, "yes" if camera.placed else "—",
+                    state.describe() if state is not None else "STOPPED", "",
+                ])
+                item.setData(0, Qt.ItemDataRole.UserRole, camera.id)
+                item.setToolTip(SOURCE_COLUMN, camera.source)
+                item.setCheckState(RECORD_COLUMN, Qt.CheckState.Checked if camera.record else Qt.CheckState.Unchecked)
+                if state is not None:
+                    item.setForeground(STATUS_COLUMN, _state_colour(state.state))
+                    # The column stretches but can still be narrower than the
+                    # sentence; an elided status must stay readable on hover.
+                    item.setToolTip(STATUS_COLUMN, state.describe())
+                if not camera.placed:
+                    item.setToolTip(PLACED_COLUMN, "Unplaced: this camera cannot locate anything on the ground.")
+                self._apply_flags(item)
+                self.tree.addTopLevelItem(item)
+                if camera.id == self._selected:
+                    item.setSelected(True)
+        finally:
+            self._quiet = False
+
+    def selected_camera(self) -> str | None:
+        items = self.tree.selectedItems()
+        return items[0].data(0, Qt.ItemDataRole.UserRole) if items else None
+
+    def _selection_changed(self) -> None:
+        if self._quiet:
+            return
+        self._selected = self.selected_camera()
+        self.selected.emit(self._selected)
+
+    def _item_changed(self, item: QTreeWidgetItem, column: int) -> None:
+        if self._quiet or column != RECORD_COLUMN or not self._editable:
+            return
+        self.record_toggled.emit(item.data(0, Qt.ItemDataRole.UserRole),
+                                 item.checkState(RECORD_COLUMN) == Qt.CheckState.Checked)
+
+
+def _review_text(review) -> str:
+    if str(review.state) == "NEW":
+        return "new"
+    who = (review.by or "").split(":")[-1]
+    return f"{str(review.state).lower()} · {who}"
+
+
+def _review_colour(state: str):
+    return {"NEW": theme.STALE, "ACKNOWLEDGED": theme.LIVE, "DISMISSED": theme.TEXT_FAINT}.get(state, theme.TEXT_MUTED)
+
+
+def _state_colour(state: str):
+    return {"LIVE": theme.LIVE, "STARTING": theme.STALE, "DARK": theme.STALE, "FAULTED": theme.FAULT}.get(state, theme.TEXT_MUTED)
+
+
+class IncidentList(QWidget):
+    """The conclusions, worst first, with the filters to find one among many."""
+
+    selected = Signal(object)
+    #: The filter changed: (camera or "", severity or "", text). The window
+    #: turns it into a query; this widget knows nothing about the store.
+    filtered = Signal(str, str, str)
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._incidents: list = []
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self._build_filters())
+        self.tree = QTreeWidget()
+        self.tree.setColumnCount(6)
+        self.tree.setHeaderLabels(["Opened", "Severity", "Risk", "Summary", "Cameras", "State"])
+        self.tree.setRootIsDecorated(False)
+        self.tree.setAlternatingRowColors(True)
+        self.tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        header = self.tree.header()
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        for column, width in ((0, 78), (1, 74), (2, 52), (4, 110), (5, 108)):
+            self.tree.setColumnWidth(column, width)
+        self.tree.itemSelectionChanged.connect(self._selection_changed)
+        layout.addWidget(self.tree)
+
+    def _build_filters(self) -> QWidget:
+        from PySide6.QtWidgets import QComboBox, QHBoxLayout, QLineEdit
+
+        bar = QWidget()
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(4, 2, 4, 2)
+        row.setSpacing(6)
+        self.camera_filter = QComboBox()
+        self.camera_filter.addItem("every camera", "")
+        self.camera_filter.currentIndexChanged.connect(self._filters_changed)
+        self.severity_filter = QComboBox()
+        self.severity_filter.addItem("any severity", "")
+        for severity in ("LOW", "MEDIUM", "HIGH", "CRITICAL"):
+            self.severity_filter.addItem(f"{severity.lower()} and worse", severity)
+        self.severity_filter.currentIndexChanged.connect(self._filters_changed)
+        self.text_filter = QLineEdit()
+        self.text_filter.setPlaceholderText("text in the summary or a note")
+        self.text_filter.setClearButtonEnabled(True)
+        self.text_filter.textChanged.connect(self._filters_changed)
+        row.addWidget(self.camera_filter)
+        row.addWidget(self.severity_filter)
+        row.addWidget(self.text_filter, 1)
+        return bar
+
+    def set_cameras(self, camera_ids: Sequence[str]) -> None:
+        """Keep the picker in step with the site without losing the choice."""
+        chosen = self.camera_filter.currentData()
+        self.camera_filter.blockSignals(True)
+        try:
+            self.camera_filter.clear()
+            self.camera_filter.addItem("every camera", "")
+            for camera_id in camera_ids:
+                self.camera_filter.addItem(camera_id, camera_id)
+            index = self.camera_filter.findData(chosen)
+            self.camera_filter.setCurrentIndex(max(0, index))
+        finally:
+            self.camera_filter.blockSignals(False)
+
+    def filters(self) -> tuple[str, str, str]:
+        return (self.camera_filter.currentData() or "", self.severity_filter.currentData() or "",
+                self.text_filter.text().strip())
+
+    def _filters_changed(self, *_args) -> None:
+        self.filtered.emit(*self.filters())
+
+    def show_incidents(self, incidents: Sequence) -> None:
+        chosen = self.selected_incident()
+        self._incidents = list(incidents)
+        self.tree.clear()
+        for incident in self._incidents:
+            item = QTreeWidgetItem([
+                time.strftime("%H:%M:%S", time.gmtime(incident.opened_at_millis / 1000)),
+                str(incident.severity), f"{incident.risk.score:.2f}", incident.summary,
+                ", ".join(incident.cameras), _review_text(incident.review),
+            ])
+            item.setData(0, Qt.ItemDataRole.UserRole, incident.id)
+            item.setForeground(1, theme.severity_colour(str(incident.severity)))
+            item.setForeground(5, _review_colour(str(incident.review.state)))
+            item.setToolTip(5, incident.review.describe())
+            item.setToolTip(3, "\n".join(f"{e.occurred_at:%H:%M:%S} [{e.severity}] {e.summary}" for e in incident.events))
+            self.tree.addTopLevelItem(item)
+            if chosen is not None and incident.id == chosen.id:
+                item.setSelected(True)
+
+    def selected_incident(self):
+        items = self.tree.selectedItems()
+        if not items:
+            return None
+        chosen = items[0].data(0, Qt.ItemDataRole.UserRole)
+        return next((i for i in self._incidents if i.id == chosen), None)
+
+    def _selection_changed(self) -> None:
+        self.selected.emit(self.selected_incident())
+
+
+class TrackTable(QWidget):
+    """What is being tracked right now, and where it is on the ground."""
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.tree = QTreeWidget()
+        self.tree.setColumnCount(7)
+        self.tree.setHeaderLabels(["Camera", "Track", "Class", "Conf.", "Speed", "From camera", "Doing"])
+        self.tree.setRootIsDecorated(False)
+        self.tree.setAlternatingRowColors(True)
+        self.tree.setTextElideMode(Qt.TextElideMode.ElideRight)
+        header = self.tree.header()
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
+        for column, width in ((0, 96), (1, 52), (2, 92), (3, 52), (4, 68), (5, 110)):
+            self.tree.setColumnWidth(column, width)
+        layout.addWidget(self.tree)
+
+    def show_tracks(self, rows: Sequence[tuple]) -> None:
+        """``rows`` is (camera_id, track, detector_info, pose, relations)."""
+        from ...domain.geo import distance_from_camera
+        from ...domain.relations import describe_group, occupants_of
+
+        self.tree.clear()
+        for camera_id, track, info, pose, relations in rows:
+            label = info.label_for(track.class_id) if info is not None else None
+            away, position = "—", "not placed on the ground"
+            if track.position is not None:
+                if track.position.is_projected:
+                    position = (f"{track.position.point.lat:.6f}, {track.position.point.lon:.6f} "
+                                f"±{track.position.radius_meters:.1f} m")
+                    if pose is not None:
+                        # Always with its error: a bare "11 m" invites somebody
+                        # to act on a precision nobody measured.
+                        away = distance_from_camera(pose, track.position).describe()
+                else:
+                    # Never a number pretending to be a fix: the camera's own
+                    # position with the whole field of view as its error.
+                    position = f"at the camera (not projected, ±{track.position.radius_meters:.0f} m)"
+            name_of = _namer(rows, info)
+            said = [r.describe(name_of) for r in relations if r.subject == track.id]
+            # The other end of the same relation: the car does not know it is
+            # occupied, so the count is assembled from the people who overlap it.
+            inside = occupants_of(relations, track.id)
+            if inside:
+                said.append(f"{describe_group([name_of(i) for i in inside])} apparently inside it")
+            doing = "; ".join(said)
+            item = QTreeWidgetItem([
+                camera_id, str(track.id), label or "unclassified" if info and info.classifies else label or "—",
+                f"{track.confidence:.2f}", "—" if track.speed is None or not track.speed.meaningful
+                else track.speed.describe(),
+                away, doing,
+            ])
+            item.setForeground(1, theme.track_colour(track.id))
+            item.setToolTip(5, position)
+            if relations:
+                # Every relation is inferred; the reasons must be one hover away.
+                item.setToolTip(6, "\n\n".join(
+                    r.describe(_namer(rows, info)) + "\n  " + "\n  ".join(r.conditions) for r in relations))
+                item.setForeground(6, theme.STALE)
+            if track.coasting:
+                item.setToolTip(1, "Coasting: the detector cannot see it and the tracker is extrapolating.")
+                item.setForeground(0, theme.TEXT_FAINT)
+            self.tree.addTopLevelItem(item)
+
+
+def _namer(rows: Sequence[tuple], info):
+    """How a track reads in a relation's sentence: its label, or its id."""
+    labels = {}
+    for row in rows:
+        track, row_info = row[1], row[2]
+        name = row_info.label_for(track.class_id) if row_info is not None else None
+        labels[track.id] = name or f"track {track.id}"
+
+    def name_of(track_id: int) -> str:
+        return labels.get(track_id, f"track {track_id}")
+
+    return name_of
+
+
+class AuditView(QWidget):
+    """The chain of custody, readable. Without this it is written for nobody."""
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.tree = QTreeWidget()
+        self.tree.setColumnCount(5)
+        self.tree.setHeaderLabels(["When (UTC)", "Who", "Action", "Subject", "Detail"])
+        self.tree.setRootIsDecorated(False)
+        self.tree.setAlternatingRowColors(True)
+        header = self.tree.header()
+        header.setStretchLastSection(True)
+        for column, width in ((0, 148), (1, 130), (2, 168), (3, 130)):
+            self.tree.setColumnWidth(column, width)
+        layout.addWidget(self.tree)
+
+    def show_rows(self, rows: Sequence) -> None:
+        self.tree.clear()
+        for row in rows:
+            stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(row["at"] / 1000))
+            item = QTreeWidgetItem([stamp, row["principal"], row["action"], row["subject"] or "", row["detail"] or ""])
+            if row["before"] or row["after"]:
+                item.setToolTip(4, f"before {row['before']}\nafter  {row['after']}")
+                item.setForeground(2, theme.ACCENT)
+            self.tree.addTopLevelItem(item)
+
+
+class FlowLayout(QLayout):
+    """Lays widgets left to right and wraps to a new line when they run out.
+
+    Qt's answer to a row of buttons that does not fit is to shrink them and
+    elide the labels — the shipped window read "dd camera.", "elete zone",
+    "ort evidenc" on a 1280-wide screen, and nothing failed or was logged.
+    Every widget here is given at least the width it asked for, so a label
+    is never cut; the toolbar grows a line instead, which the operator can
+    see. Qt ships this as an example, not as a class.
+    """
+
+    def __init__(self, parent=None, spacing: int = 6):
+        super().__init__(parent)
+        self._items: list = []
+        self.setSpacing(spacing)
+
+    def addItem(self, item) -> None:  # noqa: N802 - Qt's name
+        self._items.append(item)
+
+    def count(self) -> int:
+        return len(self._items)
+
+    def itemAt(self, index: int):  # noqa: N802 - Qt's name
+        return self._items[index] if 0 <= index < len(self._items) else None
+
+    def takeAt(self, index: int):  # noqa: N802 - Qt's name
+        return self._items.pop(index) if 0 <= index < len(self._items) else None
+
+    def expandingDirections(self):  # noqa: N802 - Qt's name
+        return Qt.Orientations(0)
+
+    def hasHeightForWidth(self) -> bool:  # noqa: N802 - Qt's name
+        return True
+
+    def heightForWidth(self, width: int) -> int:  # noqa: N802 - Qt's name
+        return self._lay(QRect(0, 0, width, 0), place=False)
+
+    def setGeometry(self, rect) -> None:  # noqa: N802 - Qt's name
+        super().setGeometry(rect)
+        self._lay(rect, place=True)
+
+    def sizeHint(self):  # noqa: N802 - Qt's name
+        return self.minimumSize()
+
+    def minimumSize(self):  # noqa: N802 - Qt's name
+        from PySide6.QtCore import QSize
+
+        size = QSize(0, 0)
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        margins = self.contentsMargins()
+        return size + QSize(margins.left() + margins.right(), margins.top() + margins.bottom())
+
+    def rows(self) -> int:
+        """How many lines the toolbar currently takes. One is the happy case."""
+        return self._rows
+
+    _rows = 1
+
+    def _lay(self, rect, *, place: bool) -> int:
+        margins = self.contentsMargins()
+        left, top = rect.x() + margins.left(), rect.y() + margins.top()
+        right = rect.right() - margins.right()
+        x, y, line_height, rows = left, top, 0, 1
+        for item in self._items:
+            wanted = item.sizeHint()
+            if x > left and x + wanted.width() > right:
+                x, y = left, y + line_height + self.spacing()
+                line_height, rows = 0, rows + 1
+            if place:
+                item.setGeometry(QRect(QPoint(x, y), wanted))
+            x += wanted.width() + self.spacing()
+            line_height = max(line_height, wanted.height())
+        if place:
+            # Only a real placement counts: Qt probes `heightForWidth` with
+            # widths it is merely considering, and recording those made the
+            # toolbar report three lines while showing one.
+            self._rows = rows
+        return y + line_height - rect.y() + margins.bottom()
+
+
+class IncidentDetail(QWidget):
+    """Why the system said what it said, for the incident that is selected.
+
+    Every claim with the evidence under it: the risk factors and their
+    weights, each event with the conditions the rule actually checked, and
+    each association with the reasons it rests on. An operator who cannot
+    see this has to take the conclusion on faith, and a conclusion taken on
+    faith is one nobody can defend afterwards.
+    """
+
+    def __init__(self, parent: QWidget | None = None):
+        from PySide6.QtWidgets import QTextBrowser
+
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.text = QTextBrowser()
+        self.text.setOpenExternalLinks(False)
+        layout.addWidget(self.text)
+        self.show_incident(None)
+
+    def show_incident(self, incident, poses: dict | None = None) -> None:
+        poses = poses or {}
+        if incident is None:
+            self.text.setHtml(f"<p style='color:{theme.TEXT_FAINT.name()}'>Select an incident to see why it was raised.</p>")
+            return
+        colour = theme.severity_colour(str(incident.severity)).name()
+        rows = [f"<h3 style='margin:0'>{_escape(incident.summary)}</h3>",
+                f"<p style='margin:2px 0'><b style='color:{colour}'>{incident.severity}</b>"
+                f" &nbsp; risk {incident.risk.score:.2f} &nbsp; "
+                f"<span style='color:{theme.TEXT_MUTED.name()}'>{incident.id}</span></p>",
+                f"<p style='color:{theme.TEXT_MUTED.name()};margin:2px 0'>"
+                f"{time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(incident.opened_at_millis / 1000))} UTC, "
+                f"lasting {incident.duration_millis / 1000:.0f} s &nbsp;·&nbsp; "
+                f"{incident.distinct_objects} distinct object(s) &nbsp;·&nbsp; "
+                f"cameras {_escape(', '.join(incident.cameras))}</p>"]
+
+        rows.append(f"<p style='margin:2px 0;color:{theme.TEXT_MUTED.name()}'>Review: "
+                    f"{_escape(incident.review.describe())}</p>")
+        rows.append("<h4>Risk</h4><ul>")
+        for factor in incident.risk.factors:
+            rows.append(f"<li>{_escape(factor.name)} <b>+{factor.weight:.2f}</b> — {_escape(factor.reason)}</li>")
+        rows.append("</ul>")
+
+        rows.append(f"<h4>Events ({len(incident.events)})</h4>")
+        for event in incident.events:
+            severity = theme.severity_colour(str(event.severity)).name()
+            place = "not projected"
+            if event.evidence.latitude is not None:
+                place = (f"{event.evidence.latitude:.6f}, {event.evidence.longitude:.6f} "
+                         f"±{event.evidence.position_uncertainty_meters:.1f} m")
+            # How far from the camera, in the panel that answers "why" —
+            # the exported report has said it for months, and the person
+            # reading the screen is the one who has to act on it.
+            away = event.evidence.distance_from(poses.get(event.evidence.camera_id))
+            if away is not None:
+                place += f", {away.describe()} from {event.evidence.camera_id}"
+            detector = event.evidence.detector
+            what = detector.name if detector.classifies else f"{detector.name} (does not classify)"
+            rows.append(
+                f"<p style='margin:6px 0 0 0'><b style='color:{severity}'>{event.severity}</b> "
+                f"{event.occurred_at:%H:%M:%S} — {_escape(event.summary)}</p>"
+                f"<p style='margin:0;color:{theme.TEXT_MUTED.name()}'>rule <code>{_escape(event.rule_id)}</code>, "
+                f"confidence {event.confidence:.2f}, {event.evidence.observations} observation(s), "
+                f"camera {_escape(event.evidence.camera_id)} track {event.evidence.track_id}, {place}<br>"
+                f"drawn by {_escape(what)}</p><ul style='margin:2px 0'>")
+            for condition in event.evidence.conditions:
+                rows.append(f"<li>{_escape(condition)}</li>")
+            rows.append("</ul>")
+
+        if incident.associations:
+            rows.append(f"<h4>Why these were treated as the same object ({len(incident.associations)})</h4>")
+            for link in incident.associations:
+                rows.append(f"<p style='margin:4px 0 0 0'>{_escape(str(link.a))} ↔ {_escape(str(link.b))}"
+                            f" &nbsp; score {link.score:.2f}</p><ul style='margin:2px 0'>")
+                for reason in link.reasons:
+                    rows.append(f"<li>{_escape(reason)}</li>")
+                rows.append("</ul>")
+        else:
+            rows.append(f"<p style='color:{theme.TEXT_MUTED.name()}'>No association: nothing was joined to anything else.</p>")
+        self.text.setHtml("".join(rows))
+
+
+def _escape(text) -> str:
+    return (str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
+class ActionBar(QWidget):
+    """The verbs that belong to one panel, under the thing they act on.
+
+    # Why this exists
+
+    Every control used to live in one row across the top of the window:
+    seventeen buttons, camera actions beside zone actions beside run control
+    beside About, all at the same weight. Two costs, and the second is the
+    expensive one:
+
+    * an operator had to read the whole row to find one thing; and
+    * five of those buttons acted on "the selected camera" from the other
+      side of the window, so the common outcome of pressing one was the
+      sentence *"Select a camera to place."* — the interface asking for
+      something it could have known.
+
+    A verb under its noun cannot have that problem: the list is right there,
+    with the row highlighted, and the button beside it.
+
+    It lays out with `FlowLayout` for the same reason the toolbar did — Qt's
+    answer to a row that will not fit is to cut the words in half.
+    """
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setObjectName("ActionBar")
+        self.flow = FlowLayout(spacing=4)
+        self.flow.setContentsMargins(4, 2, 4, 4)
+        self.setLayout(self.flow)
+        self._widgets: list[QWidget] = []
+
+    def add(self, *widgets: QWidget) -> None:
+        for widget in widgets:
+            self.flow.addWidget(widget)
+            self._widgets.append(widget)
+
+    def widgets(self) -> list[QWidget]:
+        return list(self._widgets)
+
+
+class Panel(QFrame):
+    """A titled box: a heading, a body, an optional detail line and actions.
+
+    The detail line is right-aligned in the heading and is where a panel says
+    what it is currently worth — how many cameras are placed, what model is
+    drawing the boxes, what the ground was measured at. Those sentences used
+    to be permanent labels on the status bar, seven of them sharing its width
+    at eleven per cent each, where they were elided to *"yolov8n-seg —
+    watching 80 cl…"* and *"MONITOR — site locked; press…"*. A sentence
+    nobody can read is not on screen.
+    """
+
+    def __init__(self, title: str, body: QWidget, *, detail: bool = False,
+                 actions: "ActionBar | None" = None, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setObjectName("Panel")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(1, 1, 1, 1)
+        layout.setSpacing(0)
+
+        heading = QWidget()
+        row = QHBoxLayout(heading)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+        self.title = QLabel(title)
+        self.title.setObjectName("PanelTitle")
+        row.addWidget(self.title)
+        self.detail = None
+        if detail:
+            self.detail = ElidingLabel("", fit=True)
+            self.detail.setObjectName("PanelDetail")
+            self.detail.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            # Takes what is left and demands nothing. Without this the label's
+            # own width becomes the panel's minimum, and a long detector line
+            # in the wall's heading squeezed the camera list until its Status
+            # column lost eighteen pixels -- a sentence about the panel
+            # deciding how wide the panel is.
+            self.detail.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+            self.detail.setMinimumWidth(0)
+            # All of the remaining width, not half of it. A stretch spacer
+            # beside a stretching label splits the room between them, and the
+            # label then elided a sentence that had space to be read.
+            row.addWidget(self.detail, 1)
+        else:
+            row.addStretch(1)
+        layout.addWidget(heading)
+        layout.addWidget(body, 1)
+        self.actions = actions
+        if actions is not None:
+            layout.addWidget(actions)
+
+    def say(self, text: str) -> None:
+        """Set the detail line. Ignored when the panel has none.
+
+        No cap is passed: the label elides to its own width, which the layout
+        decides and re-decides on every resize. A cap computed here would be a
+        second opinion about how wide the label is, and the two disagreed.
+        """
+        if self.detail is not None:
+            self.detail.setText(text)

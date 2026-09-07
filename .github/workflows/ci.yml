@@ -257,3 +257,10 @@ jobs:
         env:
           QT_QPA_PLATFORM: offscreen
         run: python -m pytest
+
+  # ------------------------------------------------------------------- v2
+  #
+  # The rewrite in v2/ is checked by its own workflow, .github/workflows/v2.yml,
+  # which installs the Rust toolchain its engine core needs and builds an
+  # installer per platform. It used to be two jobs here that installed no
+  # toolchain, so the core's tests silently never ran.

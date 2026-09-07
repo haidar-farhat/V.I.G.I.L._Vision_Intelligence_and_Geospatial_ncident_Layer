@@ -41,25 +41,36 @@ import json
 import sqlite3
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from dataclasses import dataclass, replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterable, Iterator, Sequence
+from typing import TYPE_CHECKING, Iterable, Iterator, Sequence
 
+from .auditing import AuditRecord
 from .core import LatLon
 from .events import Event, Evidence, EventType, Severity, utc_from_millis
 from .incidents import Association, Incident, Risk, RiskFactor
+from .registry import DEFAULT_PLATE_FORMAT, PlateFormat, Register
+from .registry import SCHEMA as _REGISTER_SCHEMA
+from .site import DEFAULT_SITE_ID, FrameKind, Identity, Site
 from .zones import Schedule, Zone, ZoneKind
 
 from . import paths
 from .logs import get as _get_logger
+
+if TYPE_CHECKING:
+    from .pipeline import TrackPlate
 
 _log = _get_logger(__name__)
 
 #: Schema version this build expects. A database at a different version is
 #: migrated forward, never opened as-is: opening a schema you do not understand
 #: and hoping the columns line up is how evidence is silently corrupted.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 12
+
+
+#: The audit column's zero, for rebuilding a millisecond timestamp exactly.
+_AUDIT_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
 class StoreError(RuntimeError):
@@ -92,6 +103,25 @@ class Migration:
     #: Every migration carries a way back. An upgrade that cannot be undone on a
     #: machine with no Internet and no spare hardware is a gamble, not an upgrade.
     down: str
+
+
+def _register_schema_sql() -> str:
+    """The register's tables, taken from the module that owns them.
+
+    Spelled here as a reference rather than as a copy of the DDL. Two spellings
+    of one schema drift — and the half that drifts would be the one holding
+    face templates, which is the half nobody may get wrong. A copied
+    ``CREATE TABLE`` missing the ``CHECK`` that keeps a ``MATCH`` sighting from
+    losing its score would make a migrated database accept a claim about a
+    person that a fresh one refuses, and only the deployments that have been
+    upgraded would hold it.
+
+    Every statement in `registry.SCHEMA` is ``IF NOT EXISTS``, so applying this
+    to a database a `Register` has already touched is a no-op rather than a
+    conflict.
+    """
+    separator = ";\n\n"
+    return separator.join(statement.strip() for statement in _REGISTER_SCHEMA) + ";"
 
 
 MIGRATIONS: tuple[Migration, ...] = (
@@ -290,7 +320,337 @@ MIGRATIONS: tuple[Migration, ...] = (
         DROP TABLE recordings;
         """,
     ),
+    Migration(
+        version=4,
+        name="sites",
+        up="""
+        -- The site: the fixed thing every geographic answer is measured from.
+        --
+        -- Until now nothing recorded it, so each screen anchored its own frame
+        -- on whatever it happened to have: the plan view on the first placed
+        -- camera, coverage on the first vertex of the boundary it was handed.
+        -- Removing that camera therefore re-anchored the whole view and every
+        -- zone, footprint and track jumped — nothing had moved, the ruler had.
+        -- An origin in a row cannot be deleted by removing a camera.
+        --
+        -- One row per site, and one site per node today. The table exists
+        -- anyway, because "there is exactly one" is the kind of assumption that
+        -- otherwise ends up compiled into forty queries.
+        CREATE TABLE sites (
+            id             TEXT PRIMARY KEY,
+            name           TEXT NOT NULL,
+            -- The anchor of the local metric frame. Not the centroid of
+            -- anything: it must not move when what it was computed from does.
+            origin_lat     REAL NOT NULL,
+            origin_lon     REAL NOT NULL,
+            -- GEOGRAPHIC: the origin is a real coordinate, so latitudes shown
+            -- against it mean what they say. LOCAL: a floor plan or sketch
+            -- whose origin is fixed but arbitrary, where distances are real and
+            -- coordinates are not. Stored rather than guessed, because a screen
+            -- that guesses eventually prints an invented coordinate beside a
+            -- surveyed one with nothing to tell them apart. Constrained here so
+            -- a third spelling cannot reach the database and be interpreted as
+            -- neither.
+            frame          TEXT NOT NULL DEFAULT 'GEOGRAPHIC'
+                           CHECK (frame IN ('GEOGRAPHIC', 'LOCAL')),
+            -- An IANA name, never an offset. An offset is right for half the
+            -- year: a site saved as UTC+3 in August is UTC+2 in January, and an
+            -- after-hours window that shifts by an hour on the night the clocks
+            -- change disarms the site at the hour nobody is watching it.
+            timezone       TEXT NOT NULL DEFAULT 'UTC',
+            -- The outline, as JSON [[lat, lon], ...] — the same shape zones
+            -- store their ring in, so one reader serves both. NULL, not '[]',
+            -- when nobody has drawn one: "not drawn yet" and "encloses nothing"
+            -- are different answers, and only the second is worth alarming on.
+            boundary_ring  TEXT,
+            created_at     INTEGER NOT NULL,
+            updated_at     INTEGER NOT NULL
+        );
+        """,
+        down="""
+        DROP TABLE sites;
+        """,
+    ),
+    Migration(
+        version=5,
+        name="register",
+        # The register: the people and vehicles somebody deliberately named, and
+        # the machinery for taking a name away again.
+        #
+        # In the ladder as well as in `registry.create_schema` because the two
+        # must produce the same database. A `Register` handed a bare connection
+        # creates its own tables, which is right for a migration tool and wrong
+        # as the only path: a deployment where the register exists because
+        # something happened to open it has a schema whose presence depends on
+        # what ran, and a fresh install would then differ from an upgraded one.
+        # The statements are read from `registry.SCHEMA` rather than copied, for
+        # the reason `_register_schema_sql` gives.
+        up=_register_schema_sql(),
+        down="""
+        -- Children first: a subject whose identifiers outlive it is an
+        -- enrolment nobody can find to delete, which is the one failure this
+        -- half of the schema exists to make impossible.
+        DROP INDEX IF EXISTS register_sightings_by_subject_time;
+        DROP TABLE IF EXISTS register_sightings;
+        DROP INDEX IF EXISTS register_identifiers_by_age;
+        DROP INDEX IF EXISTS register_identifiers_by_subject;
+        DROP INDEX IF EXISTS register_template_unique;
+        DROP INDEX IF EXISTS register_plate_unique;
+        DROP TABLE IF EXISTS register_identifiers;
+        DROP TABLE IF EXISTS register_subjects;
+        """,
+    ),
+    Migration(
+        version=6,
+        name="audit_records",
+        up="""
+        -- The structured half of an audit row. Until now an edit reached this
+        -- table as one prose string — "kind RESTRICTED -> EXCLUSION" — which is
+        -- readable and nothing else: it cannot be filtered, replayed or
+        -- checked, and it keeps only the fields somebody wrote a branch for.
+        --
+        -- Every column is nullable, and that is load-bearing rather than
+        -- lenient. Every row already written has none of them, and an audit log
+        -- is append-only: there is no pass that can go back and fill these in,
+        -- so a NOT NULL here would either fail the migration or force this code
+        -- to invent a before-state for an edit made last year.
+        ALTER TABLE audit_logs ADD COLUMN before_json TEXT;
+        ALTER TABLE audit_logs ADD COLUMN after_json TEXT;
+        -- Which node wrote the row. Two nodes' logs merged without it are one
+        -- log in which nobody can say where an entry came from.
+        ALTER TABLE audit_logs ADD COLUMN node_id TEXT;
+        -- SHA-256 over this record and the hash before it. It detects
+        -- alteration; it does not prevent it, and it is not a signature —
+        -- anybody able to rewrite a row can recompute every hash after it. What
+        -- it buys is that an alteration has to be complete to go unnoticed.
+        ALTER TABLE audit_logs ADD COLUMN chain_hash TEXT;
+        """,
+        down="""
+        ALTER TABLE audit_logs DROP COLUMN chain_hash;
+        ALTER TABLE audit_logs DROP COLUMN node_id;
+        ALTER TABLE audit_logs DROP COLUMN after_json;
+        ALTER TABLE audit_logs DROP COLUMN before_json;
+        """,
+    ),
+    Migration(
+        version=7,
+        name="zone_classes",
+        up="""
+        -- Which detector labels a zone acts on: a JSON list of the model's own
+        -- label strings, e.g. '["person"]'. Until now a RESTRICTED zone fired
+        -- on any class the detector named — on a real camera, "1 couch in Room
+        -- (HIGH, risk 55)" — and an operator who has seen a sofa raise a HIGH
+        -- incident stops believing incidents.
+        --
+        -- '[]' means any, and it is the default rather than NULL because it is
+        -- what every zone written before this column meant: an outline drawn
+        -- last year keeps firing for whatever crosses it. A zone that went
+        -- quiet on upgrade would read on screen as protection.
+        --
+        -- The down drops the filters with the column. A build that predates
+        -- the column cannot honour them, and stashing the JSON somewhere it
+        -- cannot read would be a promise nobody keeps; the zones themselves
+        -- survive, as `test_store.py` checks on a populated database.
+        ALTER TABLE zones ADD COLUMN classes TEXT NOT NULL DEFAULT '[]';
+        """,
+        down="""
+        ALTER TABLE zones DROP COLUMN classes;
+        """,
+    ),
+    Migration(
+        version=8,
+        name="plate_reads",
+        up="""
+        -- What each vehicle track's plate was read as. Until now a reading
+        -- reached the screen and nothing else: `FrameResult.plates` was drawn
+        -- beside the box and dropped with the frame, so the first question an
+        -- operator asks of a plate reader — "which plates did you see last
+        -- night" — had no answer at all, however well the reader worked.
+        --
+        -- One row per (camera, track), and that key is the whole design. A
+        -- reading is published on every frame of the track and refined as
+        -- reads accumulate; a row per frame would store one guess forty times
+        -- and let the forty count as forty vehicles. The row holds the latest
+        -- conclusion and the window of frames it was seen over.
+        --
+        -- `text` is NULL until every character resolved, exactly as the
+        -- pipeline publishes it, and `is_confident` is the only column a rule,
+        -- a register or an export may act on: `display` carries `?` where a
+        -- character is unread and exists for a person to look at. The CHECK
+        -- keeps a confident row from arriving without its text, which is the
+        -- one shape nothing downstream could interpret.
+        --
+        -- `seen_at_millis` is the pipeline's clock — the one events carry in
+        -- `occurred_at_millis` — so a reading lines up with the events of the
+        -- track it was read on. It is not the wall clock for a file source.
+        CREATE TABLE plate_reads (
+            camera_id       TEXT NOT NULL,
+            track_id        INTEGER NOT NULL,
+            first_frame     INTEGER NOT NULL,
+            last_frame      INTEGER NOT NULL,
+            country         TEXT NOT NULL,
+            display         TEXT NOT NULL,
+            text            TEXT,
+            is_confident    INTEGER NOT NULL CHECK (is_confident IN (0, 1)),
+            agreement       INTEGER NOT NULL,
+            reads           INTEGER NOT NULL,
+            seen_at_millis  INTEGER NOT NULL,
+            CHECK (is_confident = 0 OR text IS NOT NULL),
+            PRIMARY KEY (camera_id, track_id)
+        );
+        CREATE INDEX plate_reads_by_time ON plate_reads (seen_at_millis);
+        """,
+        down="""
+        DROP INDEX IF EXISTS plate_reads_by_time;
+        DROP TABLE IF EXISTS plate_reads;
+        """,
+    ),
+    Migration(
+        version=9,
+        name="site_identity",
+        up="""
+        -- The per-site identity switch: whether this site reads plates, looks
+        -- at faces, and has agreed to keep face crops. On the site row rather
+        -- than in memory or in a file, because a switch that is off again
+        -- after every restart is a register that silently matches nobody on
+        -- Monday, and a switch in a file is a change nobody audited.
+        --
+        -- Three columns rather than one, because they are three different
+        -- claims on the people a camera sees and each is its own decision. A
+        -- site that reads plates has agreed to nothing about faces.
+        --
+        -- NOT NULL DEFAULT 0 is the load-bearing part. Every site row written
+        -- before this migration is a site nobody asked, and the only honest
+        -- reading of "nobody asked" is off. NULL would have to be interpreted
+        -- by every reader, and one of them would interpret it as on.
+        --
+        -- identity_face_crops is stored and audited and read by nothing in
+        -- this build. It exists so the decision to keep photographs is
+        -- recorded as a decision the moment somebody takes it; nothing keeps a
+        -- crop until the code that would retain and audit one exists.
+        ALTER TABLE sites ADD COLUMN identity_plates INTEGER NOT NULL DEFAULT 0
+            CHECK (identity_plates IN (0, 1));
+        ALTER TABLE sites ADD COLUMN identity_faces INTEGER NOT NULL DEFAULT 0
+            CHECK (identity_faces IN (0, 1));
+        ALTER TABLE sites ADD COLUMN identity_face_crops INTEGER NOT NULL DEFAULT 0
+            CHECK (identity_face_crops IN (0, 1));
+        """,
+        down="""
+        -- A build that predates the switch cannot honour it, so the flags go
+        -- with the columns: a site rolled back is a site with identity off,
+        -- which is the safe direction to fail in. The site itself survives.
+        ALTER TABLE sites DROP COLUMN identity_face_crops;
+        ALTER TABLE sites DROP COLUMN identity_faces;
+        ALTER TABLE sites DROP COLUMN identity_plates;
+        """,
+    ),
+    Migration(
+        version=10,
+        name="site_declared",
+        up="""
+        -- Whether an operator declared this site, or the node wrote the row
+        -- by itself to hold the identity switch before any site editor
+        -- existed. The switch lives on the site row (migration 9), so
+        -- turning plates on for a deployment nobody has declared a site for
+        -- has to write a site row — and that row's origin is whatever the
+        -- node could derive at the time, the first placed camera or (0, 0).
+        -- Without this flag that snapshot became the authoritative origin:
+        -- a camera placed afterwards left the site anchored on nowhere, for
+        -- good, because a stored origin is exactly what the sites table says
+        -- must not move.
+        --
+        -- DEFAULT 1 is the load-bearing part. A row that exists was written
+        -- by something that chose its origin, and the node overriding a
+        -- chosen origin from the cameras would bring back the plan-view jump
+        -- the table exists to end. Only the node's own placeholder says 0,
+        -- and it says so when it is written.
+        ALTER TABLE sites ADD COLUMN declared INTEGER NOT NULL DEFAULT 1
+            CHECK (declared IN (0, 1));
+        """,
+        down="""
+        -- A build without the flag reads every row as declared, which is the
+        -- safe direction: a placeholder read as declared freezes an origin,
+        -- a declared row read as a placeholder moves one. The site survives.
+        ALTER TABLE sites DROP COLUMN declared;
+        """,
+    ),
+    Migration(
+        version=11,
+        name="camera_recording",
+        up="""
+        -- Whether this camera records continuously when it runs. Off by
+        -- default: writing video is the most expensive thing this system can
+        -- do to a disk — roughly 17.5 GB per camera per day at 640x480/15fps
+        -- — so it happens because somebody asked for it, per camera, and the
+        -- asking survives a restart. The console's Record checkbox and
+        -- `Node.set_recording` write it; `Node.start` reads it. Recording
+        -- was engine-and-CLI only until this column existed: the console had
+        -- no way to switch it on, so nothing it exported carried footage.
+        ALTER TABLE cameras ADD COLUMN record INTEGER NOT NULL DEFAULT 0
+            CHECK (record IN (0, 1));
+        """,
+        down="""
+        -- A build without the flag records nothing from the console, which
+        -- is what it did before the flag existed. The camera survives.
+        ALTER TABLE cameras DROP COLUMN record;
+        """,
+    ),
+    Migration(
+        version=12,
+        name="users",
+        up="""
+        -- Local accounts. `password_hash` is the one column in this schema
+        -- allowed to look like a secret: it is a salted scrypt hash of a local
+        -- operator's password, one-way, never a device credential — the
+        -- exception DATABASE.md has named since the first day. Roles are
+        -- stored as their name; code checks permissions, never role names.
+        CREATE TABLE users (
+            name          TEXT PRIMARY KEY,
+            password_hash TEXT NOT NULL,
+            role          TEXT NOT NULL CHECK (role IN ('VIEWER','OPERATOR','ANALYST','ADMIN')),
+            active        INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+            created_at    INTEGER NOT NULL,
+            updated_at    INTEGER NOT NULL
+        );
+        """,
+        down="""
+        -- A build without accounts attributes everything to "console" again.
+        -- The audit rows written under names survive, as they must.
+        DROP TABLE users;
+        """,
+    ),
 )
+
+
+@dataclass(frozen=True, slots=True)
+class PlateRead:
+    """What one vehicle track's plate was last read as, and over which frames.
+
+    The store's own shape rather than the pipeline's `TrackPlate`, because a
+    row outlives the run that wrote it and carries two things the live reading
+    does not: which camera it came from, and the window it was seen over. The
+    live fields keep their names and their meaning — `display` is for a person
+    and carries ``?``; `text` is ``None`` until every character resolved;
+    `is_confident` is the only field anything may act on.
+    """
+
+    camera_id: str
+    track_id: int
+    #: The first and last frame this node saw the reading on. The node takes
+    #: the newest frame per poll and skips the rest, so the first frame here
+    #: is the first one *collected*, not the first one the reader took.
+    first_frame: int
+    last_frame: int
+    country: str
+    display: str
+    text: str | None
+    is_confident: bool
+    #: Reads behind the least-agreed character, and reads that voted in total.
+    agreement: int
+    reads: int
+    #: The pipeline's clock for the last frame — media time for a file, the
+    #: wall clock for a live camera — the same clock the track's events carry.
+    seen_at_millis: int
 
 
 # ------------------------------------------------------------------- the store
@@ -327,38 +687,158 @@ class Store:
     transaction — a subtle way to commit half of somebody else's write.
     """
 
-    __slots__ = ("_connection", "_path")
+    __slots__ = ("_closed", "_connection", "_path", "_plate_format", "_register")
 
-    def __init__(self, path: str | Path = ":memory:", *, auto_migrate: bool = True):
+    def __init__(
+        self,
+        path: str | Path = ":memory:",
+        *,
+        auto_migrate: bool = True,
+        plate_format: PlateFormat = DEFAULT_PLATE_FORMAT,
+    ):
         """
         ``auto_migrate`` is on for application use: an operator starting the
         console should not have to run a command first. It is off for
         maintenance, because a rollback that the next open silently re-applies
         is not a rollback — somebody stepping back a version to diagnose a
         problem would find the step undone underneath them.
+
+        ``plate_format`` is how this site's country writes a registration down,
+        and it is set here because :attr:`register` is the only way to reach the
+        register: a caller that could not name the format would have to build
+        its own `Register`, which is the thing this store exists to stop.
         """
         self._path = str(path)
+        self._plate_format = plate_format
+        self._register: Register | None = None
+        self._closed = False
         if self._path != ":memory:":
             Path(self._path).parent.mkdir(parents=True, exist_ok=True)
 
-        self._connection = sqlite3.connect(self._path, isolation_level=None)
-        self._connection.row_factory = sqlite3.Row
+        try:
+            self._connection = sqlite3.connect(self._path, isolation_level=None)
+            self._connection.row_factory = sqlite3.Row
+            if self._path != ":memory:":
+                self._require_intact()
+        except sqlite3.DatabaseError as error:
+            raise StoreError(
+                f"{self._path} is not a usable database ({error}). Restore the "
+                "most recent backup with `sentinel restore <backup> --replace`; "
+                "the damaged file is kept beside it."
+            ) from None
 
         # WAL lets a reader run while a writer commits, which matters when the
         # interface is querying incidents while a pipeline is inserting events.
         # Not available in memory, where it is also unnecessary.
         if self._path != ":memory:":
-            self._connection.execute("PRAGMA journal_mode = WAL")
+            self._set_wal()
         # Off by default in SQLite, which silently permits orphaned evidence.
         self._connection.execute("PRAGMA foreign_keys = ON")
+        # No `busy_timeout` is set here on purpose. The driver already opens
+        # every connection with one — measured at five seconds on this build —
+        # so a second writer waits for the first rather than failing at once.
+        # What a timeout cannot fix is a unit of work that reads and then
+        # writes: SQLite refuses that one immediately, without consulting the
+        # busy handler at all, because waiting could not make the stale read
+        # current. `transaction(immediate=True)` is the answer to that, and
+        # `audit_record` is the caller that needs it.
 
         self._ensure_schema(auto_migrate)
+
+    def _set_wal(self) -> None:
+        """Put the file in WAL, but never fail to open because of it.
+
+        Changing the journal mode needs a lock no other connection holds, and it
+        is refused rather than queued: a busy timeout does not save it. So a
+        console opening the database while a `sentinel` command is mid-write
+        used to die on this line with "database is locked" — the store never
+        opened, and the reason had nothing to do with what the operator asked
+        for.
+
+        Skipped when the file is already in WAL, which is the usual case after
+        the first open, and downgraded to a warning when it cannot be set. The
+        journal mode is how well concurrent readers and writers get along; it is
+        not what makes a write correct, and refusing to open at all in order to
+        secure it trades a real failure for a hypothetical one.
+        """
+        row = self._connection.execute("PRAGMA journal_mode").fetchone()
+        if row is None or str(row[0]).lower() != "wal":
+            try:
+                self._connection.execute("PRAGMA journal_mode = WAL")
+            except sqlite3.OperationalError as refused:
+                _log.warning(
+                    "%s: could not switch to WAL (%s); staying in %s",
+                    self._path, refused, row[0] if row is not None else "the current mode",
+                )
+                return
+        # NORMAL with WAL: durable across a process crash, at risk only in a
+        # power loss between checkpoints — the trade DATABASE.md describes, and
+        # until this line it described a setting nobody had made (SQLite's
+        # default is FULL). Set every open, because it is per connection.
+        self._connection.execute("PRAGMA synchronous = NORMAL")
+
+    def _require_intact(self) -> None:
+        """Refuse a damaged file at open, with the way out named.
+
+        `quick_check` rather than `integrity_check`: it skips index-content
+        verification and runs in milliseconds on this database's size, which is
+        what an open can afford. A file that fails it is not repaired here —
+        repairing evidence is not a thing to do silently — and the message
+        says which command restores the last backup and that the file is kept.
+        """
+        row = self._connection.execute("PRAGMA quick_check").fetchone()
+        verdict = str(row[0]) if row is not None else "no answer"
+        if verdict.lower() != "ok":
+            raise sqlite3.DatabaseError(f"quick_check: {verdict}")
 
     @property
     def path(self) -> str:
         return self._path
 
+    @property
+    def register(self) -> Register:
+        """Who is enrolled, over this store's own connection.
+
+        A property rather than something a caller constructs, because a
+        `Register` needs a connection and the obvious way to get one is to open
+        a second connection to the same file. That fails three ways at once, all
+        of them quietly: the second connection creates the register's tables
+        outside the migration ladder, so a database's schema comes to depend on
+        which process opened it first; it cannot see anything written inside a
+        transaction this store has open, so an enrolment and the audit row
+        proving it was made can disagree about whether it happened; and two
+        writers on one SQLite file take turns, so an enrolment during a
+        correlation pass waits for a lock or fails on one.
+
+        Built once and kept, since constructing one runs its DDL, and reusing
+        the object is what makes "the register" a single thing on this node.
+
+        Raises after :meth:`close`, naming this store. The register is the
+        object most likely to outlive the store that made it — a panel holding
+        one while the node behind it shuts down — and without this the caller
+        would get a bare ``sqlite3.ProgrammingError`` raised from inside
+        `registry`, three modules from the thing that actually went.
+        """
+        if self._closed:
+            raise StoreError(
+                f"the store at {self._path} is closed; its register closed with it"
+            )
+        if self._register is None:
+            self._register = Register(
+                self._connection, plate_format=self._plate_format
+            )
+        return self._register
+
     def close(self) -> None:
+        """Close the connection, and let go of the register with it.
+
+        The cached `Register` is dropped rather than left pointing at a dead
+        connection, so that touching it afterwards fails from :attr:`register`
+        with this store's path in the message instead of from inside `registry`
+        with a bare "cannot operate on a closed database".
+        """
+        self._closed = True
+        self._register = None
         self._connection.close()
 
     def __enter__(self) -> "Store":
@@ -370,12 +850,29 @@ class Store:
     # ------------------------------------------------------------ transactions
 
     @contextmanager
-    def transaction(self) -> Iterator[sqlite3.Connection]:
+    def transaction(self, *, immediate: bool = False) -> Iterator[sqlite3.Connection]:
         """A unit of work that either lands completely or not at all.
 
         Nesting uses savepoints, because repositories compose — writing an
         incident also writes its events — and an inner failure must be able to
         roll back without abandoning the outer unit of work.
+
+        ``immediate`` takes the write lock at ``BEGIN`` instead of at the first
+        write. Use it for a unit that *reads a value it is about to extend* —
+        :meth:`audit_record` reads the chain head. A deferred ``BEGIN`` takes
+        its read snapshot at the first ``SELECT``, and if another connection
+        commits before this one reaches its ``INSERT``, SQLite refuses the write
+        with "database is locked" **immediately**: the busy handler is not
+        consulted, because no amount of waiting would make the snapshot current
+        again. Measured at 0.00 s against a connection whose busy timeout was
+        five seconds. A read-then-write is the only case that needs the early
+        lock; taking it everywhere would serialise readers behind writers for
+        nothing.
+
+        Only the outermost unit chooses. A nested call runs in a savepoint under
+        whatever lock the outer ``BEGIN`` took, and cannot upgrade it — SQLite
+        has no way to promote a deferred transaction — so a caller that needs
+        the early lock must be the one that opens the transaction.
         """
         in_transaction = self._connection.in_transaction
         if in_transaction:
@@ -390,7 +887,7 @@ class Store:
                 self._connection.execute(f"RELEASE {name}")
             return
 
-        self._connection.execute("BEGIN")
+        self._connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
         try:
             yield self._connection
             self._connection.execute("COMMIT")
@@ -408,6 +905,19 @@ class Store:
             "  applied_at INTEGER NOT NULL"
             ")"
         )
+        # A database written by a newer build carries migrations this build
+        # has never heard of. Opening it anyway — and auto-migrating nothing,
+        # because nothing is pending — would let an older console read rows
+        # whose meaning changed, and write rows the newer schema forbids.
+        # Refused, with both numbers, before a single row is touched.
+        newest_known = MIGRATIONS[-1].version
+        ahead = [v for v in self.applied_versions() if v > newest_known]
+        if ahead:
+            raise StoreError(
+                f"{self._path} was written by a newer build: it carries schema "
+                f"migration {max(ahead)}, and this build knows up to {newest_known}. "
+                "Run the newer build, or restore a backup taken by this one."
+            )
         if auto_migrate:
             self.migrate()
 
@@ -431,11 +941,26 @@ class Store:
         A failure therefore leaves nothing partially applied, and nothing
         recorded as applied — an operator upgrading an air-gapped deployment
         must get a deterministic result or a clean refusal.
+
+        Each transaction is ``IMMEDIATE`` and re-asks, under that lock, whether
+        the migration is still pending. :meth:`pending` was read before any lock
+        was held, so two processes opening the same new database — a console
+        starting while a `sentinel` command runs — both saw the same empty
+        ladder and both tried to apply migration 1. The loser got "table
+        cameras already exists" wrapped as a failed migration, which reads like
+        a corrupt database and is not one. Whoever takes the lock second finds
+        the row already there and moves on.
         """
         done: list[Migration] = []
         for migration in self.pending():
             try:
-                with self.transaction() as connection:
+                with self.transaction(immediate=True) as connection:
+                    applied = connection.execute(
+                        "SELECT 1 FROM schema_migrations WHERE version = ?",
+                        (migration.version,),
+                    ).fetchone()
+                    if applied is not None:
+                        continue
                     for statement in _statements(migration.up):
                         connection.execute(statement)
                     connection.execute(
@@ -481,6 +1006,7 @@ class Store:
         source: str,
         pose=None,
         credentials_ref: str | None = None,
+        record: bool | None = None,
     ) -> None:
         """Record a camera.
 
@@ -488,17 +1014,31 @@ class Store:
         never the raw URL. ``credentials_ref`` is an opaque handle into the
         operating system's keychain; a password must never reach this function,
         and a test asserts that nothing stored here looks like one.
+
+        ``record`` is whether the camera records when it runs. ``None`` keeps
+        whatever is stored — a placement is not a decision about recording,
+        and an upsert that reset the flag on every placement would switch a
+        camera's recording off the moment somebody nudged it on the map. A
+        new camera with ``None`` does not record: the expensive thing is opted
+        into, never acquired by omission.
         """
         now = _now()
         with self.transaction() as connection:
+            if record is None:
+                stored = connection.execute(
+                    "SELECT record FROM cameras WHERE id = ?", (camera_id,)
+                ).fetchone()
+                flag = int(stored["record"]) if stored is not None else 0
+            else:
+                flag = 1 if record else 0
             connection.execute(
                 """
                 INSERT INTO cameras (
                     id, name, source, credentials_ref,
                     latitude, longitude, mount_height, heading, pitch, roll,
-                    horizontal_fov, vertical_fov, range_meters,
+                    horizontal_fov, vertical_fov, range_meters, record,
                     created_at, updated_at
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(id) DO UPDATE SET
                     name = excluded.name,
                     source = excluded.source,
@@ -512,6 +1052,7 @@ class Store:
                     horizontal_fov = excluded.horizontal_fov,
                     vertical_fov = excluded.vertical_fov,
                     range_meters = excluded.range_meters,
+                    record = excluded.record,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -525,14 +1066,33 @@ class Store:
                     pose.horizontal_fov if pose else None,
                     pose.vertical_fov if pose else None,
                     pose.range_meters if pose else None,
+                    flag,
                     now, now,
                 ),
             )
+
+    def camera_recording(self, camera_id: str) -> bool:
+        """Whether a camera is asked to record. ``False`` for one that is not stored."""
+        row = self._connection.execute(
+            "SELECT record FROM cameras WHERE id = ?", (camera_id,)
+        ).fetchone()
+        return bool(row["record"]) if row is not None else False
 
     def cameras(self) -> list[sqlite3.Row]:
         return self._connection.execute(
             "SELECT * FROM cameras ORDER BY id"
         ).fetchall()
+
+    def delete_camera(self, camera_id: str) -> bool:
+        """Forget a camera. Returns whether there was one to forget.
+
+        Its events and incidents stay: they are evidence of what was seen,
+        and a camera being taken down does not unmake what it saw. They carry
+        the camera id as text, not a foreign key, for exactly this reason.
+        """
+        with self.transaction() as connection:
+            cursor = connection.execute("DELETE FROM cameras WHERE id = ?", (camera_id,))
+            return cursor.rowcount > 0
 
     def camera_pose(self, camera_id: str):
         """The stored pose, or ``None`` if the camera was never placed."""
@@ -558,9 +1118,107 @@ class Store:
             range_meters=row["range_meters"],
         )
 
+    # ------------------------------------------------------------------- sites
+
+    def save_site(self, site: Site) -> None:
+        """Record the place being watched: its origin, outline and clock.
+
+        Idempotent on the id, like every other write here, so a console that
+        saves the site on each edit updates one row rather than accumulating a
+        history nobody asked for. ``created_at`` is deliberately absent from the
+        update: it is when this site was first recorded, and re-saving the
+        boundary must not rewrite that any more than a re-sent event may rewrite
+        when it was accepted.
+
+        An empty boundary is stored as NULL rather than ``[]``. "Nobody has
+        drawn the outline yet" and "the outline encloses nothing" lead to
+        different screens — the first says coverage cannot be computed, the
+        second says none of the site is covered — and collapsing them is how a
+        site with no outline gets reported as entirely unwatched.
+
+        The identity switch is written with the rest of the row, as three
+        integers the schema constrains to 0 or 1. Saving a site therefore
+        saves its switch: a caller editing the boundary carries the identity it
+        read back, and an edit that lost it would turn faces off — or on — as
+        a side effect of moving a corner. `Node.set_identity` is the only
+        caller that means to change it, and it audits the change.
+
+        ``declared`` is written as given and updated on conflict like every
+        other field, so the node's own placeholder row — written to hold the
+        switch before anybody declared a site — becomes a declared site the
+        moment a site editor saves over it, and stays a placeholder while only
+        the node keeps re-saving it.
+        """
+        now = _now()
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO sites (
+                    id, name, origin_lat, origin_lon, frame, timezone,
+                    boundary_ring, identity_plates, identity_faces,
+                    identity_face_crops, declared, created_at, updated_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(id) DO UPDATE SET
+                    name = excluded.name,
+                    origin_lat = excluded.origin_lat,
+                    origin_lon = excluded.origin_lon,
+                    frame = excluded.frame,
+                    timezone = excluded.timezone,
+                    boundary_ring = excluded.boundary_ring,
+                    identity_plates = excluded.identity_plates,
+                    identity_faces = excluded.identity_faces,
+                    identity_face_crops = excluded.identity_face_crops,
+                    declared = excluded.declared,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    site.id,
+                    site.name,
+                    site.origin.lat,
+                    site.origin.lon,
+                    site.frame.value,
+                    site.timezone,
+                    (
+                        json.dumps([[p.lat, p.lon] for p in site.boundary])
+                        if site.boundary
+                        else None
+                    ),
+                    1 if site.identity.plates else 0,
+                    1 if site.identity.faces else 0,
+                    1 if site.identity.face_crops else 0,
+                    1 if site.declared else 0,
+                    now, now,
+                ),
+            )
+
+    def site(self, site_id: str = DEFAULT_SITE_ID) -> Site | None:
+        """The stored site, or ``None`` if this deployment has never named one.
+
+        ``None`` rather than a site invented from the cameras, which is the
+        behaviour this table exists to remove: an origin derived from whatever
+        was placed first moves the moment that camera is deleted, and every
+        object on the plan view moves with it. A caller with no site has to
+        decide what to do about it in the open.
+        """
+        row = self._connection.execute(
+            "SELECT * FROM sites WHERE id = ?", (site_id,)
+        ).fetchone()
+        return None if row is None else _site_from_row(row)
+
+    def sites(self) -> list[Site]:
+        """Every site, for the tooling that must not assume there is one."""
+        rows = self._connection.execute("SELECT * FROM sites ORDER BY id").fetchall()
+        return [_site_from_row(row) for row in rows]
+
     # ------------------------------------------------------------------- zones
 
     def save_zone(self, zone: Zone) -> None:
+        """Record a zone, its class filter included.
+
+        The filter is written sorted, so the same set produces the same text
+        whichever order the console collected it in — a row that changed
+        because a set was iterated differently is an edit nobody made.
+        """
         schedule = zone.schedule
         with self.transaction() as connection:
             connection.execute(
@@ -569,8 +1227,8 @@ class Store:
                     id, name, kind, ring,
                     schedule_start, schedule_end, schedule_days,
                     enter_after_millis, exit_after_millis, accept_uncertain,
-                    created_at
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                    classes, created_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(id) DO UPDATE SET
                     name = excluded.name,
                     kind = excluded.kind,
@@ -580,7 +1238,8 @@ class Store:
                     schedule_days = excluded.schedule_days,
                     enter_after_millis = excluded.enter_after_millis,
                     exit_after_millis = excluded.exit_after_millis,
-                    accept_uncertain = excluded.accept_uncertain
+                    accept_uncertain = excluded.accept_uncertain,
+                    classes = excluded.classes
                 """,
                 (
                     zone.id,
@@ -593,6 +1252,7 @@ class Store:
                     zone.enter_after_millis,
                     zone.exit_after_millis,
                     int(zone.accept_uncertain),
+                    json.dumps(sorted(zone.classes)),
                     _now(),
                 ),
             )
@@ -600,6 +1260,16 @@ class Store:
     def zones(self) -> list[Zone]:
         rows = self._connection.execute("SELECT * FROM zones ORDER BY id").fetchall()
         return [_zone_from_row(row) for row in rows]
+
+    def delete_zone(self, zone_id: str) -> bool:
+        """Forget a zone. Returns whether there was one to forget.
+
+        Events raised inside it keep its name in their own text; the zone
+        table is the geography as it is now, not as it was.
+        """
+        with self.transaction() as connection:
+            cursor = connection.execute("DELETE FROM zones WHERE id = ?", (zone_id,))
+            return cursor.rowcount > 0
 
     # ------------------------------------------------------------------ events
 
@@ -1048,6 +1718,118 @@ class Store:
             "SELECT COUNT(*) AS n FROM recordings"
         ).fetchone()["n"]
 
+    # ------------------------------------------------------------------ plates
+
+    def save_plate_read(
+        self,
+        camera_id: str,
+        plate: "TrackPlate",
+        *,
+        frame_index: int,
+        seen_at_millis: int,
+    ) -> None:
+        """Record what a track's plate reads as, once per track, not per frame.
+
+        Keyed on (camera, track) and upserted, so the fortieth frame of a
+        parked van refreshes one row rather than adding a fortieth. The latest
+        reading replaces the stored one wholesale — agreement, resolved text
+        and confidence included — because the accumulator behind it re-tallies
+        every read and a later tally is the better one, whichever direction it
+        moved. Only the window is folded: the first frame is kept and the last
+        advances.
+
+        A frame index that goes *backwards* starts the window again. Track ids
+        and frame indices both restart with the run, so a restarted node reads
+        "track 3" on a camera that had a track 3 yesterday; keeping yesterday's
+        first frame would report a new vehicle as having been in shot since a
+        run that ended. This catches a restart whose new index is still below
+        the old last frame, which is the common case; a short old run followed
+        by a long new one is not detected, and the row then reads as one
+        window. Named here rather than solved: solving it needs a run id the
+        schema does not carry.
+
+        A confident reading with no text is refused before it reaches the
+        table. The pipeline never publishes one, and a row in that shape would
+        be a plate everything may act on that nobody can read.
+        """
+        if plate.is_confident and plate.text is None:
+            raise StoreError(
+                f"camera {camera_id!r} track {plate.track_id}: a confident "
+                "reading with no text is a contradiction, and a contradiction "
+                "is not evidence"
+            )
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO plate_reads (
+                    camera_id, track_id, first_frame, last_frame, country,
+                    display, text, is_confident, agreement, reads, seen_at_millis
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(camera_id, track_id) DO UPDATE SET
+                    first_frame = CASE
+                        WHEN excluded.last_frame < plate_reads.last_frame
+                        THEN excluded.first_frame
+                        ELSE MIN(plate_reads.first_frame, excluded.first_frame)
+                    END,
+                    last_frame = excluded.last_frame,
+                    country = excluded.country,
+                    display = excluded.display,
+                    text = excluded.text,
+                    is_confident = excluded.is_confident,
+                    agreement = excluded.agreement,
+                    reads = excluded.reads,
+                    seen_at_millis = excluded.seen_at_millis
+                """,
+                (
+                    camera_id,
+                    plate.track_id,
+                    frame_index,
+                    frame_index,
+                    plate.country,
+                    plate.display,
+                    plate.text,
+                    int(plate.is_confident),
+                    plate.agreement,
+                    plate.reads,
+                    seen_at_millis,
+                ),
+            )
+
+    def plate_reads(
+        self,
+        *,
+        camera_id: str | None = None,
+        since_millis: int | None = None,
+        limit: int = 200,
+    ) -> list[PlateRead]:
+        """Readings, newest last-seen first, optionally for one camera.
+
+        Newest first because the question this answers is "what has been read
+        lately", and a panel that shows the oldest 200 of a week's readings
+        shows nothing that happened tonight. ``since_millis`` is compared
+        against the same clock the rows carry — the pipeline's — and ordered
+        on it too, so a query across cameras is not interleaved by two clocks.
+        """
+        clauses, params = [], []
+        if camera_id is not None:
+            clauses.append("camera_id = ?")
+            params.append(camera_id)
+        if since_millis is not None:
+            clauses.append("seen_at_millis >= ?")
+            params.append(since_millis)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._connection.execute(
+            f"SELECT * FROM plate_reads {where} "
+            "ORDER BY seen_at_millis DESC, camera_id, track_id LIMIT ?",
+            (*params, limit),
+        ).fetchall()
+        return [_plate_read_from_row(row) for row in rows]
+
+    def plate_read_count(self) -> int:
+        return self._connection.execute(
+            "SELECT COUNT(*) AS n FROM plate_reads"
+        ).fetchone()["n"]
+
     # ------------------------------------------------------------------- audit
 
     def audit(
@@ -1057,6 +1839,12 @@ class Store:
 
         No code path in this module updates or deletes an audit row, and there is
         deliberately no method to. An audit log that can be edited is not one.
+
+        The prose-only path, and it stays. Most actions have no before-state to
+        record — a node starting, analysis stopping — and forcing every caller
+        through :meth:`audit_record` would make them invent one. A row written
+        here carries no structured before/after and no chain hash, which
+        :meth:`audit_chain_head` is explicit about.
         """
         with self.transaction() as connection:
             connection.execute(
@@ -1065,12 +1853,174 @@ class Store:
                 (_now(), actor, action, subject, detail),
             )
 
+    def audit_record(self, record: AuditRecord, *, detail: str | None = None) -> str:
+        """Record a change in both forms: the prose and the states behind it.
+
+        The prose goes in ``detail`` exactly as before, so a person reading the
+        Audit tab sees the line they have always seen; the canonical JSON of
+        both states goes beside it, so the same edit can now be filtered,
+        replayed and checked. Both come from one comparison — `AuditRecord`
+        renders its own changes — which is what stops the two halves drifting
+        into disagreeing about what happened.
+
+        ``detail`` overrides that rendering, for a call whose existing line says
+        more than a generic diff would: a camera's placement reads as
+        ``33.893800,35.501800 h=6.0 hdg=145.0`` and a diff of two poses would
+        replace that with JSON. **An overridden line is outside the hash**, which
+        covers the record's own fields and not this column. That is a real limit
+        and it is named here rather than implied away: the states are protected,
+        the sentence rendered from them is not.
+
+        Returns the chain hash written, so a caller can record the head
+        somewhere this process cannot reach — which is the only thing that turns
+        the chain into evidence of tampering rather than an integrity check.
+
+        ``record.at`` should be timezone-aware. A naive one is read in this
+        machine's local zone, which puts the row hours away from where it
+        belongs on a node whose clock is not UTC.
+
+        The transaction is ``IMMEDIATE`` because this one reads before it
+        writes: the head it chains onto is read inside the unit of work. With a
+        deferred ``BEGIN``, a `sentinel` command running beside the console
+        could commit between this read and this insert, and the insert would
+        then be refused outright — not delayed, refused, with the busy timeout
+        never consulted. The write lost would be an audit row, which is the
+        write this database least wants to lose. Taking the lock at ``BEGIN``
+        turns that into a wait, which is what the timeout is for.
+        """
+        with self.transaction(immediate=True) as connection:
+            # Hash exactly what will be written. The column holds milliseconds;
+            # a record stamped with microseconds hashed one moment and stored
+            # another, so the very first chained row in a fresh database failed
+            # its own verification — the Audit tab's first photograph showed
+            # "the chain breaks at chained record 1 of 1". Truncate first, then
+            # hash, so what is read back re-hashes to what was written.
+            millis = int(record.at.timestamp() * 1000)
+            record = replace(record, at=_AUDIT_EPOCH + timedelta(milliseconds=millis))
+            previous = self.audit_chain_head()
+            chain_hash = record.chain(previous)
+            connection.execute(
+                "INSERT INTO audit_logs "
+                "(at, actor, action, subject, detail, before_json, after_json, "
+                " node_id, chain_hash) VALUES (?,?,?,?,?,?,?,?,?)",
+                (
+                    int(record.at.timestamp() * 1000),
+                    record.actor,
+                    record.action,
+                    record.subject,
+                    record.describe() if detail is None else detail,
+                    record.before_json,
+                    record.after_json,
+                    record.node_id,
+                    chain_hash,
+                ),
+            )
+        return chain_hash
+
+    def audit_chain_head(self) -> str | None:
+        """The most recent chain hash, or ``None`` if nothing carries one.
+
+        By insertion order rather than by ``at``, because that is the order the
+        chain was folded in. Two rows written in the same millisecond — which
+        happens whenever an edit writes more than one — would otherwise be
+        chained one way and verified the other.
+
+        Rows written by :meth:`audit` are skipped, because they have no hash.
+        The chain therefore covers the structured records and reports nothing
+        about the prose-only rows between them: an honest chain over part of the
+        log beats a claim of coverage over all of it.
+        """
+        row = self._connection.execute(
+            "SELECT chain_hash FROM audit_logs WHERE chain_hash IS NOT NULL "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        return None if row is None else row["chain_hash"]
+
+    def audit_totals(self) -> tuple[int, int]:
+        """How many audit rows there are, and how many carry a chain hash.
+
+        Two numbers because they answer different questions and the difference
+        between them is the honest part: the first is how much of what happened
+        was written down, the second is how much of it a later reader can prove
+        was not edited afterwards. Reporting only the first would imply the
+        chain covers the whole log, which :meth:`audit_chain_head` is explicit
+        that it does not.
+
+        Counts rather than rows, so that something showing the log's state on a
+        status line does not have to read the log to do it.
+        """
+        row = self._connection.execute(
+            "SELECT COUNT(*) AS rows_written, "
+            "COUNT(chain_hash) AS chained FROM audit_logs"
+        ).fetchone()
+        return row["rows_written"], row["chained"]
+
     def audit_trail(self, *, limit: int = 200) -> list[sqlite3.Row]:
         return self._connection.execute(
             "SELECT * FROM audit_logs ORDER BY at DESC, id DESC LIMIT ?", (limit,)
         ).fetchall()
 
     # ------------------------------------------------------------ introspection
+
+    # --------------------------------------------------------------- users
+
+    def save_user(self, name: str, password_hash: str, role: str, *, active: bool = True) -> None:
+        now = _now()
+        with self.transaction() as connection:
+            connection.execute(
+                "INSERT INTO users (name, password_hash, role, active, created_at, updated_at) "
+                "VALUES (?,?,?,?,?,?)",
+                (name, password_hash, role, 1 if active else 0, now, now),
+            )
+
+    def user(self, name: str):
+        return self._connection.execute(
+            "SELECT * FROM users WHERE name = ?", (name,)
+        ).fetchone()
+
+    def users(self) -> list[sqlite3.Row]:
+        return self._connection.execute("SELECT * FROM users ORDER BY name").fetchall()
+
+    def set_user_hash(self, name: str, password_hash: str) -> None:
+        with self.transaction() as connection:
+            connection.execute(
+                "UPDATE users SET password_hash = ?, updated_at = ? WHERE name = ?",
+                (password_hash, _now(), name),
+            )
+
+    def set_user_active(self, name: str, active: bool) -> None:
+        with self.transaction() as connection:
+            connection.execute(
+                "UPDATE users SET active = ?, updated_at = ? WHERE name = ?",
+                (1 if active else 0, _now(), name),
+            )
+
+    # ------------------------------------------------------------- backups
+
+    def backup_to(self, destination: "str | Path") -> Path:
+        """Copy this database to ``destination`` with SQLite's own backup API.
+
+        The backup API, never a file copy: a WAL database in use is two files
+        and a copy of one of them is a corrupt database that opens. The copy
+        is a consistent snapshot as of the call, taken page by page while
+        writers continue. A SHA-256 sidecar is written beside it so a restore
+        can prove the file is the one that was made.
+        """
+        target = Path(destination)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists():
+            raise StoreError(f"{target} already exists; a backup never overwrites one")
+        copy = sqlite3.connect(str(target))
+        try:
+            self._connection.backup(copy)
+        finally:
+            copy.close()
+        digest = _sha256_of(target)
+        target.with_suffix(target.suffix + ".sha256").write_text(
+            f"{digest}  {target.name}\n", encoding="utf-8"
+        )
+        _log.info("backed up %s to %s (%s)", self._path, target, digest[:12])
+        return target
 
     def table_names(self) -> list[str]:
         rows = self._connection.execute(
@@ -1086,6 +2036,103 @@ class Store:
 # ------------------------------------------------------------- reconstruction
 
 
+
+
+def _sha256_of(path: Path) -> str:
+    import hashlib
+
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def verify_backup(backup: "str | Path") -> list[str]:
+    """Why a backup file cannot be trusted, or an empty list.
+
+    Checks the sidecar digest when there is one, that SQLite accepts the file
+    and its quick_check passes, and that its schema is one this build knows.
+    """
+    path = Path(backup)
+    problems: list[str] = []
+    if not path.is_file():
+        return [f"{path} does not exist"]
+    sidecar = path.with_suffix(path.suffix + ".sha256")
+    if sidecar.is_file():
+        expected = sidecar.read_text(encoding="utf-8").split()[0]
+        if _sha256_of(path) != expected:
+            problems.append("the SHA-256 sidecar does not match the file")
+    try:
+        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            verdict = connection.execute("PRAGMA quick_check").fetchone()[0]
+            if str(verdict).lower() != "ok":
+                problems.append(f"quick_check: {verdict}")
+            versions = [
+                int(r[0]) for r in connection.execute(
+                    "SELECT version FROM schema_migrations"
+                ).fetchall()
+            ]
+            newest = MIGRATIONS[-1].version
+            if any(v > newest for v in versions):
+                problems.append(
+                    f"written by a newer build (schema {max(versions)}; this build knows {newest})"
+                )
+        finally:
+            connection.close()
+    except sqlite3.DatabaseError as error:
+        problems.append(f"not a database: {error}")
+    return problems
+
+
+def restore_backup(backup: "str | Path", database: "str | Path", *, replace: bool = False) -> Path:
+    """Put a backup in place as the live database.
+
+    Validates first (`verify_backup`), and never silently overwrites: a
+    database already at ``database`` is refused unless ``replace`` is given,
+    and even then it is moved aside — with its WAL and shared-memory files —
+    as ``<name>.replaced-<stamp>`` rather than deleted, because the file being
+    replaced may be the evidence somebody is trying to recover. The backup is
+    copied in through SQLite's backup API, so what lands is a clean,
+    checkpointed file. A database that is open elsewhere cannot be moved on
+    Windows, which is the refusal a live console gets.
+    """
+    source = Path(backup)
+    target = Path(database)
+    problems = verify_backup(source)
+    if problems:
+        raise StoreError(f"{source} cannot be restored: " + "; ".join(problems))
+    if target.exists():
+        if not replace:
+            raise StoreError(
+                f"{target} already exists. Pass --replace to move it aside as "
+                "<name>.replaced-<stamp> and put the backup in its place."
+            )
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        for suffix in ("", "-wal", "-shm"):
+            live = Path(str(target) + suffix)
+            if live.exists():
+                aside = Path(f"{target}.replaced-{stamp}{suffix}")
+                try:
+                    live.rename(aside)
+                except OSError as error:
+                    raise StoreError(
+                        f"{live} could not be moved aside ({error.strerror or error}); "
+                        "is the console or a `sentinel` command still using it?"
+                    ) from None
+    target.parent.mkdir(parents=True, exist_ok=True)
+    origin = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
+    try:
+        landed = sqlite3.connect(str(target))
+        try:
+            origin.backup(landed)
+        finally:
+            landed.close()
+    finally:
+        origin.close()
+    _log.info("restored %s from %s", target, source)
+    return target
 
 
 def _segment_from_row(row: sqlite3.Row) -> "Segment":
@@ -1107,6 +2154,22 @@ def _segment_from_row(row: sqlite3.Row) -> "Segment":
         complete=bool(row["complete"]),
     )
 
+
+
+def _plate_read_from_row(row: sqlite3.Row) -> PlateRead:
+    return PlateRead(
+        camera_id=row["camera_id"],
+        track_id=row["track_id"],
+        first_frame=row["first_frame"],
+        last_frame=row["last_frame"],
+        country=row["country"],
+        display=row["display"],
+        text=row["text"],
+        is_confident=bool(row["is_confident"]),
+        agreement=row["agreement"],
+        reads=row["reads"],
+        seen_at_millis=row["seen_at_millis"],
+    )
 
 
 def _event_from_row(row: sqlite3.Row) -> Event:
@@ -1149,7 +2212,55 @@ def _event_from_row(row: sqlite3.Row) -> Event:
     )
 
 
+def _site_from_row(row: sqlite3.Row) -> Site:
+    """Rebuild a site, losing neither its frame kind nor its clock.
+
+    Both have been dropped by a reader before, elsewhere in this file, and both
+    fail quietly: a site read back as GEOGRAPHIC when it is a floor plan prints
+    coordinates that mean nothing, and one read back as UTC evaluates an
+    after-hours schedule in the wrong clock.
+
+    The identity switch is the third field a reader could drop, and it would
+    fail in the safe direction — a site read back with everything off runs no
+    face model — which is exactly why it would go unnoticed: a register the
+    operator switched on would match nobody and nothing would say so. Read
+    from the row, never defaulted here.
+    """
+    ring = row["boundary_ring"]
+    return Site(
+        id=row["id"],
+        name=row["name"],
+        origin=LatLon(row["origin_lat"], row["origin_lon"]),
+        frame=FrameKind(row["frame"]),
+        timezone=row["timezone"],
+        # NULL stays empty: a site nobody has outlined has no boundary, which is
+        # not the same as one whose boundary is empty.
+        boundary=(
+            tuple(LatLon(lat, lon) for lat, lon in json.loads(ring)) if ring else ()
+        ),
+        identity=Identity(
+            plates=bool(row["identity_plates"]),
+            faces=bool(row["identity_faces"]),
+            face_crops=bool(row["identity_face_crops"]),
+        ),
+        # Read from the row, never defaulted: a placeholder read as declared
+        # freezes an origin nobody chose, which is the quiet failure the
+        # column was added to end.
+        declared=bool(row["declared"]),
+    )
+
+
 def _zone_from_row(row: sqlite3.Row) -> Zone:
+    """Rebuild a zone, its class filter included.
+
+    The filter column is read only if the row has one. A store stepped back
+    below `zone_classes` to diagnose something still lists its zones — the
+    rollback tests in `test_store.py` read them on the way down — and a reader
+    that raised on the missing column would turn a rollback into a database
+    that cannot show its own geography. A zone read that way watches
+    everything, which is the truth about that schema: the filter is gone with
+    the column, and it comes back empty when the column does.
+    """
     from datetime import time as clock
 
     schedule = None
@@ -1160,6 +2271,8 @@ def _zone_from_row(row: sqlite3.Row) -> Zone:
             days=frozenset(json.loads(row["schedule_days"] or "[]")),
         )
 
+    classes = row["classes"] if "classes" in row.keys() else None
+
     return Zone(
         id=row["id"],
         name=row["name"],
@@ -1169,6 +2282,7 @@ def _zone_from_row(row: sqlite3.Row) -> Zone:
         enter_after_millis=row["enter_after_millis"],
         exit_after_millis=row["exit_after_millis"],
         accept_uncertain=bool(row["accept_uncertain"]),
+        classes=frozenset(json.loads(classes or "[]")),
     )
 
 

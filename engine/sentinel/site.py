@@ -1,0 +1,365 @@
+"""The site: one fixed origin, one boundary, one clock.
+
+Everything geographic here has until now been anchored to whatever happened to
+be placed first. The plan view takes its origin from the first camera, so
+removing that camera re-anchors the frame and every zone, track and footprint
+jumps on screen — nothing moved, the ruler did. Coverage takes its origin from
+the first vertex of whatever boundary it was handed, so listing the same site
+from a different corner builds a different tangent plane and returns areas that
+differ in the last digits for no reason anybody could explain.
+
+A site row is what stops an origin from being a side effect of insertion order.
+It is also the thing basemaps, floor levels, plans and exports will each have to
+agree with, and they can only agree with something that is written down.
+
+Three fields, each because something above needs it:
+
+**An origin and a frame kind.** A ``GEOGRAPHIC`` site's origin is a real
+coordinate: latitudes shown against it mean what they say. A ``LOCAL`` site is a
+floor plan or a hand sketch whose origin is a fixed but arbitrary point, and
+every coordinate an interface would print for it is invented precision. The kind
+is stored so that interface can refuse to print them, rather than each screen
+guessing.
+
+**An IANA time-zone name.** A schedule typed as 18:00–06:00 means 18:00 at the
+site. Storing an offset instead would be wrong for half the year, in the dark,
+on the night the clocks change — see :meth:`Site.clock`.
+
+**A boundary ring, or nothing.** Optional on purpose: a site whose outline has
+not been drawn is a normal state, and an empty ring stored as though it were a
+real one would report the whole site as one uncovered gap. Stored as JSON in the
+same shape zones store theirs, so one reader serves both.
+
+**An identity switch**, :class:`Identity`, and it is here rather than in the
+register or the pipeline because it is a fact about the *site*: whether this
+place reads plates and whether it looks at faces is a decision an operator
+takes for a deployment, under a lawful basis they can name, and it has to live
+in the one row that describes the deployment. A switch kept in memory would be
+off again after every restart — which sounds safe and is not, because an
+operator who turned faces on for a contractor list would find the register
+silently matching nobody on Monday. A switch in a configuration file would be a
+change nobody audited. In the site row it survives a restart and every flip of
+it is an audit row with a before and an after.
+
+**Declared, or written by the node.** A site row is meant to be an operator's
+declaration — this is where the site is, this is its clock. Until a site editor
+exists, though, the one thing that *must* be written before anybody has
+declared a site is :class:`Identity`: it lives on the site row, and a node with
+plates switched on has to persist that on a row somebody has to write. So the
+node writes one, and :attr:`Site.declared` records that nobody chose what is in
+it. A reader that finds ``declared`` false treats the row as authoritative for
+the switch and for nothing else: its origin is a snapshot of what the node
+could derive when it wrote the row — the first placed camera, or nowhere — and
+the node keeps deriving it afterwards rather than freezing every later camera
+placement onto an origin of (0, 0) that nobody ever meant.
+
+:class:`SiteFrame` is the conversion between latitude/longitude and metres east
+and north of that origin. It is intended to replace both
+``sentinel.coverage._Frame`` and ``MapView._to_local``, which are today the same
+arithmetic written twice in two files that cannot see each other. Neither is
+edited here: until the plan view actually reads a stored origin, swapping the
+class underneath it would move nothing, and a test asserts the two agree so they
+cannot drift in the meantime. It is built from ``haversine_distance``,
+``bearing_degrees`` and ``destination_point`` — never from metres-per-degree
+constants of its own. Those constants exist, in Rust, and are tested there; a
+second copy in Python would be a second answer, and the two would come to differ
+for reasons nobody would find.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from datetime import timezone as fixed_timezone, tzinfo
+from enum import Enum
+from typing import Sequence
+
+from .core import LatLon, bearing_degrees, destination_point, haversine_distance
+
+#: The id of the site every deployment has before anybody names a second one.
+#: One site per node today; the id exists so that stops being an assumption
+#: baked into every query.
+DEFAULT_SITE_ID = "default"
+
+#: What a site's clock is when nobody has declared one. UTC rather than the
+#: machine's own zone: a schedule evaluated in a zone the operator never chose
+#: is wrong in a way nothing on screen explains, and UTC is at least wrong in a
+#: way somebody can spot. It is also the one name :meth:`Site.clock` can answer
+#: with no tz database installed, so the default site is never hostage to an
+#: optional package.
+DEFAULT_TIMEZONE = "UTC"
+
+
+class SiteError(ValueError):
+    """The site record cannot be used as given."""
+
+
+class FrameKind(str, Enum):
+    """Whether this site's coordinates mean anything outside the drawing.
+
+    Recorded rather than inferred from whether an origin looks plausible. Every
+    latitude is plausible, including the one somebody typed to get a floor plan
+    onto the screen, and a screen that guesses will eventually print a
+    fabricated coordinate beside a real one with nothing to tell them apart.
+    """
+
+    #: The origin is a surveyed or mapped coordinate. Latitudes mean what they
+    #: say, and may be exported, printed, and handed to somebody driving there.
+    GEOGRAPHIC = "GEOGRAPHIC"
+    #: The origin is a fixed but arbitrary point on a plan. Distances and areas
+    #: are real; coordinates are not, and must not be shown as though they were.
+    LOCAL = "LOCAL"
+
+
+@dataclass(frozen=True, slots=True)
+class Identity:
+    """Which of the identity features this site has switched on. All off by default.
+
+    Three booleans rather than one, because they are three different claims on
+    the people who walk past a camera. A plate is a legally displayed identifier
+    photographed in public; a face template is a measurement of somebody's body;
+    a face crop is a photograph of it. Each needs its own justification, so each
+    is its own decision, and a site that reads plates has not thereby agreed to
+    anything about faces.
+
+    ``face_crops`` is stored and audited and does nothing else in this build.
+    That is deliberate and it is not a loose end: the flag exists so that the
+    decision to keep photographs — the one that needs the most justification —
+    is recorded as a decision the moment somebody takes it, and it is refused
+    any effect until the code that would keep a crop under its own retention
+    and its own audit row exists. Nothing reads it to store anything.
+
+    Off is the value every site starts with, and off means *nothing runs*: no
+    face is detected, no template computed, no plate cropped. It does not mean
+    a column is hidden. That is enforced where the work happens — the node
+    builds no face engine and hands no plate reader to a pipeline — and a test
+    proves the models were shown no pixels.
+    """
+
+    #: Plate reading inside vehicle tracks. Needs the operator's plate models.
+    plates: bool = False
+    #: Face templates inside person tracks. Needs the operator's YuNet and
+    #: SFace models. A template is 128 floats, not an image.
+    faces: bool = False
+    #: A separate opt-in for keeping the crop a template was taken from.
+    #: Recorded and audited; **not implemented** beyond that in this build, and
+    #: :meth:`describe` says so rather than reading as a feature.
+    face_crops: bool = False
+
+    def describe(self) -> str:
+        """The switch as one short phrase: ``off``, ``plates``, ``faces``, ``plates, faces``.
+
+        The crop flag is named separately and honestly when it is set, because
+        an operator reading ``faces`` on a status strip must not be left
+        believing photographs are being kept when nothing keeps them.
+        """
+        parts = [name for name in ("plates", "faces") if getattr(self, name)]
+        if not parts:
+            return "off"
+        described = ", ".join(parts)
+        if self.face_crops:
+            described += " (face crops recorded as on; not kept in this build)"
+        return described
+
+
+@dataclass(frozen=True, slots=True)
+class Site:
+    """The place being watched, as one record.
+
+    ``origin`` anchors the metric frame and is deliberately not derived from the
+    cameras: a derived origin moves when the thing it was derived from is
+    deleted, which is the plan view bug this record exists to end.
+
+    ``boundary`` is an open ring of at least three points, or empty. Empty means
+    *not drawn yet*, and must not be read as an outline enclosing nothing — the
+    difference is between "coverage cannot be computed" and "none of this site is
+    covered", and only one of those is worth alarming about.
+    """
+
+    id: str
+    name: str
+    origin: LatLon
+    frame: FrameKind = FrameKind.GEOGRAPHIC
+    #: An IANA name such as ``Asia/Beirut``. Never a fixed offset — see
+    #: :meth:`clock`.
+    timezone: str = DEFAULT_TIMEZONE
+    boundary: tuple[LatLon, ...] = ()
+    #: What this site has agreed to identify. :class:`Identity` — everything
+    #: off — for every site that has never been asked, which is every site
+    #: written before the switch existed as well as every new one.
+    identity: Identity = Identity()
+    #: Whether an operator declared this site, or the node wrote the row on
+    #: its own to hold the identity switch before anybody had declared one.
+    #: True by default and for every row written before the flag existed,
+    #: because a stored origin somebody may have chosen must not be
+    #: second-guessed: overriding a declared origin from the cameras would
+    #: bring back the plan-view jump this record exists to end. False only on
+    #: the row `Node.set_identity` writes when no site exists — and for that
+    #: row the switch is the only field that means anything; the node keeps
+    #: deriving the origin from the first placed camera until an operator
+    #: declares one, rather than freezing the placeholder's (0, 0) forever.
+    declared: bool = True
+
+    def __post_init__(self) -> None:
+        """Refuse a ring of one or two points at the door.
+
+        A two-point boundary reaches shapely as a line, whose area is zero, so
+        every coverage figure computed against it is a division by zero or a
+        confident 0% — a site reported as entirely unwatched because somebody
+        clicked twice and stopped.
+        """
+        if 0 < len(self.boundary) < 3:
+            raise SiteError(
+                f"a site boundary needs at least three points; "
+                f"{len(self.boundary)} were given. Leave it empty for a site "
+                "whose outline has not been drawn yet."
+            )
+
+    @property
+    def is_georeferenced(self) -> bool:
+        """Whether a coordinate from this site may be shown to somebody.
+
+        The question every screen that prints a latitude has to ask. A position
+        in a LOCAL frame is a position on a drawing, and presenting it as a place
+        on the Earth is the same class of lie as presenting a camera's own
+        position as the location of what it saw.
+        """
+        return self.frame is FrameKind.GEOGRAPHIC
+
+    @property
+    def has_boundary(self) -> bool:
+        """Whether coverage has anything to subtract footprints from."""
+        return len(self.boundary) >= 3
+
+    def clock(self) -> tzinfo:
+        """The zone this site's schedules are written in.
+
+        An IANA name rather than a stored offset, because an offset is wrong for
+        half the year: a site recorded as UTC+3 in August is UTC+2 in January,
+        and an "after hours" window that moves by an hour on the night the clocks
+        change disarms the site at exactly the hour nobody is watching it.
+
+        UTC is answered from the stdlib without consulting the tz database at
+        all. It is the one zone with no rules to look up — no offset that
+        changes, no night the clocks move — and on Windows the database is an
+        optional package, so ``ZoneInfo("UTC")`` raises on a machine that has
+        not installed ``tzdata``. Since UTC is also :data:`DEFAULT_TIMEZONE`,
+        going through ZoneInfo for it would mean every fresh deployment had a
+        site whose clock could not be read until an operator installed a package
+        for a zone that needs no database — and the error would tell them to.
+
+        Raises :class:`SiteError` rather than falling back to UTC for every real
+        IANA name that cannot be resolved — which on Windows means ``tzdata`` is
+        genuinely missing. A silent fallback is how an evaluator came to arm at
+        21:00 local instead of 18:00 with nothing on screen saying so; a caller
+        that wants to carry on anyway has to choose that itself, somewhere the
+        operator can see the choice.
+        """
+        if self.timezone in ("UTC", "Etc/UTC"):
+            return fixed_timezone.utc
+
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+        try:
+            return ZoneInfo(self.timezone)
+        except (ZoneInfoNotFoundError, ValueError, KeyError) as error:
+            raise SiteError(
+                f"the site's time zone {self.timezone!r} cannot be resolved on "
+                "this machine, so its schedules cannot be read in the site's "
+                "clock. On Windows the tz database is not shipped with Python: "
+                "install the 'tzdata' package."
+            ) from error
+
+    def metric_frame(self) -> "SiteFrame":
+        """The frame every module measuring this site is meant to share.
+
+        Handed out by the site rather than constructed per caller, because two
+        frames on two different origins are two answers to the same question —
+        and the place they disagree, the far corner of a large site, is the place
+        nobody checks.
+        """
+        return SiteFrame(self.origin)
+
+
+class SiteFrame:
+    """Metres east and north of a site origin, and back.
+
+    Planar geometry needs metres. A union or an area computed in degrees is
+    wrong by the cosine of the latitude, which at this project's own test site
+    is an 18% error that looks entirely plausible. A site is hundreds of metres
+    across, not hundreds of kilometres, so a local tangent plane about a fixed
+    origin is exact enough — it round-trips a point a kilometre out to well
+    inside a centimetre — and it needs no projection library.
+
+    Intended to replace ``sentinel.coverage._Frame`` and ``MapView._to_local``,
+    which do this same arithmetic in two other files today. Those are left alone
+    here: replacing them is a separate change with its own tests, and until the
+    plan view reads a stored origin, swapping the class underneath it would move
+    nothing. A test asserts this frame and ``coverage._Frame`` agree on the same
+    point, so the two cannot drift apart in the meantime.
+
+    The conversion goes through ``haversine_distance``, ``bearing_degrees`` and
+    ``destination_point`` — the Rust core's geodesy, tested there — rather than
+    metres-per-degree constants of its own, so there is exactly one answer in the
+    system to "how far apart are these two points".
+    """
+
+    __slots__ = ("origin",)
+
+    def __init__(self, origin: LatLon):
+        self.origin = origin
+
+    @classmethod
+    def of(cls, site: Site) -> "SiteFrame":
+        """The frame of a stored site, on its recorded origin.
+
+        The whole point of the site record: an origin that outlives the first
+        camera placed on it.
+        """
+        return cls(site.origin)
+
+    def to_xy(self, point: LatLon) -> tuple[float, float]:
+        """Metres east and north of the origin.
+
+        Identical to ``coverage._Frame.to_xy`` deliberately, down to the
+        zero-distance branch: the bearing from a point to itself is arbitrary,
+        and multiplying an arbitrary bearing by a zero distance is harmless only
+        until somebody changes the multiplication.
+        """
+        distance = haversine_distance(self.origin, point)
+        if distance == 0.0:
+            return (0.0, 0.0)
+        bearing = math.radians(bearing_degrees(self.origin, point))
+        return (distance * math.sin(bearing), distance * math.cos(bearing))
+
+    def to_latlon(self, x: float, y: float) -> LatLon:
+        """The coordinate that many metres east and north of the origin.
+
+        The exact inverse of :meth:`to_xy`, and it has to be: an outline drawn on
+        screen is converted one way and stored the other, so a conversion losing
+        a millimetre a trip would walk a site's boundary off its own fence over a
+        season of edits.
+        """
+        distance = math.hypot(x, y)
+        if distance == 0.0:
+            return self.origin
+        return destination_point(
+            self.origin, math.degrees(math.atan2(x, y)) % 360.0, distance
+        )
+
+    def ring_to_xy(self, ring: Sequence[LatLon]) -> list[tuple[float, float]]:
+        """A whole ring in one call, for handing to shapely.
+
+        Every caller of this conversion is really converting a polygon, and the
+        comprehension that does it was about to be written for a fourth time.
+        """
+        return [self.to_xy(point) for point in ring]
+
+    def ring_to_latlon(
+        self, points: Sequence[tuple[float, float]]
+    ) -> tuple[LatLon, ...]:
+        """A shapely ring back to coordinates, in the order it went in."""
+        return tuple(self.to_latlon(x, y) for x, y in points)
+
+    def __repr__(self) -> str:
+        return f"SiteFrame(origin={self.origin!r})"

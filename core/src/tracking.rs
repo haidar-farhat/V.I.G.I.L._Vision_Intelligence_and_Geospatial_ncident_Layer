@@ -21,7 +21,7 @@
 //! centre lands within a size-scaled gate of the *predicted* position associates
 //! too, ranked below any real overlap.
 
-use crate::geometry::{bearing_degrees, haversine_distance, project_detection};
+use crate::geometry::{bearing_degrees, haversine_distance, project_point};
 use crate::geometry::{BoundingBox, CameraPose, LatLon, PositionEstimate, PositionSource, Vec2};
 
 #[derive(Debug, Clone, Copy)]
@@ -30,6 +30,27 @@ pub struct Detection {
     pub confidence: f64,
     /// Index into the model's class list. Class identity is opaque here.
     pub class_id: u32,
+    /// Where the object meets the ground, in normalised image coordinates.
+    ///
+    /// Measured from a segmentation mask when there is one — the lowest row
+    /// that has any of the object in it — and the box's bottom-centre when
+    /// there is not. Every map position this tracker reports is projected from
+    /// this point and nothing else, so a detector that knows the shape improves
+    /// the position without the tracker knowing anything about masks.
+    pub contact: Vec2,
+}
+
+impl Detection {
+    /// A detection whose contact point is the box's bottom-centre — what every
+    /// detector without a mask has always meant.
+    pub fn from_box(bbox: BoundingBox, confidence: f64, class_id: u32) -> Self {
+        Detection {
+            bbox,
+            confidence,
+            class_id,
+            contact: bbox.ground_contact(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -41,6 +62,9 @@ pub struct Track {
     /// Last frame in which a detection actually matched, as opposed to coasting.
     pub last_detected_millis: i64,
     pub bbox: BoundingBox,
+    /// The last measured ground contact, carried along with the box while the
+    /// track coasts. See [`Detection::contact`].
+    pub contact: Vec2,
     /// Normalised image units per millisecond.
     pub velocity: Vec2,
     pub confidence: f64,
@@ -339,11 +363,12 @@ impl Tracker {
                 last_seen_millis: at_millis,
                 last_detected_millis: at_millis,
                 bbox: detection.bbox,
+                contact: detection.contact,
                 velocity: Vec2 { x: 0.0, y: 0.0 },
                 confidence: detection.confidence,
                 hits: 1,
                 confirmed: self.config.min_hits_to_confirm <= 1,
-                position: self.pose.map(|p| project_detection(&p, &detection.bbox)),
+                position: self.pose.map(|p| project_point(&p, detection.contact)),
                 ground_history: Vec::new(),
                 speed_mps: None,
                 heading_degrees: None,
@@ -372,10 +397,18 @@ impl Tracker {
             if track.confirmed {
                 // Coast along the velocity so the track keeps a plausible
                 // position through the occlusion.
-                let coasted = Self::predict(track, at_millis);
-                track.bbox = clamp_box(coasted);
+                let coasted = clamp_box(Self::predict(track, at_millis));
+                // The contact moves with the box rather than being re-derived
+                // from it: a measured foot position that was off-centre stays
+                // off-centre through the gap, instead of snapping back to the
+                // rectangle's bottom-centre the moment the detector blinks.
+                track.contact = Vec2 {
+                    x: track.contact.x + (coasted.x - track.bbox.x),
+                    y: track.contact.y + (coasted.y - track.bbox.y),
+                };
+                track.bbox = coasted;
                 track.last_seen_millis = at_millis;
-                track.position = pose.map(|p| project_detection(&p, &track.bbox));
+                track.position = pose.map(|p| project_point(&p, track.contact));
 
                 // Deliberately NOT recorded into ground_history. A coasted box
                 // is extrapolation, and clamp_box pins it to the frame edge once
@@ -425,6 +458,7 @@ fn apply_detection(
     }
 
     track.bbox = detection.bbox;
+    track.contact = detection.contact;
     track.last_seen_millis = at_millis;
     track.last_detected_millis = at_millis;
     track.confidence = track.confidence * 0.7 + detection.confidence * 0.3;
@@ -435,7 +469,7 @@ fn apply_detection(
         track.confirmed = true;
     }
 
-    track.position = pose.map(|p| project_detection(&p, &detection.bbox));
+    track.position = pose.map(|p| project_point(&p, detection.contact));
     record_ground(track, at_millis, config);
 }
 
@@ -561,11 +595,96 @@ mod tests {
     }
 
     fn detection(bbox: BoundingBox, class_id: u32) -> Detection {
-        Detection {
-            bbox,
-            confidence: 0.9,
-            class_id,
+        Detection::from_box(bbox, 0.9, class_id)
+    }
+
+    #[test]
+    fn the_map_position_is_projected_from_the_contact_not_the_box() {
+        // Two detections with the identical box; one has a measured contact
+        // well to the left of the box's bottom-centre — a person leaning out
+        // from behind a car. Same rectangle, different place on the ground.
+        let bbox = BoundingBox {
+            x: 0.4,
+            y: 0.5,
+            w: 0.2,
+            h: 0.3,
+        };
+        let from_box = Detection::from_box(bbox, 0.9, 0);
+        let measured = Detection {
+            contact: Vec2 { x: 0.42, y: 0.78 },
+            ..from_box
+        };
+
+        let mut plain = Tracker::new(TrackerConfig::default(), Some(pose()));
+        let mut shaped = Tracker::new(TrackerConfig::default(), Some(pose()));
+        for step in 0..3 {
+            plain.update(&[from_box], step * 200);
+            shaped.update(&[measured], step * 200);
         }
+
+        let a = plain
+            .tracks()
+            .next()
+            .expect("one track")
+            .position
+            .expect("placed camera projects");
+        let b = shaped
+            .tracks()
+            .next()
+            .expect("one track")
+            .position
+            .expect("placed camera projects");
+        assert!(
+            haversine_distance(a.point, b.point) > 0.5,
+            "a contact 8% of the frame away from the box centre moved the map position by only {} m",
+            haversine_distance(a.point, b.point)
+        );
+        assert_eq!(
+            shaped.tracks().next().expect("one track").contact,
+            Vec2 { x: 0.42, y: 0.78 }
+        );
+        // And without a mask the answer is exactly what the box always gave.
+        assert_eq!(
+            plain.tracks().next().expect("one track").contact,
+            bbox.ground_contact()
+        );
+    }
+
+    #[test]
+    fn a_coasting_track_carries_its_measured_contact_with_the_box() {
+        // The detector blinks. The predicted box moves on; the contact must
+        // move with it by the same amount, not snap back to the rectangle's
+        // bottom-centre — that would report a person's position jumping
+        // sideways at exactly the moment the evidence for it went missing.
+        let mut tracker = Tracker::new(TrackerConfig::default(), None);
+        for step in 0..4 {
+            let bbox = BoundingBox {
+                x: 0.3 + step as f64 * 0.02,
+                y: 0.5,
+                w: 0.1,
+                h: 0.3,
+            };
+            let detection = Detection {
+                contact: Vec2 {
+                    x: bbox.x + 0.01,
+                    y: 0.78,
+                },
+                ..Detection::from_box(bbox, 0.9, 0)
+            };
+            tracker.update(&[detection], step * 200);
+        }
+        let before = tracker.tracks().next().expect("one track").clone();
+        let offset_before = before.contact.x - before.bbox.x;
+
+        tracker.update(&[], 4 * 200);
+        let after = tracker.tracks().next().expect("one track");
+
+        assert!(after.bbox.x > before.bbox.x, "the box did not coast");
+        assert!(
+            (after.contact.x - after.bbox.x - offset_before).abs() < 1e-9,
+            "the contact's offset from its box changed while coasting"
+        );
+        assert!((after.contact.y - before.contact.y).abs() < 1e-9);
     }
 
     #[test]
@@ -846,16 +965,16 @@ mod tests {
         let mut tracker = Tracker::new(TrackerConfig::default(), Some(pose()));
 
         for step in 0..3 {
-            let detection = Detection {
-                bbox: BoundingBox {
+            let detection = Detection::from_box(
+                BoundingBox {
                     x: 0.4 + step as f64 * 0.02,
                     y: 0.6,
                     w: 0.05,
                     h: 0.1,
                 },
-                confidence: 0.9,
-                class_id: 0,
-            };
+                0.9,
+                0,
+            );
             tracker.update(&[detection], step * 200);
         }
 
@@ -872,16 +991,16 @@ mod tests {
         let mut tracker = Tracker::new(TrackerConfig::default(), Some(pose()));
 
         for step in 0..14 {
-            let detection = Detection {
-                bbox: BoundingBox {
+            let detection = Detection::from_box(
+                BoundingBox {
                     x: 0.4 + step as f64 * 0.01,
                     y: 0.6,
                     w: 0.05,
                     h: 0.1,
                 },
-                confidence: 0.9,
-                class_id: 0,
-            };
+                0.9,
+                0,
+            );
             tracker.update(&[detection], step * 200);
         }
 
@@ -903,16 +1022,16 @@ mod tests {
         boxes.push(0.40); // the jump
 
         for (step, y) in boxes.iter().enumerate() {
-            let detection = Detection {
-                bbox: BoundingBox {
+            let detection = Detection::from_box(
+                BoundingBox {
                     x: 0.5,
                     y: *y,
                     w: 0.05,
                     h: 0.1,
                 },
-                confidence: 0.9,
-                class_id: 0,
-            };
+                0.9,
+                0,
+            );
             tracker.update(&[detection], step as i64 * 200);
         }
 

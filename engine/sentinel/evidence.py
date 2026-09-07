@@ -52,7 +52,9 @@ EXPORT_FORMAT_VERSION = 1
 #: Bumped when the *system* changes in a way that affects what it concludes.
 #: Recorded in every export, because "which build said this" is a question that
 #: gets asked long after the build has been replaced.
-APPLICATION_VERSION = "0.1.0"
+# One source for the version: `sentinel.version`. Kept under this name because
+# it is what the manifest and the report have always been written from.
+from .version import __version__ as APPLICATION_VERSION, describe as _describe_build
 
 
 class ExportError(RuntimeError):
@@ -171,6 +173,18 @@ def _event_dict(event: Event) -> dict:
     }
 
 
+def _association_dict(link) -> dict:
+    return {
+        "a": f"{link.a[0]}#{link.a[1]}",
+        "b": f"{link.b[0]}#{link.b[1]}",
+        "score": link.score,
+        "separation_meters": link.separation_meters,
+        "allowance_meters": link.allowance_meters,
+        "time_gap_millis": link.time_gap_millis,
+        "reasons": list(link.reasons),
+    }
+
+
 def _incident_dict(incident: Incident) -> dict:
     return {
         "id": incident.id,
@@ -200,17 +214,17 @@ def _incident_dict(incident: Incident) -> dict:
                 for f in incident.risk.factors
             ],
         },
+        # Two lists, because they are two claims. A cross-camera link says a
+        # hand-off happened; a same-camera link says the tracker lost and
+        # re-found one object. The old key keeps its old meaning so a package
+        # written before same-camera links existed reads the same.
         "cross_camera_associations": [
-            {
-                "a": f"{link.a[0]}#{link.a[1]}",
-                "b": f"{link.b[0]}#{link.b[1]}",
-                "score": link.score,
-                "separation_meters": link.separation_meters,
-                "allowance_meters": link.allowance_meters,
-                "time_gap_millis": link.time_gap_millis,
-                "reasons": list(link.reasons),
-            }
-            for link in incident.associations
+            _association_dict(link)
+            for link in incident.associations if link.a[0] != link.b[0]
+        ],
+        "same_camera_associations": [
+            _association_dict(link)
+            for link in incident.associations if link.a[0] == link.b[0]
         ],
         "timeline": [
             {
@@ -254,9 +268,14 @@ def _readable_report(incident: Incident, exported_by: str, at: datetime) -> str:
     for factor in incident.risk.factors:
         lines.append(f"  {factor.points:+6.0f}  {factor.name}: {factor.because}")
 
-    if incident.associations:
-        lines += ["", "CROSS-CAMERA ASSOCIATIONS", "-" * 70]
-        for link in incident.associations:
+    across = [link for link in incident.associations if link.a[0] != link.b[0]]
+    within = [link for link in incident.associations if link.a[0] == link.b[0]]
+    for heading, links in (("CROSS-CAMERA ASSOCIATIONS", across),
+                           ("SAME-CAMERA ASSOCIATIONS (one object the tracker lost and re-found)", within)):
+        if not links:
+            continue
+        lines += ["", heading, "-" * 70]
+        for link in links:
             lines.append(
                 f"  {link.a[0]}#{link.a[1]} = {link.b[0]}#{link.b[1]}  "
                 f"(score {link.score:.2f})"
@@ -266,9 +285,17 @@ def _readable_report(incident: Incident, exported_by: str, at: datetime) -> str:
 
     lines += ["", "TIMELINE", "-" * 70]
     for entry in incident.timeline():
+        # Relative to when the incident opened, which is what "t+" claims.
+        # `at_millis` is a wall clock: for a file it starts near zero and this
+        # read correctly, but for a live camera it is a Unix epoch, and the
+        # first real evidence package from a webcam timed its own first event
+        # at "t+1788513275.8s" — fifty-six years after the incident it belongs
+        # to. The absolute UTC time is printed beside it, because a package
+        # read a year later needs both.
+        offset = (entry.at_millis - incident.opened_at_millis) / 1000
         lines.append(
-            f"  t+{entry.at_millis / 1000:7.1f}s  [{entry.severity.value:8}]  "
-            f"{entry.camera_id}  {entry.summary}"
+            f"  t+{offset:7.1f}s  {entry.at:%H:%M:%S} UTC  "
+            f"[{entry.severity.value:8}]  {entry.camera_id}  {entry.summary}"
         )
 
     lines += ["", "EVIDENCE", "-" * 70]
@@ -315,7 +342,7 @@ def _readable_report(incident: Incident, exported_by: str, at: datetime) -> str:
         "-" * 70,
         f"  Exported by   {exported_by}",
         f"  Exported at   {at:%Y-%m-%d %H:%M:%S} UTC",
-        f"  Application   Sentinel Vision {APPLICATION_VERSION}",
+        f"  Application   {_describe_build()}",
         f"  Format        {EXPORT_FORMAT_VERSION}",
         f"  Platform      {platform.platform()}",
         f"  Python        {sys.version.split()[0]}",

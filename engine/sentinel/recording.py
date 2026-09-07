@@ -155,6 +155,53 @@ class RecorderStats:
         return self.frames_dropped / total if total else 0.0
 
 
+def file_safe(name: str) -> str:
+    """A camera id as a file or directory name.
+
+    Letters, digits, dot, dash and underscore survive; everything else becomes
+    a dash and runs collapse, so ``device:0`` — the id every local camera gets
+    — is ``device-0``. Windows reads the colon as a drive or an alternate
+    data stream: the first packaged camera run asked to record and its
+    pipeline died in ``mkdir`` on ``recordings/device:0`` before a frame was
+    analysed. A URL-shaped id can never carry a path separator either.
+    """
+    cleaned = "".join(ch if (ch.isalnum() or ch in "._-") else "-" for ch in str(name))
+    cleaned = "-".join(part for part in cleaned.split("-") if part)
+    return cleaned or "camera"
+
+
+def _unique_path(path: Path) -> Path:
+    """A path nothing is already using.
+
+    `cv2.VideoWriter` truncates an existing file — verified — and for a file
+    source every part of a segment's name is deterministic: the epoch comes
+    from the source's modification time, and the frame timestamps and indices
+    replay identically. So analysing the same clip twice into the same
+    directory reproduced the first run's filenames exactly and overwrote it.
+
+    That was worse than losing a recording. `save_segment` upserts on the path
+    and deliberately preserves `preserved=1`, so a segment held as incident
+    evidence would have had its bytes replaced while the index went on
+    vouching for it with a freshly computed hash — and the SHA-256 already
+    quoted in an exported `footage.json` would match nothing at all.
+
+    Re-analysing footage is a legitimate thing to do, so the second run gets a
+    suffix rather than a refusal, and both recordings survive.
+    """
+    if not path.exists():
+        return path
+
+    index = 2
+    while True:
+        candidate = path.with_name(f"{path.stem}-{index}{path.suffix}")
+        if not candidate.exists():
+            _log.info(
+                "%s already exists; writing %s instead", path.name, candidate.name
+            )
+            return candidate
+        index += 1
+
+
 def sha256_of(path: Path) -> str:
     """Streamed, because a segment is tens of megabytes."""
     digest = hashlib.sha256()
@@ -339,15 +386,25 @@ class Recorder:
         because a file is evidence and a recording missing three frames in four
         is not evidence of anything.
 
-        The image is copied. For a live source OpenCV reuses its capture buffer,
-        so keeping a reference would hand the writer a frame that changes
-        underneath it — and the recording would be of the wrong moments.
+        **The image is copied, with `.copy()` and not with
+        `np.ascontiguousarray`.** That distinction was a real defect: a frame
+        from `cv2.VideoCapture.read()` is already C-contiguous, so
+        `ascontiguousarray` returns *the same object* — verified — and the
+        queued frame aliased the array the caller went on using. Two ways that
+        loses evidence. A viewer draws track boxes onto `FrameResult.image`,
+        which is the same array, so the overlay gets baked into the recording;
+        and `decode.py` warns that a live capture may reuse its buffer, which
+        would make every queued frame mutate into a later moment while its
+        timestamp, hash and index all went on describing the earlier one.
+
+        The copy costs about 0.9 MB per frame at 640×480 — a memcpy, far below
+        the encode it feeds.
         """
         if self._thread is None or self._stop.is_set():
             return False
 
         copied = Frame(
-            image=np.ascontiguousarray(frame.image),
+            image=frame.image.copy(),
             timestamp_millis=frame.timestamp_millis,
             index=frame.index,
             source_id=frame.source_id,
@@ -367,6 +424,14 @@ class Recorder:
                             "will not be recorded", self._camera_id,
                         )
                         return False
+            return False
+
+        if not self.is_running:
+            # The writer is gone, so this frame is not going to be recorded.
+            # Reporting that as a drop is the truth; returning True would have
+            # the caller believe it was written.
+            with self._lock:
+                self._stats.frames_dropped += 1
             return False
 
         try:
@@ -473,7 +538,10 @@ class Recorder:
         # operator nothing about when it happened.
         wall = self._epoch_millis + frame.timestamp_millis
         stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime(wall / 1000))
-        path = self._directory / f"{self._camera_id}_{stamp}_{frame.index:08d}{CONTAINER}"
+        path = _unique_path(
+            self._directory
+            / f"{file_safe(self._camera_id)}_{stamp}_{frame.index:08d}{CONTAINER}"
+        )
 
         writer = cv2.VideoWriter(
             str(path), cv2.VideoWriter_fourcc(*self._codec),
@@ -673,7 +741,10 @@ def apply_retention(
     candidates.sort(key=lambda segment: segment.started_millis)
 
     total_bytes = store.recorded_bytes()
-    free_bytes = _free_bytes(shutil, candidates)
+    # Measured from any segment, preserved ones included: a store where every
+    # clip is preserved has no candidate, and a sweep that then reported
+    # infinite free space would never say the one thing it exists to say.
+    free_bytes = _free_bytes(shutil, candidates or everything)
 
     def over_budget() -> bool:
         if policy.max_bytes is not None and total_bytes > policy.max_bytes:

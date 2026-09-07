@@ -27,11 +27,12 @@ How to install it, run it, and read what it tells you.
 4. [The command line](#4-the-command-line)
 5. [Docker](#5-docker)
 6. [Cameras](#6-cameras)
-7. [Recording](#7-recording)
-8. [Where your files are](#8-where-your-files-are)
-9. [Logs, and the developer build](#9-logs-and-the-developer-build)
-10. [When something is wrong](#10-when-something-is-wrong)
-11. [What it will refuse to do](#11-what-it-will-refuse-to-do)
+7. [Detection models](#7-detection-models)
+8. [Recording](#8-recording)
+9. [Where your files are](#9-where-your-files-are)
+10. [Logs, and the developer build](#10-logs-and-the-developer-build)
+11. [When something is wrong](#11-when-something-is-wrong)
+12. [What it will refuse to do](#12-what-it-will-refuse-to-do)
 
 ---
 
@@ -213,6 +214,181 @@ camera's datasheet is not what it can see:
 The footprint drawn on the plan view is an **annular sector**, not a pie slice —
 a downward-tilted camera cannot see the ground at its own mast, and drawing the
 slice would claim coverage it does not have.
+
+### Driving the console from the command line
+
+`SentinelVision.exe --start` (or `python tasks.py console -- --start`) starts
+every camera the node restored as soon as the window is up. For a control room
+that is the difference between a site watched from the moment the shift begins
+and one unwatched until somebody finds the Start button. With no cameras it says
+so in the status bar rather than looking busy.
+
+The rest of the flags exist because **the packaged binary is the thing under
+test**, and a test cannot click. They take the same syntax as `sentinel run`:
+
+| flag | does |
+|---|---|
+| `--camera SOURCE` | Has this camera — `device:0`, an `rtsp://` URL, a file. Added if the node lacks it, kept if it has it. Repeatable |
+| `--place SPEC` | `lat,lon,height,heading,pitch[,hfov,vfov,range]`, applied to every camera named by `--camera` in the same command — a camera restored unplaced is placed |
+| `--zone SPEC` | `name:lat,lon;lat,lon;lat,lon`, a restricted polygon, added unless a zone of that name is stored. Repeatable |
+| `--zone-classes NAME=label,label` | Which labels a `--zone` in this command acts on |
+| `--record` | Ask the cameras named by `--camera` to record whenever they run; stored with them like the Record box |
+| `--watch LABELS` | The classes tracked *this run* — `person,car` — instead of the machine's setting. Not remembered; refused before the window opens if the model does not name one |
+| `--confidence X` | The floor *this run*, 0.10–0.95. Not remembered |
+| `--settings FILE` | Keep the per-machine settings in this INI instead of the registry, so a test run leaves the operator's alone |
+| `--for SECONDS` | Close after this long and print what was concluded: every camera's frames, tracks by class, events, incidents, the audit chain head |
+| `--screenshots DIR` | With `--for`: photograph the window and every panel into DIR first |
+| `--model FILE` / `--no-model` | Which detector; see §7 |
+| `--database FILE` | Which database |
+
+Every change these make goes through the node and is audited exactly as a
+clicked one is; a flag is a deliberate act by whoever launched the process, so
+it does not pass through the Configure lock that guards a screen from a stray
+click.
+
+An unattended run on the real camera, the way the product is tested:
+
+```bash
+SentinelVision-dev.exe --settings %TEMP%\t.ini --camera device:0 ^
+    --place 33.8938,35.5018,1.2,180,-15 ^
+    --zone "Room:33.893836,35.501780;33.893836,35.501820;33.893800,35.501820;33.893800,35.501780" ^
+    --zone-classes Room=person --start --for 30 --screenshots evidence\run-1
+```
+
+`python tasks.py exetest` does exactly that against `dist/`, in an isolated
+data directory, and reads the summary back into one table with a PASS or a
+FAIL — see §10.
+
+### Cameras and zones are managed from the toolbar and the Zones tab
+
+| control | what it does |
+|---|---|
+| **Remove camera** | Forgets the selected camera. If it is running it is stopped first and its last events kept. What it saw — events, incidents — stays in the database; only the camera goes |
+| **Move on map** | Click the plan view to move the selected camera there. Height, heading and optics are kept. The first placement has to be *Place…*, because a click cannot say how high a camera is or which way it faces |
+| **Add zone…** | A square: name, kind, size, and where — in front of the selected camera, or a point you click on the plan view |
+| **Zones tab → Draw zone** | Any outline. Click each corner on the plan view; double-click or Enter closes it; right-click or Backspace undoes a corner; Esc abandons. Fewer than three corners is never accepted, and a figure of eight is refused with the reason |
+| **Zones tab → Reshape** | Edit the selected zone's outline: drag a corner, click an edge to add one, right-click a corner to remove it (never below three), drag inside to move the whole zone. Enter applies, Esc reverts. The audit row records the corner count before and after |
+| **Zones tab → properties** | Beside the list: name, kind, schedule (a window that ends before it starts wraps midnight; weekdays), how long an object must be inside before it counts, how long it must be gone before the presence ends, and whether an uncertain position may count. Nothing is written until *Apply* |
+| **Zones tab → Remove** | Forgets the zone. Events it raised keep its name |
+| **Click a zone on the map** | Selects it in the list and shows its properties |
+
+Five kinds of zone, each drawn in its own colour on the plan view so a rule to
+*ignore* a place never looks like a rule that nobody should be there:
+
+| kind | meaning | colour |
+|---|---|---|
+| restricted | nobody should be here; presence alone is an event | red |
+| perimeter | the site boundary; crossing it inbound matters | orange |
+| entry | a door, gate or lane where presence is expected | blue |
+| exclusion | ignore this: a public pavement, a tree that moves | grey |
+| interest | worth recording presence in, without implying anything is wrong | green |
+
+Every change is written to the audit log with what changed — a restricted area
+quietly becoming an exclusion zone is exactly the edit an audit log is for.
+
+### The footprint is shaded by how well the camera can locate
+
+A flat wedge would claim the far edge of a 90 m range is as good as the near
+edge. It is not: position error grows super-linearly with distance, so the map
+draws four nested bands — 1σ within 0.5 m, 1 m, 2 m and 5 m — and leaves the
+rest of the footprint bare. Bare does not mean unseen. It means seen, with the
+position known to worse than five metres.
+
+That distinction decides whether a zone can work at all:
+
+| the zone panel says | what it means |
+|---|---|
+| **Covered 100% · 92% confidently** | every part is in view, and nearly all of it is known well enough to say which side of the line somebody is on |
+| **Covered 100% · 0% confidently** | fully in view, and the system still cannot adjudicate it — memberships will be UNCERTAIN, which a restricted area does not act on. The zone is armed and silent |
+| **⚠ 0%** in the list | no camera can see it. It can never fire |
+
+"Confidently" is measured against the zone's *own* narrowest width: two metres
+of error is fine for a car park and useless for a doorway.
+
+While you draw an outline the same numbers appear in the band across the top of
+the map, from the third corner onward — before the zone is committed, not after.
+The part of a selected zone that no camera can see is hatched.
+
+Every warning is a warning, never a refusal. A zone nothing can see is still
+created, because you may be about to place the camera that fixes it; the status
+bar and the properties panel say what is wrong with it until you do.
+
+### One selected thing, and what the next click will do
+
+Click a track's disc on the plan view and the same object is outlined on its
+camera pane and highlighted in the track table. Click an incident and it is
+selected too. **Escape clears it.** Exactly one thing is selected at a time, in
+one colour, everywhere — a track is identified by *camera and id*, because `#3`
+on the gate and `#3` on the yard are different people.
+
+Hovering tells you what the system actually knows: for a track, the distance and
+bearing from its camera, the 1σ error, and whether the position was projected
+onto the ground or fell back to "something at this camera" — the fallback is
+drawn as a dashed ring rather than a filled dot, because it is not a location.
+
+The status bar shows the ground under the pointer continuously, named from the
+camera it is measured from. **Ctrl+C** copies it; right-clicking a track row
+copies that object's position.
+
+| mode | what a click does |
+|---|---|
+| **Select** (default) | selects what is under the pointer; drag pans, wheel zooms |
+| **Draw** | places zone corners. Needs Configure |
+| **Measure** | two clicks give metres and bearing. Changes nothing, so it works while locked |
+
+### Monitor and Configure
+
+The console opens in **Monitor**: watch, select, hover, pan, zoom, measure.
+Anything that changes the site — adding or removing a camera, placing one,
+drawing, reshaping or removing a zone, editing zone properties — needs
+**Configure**, which you turn on in the toolbar. The status bar says which of
+the two you are in at all times. Configure turns itself off after ten idle
+minutes, abandoning anything half-drawn, or when you press the button again;
+both edges are written to the audit log. Escape abandons a drawing or clears a
+selection and does **not** relock.
+
+**Who is at the console.** The first start offers to create an administrator;
+after that the console asks you to sign in, and everything you change is
+written to the audit trail under your name. A viewer can watch, select, hover,
+measure — and cannot press Configure or export evidence; the status bar says
+so, and the refusal is audited. Accounts are managed from the command line:
+
+```bash
+sentinel users add alice --role OPERATOR   # prompts for the password, twice
+sentinel users list
+sentinel users passwd alice
+sentinel users disable alice
+```
+
+Roles: **viewer** watches; **operator** changes the site and exports;
+**analyst** exports and reads the audit; **admin** does everything including
+accounts. Skip the first-administrator offer and the console opens with nothing
+gated, and says on every start that the audit trail names nobody.
+
+**When something goes wrong, something leaves the process.** A camera that
+is alive but has delivered no frame for thirty seconds, a recording that
+stopped early, a retention sweep that cannot reach its target because
+everything left is preserved evidence, and an analysis thread that would not
+stop each raise an *alert*: a red banner in the console, one sound, an
+`alert.raised` audit row, and a line in `alerts.log` beside the log. Each
+clears when the condition does. Three environment variables choose where else
+an alert goes; `sentinel alerts` prints the choice and `sentinel alerts
+--test` sends one through every sink:
+
+| Variable | What it does |
+|---|---|
+| `SENTINEL_ALERT_FILE` | The file a line is appended to (default `alerts.log` beside the log; empty disables) |
+| `SENTINEL_ALERT_COMMAND` | A command run per alert, with the kind, subject, detail and state as its last four arguments and as `SENTINEL_ALERT_*` in its environment |
+| `SENTINEL_ALERT_WEBHOOK` | An address on the local network that receives the alert as a JSON body; a public address is refused |
+
+**A greyed button still answers a click.** Clicking *Place…*, *Add zone…*,
+*Remove camera* or any other locked control while the site is locked says what
+that control does, that the site is locked, and offers to unlock it and carry
+on — one question, then the dialog you asked for. Decline and nothing changes.
+*Draw* does the same.
+
+Undo helps the operator who notices a mis-drag. A lock protects against the one
+who does not.
 
 ### Reading the plan view
 
@@ -527,7 +703,100 @@ together when a switch loses power, and twenty dialogs is not a user interface.
 
 ---
 
-## 7. Recording
+## 7. Detection models
+
+Out of the box the system detects **motion**. That is free, needs nothing, and
+has two limits worth stating plainly, because they decide what the rest of the
+product can conclude:
+
+- It does not classify. Every track is `unclassified`, and the system says so
+  rather than guessing.
+- It cannot see anything that has stopped moving. A person standing still
+  disappears.
+
+Point it at a model and both limits go away:
+
+```bash
+sentinel run device:0 --model models/yolov8n-seg.onnx
+```
+
+The console takes the same flag, and with no flag it uses the first `*-seg.onnx`
+it finds in the models directory:
+
+```bash
+sentinel-console --model models/yolov8n-seg.onnx
+sentinel-console --no-model          # motion only, whatever is installed
+```
+
+Which detector you get is decided by **reading the file**, not by a flag:
+
+| The model has | You get | What it can conclude |
+|---|---|---|
+| *no model* | motion | something changed here |
+| one output | detection | a *person* is in this box |
+| two outputs | segmentation | a *person* is this shape, and touches the ground *here* |
+
+That last column is the whole reason to bother. Every position this system
+reports comes from one point per object — where it meets the ground — and
+without a mask that point is the bottom-centre of a rectangle, which is only
+correct for someone upright, unoccluded, and tightly boxed. With a mask it is
+the object's own lowest pixel. The console draws that point as a small dot in
+the track's colour, so you can see for yourself where the map position came
+from: on the feet with a model, at the bottom of the box without one.
+
+The line beside the toolbar always names what is actually running, with the
+model's SHA-256 abbreviated. That digest is recorded on every event, so a
+detection can be traced to the exact file months later.
+
+### What is watched, and how sure it must be
+
+A model that names eighty classes will track a jar on a shelf as a *bottle* and
+a sofa as a *couch*, in the same green as a person — and on a laptop camera it
+did, with "1 couch in Room (HIGH)" as the incident. The operator's word for it
+was "hallucinations". They are not: the model saw a jar. But a security console
+must not track what nobody asked it to watch, so two things are decided per
+machine, from **Detection → Watched classes and confidence…**, and applied at
+the next *Start*:
+
+| setting | default | what it does |
+|---|---|---|
+| **Watched classes** | person, bicycle, car, motorcycle, bus, truck | Every other class is dropped at the detector, before it can become a track, a zone event or an incident. *Security default* and *Everything* are one click each, and the list offers only what the model can actually name |
+| **Minimum confidence** | 0.50 | A detection scoring below it is dropped. The model's own convention is 0.35; on the laptop camera the person held 0.86 while the couch, the jar and the phone scored 0.39–0.51. Lower it for a site whose people are small and far; raise it for a busy room |
+
+The status bar names both beside the model — `watching bicycle, bus, car,
+motorcycle, person, truck with masks · ≥ 0.50 · f828ccfa4b69` — so a row
+reading `person 0.52` in the track table can be seen to have cleared the bar.
+The motion detector takes neither: it names nothing, and its "confidence" is
+how much of a box moved, not a probability.
+
+### Getting a model
+
+**Nothing is ever downloaded by the product.** Not on first run, not as a
+fallback, not ever. You obtain a model once, on a machine with a network:
+
+```bash
+pip install ultralytics onnxslim
+python devtools/export_model.py --task segment --size n
+```
+
+That writes `models/yolov8n-seg.onnx` (about 14 MB) and prints its SHA-256.
+Copy the file to the offline machine and put it in the models directory —
+`SENTINEL_MODELS_DIR` if you have set it, otherwise `models/` **beside the
+executables** (`sentinel where` prints the exact path). Packaging copies any
+model already in the checkout's `models/` into the bundle for you.
+`ultralytics` is a developer tool and is deliberately **not** a dependency of
+the product; see `devtools/README.md` for why that separation matters.
+
+### What it costs
+
+On an ordinary laptop CPU, YOLOv8n-seg runs at roughly **11–14 fps** against a
+640×480 webcam, against a few hundred for motion. That is the trade: motion is
+nearly free and tells you almost nothing; segmentation costs a core and tells
+you what the object is and where it stands.
+
+---
+
+## 8. Recording
 
 Off by default, because writing video is the single most expensive thing this
 system can do to a disk. Turn it on per run:
@@ -574,6 +843,48 @@ a writer that falls behind drops frames rather than building the backlog that
 kills the process — and counts every drop, because a recorder silently
 discarding input is the worst failure a security system can have.
 
+### Recording from the console
+
+Tick **Record** in the camera list — Configure first, because it changes the
+site. The tick is stored with the camera, so it survives a restart, and it
+takes effect when the camera is next started: a camera already running keeps
+doing what it was started with, and its status says *will record when
+restarted* until then. A recording camera shows **● rec** and its clip count in
+the Status column; a recorder that stopped early says so there, with the
+reason. Clips go under the data directory's `recordings/` folder — `sentinel
+where` prints it — one folder per camera, and an incident exported from the
+console now carries the clips that cover it, preserved from retention.
+
+While the console or `sentinel node` runs, retention runs by itself every ten
+minutes with the defaults below (14 days, 5 GiB free), audited like the
+command; a sweep that cannot reach its target because everything left is
+preserved evidence is logged as an error. `sentinel node --record` still
+records every camera, as it always did; the console records the ones ticked,
+and `SentinelVision.exe --camera device:0 --record` ticks a camera from the
+command line.
+
+### Running unattended: the node as a service
+
+```bash
+sentinel node                       # run the cameras the database holds, until stopped
+sentinel node --stop                # ask the running node to stop (works on Windows too)
+sentinel supervise -- --record      # run the node and restart it when it dies
+sentinel service print -- --record  # show what `install` would register on this machine
+sentinel service install -- --record
+sentinel service uninstall
+```
+
+`node` with no source runs whatever the console has added — the form a
+scheduler needs. `--stop` writes a small file in the data directory that the
+running node sees on its next poll and exits cleanly; that is the stop channel
+on every platform, because a service has no terminal and Windows delivers no
+Ctrl-C to a process without one. `supervise` restarts the node after a crash
+with a growing pause (1, 2, 5, 10, 30, 60 s) and stops only when the node exits
+cleanly — a `--for` that ran out, or a stop that was asked for. `service
+install` registers the supervisor with the operating system's own starter: a
+scheduled task at logon on Windows, a user unit on systemd, a launch agent on
+macOS. Nothing else is installed, and `uninstall` removes exactly that.
+
 ### Retention — the disk is finite
 
 ```bash
@@ -597,9 +908,19 @@ Two rules that do not bend:
 
 ### Footage in evidence packages
 
-An exported incident now includes its clips — with a lead-in before the
-incident opened, because an intrusion event fires *after* somebody is already
-inside the zone, and the footage that explains it starts earlier.
+An exported incident includes its clips — with a lead-in before the incident
+opened, because an intrusion event fires *after* somebody is already inside the
+zone, and the footage that explains it starts earlier. Adjust the window with
+`--lead` and `--trail`:
+
+```bash
+sentinel export inc_ABA008BFC4EF5A862535 --to ./evidence --lead 60 --trail 30
+```
+
+Exporting also **preserves** the clips it used: they are marked as evidence in
+the index and retention will not delete them afterwards, however old they get.
+That preservation is itself audited, so "why can this segment not be deleted?"
+has an answer on the record.
 
 The package's `footage.json` states, per camera, exactly what the clips cover
 — and **what they do not**:
@@ -630,7 +951,7 @@ of choice.
 
 ---
 
-## 8. Where your files are
+## 9. Where your files are
 
 ```bash
 sentinel where
@@ -671,14 +992,54 @@ python tasks.py db-rollback  # undo the most recent one
 knowingly. Every migration carries a way back, because an upgrade that cannot be
 undone on a machine with no Internet and no spare hardware is a gamble.
 
+### Network camera passwords
+
+Add the camera with its password in the console, or on the command line once,
+and it is kept by the operating system's keychain under a random handle — the
+database, a backup, the log and every export hold the handle only, and the
+camera opens again after a restart. To give a stored camera its password
+without it ever appearing in a command line:
+
+```bash
+sentinel password gate          # prompts; nothing is echoed
+```
+
+Operator accounts — who may change the site and export evidence — are the
+same shape: `sentinel users add NAME --role ROLE` prompts for the password,
+`--stdin` reads it from standard input for a script, and `list`, `passwd`,
+`disable` and `enable` do what they say. The CLI itself runs as the
+operating-system account that launched it and writes `cli:<account>` to the
+audit trail.
+
+`run` and `node` warn when a source on the command line carries a password,
+because an argument is readable by every process on the machine. A machine
+with no keychain — a container without D-Bus — stores nothing and says so; the
+password is then needed again after each restart, as before.
+
+### Backup and restore
+
+```bash
+sentinel backup                                # a consistent snapshot + .sha256, under backups/
+sentinel restore backups\\sentinel-<stamp>.db   # refuses if a database is already there
+sentinel restore backups\\sentinel-<stamp>.db --replace   # moves the current one aside first
+```
+
+Taken with SQLite's own backup API while the console runs, so it is consistent;
+checked against its digest, its own integrity and this build's schema before
+it is put in place; and a replaced database is kept as `<name>.replaced-<stamp>`,
+never deleted. Stop the console before restoring — a database it holds open
+cannot be moved. A database written by a newer build is refused at open with
+both schema numbers, and a damaged file is refused with this command named.
+
 ---
 
-## 9. Logs, and the developer build
+## 10. Logs, and the developer build
 
 | variable | effect |
 |---|---|
 | `SENTINEL_LOG_LEVEL` | `DEBUG`, `INFO` (default), `WARNING`, `ERROR`. Turns a packaged build up in the field without a rebuild |
 | `SENTINEL_LOG_FILE` | a specific path, or `""` to write nothing to disk — which is what a container wants, since its log is stdout |
+| `crash.log` beside `sentinel.log` | not a setting: where a *hard* crash — a segfault, an abort, a heap corruption — leaves the Python stack of every thread at the moment it happened, written from C by `faulthandler`. The ordinary log cannot record its own process dying; this can. Empty is the normal state |
 
 The file rotates at 5 MB and keeps five, so it cannot become the thing that
 fills the disk.
@@ -691,6 +1052,30 @@ needs the log to say what happened.
 
 Not a debug build — the same code with its output visible, plus `--verbose`
 forced on.
+
+### Testing the shipped binary on the camera
+
+The product is tested through the real camera and the binary in `dist/`, never
+through a prerecorded file and never through a checkout — the unit suites use a
+rendered scene because they must be deterministic, and three defects were found
+only by a person running the packaged console on the laptop camera. So:
+
+```bash
+python tasks.py package          # the three executables
+python tasks.py exetest          # 30 s on device:0, a person in frame
+python tasks.py exetest --seconds 60 --watch person --confidence 0.6
+```
+
+`exetest` seeds a camera, a placement and a person-only restricted zone two
+metres in front of it, runs the dev executable with `--start --for N
+--screenshots`, and leaves `dist/exetest/<stamp>/` holding the pictures of
+every panel, `stdout.txt` with the summary, `stderr.txt`, and the run's own
+`sentinel.log`. It then reads the summary back: frames analysed, every track
+with its class and duration, events, incidents — and says PASS only when
+frames flowed and pictures were taken, with a caveat when nobody was in front
+of the camera. **Look at the pictures before believing it.** The run is
+isolated in a temporary data directory and settings file; the operator's
+database, log and watch list are untouched.
 
 It exists because a packaged Qt application on Windows has nowhere to print. An
 exception raised before the window appears leaves no trace at all, and *"it just
@@ -720,11 +1105,13 @@ modules or open a socket.
 
 ---
 
-## 10. When something is wrong
+## 11. When something is wrong
 
 | what you see | why | what to do |
 |---|---|---|
 | **No events at all** | The zone is somewhere the camera cannot see. This is the most common cause by a distance | `sentinel coverage --place …` and use the zone it hands you |
+| **The buttons are grey and do nothing** | The site is locked: the console opens in Monitor, and the status bar says so | Click the button anyway — it says what it does and offers to unlock — or press *Configure* |
+| **Jars, sofas and phones are tracked in green** | Every class the model names was being watched, at the model's own 0.35 floor | Detection → *Watched classes and confidence…*: the security default watches people and vehicles at 0.50 or better. Stop and Start for it to take effect |
 | **Objects tracked but "not placed"** | The camera has no pose. There is no default, deliberately | Place it — console *Place camera*, or `--place` |
 | **A huge uncertainty circle at the camera** | Projection failed, so it fell back to "something is happening at this camera" | Check the pitch. A camera near level sees the horizon, where a pixel is hundreds of metres |
 | **Objects reported near the horizon with metre-scale error** | Uncertainty grows **super-linearly** with distance; this is honest, not broken | Put zones near the camera. That is where the geometry is worth anything |
@@ -733,7 +1120,7 @@ modules or open a socket.
 | **`The Rust engine core was not found`** | The core is not built, or you moved the library | `python tasks.py build`, or set `SENTINEL_CORE_LIB` |
 | **`reports ABI version N; this build expects M`** | A stale core beside a newer engine | `cargo build --release` in `core/`. The refusal is deliberate: calling a function whose signature moved produces plausible, wrong geometry |
 | **`does not export sentinel_abi_version`** | That library is not the engine core, or is far older | Same fix |
-| **`Refused to contact "…"`** | The egress guard: that address is not on a private network | Intended. Use a LAN address. There is no override, and there will not be one |
+| **`Refused to contact "…"`** | The egress guard: that address is not on a private network | Intended. Use a LAN address. The one override is `SENTINEL_ALLOW_PUBLIC_SOURCES=1` in the environment of the process — for a camera on a routed private WAN, never for the Internet. It is an environment variable so it cannot be ticked by accident, the product never sets it, and every start and every connection it allows is logged at WARNING with the address |
 | **`Failed to load Python DLL '…\_internal\python3xx.dll'`** | An executable was run away from the `_internal` folder beside it — most often one out of `build/`, which is PyInstaller's scratch directory and not the product | Run from `dist/SentinelVision/`. `python tasks.py package` now deletes those stubs |
 | **The console exits immediately, packaged** | An exception before the window appeared | Run `SentinelVision-dev.exe` — that is what it is for |
 | **A camera is listed but will not open** | In use by another application, blocked by a privacy setting, or not a capture device at all — a Windows Hello IR sensor lists as a camera and opens on nothing | `sentinel devices --probe` shows which ones actually open |
@@ -750,7 +1137,7 @@ the log cannot contain a camera password.
 
 ---
 
-## 11. What it will refuse to do
+## 12. What it will refuse to do
 
 Not limitations. Design rules, each enforced by something other than intention.
 
@@ -759,7 +1146,7 @@ Not limitations. Design rules, each enforced by something other than intention.
 | Reach the Internet | Zero WAN, checked three ways: a static source audit at commit, an offline CI job that drops all outbound traffic, and the runtime egress guard |
 | Download a model | Models are supplied by you and placed in `models/`. A missing model is an error that says so, not a cue to go and find one |
 | Send telemetry | Nothing here, and onnxruntime's own telemetry is switched off explicitly — the promise has to hold for every dependency |
-| Identify a person | No facial recognition, no biometrics, no identity database. Objects are tracked; people are not identified. Enforced by absence |
+| Identify a person | Today: no facial recognition, no biometrics, no identity database — objects are tracked, people are not identified, enforced by absence. An opt-in People register is designed (FEATURES.md); when it ships it is off per site until switched on, nobody is enrolled by being seen, and a name never appears without the score and face behind it |
 | Control a camera or take a security action | The AI is an analyst. The operator is the decision maker |
 | Invent a position | A projection that cannot be made returns nothing. It never guesses and never clamps |
 | Report speed it cannot measure | Speed is withheld below 1.2 s of observation, because dividing a distance by one frame interval amplifies position error fivefold |

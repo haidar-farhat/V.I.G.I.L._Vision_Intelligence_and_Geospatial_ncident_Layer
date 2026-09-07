@@ -13,6 +13,8 @@ from __future__ import annotations
 import ctypes
 import math
 
+import numpy as np
+
 import pytest
 
 from sentinel.core import (
@@ -20,6 +22,7 @@ from sentinel.core import (
     BoundingBox,
     CameraPose,
     CDetection,
+    ContactPoint,
     CoreError,
     CPoint,
     CPose,
@@ -483,3 +486,106 @@ def test_every_segment_count_returns_a_closed_ring():
         ring = field_of_view(camera, arc_segments=segments)
         # far arc + near arc, both of `max(2, segments) + 1` points.
         assert len(ring) == 2 * (max(2, segments) + 1)
+
+
+# ------------------------------------------------------------ ground contact
+
+
+def test_the_map_position_is_projected_from_the_mask_not_the_box():
+    """The whole point of carrying the mask across the boundary.
+
+    Two detections with the identical box. One has a mask whose lowest lit row
+    is far to the left of the box's bottom-centre — a person leaning out from
+    behind something. Same rectangle, different place on the ground, and the
+    map must say so.
+    """
+    box = BoundingBox(0.4, 0.5, 0.2, 0.3)
+    mask = np.zeros((30, 20), dtype=np.uint8)
+    mask[:, 0:4] = 1  # a bar down the left edge: the foot is at the left
+
+    plain = Detection(bbox=box, confidence=0.9, class_id=0)
+    shaped = Detection(bbox=box, confidence=0.9, class_id=0, mask=mask)
+
+    with Tracker(pose(), min_hits_to_confirm=1) as a, Tracker(pose(), min_hits_to_confirm=1) as b:
+        for step in range(3):
+            from_box = a.update([plain], step * 200)
+            from_mask = b.update([shaped], step * 200)
+
+    assert from_box[0].contact == ContactPoint(0.5, 0.8), (
+        "without a mask the contact must be exactly the box's bottom-centre"
+    )
+    assert from_mask[0].contact is not None
+    assert from_mask[0].contact.x < 0.45, "the mask's foot was on the left"
+    assert from_mask[0].contact == ground_contact_of(shaped)
+
+    assert from_box[0].position is not None and from_mask[0].position is not None
+    moved = haversine_distance(from_box[0].position.point, from_mask[0].position.point)
+    assert moved > 0.5, f"the map position moved only {moved:.2f} m for a foot 8% of the frame away"
+
+
+def ground_contact_of(detection: Detection) -> ContactPoint:
+    from sentinel.core import ground_contact
+
+    return ground_contact(detection)
+
+
+def test_a_contact_point_survives_the_round_trip_through_the_core():
+    # Written into CDetection by the tracker, read back out of CTrack. If the
+    # two struct layouts disagree the value comes back as plausible garbage,
+    # which is exactly the failure the struct-size guard cannot see.
+    box = BoundingBox(0.4, 0.5, 0.2, 0.3)
+    mask = np.zeros((10, 10), dtype=np.uint8)
+    mask[9, 7:9] = 1  # one foot, bottom right
+    detection = Detection(bbox=box, confidence=0.9, class_id=0, mask=mask)
+
+    with Tracker(None, min_hits_to_confirm=1) as tracker:
+        (track,) = tracker.update([detection], 0)
+
+    assert track.contact is not None
+    assert track.contact.x == pytest.approx(0.4 + 0.2 * 8.0 / 10.0, abs=1e-9)
+    assert track.contact.y == pytest.approx(0.8, abs=1e-9)
+
+
+def test_a_box_on_the_frames_bottom_edge_yields_a_bound_not_a_confident_point():
+    """The laptop camera's finding: feet below the frame, a confident wrong place.
+
+    A person seated half a metre from the lens had every contact on the frame's
+    bottom edge and was projected to 2.16 m ± 0.13 m — inside a zone that began
+    at 2 m — and "entered" it without leaving their chair. The geometry supports
+    a bound, not a point: somewhere between the camera and where the edge
+    projects. So the estimate must reach the camera at one end and the edge's
+    ground point at the other, and say which kind of estimate it is.
+    """
+    from sentinel.core import (
+        CameraPose, Detection, BoundingBox, LatLon, Tracker, haversine_distance,
+        project_to_ground,
+    )
+
+    site = LatLon(33.8938, 35.5018)
+    pose = CameraPose(position=site, mount_height=3.0, heading=0.0, pitch=-30.0)
+    truncated = Detection(bbox=BoundingBox(0.4, 0.5, 0.2, 0.5), confidence=0.9, class_id=0)
+    whole = Detection(bbox=BoundingBox(0.4, 0.3, 0.2, 0.4), confidence=0.9, class_id=0)
+
+    with Tracker(pose, min_hits_to_confirm=1) as tracker:
+        (bounded,) = tracker.update([truncated], 0)
+    with Tracker(pose, min_hits_to_confirm=1) as tracker:
+        (measured,) = tracker.update([whole], 0)
+
+    assert measured.position is not None and measured.position.source == "GROUND_PROJECTION"
+
+    assert bounded.position is not None
+    assert bounded.position.source == "FRAME_EDGE"
+    edge = project_to_ground(pose, 0.5, 1.0)
+    assert edge is not None
+    far = edge.ground_distance_meters
+    centre = haversine_distance(site, bounded.position.point)
+    reach = bounded.position.radius_meters
+    # Covers the camera at one end and the edge's ground point at the other,
+    # and is not the small uncertainty of a nearby point.
+    assert centre - reach <= 0.05
+    assert centre + reach >= far - 0.05
+    assert reach > edge.uncertainty_meters * 3
+    # And an unplaced tracker still locates nothing, rather than bounding it.
+    with Tracker(None, min_hits_to_confirm=1) as tracker:
+        (unplaced,) = tracker.update([truncated], 0)
+    assert unplaced.position is None

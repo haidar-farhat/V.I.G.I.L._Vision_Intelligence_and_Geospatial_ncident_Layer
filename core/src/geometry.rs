@@ -318,8 +318,17 @@ pub fn project_to_ground(
 /// field of view. The operator still learns "something is happening at this
 /// camera" — which is true — without the map implying precision that is not there.
 pub fn project_detection(pose: &CameraPose, bbox: &BoundingBox) -> PositionEstimate {
-    let contact = bbox.ground_contact();
+    project_point(pose, bbox.ground_contact())
+}
 
+/// Project one image point — where an object meets the ground — to a map
+/// position, degrading honestly. See [`project_detection`] for the fallback.
+///
+/// Separate from the box version because the point is now measured rather than
+/// assumed: a segmentation mask gives the lowest row that has any of the object
+/// in it, and for a person leaning, carrying something or half behind a car
+/// that is not the bottom-centre of their rectangle.
+pub fn project_point(pose: &CameraPose, contact: Vec2) -> PositionEstimate {
     match project_to_ground(
         pose,
         contact.x,

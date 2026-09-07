@@ -11,6 +11,8 @@ from datetime import datetime, time, timezone
 
 import pytest
 
+from dataclasses import dataclass
+
 from sentinel.core import (
     BoundingBox,
     LatLon,
@@ -20,7 +22,7 @@ from sentinel.core import (
     destination_point,
     zone_membership,
 )
-from sentinel.zones import Schedule, Zone, ZoneEvaluator, ZoneKind
+from sentinel.zones import Schedule, Zone, ZoneEvaluator, ZoneKind, zone_warnings
 
 SITE = LatLon(33.8938, 35.5018)
 
@@ -50,6 +52,7 @@ def make_track(
     first: int = 0,
     last: int = 0,
     speed: float | None = None,
+    class_id: int = 0,
 ) -> Track:
     position = (
         PositionEstimate(point=point, radius_meters=uncertainty, source="GROUND_PROJECTION")
@@ -58,7 +61,7 @@ def make_track(
     )
     return Track(
         id=track_id,
-        class_id=0,
+        class_id=class_id,
         bbox=BoundingBox(0.4, 0.5, 0.1, 0.2),
         confidence=0.9,
         hits=10,
@@ -296,3 +299,433 @@ def test_one_track_in_two_zones_is_two_presences():
         changes.extend(evaluator.update([track], step * 200))
 
     assert {c.presence.zone_id for c in changes if c.kind == "ENTERED"} == {"a", "b"}
+
+
+# ------------------------------------------------------------- a usable ring
+
+
+def test_a_self_intersecting_outline_is_refused():
+    # A figure of eight has no inside: point-in-polygon flips depending on the
+    # lobe, so events would fire at random. Shapely decides, not a hand-rolled
+    # segment test.
+    from sentinel.zones import Zone, ZoneKind, ring_problem
+    from sentinel.core import LatLon
+
+    bow_tie = (
+        LatLon(33.8938, 35.5018), LatLon(33.8939, 35.5019),
+        LatLon(33.8938, 35.5019), LatLon(33.8939, 35.5018),
+    )
+    assert ring_problem(bow_tie) is not None
+    with pytest.raises(ValueError, match="self-intersection"):
+        Zone(id="z", name="Bow tie", kind=ZoneKind.RESTRICTED, ring=bow_tie)
+
+
+def test_collinear_points_are_not_an_area():
+    from sentinel.zones import ring_problem
+    from sentinel.core import LatLon
+
+    line = (LatLon(33.8938, 35.5018), LatLon(33.8939, 35.5019), LatLon(33.8940, 35.5020))
+    assert "no area" in (ring_problem(line) or "")
+
+
+def test_a_simple_outline_is_accepted_whatever_its_winding():
+    from sentinel.zones import ring_problem
+    from sentinel.core import LatLon
+
+    square = (
+        LatLon(33.8938, 35.5018), LatLon(33.8939, 35.5018),
+        LatLon(33.8939, 35.5019), LatLon(33.8938, 35.5019),
+    )
+    assert ring_problem(square) is None
+    assert ring_problem(tuple(reversed(square))) is None
+
+
+# ------------------------------------------------------------ the site clock
+
+
+def test_schedules_are_read_in_the_site_clock_not_utc():
+    """18:00–06:00 typed in Beirut means 18:00 in Beirut.
+
+    The evaluator used to read the window off a UTC moment, so that schedule
+    armed at 21:00 local and disarmed at 09:00 — three hours of an open site
+    every morning, and nothing on screen said so.
+    """
+    from datetime import timedelta
+
+    night = zone(schedule=Schedule(time(18, 0), time(6, 0)), enter_after_millis=200)
+    track = make_track(1, SITE)
+
+    # 16:30Z is 19:30 at UTC+3 (Beirut, in summer): inside the window there,
+    # outside it in UTC. A fixed offset rather than an IANA zone, because a
+    # Windows machine has no tz database unless the optional tzdata is installed.
+    moment = datetime(2026, 8, 30, 16, 30, tzinfo=timezone.utc)
+
+    beirut = ZoneEvaluator([night], site_tz=timezone(timedelta(hours=3)))
+    for step in range(3):
+        beirut.update([track], step * 200, moment)
+    assert len(beirut.open_presences()) == 1, "the window is open in Beirut at 19:30"
+
+    utc = ZoneEvaluator([night])
+    for step in range(3):
+        utc.update([track], step * 200, moment)
+    assert utc.open_presences() == (), "without a site clock the moment is taken as given"
+
+    # And 04:30Z, 07:30 in Beirut, is outside the window there.
+    early = ZoneEvaluator([night], site_tz=timezone(timedelta(hours=3)))
+    for step in range(3):
+        early.update([track], step * 200, datetime(2026, 8, 30, 4, 30, tzinfo=timezone.utc))
+    assert early.open_presences() == ()
+
+
+# ------------------------------------------ what is wrong with this zone
+
+
+@dataclass
+class FakeReport:
+    """Stands in for `coverage.ZoneReport`, which `zone_warnings` duck-types.
+
+    Deliberately not the real thing: these tests are about the warnings, and
+    building a real report would tie them to a camera pose and make a change in
+    the projection show up as a failure here.
+    """
+
+    covered_fraction: float = 1.0
+    confident_fraction: float = 1.0
+    area_m2: float = 100.0
+
+
+def square(centre: LatLon, half: float) -> tuple[LatLon, ...]:
+    return tuple(
+        destination_point(centre, bearing, half * 1.4142135623730951)
+        for bearing in (45.0, 135.0, 225.0, 315.0)
+    )
+
+
+def area_zone(zone_id: str, name: str, kind: ZoneKind, centre: LatLon, half: float = 5.0,
+              **overrides) -> Zone:
+    return Zone(id=zone_id, name=name, kind=kind, ring=square(centre, half), **overrides)
+
+
+def test_a_zone_nothing_can_see_is_named_as_unable_to_fire():
+    # The most dangerous object in the system: it looks exactly like protection.
+    yard = area_zone("a", "Yard", ZoneKind.RESTRICTED, SITE)
+
+    (warning,) = zone_warnings(yard, FakeReport(covered_fraction=0.0, confident_fraction=0.0))
+
+    assert "no camera can see this zone" in warning
+    assert "never fire" in warning
+
+
+def test_a_zone_wider_than_its_own_position_error_is_warned():
+    yard = area_zone("a", "Yard", ZoneKind.RESTRICTED, SITE)
+
+    (warning,) = zone_warnings(yard, FakeReport(confident_fraction=0.2))
+
+    assert warning.startswith("80% of this zone is beyond confident range")
+    assert "UNCERTAIN" in warning
+
+
+def test_a_zone_that_accepts_uncertainty_is_not_warned_about_it():
+    # An interest or exclusion zone is allowed to act on an uncertain position;
+    # warning about it would be noise, and noise is how warnings stop working.
+    watching = area_zone("a", "Car park", ZoneKind.INTEREST, SITE, accept_uncertain=True)
+
+    assert zone_warnings(watching, FakeReport(confident_fraction=0.2)) == ()
+
+
+def test_an_exclusion_over_a_restricted_zone_is_reported_as_silencing_it():
+    yard = area_zone("a", "Yard", ZoneKind.RESTRICTED, SITE)
+    pavement = area_zone(
+        "x", "Public pavement", ZoneKind.EXCLUSION, destination_point(SITE, 90.0, 6.0)
+    )
+
+    (warning,) = zone_warnings(yard, FakeReport(), [pavement])
+
+    assert warning == "inside exclusion Public pavement: silenced there"
+
+
+def test_same_kind_overlaps_are_reported_with_their_area():
+    # Two 10 m squares, one 6 m east of the other: they share 4 m by 10 m.
+    yard = area_zone("a", "Yard", ZoneKind.RESTRICTED, SITE)
+    twin = area_zone(
+        "b", "Second yard", ZoneKind.RESTRICTED, destination_point(SITE, 90.0, 6.0)
+    )
+
+    (warning,) = zone_warnings(yard, FakeReport(), [twin])
+
+    assert warning.startswith("overlaps Second yard (RESTRICTED),")
+    assert "40 m²" in warning, warning
+
+
+def test_a_zone_does_not_report_overlapping_itself():
+    yard = area_zone("a", "Yard", ZoneKind.RESTRICTED, SITE)
+
+    assert zone_warnings(yard, FakeReport(), [yard]) == ()
+
+
+def test_a_schedule_that_covers_no_time_is_warned():
+    # `covers` asks start <= now < end, which no moment satisfies when they are
+    # equal — so the zone is disarmed for ever and reads as merely scheduled.
+    dead = area_zone(
+        "a", "Yard", ZoneKind.RESTRICTED, SITE, schedule=Schedule(time(9, 0), time(9, 0))
+    )
+
+    (warning,) = zone_warnings(dead, FakeReport())
+
+    assert warning == "schedule 09:00–09:00 covers no time"
+
+
+def test_a_zone_smaller_than_a_square_metre_is_warned():
+    tiny = area_zone("a", "Speck", ZoneKind.RESTRICTED, SITE, half=0.3)
+
+    (warning,) = zone_warnings(tiny, FakeReport(area_m2=0.36))
+
+    assert warning == "area 0.4 m² is under 1 m²"
+
+
+def test_a_healthy_zone_produces_no_warnings():
+    yard = area_zone("a", "Yard", ZoneKind.RESTRICTED, SITE)
+    elsewhere = area_zone(
+        "b", "Far field", ZoneKind.RESTRICTED, destination_point(SITE, 90.0, 400.0)
+    )
+
+    assert zone_warnings(yard, FakeReport(), [elsewhere]) == ()
+
+
+# ------------------------------------------------------ what a zone watches
+#
+# The sofa incident. On a real camera a RESTRICTED zone raised "1 couch in Room
+# (HIGH, risk 55)", because it fired on any class the detector named. The
+# filter is by the detector's own label string — the only vocabulary a site
+# has — and empty means any, which is what every zone meant before it existed.
+
+
+def test_a_zone_watches_everything_by_default():
+    # Every zone written before the filter existed has this, and it must keep
+    # meaning "any": an outline that went quiet on upgrade reads as protection.
+    unfiltered = zone()
+
+    assert unfiltered.classes == frozenset()
+    assert unfiltered.watches("person") is True
+    assert unfiltered.watches("couch") is True
+    assert unfiltered.watches("unclassified") is True
+    assert unfiltered.watches(None) is True, "a motion detector must still fire it"
+
+
+def test_a_filtered_zone_watches_only_what_it_names():
+    people = zone(classes=frozenset({"person"}))
+
+    assert people.watches("person") is True
+    assert people.watches("couch") is False
+    assert people.watches("bottle") is False
+    assert people.watches("unclassified") is False
+
+
+def test_a_detector_that_cannot_name_things_fires_an_empty_filter_and_never_a_set_one():
+    """The distinction the whole feature rests on, stated on its own.
+
+    A motion detector labels nothing, which reaches `watches` as ``None``. An
+    empty filter fires on it — that is the motion-only site, and it must keep
+    working. A non-empty filter never does: the detector cannot say what the
+    thing was, so it cannot say it was a person, and a person-only zone that
+    fired anyway would be the sofa incident with the word "person" on it.
+    """
+    assert zone().watches(None) is True
+    assert zone(classes=frozenset({"person"})).watches(None) is False
+    assert zone(classes=frozenset({"person", "car"})).watches(None) is False
+
+
+def test_the_filter_is_the_detectors_exact_label():
+    # "person" is whatever the model calls "person". No case-folding, no
+    # synonyms: a filter that matched more than it says would be a claim the
+    # model never made. `zone_warnings` is where a mismatch gets pointed out.
+    people = zone(classes=frozenset({"person"}))
+
+    assert people.watches("Person") is False
+    assert people.watches("people") is False
+
+
+def test_a_filter_handed_over_as_a_list_is_held_as_a_frozenset():
+    # A console collects checked boxes into whatever it has. The zone must
+    # still hash, and two zones with the same filter in a different order
+    # must compare equal, or the audit diff reports an edit nobody made.
+    a = zone(classes=["person", "car"])  # type: ignore[arg-type]
+    b = zone(classes={"car", "person"})  # type: ignore[arg-type]
+
+    assert isinstance(a.classes, frozenset)
+    assert a == b and hash(a) == hash(b)
+
+
+def test_every_existing_way_of_building_a_zone_still_works():
+    # The field has a default, so nothing that built a zone before needs to
+    # change — and nothing that did gets a filter it did not ask for.
+    plain = Zone(id="z", name="Z", kind=ZoneKind.RESTRICTED, ring=ring_around(SITE, 10.0))
+
+    assert plain.classes == frozenset()
+    assert plain.watches(None) is True
+
+
+# -------------------------------------- a filter the detector cannot satisfy
+
+
+def test_a_filter_under_a_detector_that_labels_nothing_is_named_as_unable_to_fire():
+    # Armed and silent, which is the worst state: it reads on screen as a
+    # zone that filters, and it is a zone that can never fire.
+    people = area_zone("a", "Yard", ZoneKind.RESTRICTED, SITE, classes=frozenset({"person"}))
+
+    (warning,) = zone_warnings(people, FakeReport(), labels=())
+
+    assert warning == "watches only person, but the detector labels nothing — it can never fire"
+
+
+def test_a_filter_naming_a_class_the_detector_never_emits_is_warned():
+    people = area_zone("a", "Yard", ZoneKind.RESTRICTED, SITE, classes=frozenset({"persn"}))
+
+    (warning,) = zone_warnings(people, FakeReport(), labels=("person", "car"))
+
+    assert warning == "watches only persn, which the detector never names — it can never fire"
+
+
+def test_a_filter_partly_outside_the_vocabulary_names_the_part():
+    mixed = area_zone(
+        "a", "Yard", ZoneKind.RESTRICTED, SITE, classes=frozenset({"person", "forklift"})
+    )
+
+    (warning,) = zone_warnings(mixed, FakeReport(), labels=("person", "car"))
+
+    assert warning == "watches forklift, which the detector never names"
+
+
+def test_a_filter_the_detector_can_satisfy_is_not_warned():
+    people = area_zone("a", "Yard", ZoneKind.RESTRICTED, SITE, classes=frozenset({"person"}))
+
+    assert zone_warnings(people, FakeReport(), labels=("person", "car")) == ()
+
+
+def test_the_filter_is_not_judged_when_the_detector_is_unknown():
+    # The default. A caller that does not know what detector will run must
+    # not be told the zone is dead, and an empty filter has nothing to judge.
+    people = area_zone("a", "Yard", ZoneKind.RESTRICTED, SITE, classes=frozenset({"person"}))
+    any_class = area_zone("b", "Yard", ZoneKind.RESTRICTED, SITE)
+
+    assert zone_warnings(people, FakeReport()) == ()
+    assert zone_warnings(any_class, FakeReport(), labels=()) == ()
+
+
+def _supported(track_id: int, at: int, *, first: int, hits: int, class_id: int = 0, point=None) -> Track:
+    """A track as the tracker reports one that a detection confirmed at `at`."""
+    from dataclasses import replace
+
+    return replace(
+        make_track(track_id, point if point is not None else SITE, first=first, last=at, class_id=class_id),
+        hits=hits,
+    )
+
+
+def _coasting(track_id: int, at: int, *, first: int, hits: int) -> Track:
+    """The same track a frame later, held on prediction: the hit count did not rise."""
+    return _supported(track_id, at, first=first, hits=hits)
+
+
+def test_a_track_split_inside_a_zone_is_one_stay_not_two():
+    """Measured before this: 7, 13 and 3 tracks for three objects in 30 s.
+
+    Every split inside a zone was a fresh ENTERED after the entry delay for a
+    person who had not moved. When a new id appears where the old one went
+    quiet — young, same class, close, within the gap — it inherits the stay.
+    """
+    evaluator = ZoneEvaluator([zone(enter_after_millis=400, exit_after_millis=2000)])
+    entered = []
+    for step in range(6):
+        at = step * 200
+        entered += [c for c in evaluator.update([_supported(1, at, first=0, hits=step + 1)], at)
+                    if c.kind == "ENTERED"]
+    assert [c.presence.track_id for c in entered] == [1]
+
+    # The split: id 1 coasts (hits unchanged), id 2 is new and supported.
+    changes = evaluator.update(
+        [_coasting(1, 1200, first=0, hits=6), _supported(2, 1200, first=1100, hits=2)], 1200
+    )
+    assert changes == []
+    (stay,) = evaluator.open_presences()
+    assert stay.track_id == 2 and stay.origin_track_id == 1 and stay.handoffs == 1
+    assert stay.started_millis == 0
+
+    # Only id 2 from here on. No second ENTERED, no LEFT, one continuous stay.
+    for step in range(7, 16):
+        at = step * 200
+        changes = evaluator.update([_supported(2, at, first=1100, hits=step)], at)
+        assert changes == [], changes
+    (stay,) = evaluator.open_presences()
+    assert stay.duration_millis == 3000 and stay.identity == ("zone-a", 1, 0)
+
+
+def test_a_stay_is_not_handed_to_a_track_that_is_not_a_split():
+    """Every condition failing is two objects, and two objects are two stays."""
+    evaluator = ZoneEvaluator([zone(enter_after_millis=400, exit_after_millis=2000)])
+    for step in range(6):
+        at = step * 200
+        evaluator.update([_supported(1, at, first=0, hits=step + 1)], at)
+
+    # An established track walking in while id 1 coasts: not young, so its own.
+    changes = evaluator.update(
+        [_coasting(1, 1200, first=0, hits=6), _supported(9, 1200, first=-20_000, hits=40)], 1200
+    )
+    assert changes == []
+    assert {p.track_id for p in evaluator.open_presences()} == {1}
+    for step in range(7, 10):
+        at = step * 200
+        changes = evaluator.update(
+            [_coasting(1, at, first=0, hits=6), _supported(9, at, first=-20_000, hits=40 + step)], at
+        )
+    assert {p.track_id for p in evaluator.open_presences()} == {1, 9}
+
+    # A young track of another class where id 1 went quiet: not the same object.
+    other = ZoneEvaluator([zone(enter_after_millis=400, exit_after_millis=2000)])
+    for step in range(6):
+        at = step * 200
+        other.update([_supported(1, at, first=0, hits=step + 1)], at)
+    other.update([_coasting(1, 1200, first=0, hits=6), _supported(2, 1200, first=1100, hits=2, class_id=7)], 1200)
+    assert {(p.track_id, p.handoffs) for p in other.open_presences()} == {(1, 0)}
+
+    # Two tracks both supported this frame are two objects, however close.
+    both = ZoneEvaluator([zone(enter_after_millis=400, exit_after_millis=2000)])
+    for step in range(4):
+        at = step * 200
+        both.update([_supported(1, at, first=0, hits=step + 1), _supported(2, at, first=0, hits=step + 1)], at)
+    assert len(both.open_presences()) == 2
+
+
+def test_a_stay_survives_the_tracker_dropping_the_id_and_issuing_a_new_one():
+    """The id dies outright, and the object comes back under a new one."""
+    evaluator = ZoneEvaluator([zone(enter_after_millis=400, exit_after_millis=2000)])
+    for step in range(6):
+        at = step * 200
+        evaluator.update([_supported(1, at, first=0, hits=step + 1)], at)
+
+    # Gone for two frames: the stay waits the exit delay rather than closing.
+    assert evaluator.update([], 1200) == []
+    assert evaluator.update([], 1400) == []
+    assert len(evaluator.open_presences()) == 1
+
+    changes = evaluator.update([_supported(2, 1600, first=1500, hits=2)], 1600)
+    assert changes == []
+    (stay,) = evaluator.open_presences()
+    assert stay.track_id == 2 and stay.started_millis == 0 and stay.handoffs == 1
+
+
+def test_a_superseded_id_does_not_reopen_the_stay_it_passed_on():
+    """The old box coasts on for a while after the split; it must not become a second stay."""
+    evaluator = ZoneEvaluator([zone(enter_after_millis=400, exit_after_millis=2000)])
+    for step in range(6):
+        at = step * 200
+        evaluator.update([_supported(1, at, first=0, hits=step + 1)], at)
+    evaluator.update([_coasting(1, 1200, first=0, hits=6), _supported(2, 1200, first=1100, hits=2)], 1200)
+
+    for step in range(7, 12):
+        at = step * 200
+        changes = evaluator.update(
+            [_coasting(1, at, first=0, hits=6), _supported(2, at, first=1100, hits=step)], at
+        )
+        assert changes == [], changes
+    assert [p.track_id for p in evaluator.open_presences()] == [2]

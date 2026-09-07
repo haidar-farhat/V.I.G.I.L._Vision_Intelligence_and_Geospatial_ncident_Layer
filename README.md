@@ -59,9 +59,20 @@ no rule.
 - **Zero WAN.** No feature requires the Internet. No cloud services, no telemetry,
   no external map tiles, no CDN assets, no auto-updater, no model downloads.
   Block all outbound traffic and the system keeps working.
+  *The network is available once, to install, and never again* — third-party
+  packages are allowed and are chosen on exactly that criterion, so anything that
+  downloads a model or a tile on first use is disqualified however good it is. An
+  air-gapped site installs from a wheelhouse carried in on a disk; see
+  [docs/SECURITY.md](docs/SECURITY.md#dependencies).
   *Enforced by:* **three checks at three different times.** `python tasks.py
   audit` — the first CI job, before any toolchain runs — scans the shipped source
-  for cloud SDKs, telemetry packages and hard-coded external hosts. The CI
+  for cloud SDKs, telemetry packages and hard-coded external hosts, *and reads
+  the compiled bytes of every dependency* for collector endpoints the source
+  scan cannot see. That second guard exists because onnxruntime — shipped here
+  from the beginning — turned out to carry a Microsoft telemetry uploader in
+  its Linux and macOS wheels, on by default; it is now disarmed before the
+  library loads, and [docs/SECURITY.md](docs/SECURITY.md#dependencies) says
+  exactly what remains. The CI
   offline job drops all outbound traffic, *proves* the drop took effect, and then
   runs every suite. At runtime, every address a camera host resolves to must be
   loopback or RFC 1918 / 4193, or the connection is refused with the address
@@ -84,7 +95,10 @@ no rule.
 - **No AI claim without evidence.** Every conclusion carries its timestamp,
   camera, evidence, confidence, triggering conditions and model version.
   *Enforced by:* the detector's own honesty — a motion blob is emitted as
-  `UNCLASSIFIED` and the console will not label it with a class, asserted by test.
+  `UNCLASSIFIED` and the console will not label it with a class, asserted by
+  test; a model's classes come from the model's own metadata, and one that
+  carries none reports no labels rather than inventing them. The toolbar names
+  the detector that is actually running, with its SHA-256.
   *Not yet:* the analyst guardrail, which is designed but not rebuilt.
 - **Privacy by default.** No facial recognition, no biometric identification, no
   identity database. Objects are tracked; people are not identified.
@@ -170,7 +184,7 @@ The dividing line is **rate**, not importance.
 
 ### Scale
 
-**547 tests** — 57 Rust, 442 engine, 48 console — plus two static checks that
+**648 tests** — 57 Rust, 543 engine, 48 console — plus two static checks that
 run before any of them: an offline audit that fails the build if the shipped
 source names any destination off the site, and a lint that fails it if any of the
 36 diagrams in this documentation no longer parses. `cargo fmt` and
@@ -181,6 +195,7 @@ would test it.
 | Throughput, 640×480, idle machine | fps | ms/frame |
 |---|---:|---:|
 | Motion detector (0.75 scale) | 433 | 2.31 |
+| YOLOv8n-seg, 80 classes with masks | ~11 | ~92 |
 | Whole pipeline, one camera | ~190 | ~5.2 |
 | Aggregate, 16 cameras | ~370 | — |
 
@@ -192,12 +207,12 @@ background model's per-pixel state, measured and written up in
 ### Not yet true, and stated as such
 
 No physical **IP** camera has been contacted — a camera attached to the machine
-has, and works end to end. No *trained* detection model has been run
-— the ONNX path executes against a model built locally for the purpose, which
-tests the machinery around a model and nothing about detection quality. All
-footage is rendered, so none of this is an accuracy claim about the real world.
-There is no authentication, no keychain storage, and no networking between
-machines.
+has, and works end to end. A trained model now runs on it: YOLOv8n-seg, on the
+laptop's own webcam, through the console. That is one model on one camera in one
+room, which is enough to say the machinery is real and nowhere near enough to be
+an accuracy claim; no benchmark has been run and no detection rate is quoted.
+The rendered footage the other tests use remains rendered. There is no
+authentication, no keychain storage, and no networking between machines.
 
 The system reports **4 distinct objects where 3 people walked past** on the
 single-camera scene, inheriting the tracker's over-count. Background subtraction
@@ -221,7 +236,7 @@ python -m pip install -e "engine[dev]" PySide6
 
 python tasks.py build      # build the Rust engine core
 python tasks.py audit      # no route off the site; every diagram parses
-python tasks.py test       # 547 tests, no network
+python tasks.py test       # 648 tests, no network
 python tasks.py lint       # rustfmt + clippy
 python tasks.py check      # all of the above — what CI runs
 ```
@@ -311,6 +326,7 @@ there is one set of instructions and no shell-script pair to drift apart.
 | `python tasks.py db` | Report the database's migration state |
 | `python tasks.py db-migrate` | Apply pending migrations |
 | `python tasks.py db-rollback` | Undo the most recent migration |
+| `python tasks.py exetest` | Run the packaged console on this machine's camera for 30 s and keep the pictures, the summary and the log — the shipped binary as the test medium |
 
 ---
 
@@ -322,9 +338,10 @@ core/               Rust engine core: geometry, projection, zones, tracking
   src/tracking.rs     track lifecycle, association, motion
   src/ffi.rs          the C ABI
 engine/             Python engine
-  sentinel/core.py       ctypes bindings to the core
+  sentinel/core.py       ctypes bindings to the core; ground contact from the mask
   sentinel/decode.py     decode, credential redaction, live streams
-  sentinel/detect.py     motion and ONNX detectors
+  sentinel/detect.py     motion and ONNX detectors, and the factory that picks
+  sentinel/segment.py    instance segmentation (YOLOv8-seg via ONNX Runtime)
   sentinel/zones.py      zones, schedules, presence with hysteresis
   sentinel/events.py     rules and events, each carrying its evidence
   sentinel/incidents.py  correlation, object identity, risk scoring

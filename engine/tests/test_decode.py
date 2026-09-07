@@ -383,3 +383,29 @@ def test_an_unexpected_failure_is_reported_rather_than_killing_the_thread(
     # exception's message may have been built from the URL that raised it.
     assert not contains_credential(message, CAMERA_URL)
     assert SECRET not in message
+
+
+def test_the_override_lets_a_public_address_through_and_says_so_every_time(monkeypatch):
+    """`SENTINEL_ALLOW_PUBLIC_SOURCES` exists (the refusal names it), so it is
+    documented and it is loud: the connection it allows is logged at WARNING
+    with the address. No socket opens here — the reachability probe is stood
+    in for — because a test must not reach for 8.8.8.8 even when allowed to."""
+    from sentinel import decode
+
+    monkeypatch.setattr(decode, "_ALLOW_PUBLIC_SOURCES", True)
+    warned = []
+    monkeypatch.setattr(decode._log, "warning", lambda message, *args: warned.append(message % args))
+
+    probed = []
+
+    def refuse(address, timeout=None):
+        probed.append(address)
+        raise ConnectionRefusedError(111, "stood in for: connection refused")
+
+    # One level below the probe, so the guard inside it still runs.
+    monkeypatch.setattr(decode.socket, "create_connection", refuse)
+    with pytest.raises(DecodeError, match="not reachable"):
+        VideoSource("rtsp://8.8.8.8:554/stream").open()
+
+    assert probed == [("8.8.8.8", 554)], "the guard did not let the address through to the probe"
+    assert any("8.8.8.8" in line and "ALLOW_PUBLIC_SOURCES" in line for line in warned), warned

@@ -16,7 +16,11 @@ does not classify, the overlay says "unclassified" rather than "person".
 
 from __future__ import annotations
 
-from PySide6.QtCore import QPointF, QRectF, Qt
+from datetime import datetime, timezone
+
+import numpy as np
+
+from PySide6.QtCore import Signal, QPointF, QRectF, Qt
 from PySide6.QtGui import (
     QBrush,
     QColor,
@@ -31,11 +35,75 @@ from PySide6.QtWidgets import QSizePolicy, QWidget
 from sentinel.detect import DetectorInfo
 
 from . import theme
-from .worker import Update
+from .selection import Selection
+from sentinel.node import Update
+
+
+#: Media time from a file will not reach this in any recording anybody will
+#: ever make; a live camera's wall-clock stamp is always past it. The two are
+#: therefore distinguishable, which they have to be, because they mean entirely
+#: different things and the same format made one of them nonsense.
+_EPOCH_THRESHOLD_MILLIS = 1_000_000_000_000
+
+
+def _stamp(millis: int) -> str:
+    """The frame's time, in whichever form is meaningful for its source.
+
+    A file's frames are counted from the start of the recording, so `t+11.933s`
+    is exactly right. A live camera's are stamped with the wall clock, and the
+    same format produced `t+1788428138.044s` — seen in a screenshot of the real
+    thing, and meaning nothing to anybody.
+    """
+    if millis >= _EPOCH_THRESHOLD_MILLIS:
+        moment = datetime.fromtimestamp(millis / 1000.0, tz=timezone.utc)
+        return moment.strftime("%H:%M:%S.") + f"{moment.microsecond // 1000:03d} UTC"
+    return f"t+{millis / 1000.0:07.3f}s"
+
+
+#: How strongly a mask tints the frame underneath it. Low on purpose: this is
+#: evidence, and an overlay that hides the pixels it is describing makes the
+#: frame useless for the one job it has.
+MASK_ALPHA = 90
+
+#: Radius, in pixels, of the dot marking where a track meets the ground. Small,
+#: because it marks one measured point; big enough to be seen against footage.
+CONTACT_RADIUS = 4.0
+
+
+def _mask_image(mask: "np.ndarray", colour: QColor) -> QImage:
+    """A translucent, single-colour image of one instance's silhouette.
+
+    Built per frame rather than cached: the mask changes every frame, and at
+    thirty a second a cache keyed on anything would miss every time while
+    holding a reference to every frame it had ever seen.
+    """
+    height, width = mask.shape
+    # ARGB32 is BGRA in memory on a little-endian machine, which every platform
+    # this runs on is. Writing the channels in the wrong order costs nothing at
+    # runtime and turns every person blue-green, which reads as a rendering
+    # style rather than as the bug it is.
+    buffer = np.empty((height, width, 4), dtype=np.uint8)
+    buffer[..., 0] = colour.blue()
+    buffer[..., 1] = colour.green()
+    buffer[..., 2] = colour.red()
+    buffer[..., 3] = (mask > 0) * MASK_ALPHA
+
+    # `tobytes()`, not the array's own buffer. A `QImage` built over a live
+    # numpy buffer only borrows it: the array must outlive both the image and
+    # every copy Qt makes of it lazily, and a local that goes out of scope at
+    # the end of this function does not. `.copy()` then forces a deep copy of
+    # the pixels, so the returned image owns everything it points at.
+    return QImage(
+        buffer.tobytes(), width, height, width * 4, QImage.Format.Format_ARGB32
+    ).copy()
 
 
 class VideoView(QWidget):
     """Renders the current frame and its overlay."""
+
+    #: A `Selection` for a box the operator clicked, or ``None`` for the frame
+    #: itself. The pane does not decide what selection means; it reports one.
+    clicked = Signal(object)
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -48,6 +116,9 @@ class VideoView(QWidget):
         self._info: DetectorInfo | None = None
         self._show_detections = True
         self._placeholder = "No source running"
+        #: Which camera this pane is. A track id means nothing without it.
+        self.camera_id: str = ""
+        self._selection: Selection | None = None
 
     # ------------------------------------------------------------------ inputs
 
@@ -62,6 +133,44 @@ class VideoView(QWidget):
         self._pixmap = None
         self._update = None
         self.update()
+
+    def set_selection(self, selection: "Selection | None") -> None:
+        """Highlight the selected track's box, if it is this camera's."""
+        self._selection = selection
+        self.update()
+
+    def hit_test(self, position) -> "Selection | None":
+        """The track whose box is under this point, smallest box first.
+
+        Smallest first because boxes nest: a person standing in front of a car
+        is entirely inside the car's box, and testing largest-first would make
+        the person unclickable.
+        """
+        if self._update is None or not self.camera_id:
+            return None
+        target = self._fit_rect()
+        if target.isEmpty():
+            return None
+
+        best: tuple[float, Selection] | None = None
+        for track in self._update.result.tracks:
+            box = track.bbox
+            rect = QRectF(
+                target.x() + box.x * target.width(),
+                target.y() + box.y * target.height(),
+                box.w * target.width(),
+                box.h * target.height(),
+            )
+            if rect.contains(position):
+                area = rect.width() * rect.height()
+                if best is None or area < best[0]:
+                    best = (area, Selection.track(self.camera_id, track.id))
+        return None if best is None else best[1]
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit(self.hit_test(event.position()))
+        super().mousePressEvent(event)
 
     def set_show_detections(self, show: bool) -> None:
         self._show_detections = show
@@ -99,8 +208,13 @@ class VideoView(QWidget):
         painter.drawPixmap(target, self._pixmap, QRectF(self._pixmap.rect()))
 
         if self._update is not None:
-            self._paint_overlay(painter, target)
-            self._paint_readout(painter, target)
+            # The readout's rectangle is computed first and handed to the
+            # overlay, so a label can move out of its way. Painting the readout
+            # last and hoping is what produced `1.6gate` — a speed drawn under a
+            # camera name, both illegible, in a screenshot of the real thing.
+            reserved = self._readout_rect(painter, target)
+            self._paint_overlay(painter, target, reserved)
+            self._paint_readout(painter, target, reserved)
 
         painter.end()
 
@@ -129,7 +243,9 @@ class VideoView(QWidget):
         painter.setFont(font)
         painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self._placeholder)
 
-    def _paint_overlay(self, painter: QPainter, target: QRectF) -> None:
+    def _paint_overlay(
+        self, painter: QPainter, target: QRectF, reserved: QRectF | None = None
+    ) -> None:
         assert self._update is not None
         result = self._update.result
 
@@ -143,21 +259,38 @@ class VideoView(QWidget):
 
         if self._show_detections:
             pen = QPen(theme.DETECTION, 1.0, Qt.PenStyle.SolidLine)
-            painter.setPen(pen)
             painter.setBrush(Qt.BrushStyle.NoBrush)
             for detection in result.detections:
                 box = detection.bbox
-                painter.drawRect(to_screen(box.x, box.y, box.w, box.h))
+                rect = to_screen(box.x, box.y, box.w, box.h)
+                # The silhouette when there is one, the rectangle when there is
+                # not. Showing both would draw a box around every mask and hide
+                # the one difference the operator is being shown: whether this
+                # detector knows the object's shape or only its extent.
+                mask = getattr(detection, "mask", None)
+                if mask is not None and mask.size:
+                    painter.drawImage(rect, _mask_image(mask, theme.DETECTION))
+                else:
+                    painter.setPen(pen)
+                    painter.drawRect(rect)
 
         font = QFont(painter.font())
         font.setPointSize(9)
         font.setBold(True)
         painter.setFont(font)
 
+        placed: list[QRectF] = []
         for track in result.tracks:
             gap = result.timestamp_millis - track.last_seen_millis
             coasting = gap > theme.COASTING_AFTER_MILLIS
             colour = theme.TRACK_COASTING if coasting else theme.TRACK
+            if self._selection is not None and self._selection.is_track(
+                self.camera_id, track.id
+            ):
+                # One highlight colour across every panel, so the thing picked
+                # on the map is the thing outlined here without the operator
+                # matching numbers by eye.
+                colour = theme.SELECTION
 
             pen = QPen(colour, 2.0)
             pen.setStyle(Qt.PenStyle.DashLine if coasting else Qt.PenStyle.SolidLine)
@@ -168,8 +301,30 @@ class VideoView(QWidget):
             rect = to_screen(box.x, box.y, box.w, box.h)
             painter.drawRect(rect)
 
+            # The one point the map position was projected from, drawn where
+            # it actually is. With a mask this sits on the feet; with a box it
+            # sits at the bottom-centre. The difference is the whole argument
+            # for segmentation, and an operator should be able to see it
+            # rather than take it on trust.
+            contact = getattr(track, "contact", None)
+            if contact is not None:
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QBrush(colour))
+                painter.drawEllipse(
+                    QPointF(
+                        target.x() + contact.x * target.width(),
+                        target.y() + contact.y * target.height(),
+                    ),
+                    CONTACT_RADIUS,
+                    CONTACT_RADIUS,
+                )
+                painter.setPen(pen)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+
             label = self._label_for(track)
-            self._draw_label(painter, rect, label, colour)
+            self._draw_label(
+                painter, rect, label, colour, target, reserved, placed
+            )
 
     def _label_for(self, track) -> str:
         """What to write beside a track.
@@ -194,18 +349,80 @@ class VideoView(QWidget):
 
         return " ".join(parts)
 
-    def _draw_label(self, painter: QPainter, rect: QRectF, text: str, colour: QColor) -> None:
+    def _draw_label(
+        self, painter: QPainter, rect: QRectF, text: str, colour: QColor,
+        frame: QRectF | None = None, reserved: QRectF | None = None,
+        placed: list[QRectF] | None = None,
+    ) -> None:
+        """Draw one track's label, avoiding the readout and the labels already
+        drawn.
+
+        ``placed`` accumulates what has been drawn this frame. Without it two
+        objects standing near each other get their labels stacked in the same
+        few pixels, which is unreadable at exactly the moment the operator most
+        needs to tell them apart — a person beside a bag reads as one smear.
+        """
         metrics = painter.fontMetrics()
         width = metrics.horizontalAdvance(text) + 10
         height = metrics.height() + 4
 
-        # Above the box normally, inside it when the box is against the top edge,
-        # so a label never leaves the frame.
+        # Above the box normally, inside it when the box is against the top edge.
         top = rect.top() - height - 2
-        if top < 0:
+        if frame is not None and top < frame.top():
             top = rect.top() + 2
 
         background = QRectF(rect.left(), top, width, height)
+
+        if frame is not None:
+            # Clamped on every edge, not just the top. Only the top was checked,
+            # so a track against the left of the frame drew its label at a
+            # negative x and ran off the picture — visible in a screenshot,
+            # invisible to every test.
+            if background.right() > frame.right():
+                background.moveRight(frame.right() - 2)
+            if background.left() < frame.left():
+                background.moveLeft(frame.left() + 2)
+            if background.bottom() > frame.bottom():
+                background.moveBottom(frame.bottom() - 2)
+            if background.top() < frame.top():
+                background.moveTop(frame.top() + 2)
+
+        if reserved is not None and background.intersects(reserved):
+            # The readout is provenance — which frame, at what time — and an
+            # operator cannot recover it from anywhere else on screen. A track
+            # label can: it is a row in the table. So the label moves.
+            below = QRectF(background)
+            below.moveTop(rect.bottom() + 2)
+            if frame is not None and below.bottom() > frame.bottom():
+                below.moveBottom(frame.bottom() - 2)
+
+            if not below.intersects(reserved):
+                background = below
+            else:
+                # Both above and below are blocked, so go sideways, to the far
+                # edge of the panel rather than on top of it.
+                background.moveLeft(reserved.right() + 4)
+                if frame is not None and background.right() > frame.right():
+                    background.moveRight(frame.right() - 2)
+
+        if placed is not None:
+            # Step down past anything already drawn. Bounded: after a few tries
+            # the labels are further apart than they are tall, and going on
+            # would push a label further from the box it names than from the one
+            # it does not — a label in the wrong place is worse than a crowded
+            # one.
+            for _ in range(6):
+                clash = next(
+                    (other for other in placed if background.intersects(other)), None
+                )
+                if clash is None:
+                    break
+                background.moveTop(clash.bottom() + 2)
+                if frame is not None and background.bottom() > frame.bottom():
+                    background.moveBottom(frame.bottom() - 2)
+                    break
+            placed.append(QRectF(background))
+
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QBrush(QColor(0, 0, 0, 170)))
         painter.drawRoundedRect(background, 3, 3)
@@ -214,22 +431,47 @@ class VideoView(QWidget):
         painter.drawText(background.adjusted(5, 0, 0, 0),
                          Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, text)
 
-    def _paint_readout(self, painter: QPainter, target: QRectF) -> None:
+    def _readout_lines(self) -> list[str]:
+        assert self._update is not None
+        result = self._update.result
+        return [
+            f"{result.source_id}",
+            f"frame {result.index}   {_stamp(result.timestamp_millis)}",
+            f"{self._update.analysis_fps:.0f} fps analysed"
+            + (f"   {self._update.skipped} frames not drawn" if self._update.skipped else ""),
+        ]
+
+    def _readout_rect(self, painter: QPainter, target: QRectF) -> QRectF:
+        """Where the readout will go, worked out before anything is drawn.
+
+        Separate from painting it so the overlay can be told to keep off.
+        """
+        if self._update is None:
+            return QRectF()
+
+        font = QFont(painter.font())
+        font.setPointSize(9)
+        font.setBold(False)
+        metrics = painter.fontMetrics() if painter.font() == font else None
+
+        painter.save()
+        painter.setFont(font)
+        metrics = painter.fontMetrics()
+        lines = self._readout_lines()
+        width = max(metrics.horizontalAdvance(line) for line in lines) + 16
+        height = metrics.height() * len(lines) + 12
+        painter.restore()
+
+        return QRectF(target.left() + 8, target.bottom() - height - 8, width, height)
+
+    def _paint_readout(self, painter: QPainter, target: QRectF, panel: QRectF) -> None:
         """Frame index, media time and rate, burned into the corner.
 
         Present because a still frame with a track box on it is not evidence
         unless you can say which frame it was.
         """
         assert self._update is not None
-        result = self._update.result
-        seconds = result.timestamp_millis / 1000.0
-
-        lines = [
-            f"{result.source_id}",
-            f"frame {result.index}   t+{seconds:07.3f}s",
-            f"{self._update.analysis_fps:.0f} fps analysed"
-            + (f"   {self._update.skipped} frames not drawn" if self._update.skipped else ""),
-        ]
+        lines = self._readout_lines()
 
         font = QFont(painter.font())
         font.setPointSize(9)
@@ -237,12 +479,11 @@ class VideoView(QWidget):
         painter.setFont(font)
         metrics = painter.fontMetrics()
 
-        width = max(metrics.horizontalAdvance(line) for line in lines) + 16
-        height = metrics.height() * len(lines) + 12
-        panel = QRectF(target.left() + 8, target.bottom() - height - 8, width, height)
-
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QBrush(QColor(0, 0, 0, 150)))
+        # Nearly opaque. At alpha 150 a bright scene showed straight through the
+        # panel and the provenance became unreadable over exactly the frames an
+        # operator would want it for.
+        painter.setBrush(QBrush(QColor(0, 0, 0, 215)))
         painter.drawRoundedRect(panel, 4, 4)
 
         painter.setPen(QPen(theme.TEXT_MUTED))

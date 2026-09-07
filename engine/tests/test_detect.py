@@ -346,3 +346,63 @@ def test_the_scale_is_part_of_the_detector_identity():
     # provenance has to be able to say which one produced it.
     assert MotionDetector(detect_scale=1.0).info.name != MotionDetector(detect_scale=0.5).info.name
     assert "0.5" in MotionDetector(detect_scale=0.5).info.name
+
+
+def test_a_motion_detector_ignores_a_watch_list_rather_than_refusing_it():
+    # It cannot name a class, so it cannot watch one; the console applies its
+    # watch list to whatever detector it has, and motion-only is not an error.
+    from sentinel.detect import WATCHED_LABELS, MotionDetector, detector_for
+
+    assert isinstance(detector_for(None, classes=WATCHED_LABELS), MotionDetector)
+    assert "person" in WATCHED_LABELS and "car" in WATCHED_LABELS
+    assert "bottle" not in WATCHED_LABELS
+
+
+def test_a_motion_detector_ignores_a_confidence_floor_rather_than_refusing_it():
+    # Its confidence is the fraction of a box that moved, not a probability, so
+    # a floor meant for a classifier is dropped the way the watch list is. The
+    # console sets one for every detector it builds, and a motion-only site
+    # must still start.
+    from sentinel.detect import MotionDetector, detector_for
+
+    detector = detector_for(None, confidence_threshold=0.5, classes={"person"})
+    assert isinstance(detector, MotionDetector)
+    assert detector.info.classifies is False
+
+
+def test_a_model_is_read_once_per_process_and_again_when_the_file_changes(tmp_path, monkeypatch):
+    """PERF-01: four session builds per Start for one camera, in the operator's log."""
+    import os
+
+    from sentinel import detect
+    from sentinel.detect import DetectorInfo, forget_models, model_info
+
+    model = tmp_path / "site.onnx"
+    model.write_bytes(b"not a real model; the loader below is a stand-in")
+    loads = []
+
+    class _Stub:
+        info = DetectorInfo(
+            kind="onnx-segment", name="stub", model_path=str(model), model_sha256="ab" * 32,
+            input_size=(640, 640), class_names={0: "person", 1: "car", 2: "bottle"}, classifies=True,
+        )
+
+    monkeypatch.setattr(detect, "detector_for", lambda path, **options: loads.append(path) or _Stub())
+    forget_models()
+    try:
+        assert sorted(model_info(model).class_names.values()) == ["bottle", "car", "person"]
+        assert model_info(model, classes=["person"]).class_names == {0: "person"}
+        assert model_info(model, classes=["Car", "person"]).class_names == {0: "person", 1: "car"}
+        assert len(loads) == 1, "the model was read again for a question already answered"
+        with pytest.raises(DetectionError, match="does not name"):
+            model_info(model, classes=["unicorn"])
+        assert len(loads) == 1
+
+        model.write_bytes(b"a different file under the same name")
+        os.utime(model, ns=(model.stat().st_atime_ns, model.stat().st_mtime_ns + 5_000_000_000))
+        model_info(model)
+        assert len(loads) == 2, "a replaced model file must be read afresh"
+        with pytest.raises(DetectionError, match="No model at"):
+            model_info(tmp_path / "missing.onnx")
+    finally:
+        forget_models()

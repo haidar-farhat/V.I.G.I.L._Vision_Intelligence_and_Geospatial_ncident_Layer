@@ -13,22 +13,22 @@ this one operates in. Every capability carries one of five states:
 | `PRODUCTION-READY` | Tested, hardened, documented, and exercised against real hardware. |
 
 **Nothing in this repository is `PRODUCTION-READY`.** No part of this system has
-been run against a physical **IP** camera, a GPU, a real detection model, or a
-multi-machine LAN. A camera attached to the machine — USB or built-in, through
-the operating system's own capture API — has been run end to end, which is the
-first piece of real hardware this system has ever touched. Everything else
-marked `TESTED` is tested against generated fixtures, which is a real bar but
-not the same bar.
+been run against a physical **IP** camera, a GPU, or a multi-machine LAN. Two
+things are no longer on that list: a camera attached to the machine — USB or
+built-in, through the operating system's own capture API — and a **real
+pretrained detection model**, both run end to end, together, through the console
+and the CLI. Everything else marked `TESTED` is tested against generated
+fixtures, which is a real bar but not the same bar.
 
 **The codebase was rewritten in Python and Rust.** The previous TypeScript
 implementation was removed in `582d0a8`; its architecture documents were kept
 because the thinking in them carried over, and are being brought up to date.
 Anything below that is not yet re-established after the rewrite says so.
 
-Current suite: **578 tests** — 57 Rust, 473 engine, 48 console — plus two static
+Current suite: **1645 tests** — 60 Rust, 1192 engine, 393 console — plus two static
 checks that run before any of them: an offline audit that fails the build if the
 shipped source names any destination off the site, and a lint that fails it if
-any of the 36 diagrams in this documentation no longer parses. `cargo fmt` and
+any of the 41 diagrams in this documentation no longer parses. `cargo fmt` and
 `clippy -D warnings` clean. Run everything with `python tasks.py check`, or the
 Python half of it inside a container with no network at all:
 `docker compose run --rm verify`. One of them opens a real camera and is skipped unless
@@ -134,6 +134,10 @@ Geometry, projection, zones and tracking, behind a C ABI.
 | Live-thread fault reporting | `TESTED` | The decode thread cannot die silently: any exception becomes a reported fault naming the exception *type*, never its text. |
 | Continuous recording | `TESTED` | Segmented mp4v on a writer thread; a file loses no frames, a camera never builds a backlog; every clip hashed on close. **CLI only — the console cannot enable it yet.** |
 | Recording index and retention | `TESTED` | Migration 3. Oldest-first by age, size and free space; every deletion audited; **a segment an incident depends on is never deleted**. Dry-run by default. |
+| Instance segmentation | `TESTED` | YOLOv8n-seg through ONNX Runtime: 80 COCO classes, one mask per object, ~11–14 fps on CPU. The ground-contact point is taken from the mask's own lowest row, not the bottom edge of a box. Weights are operator-supplied and **never downloaded**. |
+| Mask contact drives the map position | `TESTED` | The contact point crosses the Rust boundary (ABI 6) as a flagged field on every detection, the projection uses it, and the track reports the point it used so the console can draw it. **Before this, the point was computed and used by nothing** — the projection still received a box. |
+| Detector chosen by reading the model | `TESTED` | No model → motion; one output → boxes; two outputs → masks. Decided from the file, because a flag can disagree with the file and the operator cannot tell which won. |
+| Live camera survives a dropped frame | `TESTED` | `VideoSource.read` returns `None` for both the end of a file and a single failed read, and the pipeline iterated a live source exactly like a file — so **one dropped frame stopped a camera for good**, logged as "analysis finished". `LiveStream` had reconnect-with-backoff all along and nothing called it. |
 | Footage in evidence | `TESTED` | Clips copied into the package with a pre-incident lead; `footage.json` states per-camera coverage and times every gap. |
 
 ## Repository guards
@@ -544,7 +548,7 @@ flowchart LR
 **Measured:** ~12.7 MiB/min → **~17.5 GB/day/camera** at 640×480/15fps
 (~280 GB/day for sixteen); encoding ~800 fps, so the writer never limits
 throughput. Storage numbers and the retention command are in
-[docs/USAGE.md §7](docs/USAGE.md).
+[docs/USAGE.md §8](docs/USAGE.md).
 
 **Found by building it, fixed, and pinned by test:** a file source losing 130 of
 180 frames to the drop policy; `on_segment` firing on the writer thread against
@@ -554,6 +558,24 @@ a silent no-op on Windows — the failure mode being *retention deletes the
 evidence*; `measured_fps` echoing the nominal rate; incident windows queried in
 media time against a wall-clock index (asked for footage from 1970, correctly
 found none).
+
+**Then reviewed adversarially, which found more.** Six dimensions over the
+diff, three independent refuters per finding. Three survived, and one of them
+was the whole feature:
+
+| Found | Why it mattered |
+|---|---|
+| **Neither CLI export path attached footage or preserved anything** | Recording worked, coverage worked, preservation worked, and *nothing called any of them*. Every package came out with no video, `preserved` was never set on any segment, and retention was free to delete the exact footage an incident depended on. Every part was tested; the wire between them was not — so the tests now test the wire |
+| `offer()` documented "the image is copied" and did not | `np.ascontiguousarray` returns *the same object* for an already-contiguous array, which every OpenCV frame is — verified. The queued frame aliased the caller's, so a viewer drawing track boxes would bake its overlay into the evidence, and a reused capture buffer would make each frame mutate into a later moment while its timestamp and hash described the earlier one |
+| A second run silently overwrote the first | `cv2.VideoWriter` truncates, and every part of a segment's name is deterministic for a file source. Re-analysing the same clip destroyed the previous run's segments — including *preserved* ones, whose index row then vouched for the replacement with a freshly computed hash |
+| `RecorderStats.fault` was surfaced by nobody | Its own docstring said "the pipeline surfaces it". A writer that died in minute one of an overnight run ended with the same cheerful summary as a healthy one. Now an ERROR line, a line on stdout, and a non-zero exit |
+
+Each is pinned by a test that was watched failing with the defect restored.
+
+**The review was cut short** — it ran out of session budget with 115 of 132
+agents unfinished, so several raised findings were never verified either way.
+The export-wiring defect above came from that unverified pile and was confirmed
+by hand; the rest are unexamined.
 
 **Stated honestly:** recording is engine/CLI only — the console cannot switch it
 on yet. No playback inside the application. No event-triggered mode. Retention

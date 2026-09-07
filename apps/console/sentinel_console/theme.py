@@ -39,10 +39,41 @@ UNCERTAINTY = QColor(96, 165, 250, 40)  # the 1-sigma position disc
 ZONE_FILL = QColor(248, 113, 113, 26)
 ZONE_EDGE = QColor(248, 113, 113, 150)
 
+#: One colour per kind of zone, keyed by the kind's value so this module stays
+#: free of engine imports. A restricted area and an exclusion zone drawn alike
+#: would let an operator read "ignore this" as "nobody should be here".
+ZONE_COLOURS = {
+    "RESTRICTED": QColor(248, 113, 113),   # nobody should be here
+    "PERIMETER": QColor(251, 146, 60),     # the site boundary
+    "ENTRY": QColor(96, 165, 250),         # a door, gate or lane
+    "EXCLUSION": QColor(148, 160, 178),    # deliberately ignored
+    "INTEREST": QColor(74, 222, 128),      # worth recording, nothing implied
+}
+
+
+def zone_colour(kind) -> QColor:
+    """The colour for a zone kind (an enum or its value). Unknown kinds fall
+    back to the restricted colour, which is the alarming one on purpose."""
+    return ZONE_COLOURS.get(getattr(kind, "value", str(kind)), QColor(ZONE_EDGE))
+
 # The map.
 CAMERA = QColor(226, 232, 240)
 FOOTPRINT = QColor(96, 165, 250, 28)
 FOOTPRINT_EDGE = QColor(96, 165, 250, 110)
+#: Alphas of the footprint blue for the ≤ 5 / ≤ 2 / ≤ 1 / ≤ 0.5 m position-error
+#: bands, loosest first. The bands nest and are painted widest first, so the
+#: alphas accumulate and the ground the camera knows best ends up the most
+#: strongly coloured — brightest where its answer can be trusted, fading to the
+#: bare footprint where the error passes five metres.
+SIGMA_BANDS = (22, 36, 52, 70)
+#: The one highlight colour, used for whatever is selected in every panel.
+#: Deliberately not any of the evidence colours: a highlight must never be
+#: mistakable for something the system observed.
+SELECTION = QColor(250, 204, 21)
+
+#: A zone's part that no camera can see, hatched in the fault colour.
+OUTSIDE_HATCH = QColor(248, 113, 113, 60)
+WARNING = STALE
 GRID = QColor(44, 50, 60)
 GRID_MAJOR = QColor(60, 68, 82)
 
@@ -83,6 +114,23 @@ QPushButton {{
 }}
 QPushButton:hover {{ background: {BORDER.name()}; }}
 QPushButton:disabled {{ color: {TEXT_FAINT.name()}; }}
+/* A checkable button that looks the same checked as unchecked is a mode
+   indicator that indicates nothing — which is the ambiguity the mode buttons
+   exist to remove. Checked is filled in the highlight colour and dark on it,
+   so the current mode is legible across a control room rather than at
+   arm's length. */
+QPushButton:checked {{
+    background: {SELECTION.name()};
+    border: 1px solid {SELECTION.name()};
+    color: {PANEL.name()};
+    font-weight: 600;
+}}
+QPushButton:checked:hover {{ background: {SELECTION.lighter(110).name()}; }}
+QPushButton:checked:disabled {{
+    background: {PANEL_RAISED.name()};
+    border: 1px solid {BORDER.name()};
+    color: {TEXT_FAINT.name()};
+}}
 QTreeWidget, QTableWidget {{
     background: {PANEL.name()};
     border: none;

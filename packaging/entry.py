@@ -31,6 +31,15 @@ def _name() -> str:
 
 
 def main() -> int:
+    # The packaged build's very first act. Everything else in this process is
+    # imported after it, which is the whole point.
+    try:
+        from sentinel import telemetry
+
+        telemetry.silence()
+    except Exception:  # noqa: BLE001 - never let this stop the app starting
+        pass
+
     name = _name()
 
     if name.startswith("sentinel") and "vision" not in name:

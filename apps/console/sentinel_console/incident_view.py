@@ -58,6 +58,7 @@ class IncidentView(QTreeWidget):
         self.setFont(font)
 
         self._expanded: set[str] = set()
+        self._selected: str | None = None
 
     def show_incidents(self, incidents: list[Incident]) -> None:
         """Replace the list, preserving which rows the operator had open.
@@ -85,6 +86,38 @@ class IncidentView(QTreeWidget):
             item = self.topLevelItem(index)
             if item.data(0, Qt.ItemDataRole.UserRole) in self._expanded:
                 item.setExpanded(True)
+            # A rebuild must not silently drop the selection: this panel is
+            # rebuilt on every collection tick.
+            if item.data(0, Qt.ItemDataRole.UserRole) == self._selected:
+                item.setSelected(True)
+                self.setCurrentItem(item)
+
+    def set_selection(self, selection) -> None:
+        """Bring the selected incident's row forward, without stealing focus.
+
+        `setCurrentItem` rather than `scrollToItem` alone: an operator who
+        selected the incident somewhere else needs to see which row it is, and
+        a row highlighted but off-screen is not an answer.
+        """
+        incident_id = getattr(selection, "incident_id", None) if selection else None
+        self._selected = incident_id
+        if incident_id is None:
+            self.clearSelection()
+            return
+        for index in range(self.topLevelItemCount()):
+            item = self.topLevelItem(index)
+            if item.data(0, Qt.ItemDataRole.UserRole) == incident_id:
+                self.setCurrentItem(item)
+                item.setSelected(True)
+                self.scrollToItem(item)
+                return
+
+    def selected_incident_id(self) -> str | None:
+        """The incident whose row is current, following a child up to its parent."""
+        item = self.currentItem()
+        while item is not None and item.parent() is not None:
+            item = item.parent()
+        return None if item is None else item.data(0, Qt.ItemDataRole.UserRole)
 
     def _remember_expansion(self) -> None:
         for index in range(self.topLevelItemCount()):
@@ -120,12 +153,17 @@ class IncidentView(QTreeWidget):
                 _detail(f"{factor.points:+.0f}", f"{factor.name} — {factor.because}")
             )
 
-        # Cross-camera associations, with the reasoning. An operator must be able
-        # to see why two cameras were treated as one object, and disagree.
+        # Associations, with the reasoning. An operator must be able to see why
+        # two tracks were treated as one object, and disagree. Labelled by what
+        # was joined: two cameras' tracks (a hand-off) or two fragments of one
+        # camera's track (the tracker lost and re-found the same object). They
+        # are different claims and were both called "linked" until same-camera
+        # links existed.
         for association in incident.associations:
+            same_camera = association.a[0] == association.b[0]
             item.addChild(
                 _detail(
-                    "linked",
+                    "same camera" if same_camera else "cross camera",
                     f"{association.a[0]}#{association.a[1]} = "
                     f"{association.b[0]}#{association.b[1]} "
                     f"({association.score:.2f}): {association.reasons[0]}",
@@ -134,8 +172,13 @@ class IncidentView(QTreeWidget):
 
         item.addChild(_heading("timeline", f"{len(incident.events)} events"))
         for entry in incident.timeline():
+            # Relative to when the incident opened, which is what "t+" claims.
+            # `at_millis` is a wall clock: near zero for a file, a Unix epoch
+            # for a live camera, and this read "t+1788513275.8s" on the laptop
+            # webcam — the defect fixed in the evidence report this morning,
+            # still here.
             child = _detail(
-                f"t+{entry.at_millis / 1000:.1f}s",
+                f"t+{(entry.at_millis - incident.opened_at_millis) / 1000:.1f}s",
                 f"{entry.camera_id}  {entry.summary}",
             )
             child.setForeground(

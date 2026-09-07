@@ -54,6 +54,12 @@ _log = _get_logger(__name__)
 #: How long to wait for a live frame before treating the stream as stalled.
 LIVE_FRAME_TIMEOUT_SECONDS = 10.0
 
+#: How long to wait for a decode thread to finish before giving up on it. Longer
+#: than a driver's own read timeout, so an ordinary slow camera is waited for
+#: rather than abandoned — abandoning it means leaking its capture, and this is
+#: the number that decides how often that happens.
+STOP_TIMEOUT_SECONDS = 5.0
+
 #: How long to wait for a network source to answer before giving up.
 #:
 #: Applied by a socket probe before the decoder is involved at all, because
@@ -161,6 +167,16 @@ class SourceInfo:
     backend: str = "FFmpeg"
 
 
+def is_live_source(url: str | Path) -> bool:
+    """Whether a source is a camera — a device or a stream — rather than a file.
+
+    A file can be read by any number of readers at once; a camera cannot, and a
+    node uses this to refuse a second camera on the same device.
+    """
+    raw = str(url)
+    return devices.is_device_source(raw) or _looks_live(raw)
+
+
 class VideoSource:
     """A file or live stream, decoded to frames.
 
@@ -170,7 +186,7 @@ class VideoSource:
     """
 
     __slots__ = ("_url", "_display", "_id", "_capture", "_info", "_index", "_is_live",
-                 "_opened", "_is_device", "_backend")
+                 "_opened", "_is_device", "_backend", "_capture_lock")
 
     def __init__(self, url: str | Path, *, source_id: str | None = None, live: bool | None = None):
         """
@@ -196,6 +212,9 @@ class VideoSource:
             # it, or `device:front`, is a typo — and a typo that quietly opened
             # index 0 would point a camera at somewhere nobody meant.
             devices.device_index(raw)
+        # `LiveStream` gave a source two owners: its decode thread closes and
+        # reopens on every reconnect while the pipeline closes on teardown.
+        self._capture_lock = threading.Lock()
         self._capture: cv2.VideoCapture | None = None
         self._info: SourceInfo | None = None
         self._index = 0
@@ -279,7 +298,10 @@ class VideoSource:
         fps = capture.get(cv2.CAP_PROP_FPS)
         count = capture.get(cv2.CAP_PROP_FRAME_COUNT)
 
-        self._capture = capture
+        # Published under the same lock that `close` takes, so a reconnecting
+        # decode thread and a closing pipeline cannot both believe they own it.
+        with self._capture_lock:
+            self._capture = capture
         self._info = SourceInfo(
             width=width,
             height=height,
@@ -374,6 +396,16 @@ class VideoSource:
                 "Internet; if that address is genuinely a camera on a routed "
                 "network, set SENTINEL_ALLOW_PUBLIC_SOURCES=1."
             )
+        if public:
+            # The one override, and it is loud: every connection it allows is
+            # named in the log at WARNING, with the address, so a machine that
+            # reaches routable addresses never does so quietly. The variable
+            # is announced once more at start-up by `logs.configure`.
+            _log.warning(
+                "%s resolves to %s, outside the local network; connecting anyway "
+                "because SENTINEL_ALLOW_PUBLIC_SOURCES is set",
+                self._display, ", ".join(sorted(public)),
+            )
 
     def _open_capture(self) -> cv2.VideoCapture:
         """Hand the URL to OpenCV.
@@ -453,17 +485,37 @@ class VideoSource:
         return cv2.VideoCapture()
 
     def close(self) -> None:
-        if self._capture is not None:
-            self._capture.release()
-            self._capture = None
-        self._opened = False
+        """Release the capture. Safe to call twice, and from two threads.
+
+        A `VideoSource` used to be touched by exactly one thread, so a plain
+        check-and-release was correct. `LiveStream` made that untrue: its decode
+        thread closes the source on every reconnect while the pipeline closes it
+        on teardown, and two threads that both pass an ``is not None`` check
+        both call `release()` on the same `cv2.VideoCapture`.
+
+        That is a double free of a C++ object, and it presented the way those
+        always do — not at the call, but as heap corruption (`0xC0000374`)
+        minutes later at interpreter shutdown, in a run where every test passed.
+        """
+        with self._capture_lock:
+            capture, self._capture = self._capture, None
+            self._opened = False
+        if capture is not None:
+            capture.release()
 
     def read(self) -> Frame | None:
         """One frame, or ``None`` at the end of a file / on a read failure."""
-        if self._capture is None:
+        # Taken once, into a local. Testing `self._capture` and then using it is
+        # the same check-then-act that `close` had: the closing thread can null
+        # the attribute and release the capture in between, and this thread then
+        # reads through a freed C++ object. Holding a reference keeps it alive
+        # even if `close` wins the race — `release()` on a live reference is
+        # defined; a read through a dangling one is not.
+        capture = self._capture
+        if capture is None:
             raise DecodeError("the source is not open")
 
-        ok, image = self._capture.read()
+        ok, image = capture.read()
         if not ok or image is None:
             return None
 
@@ -581,11 +633,39 @@ class LiveStream:
         self._thread.start()
 
     def stop(self) -> None:
+        """Stop reading, and release the capture **only if it is safe to**.
+
+        The join can time out: a decode thread blocked inside a driver's
+        `read()` on a camera that has stopped answering is not interruptible
+        from here, and no amount of waiting makes it so. Closing the source
+        anyway — which this used to do unconditionally — calls `release()` on a
+        `cv2.VideoCapture` that another thread is still reading through. That
+        frees the native decoder under a live caller, and the corruption
+        surfaces later and elsewhere: in this repository it appeared as
+        `0xC0000374` at interpreter shutdown, in a console test run where every
+        test had passed.
+
+        So when the thread does not end, the capture is deliberately **leaked**.
+        A leaked capture costs one file handle in a process that is stopping;
+        the alternative costs the heap.
+        """
         self._state.stop.set()
+
+        ended = True
         if self._thread is not None:
-            self._thread.join(timeout=5.0)
+            self._thread.join(timeout=STOP_TIMEOUT_SECONDS)
+            ended = not self._thread.is_alive()
             self._thread = None
-        self._source.close()
+
+        if ended:
+            self._source.close()
+        else:
+            _log.error(
+                "%s: the decode thread did not stop within %.0fs; its capture is "
+                "being left open rather than released underneath it",
+                self._source.source_id,
+                STOP_TIMEOUT_SECONDS,
+            )
 
     def read(self, timeout: float = LIVE_FRAME_TIMEOUT_SECONDS) -> Frame | None:
         """The newest frame, or ``None`` if none arrived within ``timeout``."""
@@ -608,6 +688,12 @@ class LiveStream:
             try:
                 self._source.open()
                 attempt = 0
+                # Cleared on success, or a stream that recovered would go on
+                # raising the failure it recovered from: `read` reports
+                # `_state.error` whenever the queue happens to be empty, and a
+                # ten-second gap on a healthy camera would then be indis-
+                # tinguishable from the outage it had already survived.
+                self._state.error = None
                 self._pump()
             except DecodeError as error:
                 # Redacted by construction: DecodeError never carries a URL that

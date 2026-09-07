@@ -26,7 +26,7 @@ import cv2
 import numpy as np
 import pytest
 
-from sentinel import logs
+from sentinel import logs, recording
 from sentinel.decode import Frame
 from sentinel.evidence import coverage_for, export_incident
 from sentinel.recording import (
@@ -217,9 +217,60 @@ def test_an_impossible_segment_length_is_refused():
         Recorder("cam", "/tmp", segment_seconds=0)
 
 
-def test_an_unavailable_codec_says_so_and_does_not_reach_for_one(tmp_path: Path):
+class _WriterThatWillNotOpen:
+    """A `cv2.VideoWriter` that reports itself unopened, and writes nothing.
+
+    A bogus fourcc used to produce this for free. It no longer does: OpenCV 5's
+    FFMPEG backend *silently substitutes* a codec when a tag is unknown —
+    `tag 'ZZZZ' is not found ... fallback to use tag 'mp4v'` — so the writer
+    opens, the recording succeeds, and both tests below passed a healthy
+    recorder off as a broken one until the substitution started happening.
+
+    What is under test here is the recorder's own reporting, not OpenCV's codec
+    table, so the failure is injected at the seam rather than coaxed out of a
+    third-party build whose behaviour differs by version and platform.
+    """
+
+    def __init__(self, *_args, **_kwargs):
+        pass
+
+    def isOpened(self) -> bool:  # noqa: N802 - the cv2 spelling
+        return False
+
+    def write(self, _image) -> None:
+        raise AssertionError("nothing may be written to a writer that never opened")
+
+    def release(self) -> None:
+        pass
+
+
+class _WriterThatDiesMidRun:
+    """Opens, takes one frame, then fails — a disk filling up, or a device
+    disappearing under an overnight run. The interesting case, because the
+    recorder has already told its caller that recording is underway."""
+
+    def __init__(self, *_args, **_kwargs):
+        self._written = 0
+
+    def isOpened(self) -> bool:  # noqa: N802
+        return True
+
+    def write(self, _image) -> None:
+        self._written += 1
+        if self._written > 1:
+            raise OSError(28, "No space left on device")
+
+    def release(self) -> None:
+        pass
+
+
+def test_an_unavailable_codec_says_so_and_does_not_reach_for_one(
+    tmp_path: Path, monkeypatch
+):
     # Nothing is ever downloaded to obtain a codec — which is exactly why H.264
     # is not the default, since asking OpenCV for it prints a download link.
+    monkeypatch.setattr(recording.cv2, "VideoWriter", _WriterThatWillNotOpen)
+
     recorder = Recorder("cam", tmp_path, fps=15.0, live=False, codec="ZZZZ")
     recorder.start()
     for frame in frames(5):
@@ -228,6 +279,30 @@ def test_an_unavailable_codec_says_so_and_does_not_reach_for_one(tmp_path: Path)
 
     assert recorder.stats.fault is not None
     assert "downloaded" in recorder.stats.fault or "codec" in recorder.stats.fault
+
+
+def test_a_dead_writer_is_reported_rather_than_accepted_from(
+    tmp_path: Path, monkeypatch
+):
+    # `offer` checked only whether it had ever started a thread, so it went on
+    # returning True for a writer that had died — telling the caller a frame was
+    # recorded when nothing was going to record it.
+    monkeypatch.setattr(recording.cv2, "VideoWriter", _WriterThatDiesMidRun)
+
+    recorder = Recorder("cam", tmp_path, fps=15.0, live=True)
+    recorder.start()
+    try:
+        deadline = time.time() + 5.0
+        while recorder.offer(frames(1)[0]) and time.time() < deadline:
+            time.sleep(0.01)
+
+        # The writer is dead by now; every further frame must be refused.
+        assert recorder.offer(frames(1)[0]) is False
+    finally:
+        recorder.close()
+
+    assert recorder.stats.fault is not None
+    assert recorder.stats.frames_dropped > 0
 
 
 def test_indexing_happens_on_the_caller_s_thread(tmp_path: Path):
@@ -547,3 +622,247 @@ def test_overlapping_segments_do_not_manufacture_a_gap(tmp_path: Path):
 
     assert coverage.is_complete
     assert coverage.gaps == ()
+
+
+# ------------------------------------------- what an adversarial review found
+#
+# Three defects that survived three independent refuters each. All three shared
+# a shape: the code was *documented* as doing the safe thing and did not, so
+# nothing looked wrong from the outside.
+
+
+def test_the_frame_handed_to_the_writer_is_a_real_copy(tmp_path: Path):
+    # `np.ascontiguousarray` returns the SAME object for an already-contiguous
+    # array, which every `cv2.VideoCapture.read()` frame is — so the docstring's
+    # "the image is copied" was false and the queued frame aliased the caller's.
+    # A viewer drawing track boxes onto `FrameResult.image` would have baked its
+    # overlay into the recorded evidence.
+    source = frames(30)
+
+    with Recorder("cam", tmp_path, fps=15.0, live=False) as recorder:
+        for frame in source:
+            recorder.offer(frame)
+            # Exactly what a viewer does to the array it was handed, and what a
+            # reused capture buffer does on its own.
+            frame.image[:] = 255
+        segments = recorder.close()
+
+    capture = cv2.VideoCapture(str(segments[0].path))
+    ok, first = capture.read()
+    capture.release()
+
+    assert ok
+    # The frames offered were mostly black with a small white block. If the
+    # writer had seen the caller's mutation, every pixel would be white.
+    assert first.mean() < 200, "the caller's mutation reached the recording"
+
+
+def test_a_second_run_does_not_overwrite_the_first(tmp_path: Path):
+    # `cv2.VideoWriter` truncates an existing file, and for a file source every
+    # part of a segment's name is deterministic — so re-analysing the same clip
+    # into the same directory reproduced the first run's filenames exactly.
+    # Worse than losing a recording: `save_segment` upserts on the path and
+    # keeps `preserved=1`, so evidence would have had its bytes replaced while
+    # the index went on vouching for it.
+    epoch = int(datetime(2026, 5, 6, 7, 8, 9, tzinfo=timezone.utc).timestamp() * 1000)
+
+    def record_once() -> list[Segment]:
+        with Recorder("cam", tmp_path, fps=15.0, live=False, epoch_millis=epoch) as rec:
+            for frame in frames(30):
+                rec.offer(frame)
+            return list(rec.close())
+
+    first = record_once()
+    second = record_once()
+
+    assert first[0].path != second[0].path, "the second run reused the first's name"
+    assert first[0].path.is_file(), "the first run's evidence was destroyed"
+    assert second[0].path.is_file()
+    assert len(list(tmp_path.glob("*.mp4"))) == 2
+
+
+def test_a_recording_that_stopped_early_is_surfaced_by_the_pipeline(
+    tmp_path: Path, reference_video: Path
+):
+    # `RecorderStats.fault` documented that "the pipeline surfaces it", and the
+    # pipeline did not read the field at all. A writer that died in the first
+    # minute of an overnight run ended with the same cheerful summary as a
+    # healthy one.
+    #
+    # The recorder is replaced with one that reports a fault, because what is
+    # under test is the *surfacing* — not the many ways a writer can die, which
+    # are covered above. `caplog` cannot be used: `logs.configure` sets
+    # propagate=False on the `sentinel` tree, deliberately, so the handler goes
+    # on the logger that actually emits.
+    import logging
+
+    from sentinel import pipeline as pipeline_module
+    from sentinel.decode import VideoSource
+    from sentinel.detect import MotionDetector
+    from sentinel.pipeline import Pipeline
+
+    class FaultingRecorder(Recorder):
+        def start(self) -> None:
+            super().start()
+            with self._lock:
+                self._stats.fault = "OSError: the disk went away"
+
+    said: list[str] = []
+
+    class Collect(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            said.append(record.getMessage())
+
+    handler = Collect(level=logging.ERROR)
+    logger = logging.getLogger("sentinel.pipeline")
+    logger.addHandler(handler)
+    original = pipeline_module.Recorder
+    pipeline_module.Recorder = FaultingRecorder
+    try:
+        with Pipeline(
+            VideoSource(reference_video, source_id="cam"),
+            MotionDetector(),
+            record_to=tmp_path,
+        ) as pipeline:
+            for _ in pipeline.run():
+                pass
+    finally:
+        pipeline_module.Recorder = original
+        logger.removeHandler(handler)
+
+    assert any("RECORDING STOPPED EARLY" in message for message in said), (
+        "a recorder that stopped early ended the run with no error anywhere"
+    )
+    assert any("the disk went away" in message for message in said), (
+        "the reason the writer stopped was not reported"
+    )
+
+
+# ------------------------------------------------- the wiring, not the parts
+#
+# Recording worked. Coverage worked. Preservation worked. And nothing in the
+# shipped code called any of them, so every exported package came out with no
+# video and no segment was ever preserved — leaving retention free to delete
+# the exact footage an incident depended on. Every part was tested; the wire
+# between them was not. These test the wire.
+
+
+def cli_run(*arguments: str) -> int:
+    from sentinel.cli import main
+
+    return main(list(arguments))
+
+
+@pytest.fixture
+def recorded_incident(tmp_path: Path, reference_video: Path):
+    """A real run with recording on, leaving an incident and its footage."""
+    database = tmp_path / "sentinel.db"
+    zone = (
+        "Yard:33.893736,35.501800;33.893628,35.501930;"
+        "33.893520,35.501800;33.893628,35.501670"
+    )
+    code = cli_run(
+        "-q", "--database", str(database), "run", str(reference_video),
+        "--id", "gate",
+        "--place", "33.8938,35.5018,6,180,-22,62,36,90",
+        "--zone", zone,
+        "--record", str(tmp_path / "recordings"),
+        "--segment-seconds", "5",
+    )
+    assert code == 0
+
+    with Store(database) as store:
+        rows = store.incidents()
+        assert rows, "the reference scene raised no incident to export"
+        return database, rows[0]["id"], tmp_path
+
+
+def test_an_exported_package_actually_contains_the_footage(recorded_incident):
+    database, incident_id, tmp_path = recorded_incident
+    destination = tmp_path / "export"
+
+    assert cli_run(
+        "-q", "--database", str(database), "export", incident_id, "--to", str(destination)
+    ) == 0
+
+    package = destination / incident_id
+    clips = sorted(package.glob("*.mp4"))
+
+    assert clips, "the package has no video in it"
+    assert (package / "footage.json").is_file()
+    assert sum(clip.stat().st_size for clip in clips) > 100_000
+
+
+def test_exporting_preserves_the_footage_from_retention(recorded_incident):
+    # The failure this prevents is delayed and invisible: the package is fine,
+    # and a retention pass weeks later deletes the originals it came from.
+    database, incident_id, tmp_path = recorded_incident
+
+    with Store(database) as store:
+        assert store.recorded_bytes(preserved=True) == 0
+
+    cli_run(
+        "-q", "--database", str(database), "export", incident_id,
+        "--to", str(tmp_path / "export"),
+    )
+
+    with Store(database) as store:
+        assert store.recorded_bytes(preserved=True) > 0, (
+            "exporting an incident left its footage deletable"
+        )
+
+        # And the strongest form: a policy that would delete everything does not.
+        result = apply_retention(
+            store, RetentionPolicy(max_age_days=0, min_free_bytes=None)
+        )
+
+    assert result.deleted == [], "retention deleted footage an incident depends on"
+    assert result.kept_preserved > 0
+
+
+def test_preserving_evidence_is_audited(recorded_incident):
+    # "Why can this segment not be deleted?" deserves an answer on the record.
+    database, incident_id, tmp_path = recorded_incident
+
+    cli_run(
+        "-q", "--database", str(database), "export", incident_id,
+        "--to", str(tmp_path / "export"),
+    )
+
+    with Store(database) as store:
+        actions = [row["action"] for row in store.audit_trail()]
+
+    assert "recording.preserved" in actions
+    assert "incident.exported" in actions
+
+
+# --------------------------------------------------- a camera id on a disk
+
+
+def test_a_camera_id_is_made_safe_for_a_file_system():
+    from sentinel.recording import file_safe
+
+    assert file_safe("device:0") == "device-0"
+    assert file_safe("gate") == "gate"
+    assert file_safe("rtsp://admin@10.0.0.5/s") == "rtsp-admin-10.0.0.5-s"
+    assert file_safe("a/../b") == "a-..-b"
+    assert file_safe("::") == "camera"
+    assert file_safe("") == "camera"
+
+
+def test_a_camera_called_device_colon_zero_records_a_clip_with_no_colon_in_its_name(tmp_path: Path):
+    """The first packaged run to ask for recording died in `mkdir` on
+    `recordings/device:0`. The id stays the id — the index and the evidence
+    name the camera as the operator does — and the disk gets a safe name."""
+    recorder = Recorder("device:0", tmp_path / "rec", live=False, fps=15.0)
+    recorder.start()
+    for frame in frames(12):
+        recorder.offer(frame)
+    segments = recorder.close()
+
+    assert segments, "nothing was recorded"
+    for segment in segments:
+        assert segment.camera_id == "device:0"
+        assert ":" not in segment.path.name
+        assert segment.path.name.startswith("device-0_")
+        assert segment.path.is_file()

@@ -53,10 +53,15 @@ SCANNED = [
 
 SUFFIXES = {".py", ".rs", ".toml"}
 
-#: This file has to spell out every name it forbids, so scanning it finds all of
-#: them. It is excluded by name rather than by a marker comment, because a marker
+#: A guard has to spell out every name it forbids, so scanning one finds all of
+#: them. Excluded by name rather than by a marker comment, because a marker
 #: comment is a mechanism any other file could also use to opt out.
+#:
+#: `binary_audit.py` is here for exactly the same reason: it names the telemetry
+#: endpoints it looks for inside compiled dependencies, and naming them is its
+#: whole job.
 SELF = Path(__file__).resolve()
+GUARDS = {SELF, SELF.parent / "binary_audit.py"}
 
 #: Distribution names and import roots. Matched as whole words so `azure` does
 #: not fire on `azure_sky_theme`.
@@ -148,7 +153,7 @@ def _files() -> list[Path]:
                 for path in sorted(entry.rglob("*"))
                 if path.suffix in SUFFIXES and "__pycache__" not in path.parts
             )
-    return [path for path in found if path.resolve() != SELF]
+    return [path for path in found if path.resolve() not in GUARDS]
 
 
 def _word_present(text: str, needle: str) -> bool:

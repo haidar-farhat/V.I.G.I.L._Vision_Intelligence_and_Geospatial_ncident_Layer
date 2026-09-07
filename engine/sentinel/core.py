@@ -18,6 +18,8 @@ functions whose signatures may have moved underneath it.
 from __future__ import annotations
 
 import ctypes
+
+import numpy as np
 import os
 import sys
 from dataclasses import dataclass
@@ -25,7 +27,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Iterable, Sequence
 
-ABI_VERSION = 5
+ABI_VERSION = 6
 
 # --------------------------------------------------------------------- structs
 
@@ -47,6 +49,14 @@ class CPose(ctypes.Structure):
 
 
 class CDetection(ctypes.Structure):
+    """A detection crossing into the core.
+
+    ``has_contact`` is 1 when ``contact_x`` / ``contact_y`` carry a measured
+    ground-contact point (ABI 6). With it 0 the core uses the box's
+    bottom-centre, which is what every position was projected from before
+    segmentation existed.
+    """
+
     _fields_ = [
         ("x", ctypes.c_double),
         ("y", ctypes.c_double),
@@ -54,7 +64,9 @@ class CDetection(ctypes.Structure):
         ("h", ctypes.c_double),
         ("confidence", ctypes.c_double),
         ("class_id", ctypes.c_uint32),
-        ("_pad", ctypes.c_uint32),
+        ("has_contact", ctypes.c_uint32),
+        ("contact_x", ctypes.c_double),
+        ("contact_y", ctypes.c_double),
     ]
 
 
@@ -81,6 +93,8 @@ class CTrack(ctypes.Structure):
         ("_pad2", ctypes.c_uint32),
         ("speed_mps", ctypes.c_double),
         ("heading_degrees", ctypes.c_double),
+        ("contact_x", ctypes.c_double),
+        ("contact_y", ctypes.c_double),
     ]
 
 
@@ -155,10 +169,74 @@ class BoundingBox:
 
 
 @dataclass(frozen=True, slots=True)
+class ContactPoint:
+    """A point in normalised image coordinates: 0..1 across, 0..1 down."""
+
+    x: float
+    y: float
+
+    def __iter__(self):
+        yield self.x
+        yield self.y
+
+
+@dataclass(frozen=True, slots=True)
 class Detection:
     bbox: BoundingBox
     confidence: float
     class_id: int
+    #: This instance's shape, cropped to `bbox`, as 0/1 `uint8`. `None` from any
+    #: detector that produces boxes only.
+    #:
+    #: Cropped rather than full-frame because a full-frame mask per detection is
+    #: megabytes per frame at video rate, and every consumer already has the box.
+    #: It is what makes a truthful ground-contact point possible: see
+    #: :func:`ground_contact`, which takes the lowest row that has any of the
+    #: object in it rather than assuming a rectangle's bottom edge.
+    mask: "np.ndarray | None" = None
+
+
+def ground_contact(detection: Detection) -> ContactPoint:
+    """Where this object meets the ground, in normalised frame coordinates.
+
+    **This is the reason segmentation is worth having.** Everything downstream —
+    the projection to a map position, the zone test, the distance between two
+    cameras' observations — rests on one point per object, and until now that
+    point was the bottom-centre of a rectangle. That is correct only for a
+    tight box around an upright, unoccluded person. For anybody leaning,
+    carrying something, or half behind a car, the bottom-centre of the box is in
+    the air or inside the obstacle, and the position it produces is confidently
+    wrong.
+
+    With a mask the answer is measurable: the lowest row that has any of this
+    object in it, and the horizontal centre *of that row* — not of the whole
+    mask, because a person mid-stride has their feet somewhere other than under
+    their centre of mass.
+
+    Falls back to the box's bottom-centre when there is no mask, which is what
+    every detector without one has always produced.
+
+    Lives here rather than beside the segmenter because the tracker calls it for
+    every detection: it is the one place the mask influences the position, and
+    it has to run whether or not a model is installed.
+    """
+    box = detection.bbox
+    if detection.mask is None or detection.mask.size == 0:
+        return ContactPoint(box.x + box.w / 2.0, box.y + box.h)
+
+    rows = np.flatnonzero(detection.mask.any(axis=1))
+    if rows.size == 0:
+        return ContactPoint(box.x + box.w / 2.0, box.y + box.h)
+
+    lowest = int(rows[-1])
+    columns = np.flatnonzero(detection.mask[lowest])
+    centre = float(columns.mean()) if columns.size else detection.mask.shape[1] / 2.0
+
+    height, width = detection.mask.shape
+    return ContactPoint(
+        box.x + box.w * (centre + 0.5) / width,
+        box.y + box.h * (lowest + 1) / height,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,7 +251,10 @@ class PositionEstimate:
 
     point: LatLon
     radius_meters: float
-    #: "GROUND_PROJECTION" or "CAMERA_FALLBACK".
+    #: "GROUND_PROJECTION" (the contact, projected), "FRAME_EDGE" (the frame
+    #: cut the contact off — the object is somewhere between the camera and
+    #: the point the edge projects to; see `FRAME_EDGE_TOLERANCE`) or
+    #: "CAMERA_FALLBACK" (the projection failed; this is the camera).
     source: str
 
 
@@ -193,6 +274,11 @@ class Track:
     #: ``None`` when the object is not moving: a heading derived from jitter
     #: would be worse than admitting there is none.
     heading_degrees: float | None
+    #: Where the object last met the ground — the point its map position was
+    #: projected from. Measured from the silhouette when the detector could see
+    #: one, the box's bottom-centre when it could not. The core always reports
+    #: it; ``None`` only for a track built by hand without one.
+    contact: ContactPoint | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -624,6 +710,17 @@ def destination_point(origin: LatLon, bearing_deg: float, distance_meters: float
 
 _MAX_TRACKS = 256
 
+#: How close to the frame's bottom edge a box's lower side may sit before its
+#: contact is taken as cut off by the frame rather than measured. Four per cent
+#: of the frame height — about twenty rows at 480p — because a detector
+#: regresses a truncated box a little short of the last row rather than onto
+#: it. Measured on the laptop camera: a person seated at the desk, half a metre
+#: from the lens with their feet below the picture, had box bottoms between
+#: 0.975 and 1.0 across three probes and was projected to 2.16 m ± 0.13 m,
+#: whatever their true distance; at two per cent the packaged build still
+#: reported three confident entries into a zone that began 2 m out.
+FRAME_EDGE_TOLERANCE = 0.04
+
 
 class Tracker:
     """A single camera's tracker, living in Rust.
@@ -633,7 +730,7 @@ class Tracker:
     long-running worker cycling cameras is a slow leak nobody notices.
     """
 
-    __slots__ = ("_handle", "_lib", "_track_buffer", "_ended_buffer", "_closed")
+    __slots__ = ("_handle", "_lib", "_track_buffer", "_ended_buffer", "_closed", "_pose")
 
     def __init__(
         self,
@@ -658,6 +755,9 @@ class Tracker:
         # Allocated once and reused: this is called per frame per camera.
         self._track_buffer = (CTrack * _MAX_TRACKS)()
         self._ended_buffer = (ctypes.c_uint64 * _MAX_TRACKS)()
+        #: Kept so a position can be judged against the camera's own location:
+        #: see `_bounded_by_the_frame_edge`.
+        self._pose = pose
 
     def __enter__(self) -> "Tracker":
         return self
@@ -684,6 +784,7 @@ class Tracker:
         self._check()
         c_pose = ctypes.byref(pose.to_c()) if pose is not None else None
         self._lib.sentinel_tracker_set_pose(self._handle, c_pose)
+        self._pose = pose
 
     def update(self, detections: Sequence[Detection], at_millis: int) -> list[Track]:
         """Feed one frame and receive the confirmed tracks."""
@@ -693,9 +794,16 @@ class Tracker:
         if count:
             buffer = (CDetection * count)()
             for index, detection in enumerate(detections):
+                # The one place a mask changes a position. For a detection
+                # without one this is the box's bottom-centre, so a detector
+                # that produces boxes only gets exactly the answer it always
+                # did — and a foreign caller that passes the flag clear does
+                # too.
+                contact = ground_contact(detection)
                 buffer[index] = CDetection(
                     detection.bbox.x, detection.bbox.y, detection.bbox.w, detection.bbox.h,
-                    detection.confidence, detection.class_id, 0,
+                    detection.confidence, detection.class_id, 1,
+                    contact.x, contact.y,
                 )
             pointer = buffer
         else:
@@ -711,7 +819,7 @@ class Tracker:
         if written < 0:
             raise CoreError("could not read tracks")
 
-        return [_to_track(self._track_buffer[i]) for i in range(written)]
+        return [_to_track(self._track_buffer[i], self._pose) for i in range(written)]
 
     def ended(self) -> list[int]:
         """Track ids closed by the most recent update."""
@@ -730,7 +838,43 @@ class Tracker:
             raise CoreError("this tracker has been closed")
 
 
-def _to_track(c: CTrack) -> Track:
+def _bounded_by_the_frame_edge(
+    c: CTrack, position: PositionEstimate, pose: CameraPose
+) -> PositionEstimate:
+    """Widen a projection whose contact the frame cut off.
+
+    A box whose lower side sits on the bottom edge of the frame is a box the
+    frame truncated: the feet are below the picture, and the lowest visible row
+    is the frame's, not the object's. Projecting that row gives the nearest
+    ground the camera sees — the same distance for everybody it happens to,
+    with the small uncertainty of a nearby point. The laptop camera showed it:
+    a person seated half a metre from the lens was placed at 2.16 m ± 0.13 m,
+    inside a zone that began at 2 m, and "entered" it without leaving their
+    chair.
+
+    What the geometry supports is a bound: the object is somewhere between the
+    camera and that point. So the estimate becomes the middle of that stretch
+    with a radius reaching both ends, tagged ``FRAME_EDGE``, and a zone that
+    begins inside the stretch sees an uncertain membership rather than a
+    confident one. The core is not changed — it reports what it measured — and
+    this is the one place the frame's edge is known to be the reason.
+    """
+    if position.source != "GROUND_PROJECTION":
+        return position
+    if c.y + c.h < 1.0 - FRAME_EDGE_TOLERANCE:
+        return position
+    far = haversine_distance(pose.position, position.point)
+    if far <= 0.0:
+        return position
+    bearing = bearing_degrees(pose.position, position.point)
+    return PositionEstimate(
+        point=destination_point(pose.position, bearing, far / 2.0),
+        radius_meters=far / 2.0 + position.radius_meters,
+        source="FRAME_EDGE",
+    )
+
+
+def _to_track(c: CTrack, pose: CameraPose | None = None) -> Track:
     position = (
         PositionEstimate(
             point=LatLon(c.lat, c.lon),
@@ -740,6 +884,8 @@ def _to_track(c: CTrack) -> Track:
         if c.has_position
         else None
     )
+    if position is not None and pose is not None:
+        position = _bounded_by_the_frame_edge(c, position, pose)
 
     return Track(
         id=int(c.id),
@@ -752,4 +898,5 @@ def _to_track(c: CTrack) -> Track:
         position=position,
         speed_mps=c.speed_mps if c.has_speed else None,
         heading_degrees=c.heading_degrees if c.has_heading else None,
+        contact=ContactPoint(c.contact_x, c.contact_y),
     )

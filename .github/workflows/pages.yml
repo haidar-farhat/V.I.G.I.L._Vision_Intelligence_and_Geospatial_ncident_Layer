@@ -1,0 +1,73 @@
+name: pages
+
+# The public page is rendered from the repository, not written beside it:
+# `python v2/tasks.py site` reads the capability manifest, the version, the
+# commit and the test counts, so the numbers on the page are the numbers in
+# the tree on the day it was built. A hand-kept page is a second description
+# of the product, and the copy that drifts is the one a stranger reads.
+#
+# One-time setting: Settings → Pages → Source must be "GitHub Actions".
+
+on:
+  push:
+    branches: [v2, main]
+    paths:
+      - 'v2/site/**'
+      - 'v2/tools/build_site.py'
+      - 'v2/vigil/capabilities.py'
+      - 'v2/vigil/version.py'
+      - 'v2/tests/**'
+      - 'v2/core/src/**'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: v2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: v2/pyproject.toml
+      # The test count on the page is pytest's own, which means collecting
+      # the suites, which means the product's imports have to resolve.
+      - name: Qt needs these on a headless Linux runner
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libxkbcommon-x11-0 libxcb-cursor0 \
+            libxcb-icccm4 libxcb-keysyms1 libxcb-shape0 libgl1
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+      - name: Render
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python tasks.py site
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: v2/dist/site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

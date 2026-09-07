@@ -17,7 +17,7 @@ that fails: the evidence looks complete and is not.
 
 from __future__ import annotations
 
-from datetime import datetime, time, timezone
+from datetime import datetime, time, timedelta, timezone, tzinfo
 from pathlib import Path
 
 import pytest
@@ -100,6 +100,11 @@ def test_no_column_in_the_schema_is_credential_shaped(store: Store):
         for column in store.column_names(table):
             lowered = column.lower()
             if lowered == "credentials_ref":
+                continue
+            if table == "users" and lowered == "password_hash":
+                # The single audited exception, as DATABASE.md has always said:
+                # a one-way salted hash of a local operator's password, never
+                # a device credential and never reversible.
                 continue
             if any(word in lowered for word in FORBIDDEN):
                 offending.append(f"{table}.{column}")
@@ -596,3 +601,1249 @@ def test_recorded_at_is_not_rewritten_by_a_re_send(store: Store):
     second = store._connection.execute("SELECT recorded_at FROM events").fetchone()[0]
 
     assert first == second, "a re-send rewrote when the event was first accepted"
+
+
+# ------------------------------------------------------------------- the site
+
+
+def populate(store: Store) -> None:
+    """A database with something in it, so a migration is tested against one.
+
+    A migration that applies to an empty schema and destroys a populated one is
+    the failure worth catching, and it is invisible to every test that migrates
+    a database with no rows in it.
+    """
+    pose = CameraPose(position=SITE, mount_height=6.0, heading=90.0, pitch=-20.0)
+    store.save_camera("cam-07", "North gate", "file:///media/north.mp4", pose)
+    store.save_zone(
+        Zone(
+            id="zone-a",
+            name="Restricted Area A",
+            kind=ZoneKind.RESTRICTED,
+            ring=tuple(destination_point(SITE, b, 30.0) for b in (0.0, 90.0, 180.0)),
+        )
+    )
+    store.save_incident(Correlator().correlate([make_event(track=n) for n in (1, 2)])[0])
+    store.audit("operator:alice", "camera.placed", "cam-07")
+
+
+def make_site(**overrides) -> "Site":
+    from sentinel.site import FrameKind, Site
+
+    fields = dict(
+        id="default",
+        name="Beirut yard",
+        origin=SITE,
+        frame=FrameKind.GEOGRAPHIC,
+        timezone="Asia/Beirut",
+        boundary=tuple(
+            destination_point(SITE, bearing, 60.0)
+            for bearing in (45.0, 135.0, 225.0, 315.0)
+        ),
+    )
+    fields.update(overrides)
+    return Site(**fields)
+
+
+def test_the_site_table_arrives_and_leaves_without_touching_the_evidence(store: Store):
+    """The migration must apply, and undo, on a database that has rows in it.
+
+    An air-gapped deployment steps back a version to diagnose something and
+    steps forward again afterwards. If either direction took the cameras, zones
+    or incidents with it, the diagnosis would cost the evidence — and no test
+    over an empty schema would ever have shown it.
+    """
+    populate(store)
+    store.save_site(make_site())
+    before = store.applied_versions()
+    events, incidents = store.event_count(), store.incident_count()
+
+    # Down to and including `sites`, rather than one step. A single `rollback()`
+    # only reached this migration while it happened to be the newest, and this
+    # test broke the moment one was added after it — which is exactly when a
+    # rollback test matters most.
+    undone = store.rollback()
+    while undone is not None and undone.name != "sites":
+        undone = store.rollback()
+
+    assert undone is not None and undone.name == "sites"
+    assert "sites" not in store.table_names(), "the table survived its own down"
+    assert store.event_count() == events, "rolling back the site took the events"
+    assert store.incident_count() == incidents
+    assert len(store.cameras()) == 1
+    assert len(store.zones()) == 1
+    assert len(store.audit_trail()) == 1
+
+    store.migrate()
+
+    assert store.applied_versions() == before
+    assert "sites" in store.table_names()
+    assert store.site() is None, "the site row is not resurrected by re-applying"
+    store.save_site(make_site())
+    assert store.site() is not None
+
+
+def test_a_site_survives_a_round_trip_with_its_boundary_and_its_clock(store: Store):
+    # The frame kind and the time zone are the two fields a reader can drop
+    # silently: the first prints invented coordinates for a floor plan, the
+    # second evaluates an after-hours schedule in the wrong clock.
+    original = make_site()
+    store.save_site(original)
+
+    restored = store.site()
+
+    assert restored is not None
+    assert restored.id == original.id
+    assert restored.name == original.name
+    assert restored.origin.lat == pytest.approx(SITE.lat)
+    assert restored.origin.lon == pytest.approx(SITE.lon)
+    assert restored.frame is original.frame
+    assert restored.timezone == "Asia/Beirut", "the site's clock did not survive"
+    assert len(restored.boundary) == len(original.boundary)
+    for restored_point, original_point in zip(restored.boundary, original.boundary):
+        assert restored_point.lat == pytest.approx(original_point.lat)
+        assert restored_point.lon == pytest.approx(original_point.lon)
+
+
+def test_a_site_nobody_has_outlined_is_not_a_site_enclosing_nothing(store: Store):
+    # Stored as NULL rather than '[]'. "Not drawn yet" means coverage cannot be
+    # computed; "encloses nothing" means none of the site is covered, which is
+    # an alarm — and a reader that conflates them raises the second for the
+    # first.
+    store.save_site(make_site(boundary=()))
+
+    restored = store.site()
+    assert restored is not None
+    assert restored.boundary == ()
+    assert restored.has_boundary is False
+
+    stored = store._connection.execute("SELECT boundary_ring FROM sites").fetchone()
+    assert stored["boundary_ring"] is None
+
+
+def test_saving_a_site_twice_stores_it_once(store: Store):
+    store.save_site(make_site(name="Beirut yard"))
+    store.save_site(make_site(name="Beirut yard, north half"))
+
+    assert len(store.sites()) == 1
+    assert store.site().name == "Beirut yard, north half"
+
+
+def test_the_origin_does_not_move_when_the_first_camera_is_removed(store: Store):
+    """The bug this whole record exists for.
+
+    The plan view anchored its frame on the first placed camera, so deleting
+    that camera re-anchored everything and every zone, footprint and track
+    jumped on screen. Nothing had moved; the ruler had. An origin in a row
+    cannot be deleted by removing a camera.
+    """
+    first = CameraPose(
+        position=destination_point(SITE, 90.0, 120.0),
+        mount_height=6.0, heading=270.0, pitch=-20.0,
+    )
+    store.save_camera("cam-07", "North gate", "file:///media/north.mp4", first)
+    store.save_site(make_site())
+    origin = store.site().origin
+
+    assert store.delete_camera("cam-07") is True
+
+    after = store.site().origin
+    assert after.lat == pytest.approx(origin.lat)
+    assert after.lon == pytest.approx(origin.lon)
+    assert after.lat == pytest.approx(SITE.lat), "the origin followed the camera"
+
+
+def test_a_local_site_does_not_claim_to_be_a_place(store: Store):
+    # A floor plan's origin is fixed but arbitrary. Distances on it are real;
+    # its coordinates are not, and a screen that prints them is inventing
+    # precision the geometry cannot support.
+    from sentinel.site import FrameKind
+
+    store.save_site(make_site(frame=FrameKind.LOCAL))
+
+    restored = store.site()
+    assert restored.frame is FrameKind.LOCAL
+    assert restored.is_georeferenced is False
+
+
+def test_a_two_point_boundary_is_refused_before_it_reaches_the_database():
+    # Two points reach shapely as a line, whose area is zero, so every coverage
+    # figure computed against it is a division by zero or a confident 0% — a
+    # site reported as entirely unwatched because somebody clicked twice.
+    from sentinel.site import SiteError
+
+    with pytest.raises(SiteError):
+        make_site(boundary=(SITE, destination_point(SITE, 90.0, 40.0)))
+
+
+def test_a_site_declares_a_clock_that_can_actually_be_read():
+    """The default site's clock has to work on the machine it ships to.
+
+    Every fresh deployment starts on DEFAULT_TIMEZONE, and node.py asks the site
+    for its clock before it can evaluate a single schedule. On Windows the tz
+    database is an optional package, so a clock() that always went through
+    ZoneInfo would leave a brand-new node with no clock at all — and tell the
+    operator to install tzdata for the one zone that has no rules to look up.
+
+    The two offsets are asserted six months apart so this cannot pass for a
+    summer-shifting zone that merely happens to sit on zero in January.
+    """
+    from sentinel.site import DEFAULT_TIMEZONE
+
+    site = make_site(timezone=DEFAULT_TIMEZONE)
+
+    clock = site.clock()
+
+    winter = datetime(2026, 1, 15, 12, 0)
+    summer = datetime(2026, 7, 15, 12, 0)
+    print("clock:", clock)
+    print("utcoffset January:", clock.utcoffset(winter))
+    print("utcoffset July:", clock.utcoffset(summer))
+
+    assert isinstance(clock, tzinfo), "the site handed back something unusable"
+    assert clock.utcoffset(winter) == timedelta(0)
+    assert clock.utcoffset(summer) == timedelta(0), "the site's clock moved in July"
+    assert winter.replace(tzinfo=clock).utcoffset() == timedelta(0)
+
+
+def test_the_site_clock_says_so_rather_than_falling_back_to_utc():
+    """An unresolvable zone must not become UTC in silence.
+
+    That fallback is how a window typed as 18:00 armed at 21:00 local, with
+    nothing on screen saying why. On Windows the tz database is not shipped with
+    Python, so this is the ordinary case, not an exotic one.
+    """
+    from sentinel.site import SiteError
+
+    site = make_site(timezone="Mars/Olympus_Mons")
+
+    with pytest.raises(SiteError) as raised:
+        site.clock()
+    assert "Mars/Olympus_Mons" in str(raised.value)
+    assert site.timezone == "Mars/Olympus_Mons", "the declared zone is still recorded"
+
+
+# ------------------------------------------------------------- the site frame
+
+
+def test_a_site_frame_round_trips_a_point_to_under_a_centimetre():
+    """Metres out and coordinates back, without walking the site off its fence.
+
+    A boundary is drawn in one direction and stored in the other, edit after
+    edit, so a conversion that lost a millimetre a trip would move a fence over
+    a season. Measured first and floored, never guessed.
+    """
+    from sentinel.core import haversine_distance
+    from sentinel.site import SiteFrame
+
+    frame = SiteFrame(SITE)
+    worst = 0.0
+    for bearing in range(0, 360, 7):
+        for distance in (0.5, 25.0, 250.0, 1000.0, 5000.0):
+            point = destination_point(SITE, float(bearing), distance)
+            east, north = frame.to_xy(point)
+            error = haversine_distance(point, frame.to_latlon(east, north))
+            worst = max(worst, error)
+
+    # Measured at 1.4e-9 m out to 5 km; the bound is six orders of magnitude
+    # looser than that, and still far inside the centimetre this has to hold.
+    print(f"worst round-trip error over 5 km: {worst * 1000:.9f} mm")
+    assert worst < 1e-3, "a round trip lost more than a millimetre"
+
+
+def test_the_origin_maps_to_the_origin():
+    # The zero-distance branch: the bearing from a point to itself is
+    # arbitrary, and an arbitrary bearing times a zero distance is harmless
+    # only until somebody changes the multiplication.
+    from sentinel.site import SiteFrame
+
+    frame = SiteFrame(SITE)
+    assert frame.to_xy(SITE) == (0.0, 0.0)
+    assert frame.to_latlon(0.0, 0.0) == SITE
+
+
+def test_the_site_frame_and_the_coverage_frame_are_the_same_conversion():
+    """Two tangent planes that came to differ would be a bug nobody could find.
+
+    `SiteFrame` is meant to replace `coverage._Frame`; while both exist they
+    must agree exactly, or the plan view and the coverage report would draw the
+    same gap in two places. Imported read-only — nothing in coverage is changed
+    here.
+    """
+    from sentinel.coverage import _Frame
+    from sentinel.site import SiteFrame
+
+    mine = SiteFrame(SITE)
+    theirs = _Frame(SITE)
+
+    worst_xy = 0.0
+    worst_latlon = 0.0
+    for bearing in (0.0, 37.0, 90.0, 143.0, 180.0, 271.0, 355.0):
+        for distance in (0.5, 25.0, 250.0, 1000.0):
+            point = destination_point(SITE, bearing, distance)
+            a, b = mine.to_xy(point), theirs.to_xy(point)
+            worst_xy = max(worst_xy, abs(a[0] - b[0]), abs(a[1] - b[1]))
+
+            back_mine = mine.to_latlon(*a)
+            back_theirs = theirs.to_latlon(*b)
+            worst_latlon = max(
+                worst_latlon,
+                abs(back_mine.lat - back_theirs.lat),
+                abs(back_mine.lon - back_theirs.lon),
+            )
+
+    print(f"worst disagreement: {worst_xy:.3e} m, {worst_latlon:.3e} degrees")
+    assert worst_xy == 0.0, "the two frames no longer do the same arithmetic"
+    assert worst_latlon == 0.0
+
+
+def test_a_stored_site_hands_out_the_frame_everything_should_share(store: Store):
+    # Constructed from the site rather than per caller: two frames on two
+    # origins are two answers to the same question, and the place they disagree
+    # is the far corner of a large site, which is the corner nobody checks.
+    from sentinel.site import SiteFrame
+
+    store.save_site(make_site())
+    restored = store.site()
+
+    frame = restored.metric_frame()
+    east, north = frame.to_xy(destination_point(SITE, 90.0, 100.0))
+
+    print(f"100 m due east reads as east={east:.4f} m, north={north:.4f} m")
+    assert east == pytest.approx(100.0, abs=0.01)
+    assert abs(north) < 0.01
+    assert SiteFrame.of(restored).origin == frame.origin
+
+
+# ------------------------------------------------------------------ the register
+
+
+def register_schema(connection) -> dict[str, str]:
+    """Every register object's definition, with comments and spacing removed.
+
+    Compared as text rather than as a list of table names, because the parts
+    that carry the weight are the CHECK constraints. A migrated database that
+    accepted a MATCH sighting with no score while a fresh one refused it would
+    hold — on upgraded deployments only — exactly the claim-without-evidence the
+    register exists to make unrepresentable, and a comparison of table names
+    would call the two databases identical.
+    """
+    rows = connection.execute(
+        "SELECT name, sql FROM sqlite_master WHERE name LIKE 'register%' "
+        "ORDER BY name"
+    ).fetchall()
+    return {row[0]: flattened(row[1]) for row in rows}
+
+
+def flattened(sql: str) -> str:
+    """One line, no comments: the schema as SQLite will enforce it."""
+    kept = [line for line in sql.splitlines() if not line.strip().startswith("--")]
+    return " ".join(" ".join(kept).split())
+
+
+def test_a_fresh_database_and_an_upgraded_one_hold_the_same_register(tmp_path: Path):
+    """The migration must build what `registry.create_schema` builds, exactly.
+
+    Two ways into one schema is two schemas eventually, and the half that drifts
+    is the half holding face templates. Checked against a database that predates
+    the register — rolled back below it and brought forward again — because that
+    is the deployment the difference would appear on, and never on the developer
+    machine where every database is fresh.
+    """
+    import sqlite3
+
+    from sentinel.registry import create_schema
+
+    with Store(tmp_path / "old.db") as upgraded:
+        populate(upgraded)
+        while any(name.startswith("register_") for name in upgraded.table_names()):
+            assert upgraded.rollback() is not None, "the register was never undone"
+        assert "register_subjects" not in upgraded.table_names()
+
+        upgraded.migrate()
+        migrated = register_schema(upgraded._connection)
+
+    bare = sqlite3.connect(":memory:")
+    try:
+        create_schema(bare)
+        fresh = register_schema(bare)
+    finally:
+        bare.close()
+
+    print(sorted(migrated))
+    assert "register_subjects" in migrated, "the migration created no register"
+    assert migrated == fresh, "an upgraded database is not the schema a new one gets"
+
+
+def test_the_register_arrives_and_leaves_without_touching_the_evidence(store: Store):
+    """The migration must apply, and undo, on a database that has rows in it.
+
+    An air-gapped deployment steps back a version to diagnose something and
+    steps forward again afterwards. If either direction took the cameras, zones,
+    incidents or the audit log with it, the diagnosis would cost the evidence.
+    """
+    from sentinel.registry import Plate
+
+    populate(store)
+    store.register.enrol(
+        subject_id="veh-1",
+        display_name="Contractor van",
+        identifier=Plate("B 7421"),
+        actor="operator:alice",
+        basis="site access list",
+    )
+    before = store.applied_versions()
+    events, incidents = store.event_count(), store.incident_count()
+
+    undone = store.rollback()
+    while undone is not None and undone.name != "register":
+        undone = store.rollback()
+
+    assert undone is not None and undone.name == "register"
+    assert [n for n in store.table_names() if n.startswith("register_")] == [], (
+        "a register table survived its own down"
+    )
+    assert store.event_count() == events, "rolling back the register took the events"
+    assert store.incident_count() == incidents
+    assert len(store.cameras()) == 1
+    assert len(store.zones()) == 1
+    assert len(store.audit_trail()) == 1
+
+    store.migrate()
+
+    assert store.applied_versions() == before
+    assert store.register.subjects() == (), (
+        "an enrolment came back from a table that had been dropped"
+    )
+    store.register.enrol(
+        subject_id="veh-1",
+        display_name="Contractor van",
+        identifier=Plate("B 7421"),
+        actor="operator:alice",
+        basis="site access list",
+    )
+    assert store.register.find_plate("B-7421") is not None
+
+
+def test_an_enrolment_made_through_the_store_survives_a_reopen(tmp_path: Path):
+    """The register is reachable from the store, and what it writes is durable.
+
+    Reachability is the point. Until this property existed the register was a
+    tested module with no way to an operator, because building one needs a
+    connection and the only honest connection is the store's own.
+    """
+    from sentinel.registry import Plate
+
+    database = tmp_path / "n.db"
+    with Store(database) as store:
+        enrolment = store.register.enrol(
+            subject_id="veh-1",
+            display_name="Contractor van",
+            identifier=Plate("b 7421", frames_agreeing=6),
+            actor="operator:alice",
+            basis="site access list",
+        )
+        assert enrolment.created_subject
+        # The audit row gets ids, kinds and counts. The plate and the name stay
+        # in the register, where forgetting can reach them.
+        store.audit(
+            "operator:alice", enrolment.action, enrolment.subject.id, enrolment.detail()
+        )
+        assert "7421" not in (store.audit_trail()[0]["detail"] or "")
+
+    with Store(database) as again:
+        subject = again.register.find_plate("B-7421")
+
+        assert subject is not None, "the enrolment did not survive the reopen"
+        assert subject.display_name == "Contractor van"
+        identifiers = again.register.identifiers("veh-1")
+        assert [identifier.plate for identifier in identifiers] == ["B7421"]
+        assert identifiers[0].raw_text == "b 7421", "the characters read were lost"
+        assert identifiers[0].basis == "site access list"
+        assert identifiers[0].enrolled_by == "operator:alice"
+
+
+def test_the_register_writes_inside_the_stores_own_unit_of_work(store: Store):
+    """One connection, so an enrolment and the row proving it land together.
+
+    A `Register` built by a caller on a second connection to the same file would
+    commit on its own: the enrolment would survive a failure that rolled back
+    everything written beside it, and the database would hold a template with no
+    audit row saying who put it there.
+    """
+    from sentinel.registry import Plate
+
+    assert store.register is store.register, "each call built another register"
+
+    with pytest.raises(RuntimeError, match="the paperwork failed"):
+        with store.transaction():
+            store.register.enrol(
+                subject_id="veh-1",
+                display_name="Contractor van",
+                identifier=Plate("B 7421"),
+                actor="operator:alice",
+                basis="site access list",
+            )
+            raise RuntimeError("the paperwork failed")
+
+    assert store.register.subjects() == (), (
+        "the enrolment committed on its own connection, outside the failed unit "
+        "of work"
+    )
+
+
+# -------------------------------------------------------- structured audit rows
+
+
+def zone_pair() -> tuple[Zone, Zone]:
+    """One zone before and after an edit that changes exactly one field."""
+    ring = tuple(destination_point(SITE, bearing, 30.0) for bearing in (0.0, 90.0, 180.0))
+    before = Zone(id="zone-a", name="Yard", kind=ZoneKind.RESTRICTED, ring=ring)
+    return before, Zone(id="zone-a", name="Yard", kind=ZoneKind.EXCLUSION, ring=ring)
+
+
+def make_record(**overrides):
+    from sentinel.auditing import AuditRecord
+
+    before, after = zone_pair()
+    fields = dict(
+        actor="operator:alice",
+        action="zone.changed",
+        subject="zone-a",
+        node_id="gatehouse",
+        at=datetime(2026, 3, 1, 9, 30, tzinfo=timezone.utc),
+        before=before,
+        after=after,
+    )
+    fields.update(overrides)
+    return AuditRecord.of(**fields)
+
+
+def test_a_structured_audit_row_keeps_the_prose_and_the_states_behind_it(store: Store):
+    # The sentence is what an operator reads; the states are what makes the row
+    # answerable to a question nobody asked at the time.
+    import json
+
+    record = make_record()
+
+    head = store.audit_record(record)
+
+    row = store.audit_trail()[0]
+    print(row["detail"])
+    assert row["detail"] == "kind RESTRICTED -> EXCLUSION"
+    assert row["actor"] == "operator:alice" and row["node_id"] == "gatehouse"
+    assert row["at"] == int(record.at.timestamp() * 1000), "the row moved in time"
+    before = json.loads(row["before_json"])
+    after = json.loads(row["after_json"])
+    assert {key for key in before if before[key] != after[key]} == {"kind"}
+    assert row["chain_hash"] == head
+
+
+def test_the_chain_folds_each_record_into_the_next(store: Store):
+    """Editing one row must break every hash after it, and say which row.
+
+    A chain that only covered the newest row would detect nothing: altering an
+    audit log means altering something old.
+    """
+    from sentinel.auditing import verify_chain
+
+    first = make_record(subject="zone-a")
+    second = make_record(subject="zone-b")
+    hashes = [store.audit_record(first), store.audit_record(second)]
+
+    assert hashes[0] != hashes[1]
+    assert store.audit_chain_head() == hashes[1]
+    assert verify_chain([first, second], hashes) is None
+
+    tampered = make_record(subject="zone-a", actor="operator:mallory")
+    assert verify_chain([tampered, second], hashes) == 0, (
+        "an edited record verified, so the chain protects nothing"
+    )
+
+
+def test_a_prose_only_row_leaves_the_chain_where_it_was(store: Store):
+    # `audit` has no before-state to record and writes no hash, and the chain is
+    # honest about covering only the rows that carry one. Claiming the whole log
+    # is chained when half of it is not is the failure this pins.
+    head = store.audit_record(make_record())
+
+    store.audit("node", "node.started", "gatehouse")
+
+    assert store.audit_chain_head() == head, "a row with no hash broke the chain"
+    assert store.audit_trail()[0]["chain_hash"] is None
+
+
+def test_an_audit_row_written_before_the_columns_existed_still_reads(store: Store):
+    """Nullable is load-bearing here, not lenient.
+
+    The audit log is append-only, so there is no pass that could go back and
+    fill a before-state in for an edit made last year. A NOT NULL column would
+    either fail the migration or force this code to invent one.
+    """
+    undone = store.rollback()
+    while undone is not None and undone.name != "audit_records":
+        undone = store.rollback()
+    assert undone is not None and undone.name == "audit_records"
+    assert "before_json" not in store.column_names("audit_logs")
+
+    store.audit("operator:alice", "camera.placed", "cam-07", "6 m mast, bearing 145")
+    store.migrate()
+
+    row = store.audit_trail()[0]
+    assert row["actor"] == "operator:alice"
+    assert row["detail"] == "6 m mast, bearing 145", "the old row lost its line"
+    assert row["before_json"] is None and row["after_json"] is None
+    assert row["node_id"] is None and row["chain_hash"] is None
+    assert store.audit_chain_head() is None
+
+    # And a structured row written after it starts the chain rather than failing
+    # on a predecessor that has no hash.
+    head = store.audit_record(make_record())
+    assert head and store.audit_chain_head() == head
+
+
+def test_the_totals_count_the_chained_rows_apart_from_the_rest(store: Store):
+    # The difference between the two numbers is the honest part: how much of
+    # the log a later reader can prove was not edited afterwards. One number
+    # would imply the chain covers everything, which it does not.
+    store.audit("node", "node.started", "gatehouse")
+    store.audit_record(make_record())
+    store.audit("node", "node.stopped", "gatehouse")
+
+    written, chained = store.audit_totals()
+
+    assert (written, chained) == (3, 1)
+    assert written - chained == 2, "the prose-only rows were counted as chained"
+
+
+# ------------------------------------------------------------------ two writers
+
+
+def test_two_writers_do_not_strand_each_others_audit_rows(tmp_path: Path):
+    """An audit row must not be lost because somebody else was mid-commit.
+
+    `audit_record` reads the chain head and then writes, and those two
+    statements are one unit of work. Under a deferred ``BEGIN`` the read takes a
+    snapshot, and a commit from the other writer in between makes the insert
+    fail *immediately* with "database is locked" — the busy handler is never
+    consulted, because waiting cannot make a stale snapshot current. Measured:
+    0.00 s to fail, on a connection whose timeout was five seconds.
+
+    So this is not a timeout test. Remove ``immediate=True`` from
+    `audit_record` and this fails with a stranded audit row, which is what the
+    console and a `sentinel` command sharing one file would do to each other.
+
+    Two stores rather than two threads on one, because a `sqlite3` connection
+    may only be used from the thread that opened it — and two processes on one
+    file is the real case anyway. Both are opened before either writes, so the
+    only thing under test is the writing; opening concurrently is its own test.
+    The barrier makes the two collide instead of leaving it to the scheduler,
+    and twenty rounds each was measured as far more than enough to.
+    """
+    import threading
+
+    database = tmp_path / "n.db"
+    rounds = 20
+    failed: list[BaseException] = []
+    together = threading.Barrier(2, timeout=30)
+
+    def write_from_the_other_process() -> None:
+        try:
+            with Store(database) as other:
+                together.wait()
+                for index in range(rounds):
+                    other.audit_record(make_record(subject=f"other-{index}"))
+        except BaseException as failure:  # reported, never swallowed
+            failed.append(failure)
+            together.abort()
+
+    with Store(database) as mine:
+        thread = threading.Thread(target=write_from_the_other_process)
+        thread.start()
+        try:
+            together.wait()
+            for index in range(rounds):
+                mine.audit_record(make_record(subject=f"mine-{index}"))
+        except threading.BrokenBarrierError:
+            pass  # the other writer failed first and is reported below
+        finally:
+            thread.join(60.0)
+
+        assert not failed, f"a writer lost an audit row: {failed!r}"
+
+        written, chained = mine.audit_totals()
+        print(f"{written} row(s) from two writers, {chained} chained")
+        assert (written, chained) == (rounds * 2, rounds * 2), (
+            "an audit row went missing between two writers"
+        )
+
+
+def test_two_processes_can_open_the_same_new_database_at_once(tmp_path: Path):
+    """The console starting while a command runs must not read as corruption.
+
+    `pending` is read before any lock is held, so two openers of the same new
+    file both saw an empty ladder and both applied migration 1. The loser got
+    "table cameras already exists", wrapped as `Migration 1 (initial) failed` —
+    which is what a corrupt database looks like to an operator, and this is not
+    one.
+
+    A barrier rather than a hope: both openers are held until the other is ready
+    so that they actually collide, instead of relying on the scheduler to make
+    the race happen.
+    """
+    import threading
+
+    database = tmp_path / "n.db"
+    together = threading.Barrier(2, timeout=30)
+    failed: list[BaseException] = []
+    seen: list[tuple[int, ...]] = []
+
+    def open_the_database() -> None:
+        try:
+            together.wait()
+            with Store(database) as opened:
+                seen.append(tuple(opened.applied_versions()))
+        except BaseException as failure:  # reported, never swallowed
+            failed.append(failure)
+
+    threads = [threading.Thread(target=open_the_database) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(60.0)
+
+    assert not failed, f"opening the same new database twice failed: {failed!r}"
+    assert len(seen) == 2 and seen[0] == seen[1], (
+        f"the two openers disagree about the schema: {seen}"
+    )
+    assert len(seen[0]) == len(MIGRATIONS), "the ladder was not fully applied"
+
+    with Store(database) as reopened:
+        applied = reopened._connection.execute(
+            "SELECT COUNT(*) AS n FROM schema_migrations"
+        ).fetchone()["n"]
+    assert applied == len(MIGRATIONS), "a migration was recorded twice"
+
+
+def test_a_migration_somebody_else_applied_first_is_not_applied_twice(
+    tmp_path: Path, monkeypatch
+):
+    """A stale pending list is what the race above actually leaves behind.
+
+    `pending` is read before any lock is held. Another opener finishing the same
+    ladder in between turns that list into a lie, and the deterministic stand-in
+    for it is simply to hand `migrate` a list of migrations that are already
+    applied — which is what the loser of the race is holding.
+
+    Without the check under the write lock, this re-runs the first migration's
+    DDL and fails with "table cameras already exists", wrapped as
+    `Migration 1 (initial) failed`: a message that reads like a corrupt
+    database to the operator who gets it, and is not one.
+    """
+    database = tmp_path / "n.db"
+    with Store(database) as store:
+        assert store.pending() == [], "the fixture is not fully migrated"
+
+        monkeypatch.setattr(Store, "pending", lambda self: list(MIGRATIONS[:1]))
+
+        assert store.migrate() == [], "a migration already applied was applied again"
+        assert store.applied_versions() == [m.version for m in MIGRATIONS], (
+            "the ladder changed under a no-op migrate"
+        )
+
+
+def test_a_store_opens_while_another_one_is_writing(tmp_path, caplog):
+    """A console must not fail to start because a command is mid-write.
+
+    Setting the journal mode needs a lock no other connection holds, and SQLite
+    refuses it outright rather than queueing it — the busy timeout does not
+    cover this one. Measured: it fails in 0.01 s, not after five seconds. So
+    opening a second store on a database somebody was writing to died inside the
+    constructor, before the caller had asked for anything, and an operator saw a
+    console that would not start for a reason unrelated to what they were doing.
+
+    Found by the two-writer test above, which could not reliably open its second
+    store at all.
+
+    The mode is forced back to a rollback journal first, because a file already
+    in WAL is skipped and the line never runs. That is the state a database is
+    in the first time it is opened by two processes at once.
+    """
+    import sqlite3
+
+    database = tmp_path / "n.db"
+    with Store(database):
+        pass  # the schema exists, so opening again writes nothing
+
+    holder = sqlite3.connect(str(database), isolation_level=None)
+    try:
+        holder.execute("PRAGMA journal_mode = DELETE")
+        holder.execute("BEGIN IMMEDIATE")
+        holder.execute(
+            "INSERT INTO audit_logs (at, actor, action) VALUES (?,?,?)",
+            (1_700_000_000_000, "holder", "node.started"),
+        )
+
+        with caplog.at_level("WARNING"), Store(database) as opened:
+            assert "audit_logs" in opened.table_names(), "the store opened unusable"
+            assert opened.audit_totals() == (0, 0), "it read the uncommitted write"
+
+        assert any("WAL" in record.getMessage() for record in caplog.records), (
+            "the journal mode was quietly left alone with nothing said"
+        )
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+
+
+def test_the_register_is_gone_once_the_store_that_held_it_is_closed(tmp_path: Path):
+    # The register is the object most likely to outlive its store — a panel
+    # holding one while the node behind it shuts down. Left cached, it points at
+    # a closed connection and fails from inside `registry` with a bare
+    # "cannot operate on a closed database", three modules from what actually
+    # went.
+    store = Store(tmp_path / "n.db")
+    assert store.register is not None
+    store.close()
+
+    with pytest.raises(StoreError, match="closed"):
+        store.register
+
+
+# ------------------------------------------------------------ the class filter
+#
+# On a real camera a RESTRICTED zone raised "1 couch in Room (HIGH, risk 55)".
+# The filter that stops that lives on the zone, and a zone is only as durable as
+# its row: a filter that did not survive a restart is a filter the operator set
+# once and lost.
+
+
+def make_zone(zone_id: str = "zone-a", **overrides) -> Zone:
+    fields = dict(
+        id=zone_id,
+        name="Restricted Area A",
+        kind=ZoneKind.RESTRICTED,
+        ring=tuple(destination_point(SITE, b, 30.0) for b in (0.0, 90.0, 180.0, 270.0)),
+    )
+    fields.update(overrides)
+    return Zone(**fields)  # type: ignore[arg-type]
+
+
+def test_a_zone_keeps_its_class_filter_across_a_round_trip(store: Store):
+    store.save_zone(make_zone("people", classes=frozenset({"person", "bicycle"})))
+    store.save_zone(make_zone("anything"))
+
+    restored = {zone.id: zone for zone in store.zones()}
+
+    assert restored["people"].classes == frozenset({"person", "bicycle"})
+    assert isinstance(restored["people"].classes, frozenset)
+    assert restored["anything"].classes == frozenset(), "an unfiltered zone came back filtered"
+    assert restored["anything"].watches(None) is True
+
+
+def test_saving_a_zone_again_replaces_its_filter(store: Store):
+    # The console saves on every edit. Clearing the filter is an edit too, and
+    # an upsert that kept the old list would silently keep the old behaviour.
+    store.save_zone(make_zone(classes=frozenset({"person"})))
+    store.save_zone(make_zone())
+
+    assert store.zones()[0].classes == frozenset()
+
+
+def test_the_filter_is_stored_in_one_spelling_whatever_order_it_was_given_in(store: Store):
+    # The audit diff and a plain `SELECT` both compare text. Two saves of the
+    # same set must not differ because a set iterated differently.
+    store.save_zone(make_zone(classes=frozenset({"car", "person", "bicycle"})))
+    first = store._connection.execute("SELECT classes FROM zones").fetchone()["classes"]
+    store.save_zone(make_zone(classes=frozenset({"person", "bicycle", "car"})))
+    second = store._connection.execute("SELECT classes FROM zones").fetchone()["classes"]
+
+    assert first == second == '["bicycle", "car", "person"]'
+
+
+def test_the_class_filter_arrives_and_leaves_without_touching_the_zones(store: Store):
+    """The migration must apply, and undo, on a database that has rows in it.
+
+    Three things are checked on the way down and back that no empty-schema
+    test could show: the zones survive the column being dropped and can still
+    be listed without it; a row written *before* the column existed reads
+    back watching everything, which is what it always did; and a filter is not
+    resurrected by re-applying — it went with the column, and a build that
+    could not read it was never honouring it.
+    """
+    populate(store)
+    store.save_zone(make_zone("people", classes=frozenset({"person"})))
+    before = store.applied_versions()
+    events, incidents = store.event_count(), store.incident_count()
+
+    # Down to and including `zone_classes`, rather than one step, for the
+    # reason the site test gives: this is the newest migration only until the
+    # next one lands.
+    undone = store.rollback()
+    while undone is not None and undone.name != "zone_classes":
+        undone = store.rollback()
+
+    assert undone is not None and undone.name == "zone_classes"
+    assert "classes" not in store.column_names("zones"), "the column survived its own down"
+    listed = {zone.id: zone for zone in store.zones()}
+    assert set(listed) == {"zone-a", "people"}, "rolling back the filter took the zones"
+    assert listed["people"].classes == frozenset(), (
+        "a schema with no column for it cannot hold a filter, and must not invent one"
+    )
+    assert store.event_count() == events and store.incident_count() == incidents
+    assert len(store.cameras()) == 1
+
+    # A row an older build would write: every column it knew, and no filter.
+    with store.transaction() as connection:
+        connection.execute(
+            """
+            INSERT INTO zones (
+                id, name, kind, ring, enter_after_millis, exit_after_millis,
+                accept_uncertain, created_at
+            ) VALUES (?,?,?,?,?,?,?,?)
+            """,
+            (
+                "older", "Drawn last year", "RESTRICTED",
+                "[[33.8941, 35.5018], [33.8938, 35.5021], [33.8935, 35.5018]]",
+                600, 2000, 0, 0,
+            ),
+        )
+
+    store.migrate()
+
+    assert store.applied_versions() == before
+    assert "classes" in store.column_names("zones")
+    listed = {zone.id: zone for zone in store.zones()}
+    assert set(listed) == {"zone-a", "people", "older"}
+    assert listed["older"].classes == frozenset(), "the default did not fill the old row"
+    assert listed["older"].watches(None) is True, "an old zone stopped firing on upgrade"
+    assert listed["people"].classes == frozenset(), "the filter was resurrected from nowhere"
+
+    store.save_zone(make_zone("people", classes=frozenset({"person"})))
+    assert {z.id: z for z in store.zones()}["people"].classes == frozenset({"person"})
+
+
+# ---------------------------------------------------------------- plate reads
+
+
+def make_reading(
+    track: int = 3,
+    *,
+    display: str = "B74?1",
+    text: str | None = None,
+    confident: bool = False,
+    agreement: int = 0,
+    reads: int = 3,
+):
+    """A reading as the pipeline publishes one, with the pipeline's own type.
+
+    Built through `TrackPlate` rather than a stand-in so that a field the
+    pipeline renames is a failure here and not a row written with a column
+    quietly holding the wrong thing.
+    """
+    from sentinel.pipeline import TrackPlate
+
+    return TrackPlate(
+        track_id=track, country="LB", display=display, text=text,
+        is_confident=confident, agreement=agreement, reads=reads,
+    )
+
+
+def test_a_reading_is_stored_once_and_refreshed_as_agreement_grows(store: Store):
+    """Three frames of one van are one row holding the latest tally.
+
+    A reading is published on every frame of a track and refined as reads
+    accumulate. A row per frame would store one guess three times and let the
+    three count as three vehicles; a row that kept the first tally would show
+    the half-read plate after the reader had finished reading it.
+    """
+    frames = (
+        (10, make_reading(display="B74?1", reads=3)),
+        (14, make_reading(display="B7421", text="B7421", agreement=3, reads=5)),
+        (22, make_reading(display="B7421", text="B7421", confident=True, agreement=4, reads=6)),
+    )
+    for index, reading in frames:
+        store.save_plate_read("gate", reading, frame_index=index, seen_at_millis=1000 + index * 40)
+
+    rows = store.plate_reads()
+
+    assert store.plate_read_count() == 1, "one track became more than one row"
+    assert len(rows) == 1
+    row = rows[0]
+    assert (row.camera_id, row.track_id) == ("gate", 3)
+    assert (row.first_frame, row.last_frame) == (10, 22), "the window did not fold"
+    assert row.text == "B7421" and row.is_confident is True
+    assert (row.agreement, row.reads) == (4, 6), "the row holds an earlier tally"
+    assert row.seen_at_millis == 1000 + 22 * 40
+    assert row.country == "LB"
+
+
+def test_a_later_tally_replaces_an_earlier_one_whichever_way_it_moved(store: Store):
+    # The accumulator re-tallies every read; a disagreeing frame can lower the
+    # agreement behind a character. The row must say what the reader says now,
+    # not the highest number it ever said.
+    store.save_plate_read("gate", make_reading(text="B7421", display="B7421", agreement=3, reads=3), frame_index=5, seen_at_millis=5)
+    store.save_plate_read("gate", make_reading(text=None, display="B742?", agreement=0, reads=4), frame_index=6, seen_at_millis=6)
+
+    row = store.plate_reads()[0]
+
+    assert row.text is None and row.display == "B742?"
+    assert (row.agreement, row.reads) == (0, 4)
+    assert (row.first_frame, row.last_frame) == (5, 6)
+
+
+def test_a_frame_index_that_went_backwards_starts_the_window_again(store: Store):
+    """A restarted run reuses track ids and frame indices from zero.
+
+    Folding the new run's window into the old one would report today's
+    vehicle as having been in shot since a run that ended yesterday.
+
+    The restart lands *inside* the old window, at 500 between 400 and 900.
+    A skeptic showed that restarting below the old first frame proves
+    nothing: plain ``MIN(400, 30)`` gives 30 whether or not a restart is
+    noticed. With 500, a fold that noticed nothing would read (400, 500).
+    """
+    store.save_plate_read("gate", make_reading(), frame_index=400, seen_at_millis=400)
+    store.save_plate_read("gate", make_reading(), frame_index=900, seen_at_millis=900)
+    store.save_plate_read("gate", make_reading(display="C99?8"), frame_index=500, seen_at_millis=500)
+
+    row = store.plate_reads()[0]
+
+    assert (row.first_frame, row.last_frame) == (500, 500), "yesterday's window survived the restart"
+    assert row.display == "C99?8"
+    assert store.plate_read_count() == 1
+
+
+def test_a_confident_reading_without_its_text_is_refused_at_both_layers(store: Store):
+    # The pipeline never publishes one, and a row in that shape would be a
+    # plate everything may act on that nobody can read. Refused in Python so
+    # the message names the track, and in the schema so no other writer can.
+    import sqlite3
+
+    with pytest.raises(StoreError, match="track 3"):
+        store.save_plate_read("gate", make_reading(text=None, confident=True, agreement=4, reads=4), frame_index=1, seen_at_millis=1)
+    assert store.plate_read_count() == 0
+
+    with pytest.raises(sqlite3.IntegrityError):
+        with store.transaction() as connection:
+            connection.execute(
+                "INSERT INTO plate_reads (camera_id, track_id, first_frame, last_frame, "
+                "country, display, text, is_confident, agreement, reads, seen_at_millis) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                ("gate", 9, 1, 1, "LB", "B7421", None, 1, 4, 4, 1),
+            )
+    assert store.plate_read_count() == 0
+
+
+def test_readings_are_listed_newest_first_and_filtered_on_the_same_clock(store: Store):
+    # Newest first, because the question is "what was read lately"; and the
+    # `since` filter and the ordering read the same column, so a query across
+    # two cameras is not interleaved by two clocks.
+    store.save_plate_read("gate", make_reading(1), frame_index=1, seen_at_millis=1_000)
+    store.save_plate_read("yard", make_reading(1), frame_index=1, seen_at_millis=3_000)
+    store.save_plate_read("gate", make_reading(2), frame_index=9, seen_at_millis=2_000)
+
+    everything = store.plate_reads()
+    assert [(r.camera_id, r.track_id) for r in everything] == [("yard", 1), ("gate", 2), ("gate", 1)]
+
+    assert [r.track_id for r in store.plate_reads(camera_id="gate")] == [2, 1]
+    assert [(r.camera_id, r.track_id) for r in store.plate_reads(since_millis=2_000)] == [("yard", 1), ("gate", 2)]
+    assert [r.camera_id for r in store.plate_reads(limit=1)] == ["yard"]
+    assert store.plate_reads(camera_id="gate", since_millis=1_500) == [everything[1]]
+
+
+def test_plate_readings_arrive_and_leave_without_touching_the_evidence(store: Store):
+    """The migration must apply, and undo, on a database that has rows in it.
+
+    An air-gapped deployment steps back a version to diagnose something and
+    forward again afterwards. The readings go with the table on the way down
+    — a build that predates them cannot hold them — and the cameras, zones,
+    events, incidents and audit rows must not go with it.
+    """
+    populate(store)
+    store.save_plate_read("cam-07", make_reading(text="B7421", display="B7421", confident=True, agreement=4, reads=5), frame_index=12, seen_at_millis=1_000)
+    before = store.applied_versions()
+    events, incidents = store.event_count(), store.incident_count()
+
+    # Down to and including `plate_reads`, rather than one step, for the
+    # reason the site test gives: this is the newest migration only until the
+    # next one lands.
+    undone = store.rollback()
+    while undone is not None and undone.name != "plate_reads":
+        undone = store.rollback()
+
+    assert undone is not None and undone.name == "plate_reads"
+    assert "plate_reads" not in store.table_names(), "the table survived its own down"
+    assert store.event_count() == events, "rolling back the readings took the events"
+    assert store.incident_count() == incidents
+    assert len(store.cameras()) == 1
+    assert len(store.zones()) == 1
+    assert len(store.audit_trail()) == 1
+
+    store.migrate()
+
+    assert store.applied_versions() == before
+    assert "plate_reads" in store.table_names()
+    assert store.plate_read_count() == 0, "a reading was resurrected by re-applying"
+    store.save_plate_read("cam-07", make_reading(), frame_index=1, seen_at_millis=1)
+    assert store.plate_read_count() == 1
+
+
+def test_a_record_stamped_to_the_microsecond_still_verifies_from_its_row(tmp_path: Path):
+    """What is hashed must be what is written.
+
+    The column holds milliseconds. A record stamped with microseconds was
+    hashed with them and stored without them, so the first chained row in a
+    fresh database failed its own verification — the Audit tab's first
+    photograph read "the chain breaks at chained record 1 of 1".
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from sentinel.auditing import AuditRecord, verify_chain
+
+    with Store(tmp_path / "s.db") as store:
+        at = datetime(2026, 9, 4, 15, 43, 36, 93873, tzinfo=timezone.utc)   # microseconds on purpose
+        written = store.audit_record(AuditRecord(
+            actor="console", action="camera.placed", subject="cam", node_id="local", at=at,
+            before_json='{"heading": 90.0}', after_json='{"heading": 180.0}',
+        ))
+        row = store.audit_trail(limit=1)[0]
+        assert row["chain_hash"] == written
+
+        rebuilt = AuditRecord(
+            actor=row["actor"], action=row["action"], subject=row["subject"], node_id=row["node_id"],
+            at=datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(milliseconds=int(row["at"])),
+            before_json=row["before_json"], after_json=row["after_json"],
+        )
+        assert verify_chain([rebuilt], [row["chain_hash"]]) is None, "the row does not re-hash to its own chain hash"
+
+
+# ------------------------------------------------------ recording, per camera
+
+
+def test_a_camera_remembers_whether_it_records_and_a_placement_does_not_forget_it(store: Store):
+    store.save_camera("cam-07", "North gate", "file:///media/north.mp4", record=True)
+    assert store.camera_recording("cam-07") is True
+
+    pose = CameraPose(
+        position=SITE, mount_height=6.5, heading=145.0, pitch=-24.0,
+        horizontal_fov=58.0, vertical_fov=33.0, range_meters=110.0,
+    )
+    # A placement says nothing about recording, so it must keep the flag.
+    store.save_camera("cam-07", "North gate", "file:///media/north.mp4", pose)
+    assert store.camera_recording("cam-07") is True
+    assert store.camera_pose("cam-07") is not None
+
+    store.save_camera("cam-07", "North gate", "file:///media/north.mp4", pose, record=False)
+    assert store.camera_recording("cam-07") is False
+    assert store.camera_recording("absent") is False
+
+    # A new camera saved without a decision does not record: the expensive
+    # thing is opted into, never acquired by omission.
+    store.save_camera("cam-08", "Yard", "file:///media/yard.mp4")
+    assert store.camera_recording("cam-08") is False
+
+
+def test_migration_eleven_carries_the_recording_flag_and_a_way_back():
+    with Store(":memory:") as store:
+        store.save_camera("cam-07", "North gate", "file:///media/north.mp4", record=True)
+        before = store.applied_versions()
+
+        # Later migrations come off first; the recording flag is the one under test.
+        undone = store.rollback()
+        while undone is not None and undone.name != "camera_recording":
+            undone = store.rollback()
+        assert undone is not None and undone.name == "camera_recording"
+        assert "record" not in store.column_names("cameras"), "the flag survived its own down"
+        assert [row["id"] for row in store.cameras()] == ["cam-07"], "the camera went with it"
+
+        store.migrate()
+        assert store.applied_versions() == before
+        # A row from before the flag records nothing — the safe direction.
+        assert store.camera_recording("cam-07") is False
+
+
+# ----------------------------------------------------- backup and restore
+
+
+def test_a_backup_is_a_consistent_copy_with_its_digest_beside_it(tmp_path: Path):
+    from sentinel.store import _sha256_of
+
+    live = tmp_path / "live.db"
+    with Store(live) as store:
+        store.save_camera("cam-07", "North gate", "file:///media/north.mp4")
+        store.audit("test", "something.happened", "cam-07", "detail")
+        written = store.backup_to(tmp_path / "backups" / "one.db")
+        # Still usable after the backup, and the backup never overwrites.
+        store.save_camera("cam-08", "Yard", "file:///media/yard.mp4")
+        with pytest.raises(StoreError, match="never overwrites"):
+            store.backup_to(written)
+
+    sidecar = written.with_suffix(".db.sha256")
+    assert sidecar.read_text(encoding="utf-8").split()[0] == _sha256_of(written)
+    with Store(written, auto_migrate=False) as copy:
+        assert [row["id"] for row in copy.cameras()] == ["cam-07"], "the snapshot moved after it was taken"
+        assert copy.pending() == []
+
+
+def test_restore_refuses_a_live_database_unless_told_and_keeps_it_aside(tmp_path: Path):
+    from sentinel.store import restore_backup
+
+    live = tmp_path / "live.db"
+    with Store(live) as store:
+        store.save_camera("cam-07", "North gate", "file:///media/north.mp4")
+        backup = store.backup_to(tmp_path / "b.db")
+        store.save_camera("cam-08", "Yard", "file:///media/yard.mp4")
+
+    with pytest.raises(StoreError, match="--replace"):
+        restore_backup(backup, live)
+
+    restore_backup(backup, live, replace=True)
+    aside = list(tmp_path.glob("live.db.replaced-*"))
+    assert [p for p in aside if p.suffix == ""] or aside, "the replaced database was not kept"
+    with Store(live, auto_migrate=False) as restored:
+        assert [row["id"] for row in restored.cameras()] == ["cam-07"]
+
+
+def test_restore_refuses_a_backup_that_fails_its_own_checks(tmp_path: Path):
+    from sentinel.store import restore_backup, verify_backup
+
+    assert verify_backup(tmp_path / "absent.db") == [f"{tmp_path / 'absent.db'} does not exist"]
+
+    garbage = tmp_path / "garbage.db"
+    garbage.write_bytes(b"not a database at all" * 100)
+    assert any("not a database" in p or "quick_check" in p for p in verify_backup(garbage))
+
+    with Store(tmp_path / "live.db") as store:
+        good = store.backup_to(tmp_path / "good.db")
+    good.with_suffix(".db.sha256").write_text("0" * 64 + "  good.db\n", encoding="utf-8")
+    assert verify_backup(good) == ["the SHA-256 sidecar does not match the file"]
+    with pytest.raises(StoreError, match="cannot be restored"):
+        restore_backup(good, tmp_path / "elsewhere.db")
+
+
+def test_a_database_from_a_newer_build_is_refused_at_open(tmp_path: Path):
+    from sentinel.store import MIGRATIONS
+
+    path = tmp_path / "future.db"
+    with Store(path) as store:
+        store._connection.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)",
+            (MIGRATIONS[-1].version + 5, "from_the_future", 0),
+        )
+    with pytest.raises(StoreError, match="newer build"):
+        Store(path)
+
+
+def test_a_damaged_database_is_refused_with_the_way_out_named(tmp_path: Path):
+    path = tmp_path / "damaged.db"
+    path.write_bytes(b"SQLite format 3\x00" + b"\xff" * 4096)
+    with pytest.raises(StoreError, match="sentinel restore"):
+        Store(path)
+
+
+def test_a_file_database_runs_wal_with_normal_synchronous_as_documented(tmp_path: Path):
+    with Store(tmp_path / "w.db") as store:
+        assert store._connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+        # 1 is NORMAL. DATABASE.md claimed this for a long time before it was true.
+        assert store._connection.execute("PRAGMA synchronous").fetchone()[0] == 1

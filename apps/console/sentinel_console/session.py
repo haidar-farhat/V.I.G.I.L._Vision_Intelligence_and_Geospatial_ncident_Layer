@@ -1,144 +1,119 @@
-"""One camera's worth of console state.
+"""The console's half of a camera.
 
-A camera is a source, a placement, a running analysis, and a view — and those
-four have to stay together or the interface starts showing one camera's tracks
-over another's frame. Bundling them is what makes a second camera a matter of
-adding to a list rather than a matter of rewriting the window.
+A camera used to be four things bundled here — a source, a placement, a running
+analysis and a widget — because the console *was* the application and there was
+nowhere else for the first three to live. There is now: `sentinel.node.Node`
+owns the source, the pose, the events, the faults and the thread, and it does so
+with no Qt anywhere near it.
 
-Each session owns its own pipeline. Nothing is shared between them except the
-zones, which belong to the ground rather than to any camera, and the correlation
-that runs above them. That independence is the same one a distributed deployment
-needs: a session is what a worker node runs.
+What is left here is the part that genuinely belongs to an interface: the widget
+that draws this camera, and the most recent frame drawn on it. Everything else
+is read through `record`, which is the node's, so there is exactly one copy of
+each fact rather than two that can disagree.
+
+That mattered more than it sounds. The old console kept its own event list, fed
+from the *latest-wins* update slot — so events on frames the interface never
+collected were never correlated and never persisted. Correlation ran on a
+frame-rate-dependent sample of the evidence, and a busy interface meant a
+quieter incident log. Reading from the node instead removes that by
+construction: the node drains events on their own path, independent of whatever
+the display managed to keep up with.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from pathlib import Path
+from dataclasses import dataclass
 
 from sentinel.core import CameraPose
-from sentinel.decode import _looks_live, redact_url
-from sentinel.events import Event
+from sentinel.node import CameraRecord, Node, Update
 
 from .video_view import VideoView
-from .worker import AnalysisWorker, Update
 
 
 @dataclass
 class CameraSession:
-    """A camera in the console: where it is, what it is watching, what it found."""
+    """One camera as the console sees it: a pane, and what was last drawn on it."""
 
-    camera_id: str
-    #: What the source *is*, as a string rather than a path: `device:0` for a
-    #: camera attached to this machine, an RTSP URL for one on the network, a
-    #: file path for footage. A `Path` could only represent the last of the
-    #: three, and made the other two look like files that did not exist.
-    #:
-    #: For a network camera this holds the credential. It is read in exactly one
-    #: place — the moment `VideoSource` is constructed — and everything else
-    #: uses `display_source`.
-    source: str
+    #: The node's record. The single copy of every fact about this camera that
+    #: is not about drawing it.
+    record: CameraRecord
     view: VideoView
-    pose: CameraPose | None = None
-    worker: AnalysisWorker | None = None
-    #: The most recent update drawn for this camera.
+    #: The node that owns `record`. Held so that assigning a pose is the same
+    #: operation the placement dialog performs — persisted and audited — rather
+    #: than a second, quieter way of doing it that forgets both.
+    node: "Node | None" = None
+    #: The most recent update collected for this camera. Used for painting and
+    #: for the track table; never for correlation, which reads the node.
     last: Update | None = None
-    #: Events this camera has raised, retained for correlation across cameras.
-    events: list[Event] = field(default_factory=list)
-    #: Set when this camera's own run ends or fails, so the window can show
-    #: which camera is in trouble rather than only that something is.
-    fault: str | None = None
+
+    # ---- everything below is the node's, exposed here so the interface reads
+    # ---- one place rather than reaching through `session.record` everywhere.
+
+    @property
+    def camera_id(self) -> str:
+        return self.record.camera_id
+
+    @property
+    def source(self) -> str:
+        """May carry a credential. Use `display_source` for anything visible."""
+        return self.record.source
 
     @property
     def display_source(self) -> str:
-        """The source with any credential removed. Safe to log, show and store."""
-        return redact_url(self.source)
+        return self.record.display_source
+
+    @property
+    def pose(self) -> CameraPose | None:
+        return self.record.pose
+
+    @pose.setter
+    def pose(self, pose: CameraPose | None) -> None:
+        """Place this camera. Not merely a field assignment.
+
+        Routed through the node so it persists, audits, and reaches a running
+        analysis — which is what placing a camera has to mean. A plain
+        attribute would have been a second way to do it that did none of those,
+        and the two would have disagreed the first time anybody used the
+        quieter one.
+        """
+        if self.node is None:
+            self.record.pose = pose
+            return
+        self.node.place_camera(self.camera_id, pose)
 
     @property
     def is_live(self) -> bool:
         """Whether this source has no end.
 
         A file is replayed to completion; a camera runs until it is stopped.
-        The difference decides whether the window can ever show "finished".
+        The difference decides whether the interface can ever show "finished".
         """
-        return _looks_live(self.source)
+        from sentinel.decode import _looks_live
+
+        return _looks_live(self.record.source)
+
+    @property
+    def fault(self) -> str | None:
+        return self.record.fault
 
     @property
     def is_running(self) -> bool:
-        return self.worker is not None and self.worker.isRunning()
+        return self.record.is_running
 
     @property
     def is_placed(self) -> bool:
-        return self.pose is not None
+        return self.record.pose is not None
 
-    def stop(self, timeout_millis: int = 3000) -> bool:
-        """Ask this camera's analysis to end, and wait for it to actually end.
-
-        Returns whether the thread finished. The return value is the point: an
-        earlier version called ``wait()`` and discarded the result, then dropped
-        the reference regardless. If the thread had not finished — a decode
-        blocked on a stalled camera is the ordinary way that happens — Python
-        would garbage-collect a running QThread, and Qt aborts the process for
-        that with "QThread: Destroyed while thread is still running".
-
-        A thread that will not stop is therefore kept referenced rather than
-        released. It is left running and marked as faulted, because leaking one
-        thread is recoverable and killing the process in front of an operator is
-        not. `terminate()` is deliberately not called: it stops the thread at an
-        arbitrary instruction, which for one holding a decoder and a database
-        handle risks far worse than a leak.
-        """
-        worker = self.worker
-        if worker is None:
-            return True
-
-        worker.stop()
-        if not worker.wait(timeout_millis):
-            self.fault = (
-                f"{self.camera_id}: the analysis thread did not stop within "
-                f"{timeout_millis / 1000:.0f}s and is still running"
-            )
-            # Deliberately keeps `self.worker` set. Dropping it here is what
-            # destroys a running QThread and aborts the process.
-            return False
-
-        # Unparented rather than deleteLater()'d. The worker is parented to the
-        # window so it cannot outlive it, but leaving it parented once it has
-        # finished means Qt owns a QThread nobody will ever start again — one
-        # per Start/Stop cycle, for the life of the console. Detaching hands
-        # ownership back to Python, whose refcount drops to zero the moment this
-        # assignment lands. `deleteLater()` was tried and is wrong here: it
-        # destroys the C++ object while queued signals from this worker may
-        # still be in flight, and Qt aborts the process for that.
-        worker.setParent(None)
-        self.worker = None
-        return True
+    @property
+    def events(self) -> list:
+        """This camera's events, as the node has them — not as the display saw them."""
+        return self.record.events
 
     def absorb(self, update: Update) -> None:
-        """Take an update from this camera's worker.
+        """Keep the newest frame for painting.
 
-        Events accumulate here rather than in the worker, because correlation
-        happens across cameras and a worker that correlated its own events in
-        isolation would produce one incident per camera — which is exactly the
-        alert duplication the system exists to prevent.
+        It no longer accumulates events. It used to, and that was the bug: the
+        update slot is latest-wins, so anything raised on a frame the interface
+        was too busy to collect never reached correlation at all.
         """
         self.last = update
-        self.events.extend(update.result.events)
-
-        # Bounded. A console left running for a week must not accumulate every
-        # event it ever saw; persistence is where the full history belongs.
-        if len(self.events) > 4000:
-            del self.events[: len(self.events) - 4000]
-
-    def describe(self) -> str:
-        if self.fault:
-            return f"{self.camera_id}: {self.fault}"
-        if not self.is_running:
-            return f"{self.camera_id}: stopped"
-        if self.last is None:
-            return f"{self.camera_id}: starting"
-        where = "placed" if self.is_placed else "not placed"
-        return (
-            f"{self.camera_id}: {self.last.analysis_fps:.0f} fps, "
-            f"{len(self.last.result.tracks)} tracked, {where}"
-        )

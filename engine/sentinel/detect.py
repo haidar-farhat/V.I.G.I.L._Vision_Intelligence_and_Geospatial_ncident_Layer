@@ -23,14 +23,16 @@ and refuse to fire on a blob.
 
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol, Sequence
+from typing import Iterable, Protocol, Sequence
 
 import cv2
 import numpy as np
 
+from . import telemetry
 from .core import BoundingBox, Detection
 
 #: Class id meaning "something moved and we do not know what it is".
@@ -283,6 +285,189 @@ class MotionDetector:
 # --------------------------------------------------------------------- ONNX
 
 
+#: What a security console watches by default when a model can name classes:
+#: people and the vehicles they arrive in. Measured on the laptop camera with
+#: every COCO class tracked: a jar on a shelf and a phone on the desk became
+#: "bottle" and "cell phone" tracks at 0.43–0.51 confidence, labelled in the
+#: same green as the person, and the operator's word for them was
+#: "hallucinations". They were not — the model saw a jar — but they were noise,
+#: and a system measured by how little it says must not track what nobody asked
+#: it to watch. Nothing is lost: the whole vocabulary stays available, and a
+#: site that wants "dog" adds it.
+WATCHED_LABELS = frozenset({"person", "bicycle", "car", "motorcycle", "bus", "truck"})
+
+
+def _restrict_vocabulary(
+    names: dict[int, str], classes: "Iterable[str] | None"
+) -> "tuple[dict[int, str], np.ndarray | None]":
+    """The part of a model's vocabulary an operator asked to watch.
+
+    Returns the names to report and the class ids to keep — ``None`` for the
+    ids when nothing was asked, which keeps everything, as before. The reported
+    names shrink with the filter on purpose: a zone's class picker reads them,
+    and offering "bottle" to a zone on a site whose detector drops bottles would
+    be a filter that silently disarms that zone.
+
+    A name the model does not know is refused rather than ignored: ignoring it
+    would let a typo in "person" watch nothing and say nothing about it. So is
+    an empty list, because "watch nothing" is never what anybody meant.
+    """
+    if classes is None:
+        return dict(names), None
+    wanted = {str(label).strip().lower() for label in classes if str(label).strip()}
+    if not wanted:
+        raise DetectionError(
+            "asked to watch no class at all; leave the watch list unset to watch everything"
+        )
+    if not names:
+        raise DetectionError(
+            f"asked to watch {', '.join(sorted(wanted))}, but this model names no classes"
+        )
+    known = {name.strip().lower(): class_id for class_id, name in names.items()}
+    unknown = sorted(wanted - set(known))
+    if unknown:
+        raise DetectionError(
+            f"asked to watch {', '.join(unknown)}, which this model does not name; "
+            f"it knows {', '.join(sorted(known))}"
+        )
+    kept = {known[label]: names[known[label]] for label in sorted(wanted)}
+    return kept, np.asarray(sorted(kept), dtype=np.int64)
+
+
+def detector_for(
+    model_path: "str | Path | None" = None, **options
+) -> "Detector":
+    """The right detector for what the operator supplied.
+
+    One place that decides, because there are now three and the difference
+    between them is not a preference — it is what the system is capable of
+    concluding:
+
+    - **No model** gives the motion detector. It answers "what changed", which
+      includes a curtain, and it cannot see anything that has stopped moving.
+      Free, fast, and the reason a real webcam produced twenty tracks for one
+      seated person.
+    - **A model with two outputs** is instance segmentation: a mask per object,
+      a class, and a ground-contact point taken from the object's own lowest
+      pixel rather than from a rectangle's bottom edge.
+    - **A model with one output** is a detector: boxes and classes, no masks.
+
+    The choice is made by *reading the model*, not by a flag, because a flag can
+    disagree with the file and the operator would have no way to tell which won.
+    """
+    if model_path is None:
+        # A motion detector cannot name a class, so it cannot watch one. The
+        # list is dropped rather than refused: the console applies its watch
+        # list to whatever detector it has, and a motion-only site is not an
+        # error.
+        options.pop("classes", None)
+        # Nor is its confidence a probability: it is the fraction of a box
+        # that actually moved (see `MotionDetector.detect`), so a floor meant
+        # for a classifier's score would silently throw away solid, real
+        # movement below it. The console hands one set of options to whatever
+        # detector it has; motion takes the ones that apply to it.
+        options.pop("confidence_threshold", None)
+        return MotionDetector(**options)
+
+    path = Path(model_path)
+    outputs = _output_count(path)
+
+    if outputs == 2:
+        from .segment import Segmenter
+
+        return Segmenter(path, **options)
+    return OnnxDetector(path, **options)
+
+
+#: What has been read from each model file this process, keyed by the file's
+#: identity (path, size, mtime) so an operator replacing the file under a
+#: running console is noticed. Two caches: the structural answer `detector_for`
+#: needs to choose a class, and the full description an interface reads.
+_OUTPUT_COUNTS: dict[tuple[str, int, int], int] = {}
+_MODEL_INFO: dict[tuple[str, int, int], DetectorInfo] = {}
+_MODEL_LOCK = threading.Lock()
+
+
+def _model_key(path: "str | Path") -> tuple[str, int, int]:
+    resolved = Path(path).resolve()
+    if not resolved.is_file():
+        raise DetectionError(
+            f"No model at {resolved}. Models are supplied by the operator; "
+            "nothing is ever downloaded."
+        )
+    stat = resolved.stat()
+    return (str(resolved), stat.st_size, stat.st_mtime_ns)
+
+
+def forget_models() -> None:
+    """Drop everything read from model files. For tests, and for nothing else."""
+    with _MODEL_LOCK:
+        _OUTPUT_COUNTS.clear()
+        _MODEL_INFO.clear()
+
+
+def model_info(model_path: "str | Path", *, classes: "Iterable[str] | None" = None) -> DetectorInfo:
+    """What a model can do, read once per process.
+
+    A console asks this question several times before a single camera starts
+    — the zone picker wants the labels, the watch-list dialog wants the whole
+    vocabulary, Start checks that the file loads — and each answer used to be
+    a full session build. The log showed `segmenter ready` four times for one
+    camera. The session built here is discarded; only its description is
+    kept, so the answer costs one load per process and per file.
+
+    ``classes`` narrows the reported names the way a detector built with the
+    same list would, and refuses an unknown name the same way, so a caller
+    validating a watch list gets the same answer without building anything.
+    """
+    key = _model_key(model_path)
+    with _MODEL_LOCK:
+        info = _MODEL_INFO.get(key)
+    if info is None:
+        info = detector_for(model_path).info
+        with _MODEL_LOCK:
+            _MODEL_INFO[key] = info
+    if classes is None:
+        return info
+    names, _ = _restrict_vocabulary(info.class_names, classes)
+    return DetectorInfo(
+        kind=info.kind, name=info.name, model_path=info.model_path,
+        model_sha256=info.model_sha256, input_size=info.input_size,
+        class_names=names, classifies=info.classifies,
+    )
+
+
+def _output_count(path: "str | Path") -> int:
+    """How many tensors the model produces, without loading it for inference.
+
+    Reads the graph only, and once per file per process: `detector_for` asks
+    this for every camera it builds a detector for, and the answer does not
+    change between cameras.
+    """
+    key = _model_key(path)
+    with _MODEL_LOCK:
+        cached = _OUTPUT_COUNTS.get(key)
+    if cached is not None:
+        return cached
+
+    from . import telemetry
+
+    telemetry.silence()
+    import onnxruntime as ort
+
+    resolved = Path(key[0])
+    try:
+        session = ort.InferenceSession(
+            str(resolved), providers=["CPUExecutionProvider"]
+        )
+    except Exception as error:
+        raise DetectionError(f"Could not load the model at {resolved}: {error}") from error
+    count = len(session.get_outputs())
+    with _MODEL_LOCK:
+        _OUTPUT_COUNTS[key] = count
+    return count
+
+
 def _sha256(path: Path) -> str:
     import hashlib
 
@@ -318,7 +503,7 @@ class OnnxDetector:
     that produced it.
     """
 
-    __slots__ = ("_session", "_input_name", "_input_size", "_layout", "_info",
+    __slots__ = ("_watched_ids", "_session", "_input_name", "_input_size", "_layout", "_info",
                  "_confidence", "_iou", "_letterbox")
 
     def __init__(
@@ -330,6 +515,7 @@ class OnnxDetector:
         class_names: dict[int, str] | None = None,
         providers: Sequence[str] | None = None,
         letterbox: bool = True,
+        classes: "Iterable[str] | None" = None,
     ):
         import onnxruntime as ort
 
@@ -345,14 +531,24 @@ class OnnxDetector:
         # to the operator's files.
         options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
-        # Telemetry off, explicitly. onnxruntime collects it by default on some
-        # builds, and this system tells the operator to their face that it sends
-        # nothing anywhere — a claim that has to be true of every dependency, not
-        # just of the code written here. Guarded because the call is absent on
-        # builds that never had telemetry to begin with.
-        disable = getattr(ort, "disable_telemetry_events", None)
-        if callable(disable):
-            disable()
+        # Telemetry off. The runtime API is the *second* half of this — the
+        # first is `ORT_DISABLE_TELEMETRY`, set by `telemetry.silence()` at every
+        # entry point, because the native library reads it when it initialises
+        # and Microsoft's own documentation says an initialisation event may
+        # already have been sent before any Python call can reach the switch.
+        #
+        # This is not hypothetical. The manylinux wheel of the version pinned
+        # here contains a Microsoft 1DS collector endpoint with an ingestion
+        # token, a statically linked mbedTLS stack, a persistent device-id
+        # database, and the payload fields `osDescription`, `cpuModel` and
+        # `totalMemoryMB` — verified by scanning the shipped `.so`, not by
+        # reading documentation. Telemetry is ON by default in the official
+        # builds. The host is deliberately not written here: the offline audit
+        # refuses shipped source that names a destination, and a comment is
+        # exactly how one gets in. `tools/binary_audit.py` holds the string,
+        # because finding it is that file's job.
+        telemetry.silence()
+        telemetry.silence_runtime_apis()
 
         try:
             session = ort.InferenceSession(
@@ -388,6 +584,9 @@ class OnnxDetector:
         self._layout = _infer_layout(session.get_outputs()[0].shape, path.name)
 
         names = dict(class_names) if class_names else _names_from_metadata(session)
+        # `classes` is what the operator asked to watch; everything else the
+        # model can see is dropped below, before it can become a track.
+        names, self._watched_ids = _restrict_vocabulary(names, classes)
         self._info = DetectorInfo(
             kind="onnx",
             name=path.stem,
@@ -458,6 +657,8 @@ class OnnxDetector:
         confidences = scores[np.arange(scores.shape[0]), class_ids]
 
         keep = confidences >= self._confidence
+        if self._watched_ids is not None:
+            keep &= np.isin(class_ids, self._watched_ids)
         if not np.any(keep):
             return []
 

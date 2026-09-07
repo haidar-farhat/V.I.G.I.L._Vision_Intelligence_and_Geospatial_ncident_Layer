@@ -1,0 +1,276 @@
+name: v2
+
+# The rewrite in v2/ is the product, and this is the whole of its check: the
+# Rust core, the offline audit and every Python suite on the three platforms
+# it ships on; the same again with the network taken away, because "no route
+# out" is the product's central claim and a claim nobody tests stops being
+# true; then the bundle and an installer for each platform, each installed on
+# the runner that built it and asked to find its own engine core.
+#
+# `python tasks.py check` builds and tests the core only when `cargo` is on
+# PATH. Before this workflow installed a Rust toolchain that meant the 77 core
+# tests and the Python-Rust cross-check in tests/test_native.py silently never
+# ran in CI, and the job was green anyway. The toolchain step below is what
+# makes that check real, and the "core actually loaded" step is what fails if
+# it ever goes missing again.
+
+on:
+  push:
+    branches: [main, v2]
+    tags: ['v*']
+  pull_request:
+    paths:
+      - 'v2/**'
+      - '.github/workflows/v2.yml'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  PIP_DISABLE_PIP_VERSION_CHECK: '1'
+  QT_QPA_PLATFORM: offscreen
+
+defaults:
+  run:
+    working-directory: v2
+
+jobs:
+  check:
+    name: check (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            v2/core/target
+          key: v2-cargo-${{ matrix.os }}-${{ hashFiles('v2/core/Cargo.lock') }}
+
+      - uses: actions/setup-python@v5
+        with:
+          # The floor stated in pyproject.toml. Development happens on 3.14;
+          # testing the floor is what keeps it a floor rather than a number
+          # nobody checks.
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: v2/pyproject.toml
+
+      - name: Qt needs these on a headless Linux runner
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libxkbcommon-x11-0 libxcb-cursor0 \
+            libxcb-icccm4 libxcb-keysyms1 libxcb-shape0 libgl1
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      # The core first, then the offline audit, then every suite: one command,
+      # the same one a developer runs, so CI cannot drift from the desk.
+      - name: The core, the offline audit and every suite
+        run: python tasks.py check
+
+      - name: The engine core actually loaded under the suite
+        # `check` would pass with the core missing — the NumPy paths are the
+        # same algorithms — but then tests/test_native.py, the proof that the
+        # two implementations agree, skips itself. This is the line that
+        # refuses a green run with the proof missing.
+        run: python -c "from vigil.kernel import native; import sys; print(native.loaded_from() if native.available() else native.fault()); sys.exit(0 if native.available() else 1)"
+
+      - name: The generated capability page is current
+        run: |
+          python tasks.py capabilities
+          git diff --exit-code CAPABILITIES.md
+
+      - name: The public page renders from the manifest
+        run: python tasks.py site
+
+  offline:
+    name: offline acceptance
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: v2/pyproject.toml
+      - name: Qt needs these on a headless Linux runner
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libxkbcommon-x11-0 libxcb-cursor0 \
+            libxcb-icccm4 libxcb-keysyms1 libxcb-shape0 libgl1
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+      - name: Build the engine core while the network is still there
+        run: python tasks.py core
+
+      # Everything above this line may use the network. Nothing below it may.
+      - name: Block all outbound traffic except loopback
+        run: |
+          sudo iptables -P OUTPUT DROP
+          sudo iptables -A OUTPUT -o lo -j ACCEPT
+      - name: Prove the network is actually blocked
+        run: |
+          if timeout 5 curl -sS https://example.com >/dev/null 2>&1; then
+            echo "outbound traffic still works; this job would prove nothing"
+            exit 1
+          fi
+          echo "confirmed: no route out"
+      - name: Rust tests with the WAN blocked
+        working-directory: v2/core
+        run: cargo test --lib --release --offline
+      - name: Every suite with the WAN blocked, core included
+        run: |
+          python -c "from vigil.kernel import native; import sys; sys.exit(0 if native.available() else 1)"
+          python -m pytest tests -q -p no:cacheprovider
+
+  package:
+    name: installers (${{ matrix.os }})
+    needs: check
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            v2/core/target
+          key: v2-cargo-${{ matrix.os }}-${{ hashFiles('v2/core/Cargo.lock') }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: v2/pyproject.toml
+      - name: Qt needs these on a headless Linux runner
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libxkbcommon-x11-0 libxcb-cursor0 \
+            libxcb-icccm4 libxcb-keysyms1 libxcb-shape0 libgl1
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Build the engine core
+        run: python tasks.py core
+
+      - name: Build the bundle
+        run: python tasks.py package
+
+      # A bundle that builds and cannot start, or starts and cannot find its
+      # core, is the failure this job exists to catch, and it is invisible
+      # without launching it.
+      - name: The bundle starts and finds its engine core
+        shell: bash
+        run: |
+          BIN="dist/vigil/vigil"
+          [ "$RUNNER_OS" = "Windows" ] && BIN="dist/vigil/vigil.exe"
+          "$BIN" --data-dir "$RUNNER_TEMP/bundle-check" doctor | tee doctor.txt
+          grep -q "^OK   engine core" doctor.txt
+
+      # The Windows runner image ships WiX 3 and NSIS. `%WIX%` names the
+      # toolset folder; putting its bin on PATH is all the installer task needs.
+      - name: WiX and NSIS on PATH
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if ($env:WIX) { Add-Content $env:GITHUB_PATH (Join-Path $env:WIX 'bin') }
+          if (Test-Path 'C:\Program Files (x86)\NSIS') { Add-Content $env:GITHUB_PATH 'C:\Program Files (x86)\NSIS' }
+          Get-Command candle, light, makensis -ErrorAction SilentlyContinue | Format-Table Name, Source
+
+      - name: Build the installers
+        run: python tasks.py installer
+
+      # Each installer is installed on the runner that built it and the
+      # installed product is asked to run `doctor` and find its core. Nothing
+      # below claims a platform it has not done this on.
+      - name: Install the .deb and run it
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y ./dist/installers/*.deb
+          dpkg -s vigil | head -5
+          vigil --data-dir "$RUNNER_TEMP/deb-check" doctor | tee deb-doctor.txt
+          grep -q "^OK   engine core" deb-doctor.txt
+          test -x /opt/vigil/vigil-console
+          sudo apt-get remove -y vigil
+
+      - name: Install the .pkg and run it
+        if: runner.os == 'macOS'
+        run: |
+          sudo installer -pkg dist/installers/*.pkg -target /
+          /usr/local/bin/vigil --data-dir "$RUNNER_TEMP/pkg-check" doctor | tee pkg-doctor.txt
+          grep -q "^OK   engine core" pkg-doctor.txt
+          test -x /Applications/Vigil.app/Contents/MacOS/Vigil
+          hdiutil verify dist/installers/*.dmg
+
+      - name: Install the .msi and run it
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $msi = (Get-ChildItem dist/installers/*.msi).FullName
+          $p = Start-Process msiexec -ArgumentList "/i", "`"$msi`"", "/qn", "/norestart", "/l*v", "install.log" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { Get-Content install.log -Tail 40; throw "msiexec exited $($p.ExitCode)" }
+          $exe = "C:\Program Files\Vigil\vigil.exe"
+          if (-not (Test-Path $exe)) { throw "the installer did not put vigil.exe where it said" }
+          & $exe --data-dir "$env:RUNNER_TEMP\msi-check" doctor | Tee-Object msi-doctor.txt
+          if (-not (Select-String -Path msi-doctor.txt -Pattern '^OK   engine core' -Quiet)) { throw "installed product did not find its core" }
+          $u = Start-Process msiexec -ArgumentList "/x", "`"$msi`"", "/qn", "/norestart" -Wait -PassThru
+          if ($u.ExitCode -ne 0) { throw "uninstall exited $($u.ExitCode)" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installers-${{ matrix.os }}
+          path: v2/dist/installers/
+          if-no-files-found: error
+
+  release:
+    # A tag `v*` collects the three runners' installers into one draft release.
+    # Draft, not published: every file in it is unsigned and says so, and
+    # publishing is a decision a person makes after reading that.
+    name: draft release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: installers-*
+          merge-multiple: true
+          path: installers
+      - name: What is in it
+        working-directory: installers
+        run: ls -la && cat SHA256SUMS-*.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+          files: installers/*
+          body: |
+            Every file here is **unsigned**. Windows, macOS and Debian will each warn, and each warning is correct.
+            Verify a download against `SHA256SUMS-<platform>.txt` before installing it, then run `vigil doctor`.

@@ -1,0 +1,367 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sentinel Vision</title>
+<meta name="description" content="Local-first multi-camera incident intelligence: ordinary cameras in, a small number of reviewable incidents out, each with the evidence that produced it, and no route to the Internet.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap">
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect x='3' y='3' width='10' height='10' transform='rotate(45 8 8)' fill='%23e8743b'/%3E%3C/svg%3E">
+<script>
+(function () {
+  var key = "vigil-theme";
+  try { var t = localStorage.getItem(key); if (t) document.documentElement.setAttribute("data-theme", t); } catch (e) {}
+  document.addEventListener("DOMContentLoaded", function () {
+    var button = document.getElementById("theme");
+    if (!button) return;
+    button.addEventListener("click", function () {
+      var root = document.documentElement, current = root.getAttribute("data-theme");
+      var dark = current ? current === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
+      var next = dark ? "light" : "dark";
+      root.setAttribute("data-theme", next);
+      try { localStorage.setItem(key, next); } catch (e) {}
+    });
+  });
+})();
+</script>
+</head>
+<body>
+
+<header class="top">
+  <div class="wrap">
+    <a class="wordmark" href="#"><i></i>VIGIL</a>
+    <nav>
+      <a href="#says">What it says</a>
+      <a href="#works">How it works</a>
+      <a href="#measured">Measured</a>
+      <a href="#refuses">Refuses</a>
+      <a href="#capabilities">Capabilities</a>
+      <a href="#get">Get it</a>
+      <a href="#stands">Where it stands</a>
+    </nav>
+    <button id="theme" type="button" aria-label="Switch between light and dark">Theme</button>
+  </div>
+</header>
+
+<main>
+
+<section class="hero">
+  <div class="wrap">
+    <div>
+      <p class="eyebrow">Sentinel Vision v2 · local-first</p>
+      <h1>It says what it <em>measured.</em></h1>
+      <p class="dek">Ordinary cameras in. A small number of reviewable incidents out, each with the evidence that produced it. No route to the Internet at any point.</p>
+      <p class="facts">
+        <span><b>{{python_tests}}</b> Python tests</span>
+        <span><b>{{rust_tests}}</b> Rust tests</span>
+        <span><b>{{tested}}</b> capabilities tested</span>
+        <span><b>0</b> outbound connections</span>
+      </p>
+    </div>
+    <figure class="plan">
+      <svg viewBox="0 0 600 440" role="img" aria-label="A site plan drawn from two cameras' own geometry: their fields of view, a restricted zone, a tracked person with an error ellipse eleven metres from the zone edge, and a car in the zone with three people apparently inside.">
+        <defs>
+          <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+            <path d="M40 0H0V40" fill="none" class="grid-line" stroke-width="1"/>
+          </pattern>
+          <marker id="head" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0L8 4L0 8z" fill="currentColor"/>
+          </marker>
+        </defs>
+        <rect width="600" height="440" fill="url(#grid)"/>
+
+        <!-- two cameras and what they reach -->
+        <polygon class="wedge" points="60,380 250,20 560,200"/>
+        <polygon class="wedge" points="560,400 160,100 80,330"/>
+        <rect class="cam" x="56" y="376" width="8" height="8" transform="rotate(45 60 380)"/>
+        <rect class="cam" x="556" y="396" width="8" height="8" transform="rotate(45 560 400)"/>
+        <text class="label strong" x="72" y="404">north-gate</text>
+        <text class="label" x="72" y="418">4 m mast · heading ±0.06° measured</text>
+        <text class="label strong" x="548" y="424" text-anchor="end">yard-east</text>
+        <text class="label" x="548" y="436" text-anchor="end">8 m · ±2° assumed, not measured</text>
+
+        <!-- the zone -->
+        <polygon class="zone" points="250,150 470,130 500,290 280,320"/>
+        <text class="zone-label" x="266" y="172">YARD</text>
+        <text class="label" x="266" y="187">restricted 22–06</text>
+
+        <!-- a car in it, and who is apparently inside -->
+        <ellipse class="ellipse" cx="412" cy="214" rx="34" ry="15" transform="rotate(49.5 412 214)"/>
+        <rect class="vehicle" x="388" y="202" width="48" height="24" rx="3"/>
+        <text class="label strong" x="412" y="250" text-anchor="middle">car · 0.91</text>
+        <text class="label" x="412" y="264" text-anchor="middle">probably 3 inside</text>
+
+        <!-- a person, where they are known to be, and how well -->
+        <ellipse class="ellipse breathe" cx="215" cy="255" rx="26" ry="11" transform="rotate(-39 215 255)"/>
+        <circle class="object" cx="215" cy="255" r="4"/>
+        <line class="motion" x1="221" y1="252" x2="256" y2="236" marker-end="url(#head)"/>
+        <text class="label strong" x="150" y="236">person · 0.84</text>
+        <text class="label" x="150" y="250">approaching</text>
+
+        <!-- the distance, never without its error -->
+        <line class="tie" x1="219" y1="256" x2="268" y2="256"/>
+        <text class="readout" x="243" y="278" text-anchor="middle">11.2 ± 2.4 m</text>
+
+        <text class="label" x="14" y="22">□ = 5 m · plan from the cameras' own geometry, no tiles</text>
+      </svg>
+      <figcaption>The plan is drawn from the cameras' own poses. A position is an ellipse, not a point — vague along the line of sight and sharp across it — and a distance never travels without its error. One camera's heading was measured from marked ground points; the other's is still the assumed ±2°, and the plan says so.</figcaption>
+    </figure>
+  </div>
+</section>
+
+<section id="says">
+  <div class="wrap">
+    <div class="section-head">
+      <p class="eyebrow">What comes out</p>
+      <h2>One sentence, and everything behind it</h2>
+      <p class="muted">Three cameras seeing the same person produce one incident, not three alerts. Every conclusion carries its camera, its frames, its rule, the model that drew it and the number it rests on.</p>
+    </div>
+    <div class="incident" role="group" aria-label="An example incident in the console's own words">
+      <div class="stripe"></div>
+      <div class="body">
+        <div class="line">
+          <span class="chip high">High</span>
+          <span class="mono muted">inc-7f3a · north-gate · 22:41:07</span>
+          <span class="mono muted" style="margin-left:auto">example, in the console's own words</span>
+        </div>
+        <p class="sentence">A person entered the Yard after hours, apparently carrying something.</p>
+        <dl>
+          <dt>Where</dt><dd>11.2 ± 2.4 m from the north gate, inside <strong>YARD</strong> (restricted 22–06)</dd>
+          <dt>Rules</dt><dd>after-hours · zone entry · approach warned 14 s earlier at <span class="mono">MEDIUM</span></dd>
+          <dt>Carrying</dt><dd><em>Inferred, never observed</em>: 0.78 of the object's box lay within the person's, for 21 frames. One camera cannot tell <em>carried</em> from <em>in front of</em>.</dd>
+          <dt>Model</dt><dd class="ev">yolov8n-seg · f828ccfa4b69 · person 0.84 · on DmlExecutionProvider</dd>
+          <dt>Evidence</dt><dd class="ev">clip 22:40:51–22:41:33 · sha256 9c1e…4b0f · 21 frames · exported with a manifest that verifies</dd>
+        </dl>
+        <div class="why">
+          <div class="row"><span>Why this is <strong>0.46</strong> and not a number somebody picked</span><span class="num">weight</span></div>
+          <div class="row"><span>after hours</span><span class="num">0.30</span></div><div class="bar"><i style="width:60%"></i></div>
+          <div class="row"><span>restricted zone</span><span class="num">0.25</span></div><div class="bar"><i style="width:50%"></i></div>
+          <div class="row"><span>carried object (inferred)</span><span class="num">0.15</span></div><div class="bar"><i style="width:30%"></i></div>
+          <div class="row"><span>distinct people</span><span class="num">1</span></div>
+          <div class="row"><span class="muted small">A dismissal needs a written reason. "Dismissed" with no reason cannot be told from nobody having looked.</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="works">
+  <div class="wrap">
+    <div class="section-head">
+      <p class="eyebrow">How it works</p>
+      <h2>Everything before the claim reports. The claim has to justify itself.</h2>
+      <p class="muted">One Python package in four layers with a strict import direction, a Rust core for the arithmetic that runs per pixel, and one service boundary through which every change to a site passes with a named principal.</p>
+    </div>
+    <figure class="flow">
+      <svg viewBox="0 0 1100 250" role="img" aria-label="The pipeline from decode to review, with what each stage carries forward and what each refuses. Stages one to seven report; zones, correlation and review make a claim.">
+        <defs>
+          <marker id="fhead" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto">
+            <path d="M0 0L8 4L0 8z" class="arrowhead"/>
+          </marker>
+        </defs>
+        <!-- stages: x = 8 + i*109, width 92 -->
+        <rect class="stage" x="8" y="70" width="92" height="46" rx="2"/><text class="name" x="54" y="98" text-anchor="middle">Decode</text>
+        <rect class="stage" x="117" y="70" width="92" height="46" rx="2"/><text class="name" x="163" y="98" text-anchor="middle">Frame quality</text>
+        <rect class="stage" x="226" y="70" width="92" height="46" rx="2"/><text class="name" x="272" y="98" text-anchor="middle">Camera motion</text>
+        <rect class="stage" x="335" y="70" width="92" height="46" rx="2"/><text class="name" x="381" y="98" text-anchor="middle">Detect</text>
+        <rect class="stage" x="444" y="70" width="92" height="46" rx="2"/><text class="name" x="490" y="98" text-anchor="middle">Describe</text>
+        <rect class="stage" x="553" y="70" width="92" height="46" rx="2"/><text class="name" x="599" y="98" text-anchor="middle">Track</text>
+        <rect class="stage" x="662" y="70" width="92" height="46" rx="2"/><text class="name" x="708" y="98" text-anchor="middle">Project</text>
+        <rect class="stage" x="771" y="70" width="92" height="46" rx="2"/><text class="name" x="817" y="98" text-anchor="middle">Zones &amp; rules</text>
+        <rect class="stage" x="880" y="70" width="92" height="46" rx="2"/><text class="name" x="926" y="98" text-anchor="middle">Correlate</text>
+        <rect class="stage person" x="989" y="70" width="92" height="46" rx="2"/><text class="name" x="1035" y="98" text-anchor="middle">Review</text>
+
+        <!-- what moves between them -->
+        <line class="edge" x1="100" y1="93" x2="115" y2="93" marker-end="url(#fhead)"/><text class="carry" x="108" y="60" text-anchor="middle">frames</text>
+        <line class="edge" x1="209" y1="93" x2="224" y2="93" marker-end="url(#fhead)"/><text class="carry" x="217" y="60" text-anchor="middle">usable frames</text>
+        <line class="edge" x1="318" y1="93" x2="333" y2="93" marker-end="url(#fhead)"/><text class="carry" x="326" y="60" text-anchor="middle">warped filters</text>
+        <line class="edge" x1="427" y1="93" x2="442" y2="93" marker-end="url(#fhead)"/><text class="carry" x="435" y="60" text-anchor="middle">boxes + masks</text>
+        <line class="edge" x1="536" y1="93" x2="551" y2="93" marker-end="url(#fhead)"/><text class="carry" x="544" y="60" text-anchor="middle">descriptors</text>
+        <line class="edge" x1="645" y1="93" x2="660" y2="93" marker-end="url(#fhead)"/><text class="carry" x="653" y="60" text-anchor="middle">tracks</text>
+        <line class="edge" x1="754" y1="93" x2="769" y2="93" marker-end="url(#fhead)"/><text class="carry" x="762" y="60" text-anchor="middle">x, y ± σ</text>
+        <line class="edge" x1="863" y1="93" x2="878" y2="93" marker-end="url(#fhead)"/><text class="carry" x="871" y="60" text-anchor="middle">events</text>
+        <line class="edge" x1="972" y1="93" x2="987" y2="93" marker-end="url(#fhead)"/><text class="carry" x="980" y="60" text-anchor="middle">incidents</text>
+
+        <!-- what each refuses -->
+        <text class="refuse" x="54" y="138" text-anchor="middle">public addresses</text><text class="refuse" x="54" y="153" text-anchor="middle">refused</text>
+        <text class="refuse" x="163" y="138" text-anchor="middle">blur, glare, freeze</text><text class="refuse" x="163" y="153" text-anchor="middle">named, not silent</text>
+        <text class="refuse" x="272" y="138" text-anchor="middle">a passing lorry</text><text class="refuse" x="272" y="153" text-anchor="middle">is not the camera</text>
+        <text class="refuse" x="381" y="138" text-anchor="middle">any ONNX model;</text><text class="refuse" x="381" y="153" text-anchor="middle">NMS per class</text>
+        <text class="refuse" x="490" y="138" text-anchor="middle">an occluded crop</text><text class="refuse" x="490" y="153" text-anchor="middle">is discarded</text>
+        <text class="refuse" x="599" y="138" text-anchor="middle">Kalman; optimal</text><text class="refuse" x="599" y="153" text-anchor="middle">assignment</text>
+        <text class="refuse" x="708" y="138" text-anchor="middle">a ray at the horizon</text><text class="refuse" x="708" y="153" text-anchor="middle">is TOO_SHALLOW</text>
+        <text class="refuse" x="817" y="138" text-anchor="middle">hysteresis; warns</text><text class="refuse" x="817" y="153" text-anchor="middle">before the breach</text>
+        <text class="refuse" x="926" y="138" text-anchor="middle">three cameras,</text><text class="refuse" x="926" y="153" text-anchor="middle">one incident</text>
+        <text class="refuse" x="1035" y="138" text-anchor="middle">a dismissal needs</text><text class="refuse" x="1035" y="153" text-anchor="middle">a written reason</text>
+
+        <!-- reports / claims -->
+        <path class="bracket" d="M8 188v8h746v-8"/>
+        <text class="bracket-label" x="381" y="216" text-anchor="middle">REPORTS</text>
+        <path class="bracket" d="M771 188v8h310v-8"/>
+        <text class="bracket-label" x="926" y="216" text-anchor="middle">MAKES A CLAIM · MUST JUSTIFY IT</text>
+      </svg>
+      <figcaption>Four association passes in the tracker: confirmed tracks against strong detections, then against weak ones (which is what recovers an object through an occlusion), then tentative tracks, then lost tracks by appearance across a gap. That last pass prevents a fragment rather than reconciling one afterwards.</figcaption>
+    </figure>
+  </div>
+</section>
+
+<section id="measured">
+  <div class="wrap">
+    <div class="section-head">
+      <p class="eyebrow">Measured</p>
+      <h2>Numbers from one laptop, reported as what they are</h2>
+      <p class="muted">Every figure below came from <code>python tasks.py bench</code> or a run against a real camera on 2026-09-06, on a machine at 33–40% background load. None of it is a product specification.</p>
+    </div>
+    <div class="tiles">
+      <div class="tile">
+        <p class="num">5 <span class="arrow">→</span> <span class="to">1</span> <small>ids</small></p>
+        <p class="what">One person, a detector that blinks, twenty seconds.</p>
+        <p class="how">Appearance during association, not reconciled an hour later.</p>
+      </div>
+      <div class="tile">
+        <p class="num">118 <span class="arrow">→</span> <span class="to">89</span> <small>switches</small></p>
+        <p class="what">Four people milling in a small space, eight runs.</p>
+        <p class="how">Optimal assignment 118→95; appearance and occlusion-awareness 95→89.</p>
+      </div>
+      <div class="tile">
+        <p class="num">79 <span class="arrow">→</span> <span class="to">0.62</span> <small>ms</small></p>
+        <p class="what">The ground raster, 230,400 cells, per frame per camera.</p>
+        <p class="how">NumPy to Rust. v1 sampled four frames a second because of this line.</p>
+      </div>
+      <div class="tile">
+        <p class="num">38.5 <span class="arrow">→</span> <span class="to">4.5</span> <small>ms</small></p>
+        <p class="what">The detection session, CPU to the integrated GPU.</p>
+        <p class="how">End to end 67.6→11.4 ms; the bottleneck moved to pre- and post-processing.</p>
+      </div>
+      <div class="tile">
+        <p class="num">0 <span class="arrow">→</span> <span class="to">0</span> <small>swaps</small></p>
+        <p class="what">Two people crossing head-on, twelve runs.</p>
+        <p class="how">A null result, reported as one: the filter's velocity keeps them apart, so this measures the filter, not the association.</p>
+      </div>
+      <div class="tile">
+        <p class="num">0.105 <span class="small muted">vs</span> <span class="to">0.35</span></p>
+        <p class="what">What real strangers score against the shipped re-identification gate.</p>
+        <p class="how">The constant was wrong. The threshold is now measured live on each scene, from pairs proven different by being in one frame.</p>
+      </div>
+    </div>
+    <p class="caveat">The appearance thresholds are the most likely thing to be wrong in the field, and the one measurement on real video said so. A scene whose own strangers look alike now declines to re-identify and lets a track fragment — visible on screen — rather than merging two people, which nobody can see.</p>
+  </div>
+</section>
+
+<section id="refuses">
+  <div class="wrap">
+    <div class="section-head">
+      <p class="eyebrow">What it refuses to claim</p>
+      <h2>A false "armed" is the most expensive mistake this system can make</h2>
+    </div>
+    <div class="refusals">
+      <div><h3>A relation is inferred, never observed</h3><p>One camera cannot tell <em>inside</em> from <em>in front of</em>. So every relation carries the overlap, the frames and the distance it was drawn from, and the interface says "probably in the car", never "in the car".</p></div>
+      <div><h3>A distance never travels alone</h3><p>Two positions each known to ±1.4 m are eleven metres apart give or take about two. It is rendered as <code>11.2 ± 2.4 m</code> on the plan, in the track table, in the incident and in the exported report.</p></div>
+      <div><h3>Nothing is a threat by default</h3><p>The shipped model names <em>knife</em> and <em>scissors</em>; a kitchen raising a critical alert every evening teaches an operator to ignore the word. A site names its own threat labels, and <code>vigil doctor</code> fails when the installed model cannot produce one.</p></div>
+      <div><h3>A threshold is measured on this site</h3><p>Two tracks visible in one frame are different objects by construction. That is ground truth without labels, and it is what the re-identification gate is set from — per scene, live.</p></div>
+      <div><h3>Faces and plates are off</h3><p>Built, behind one switch, off by default, audited, and with no model shipped: every threshold in them is a stated default with no measurement behind it, and each says so in its own docstring.</p></div>
+      <div><h3>Nothing needs the Internet</h3><p>No cloud, no telemetry, no tiles, no updater, no model downloads. An audit fails the build on any address in shipped source, and CI runs the whole suite with outbound traffic dropped at the firewall.</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="capabilities">
+  <div class="wrap">
+    <div class="section-head">
+      <p class="eyebrow">Capabilities</p>
+      <h2>What exists, as data a test can check</h2>
+      <p class="muted">The manifest names the symbols that implement each capability and the tests that exercise it. A test fails when a symbol does not exist, when a tested capability's tests never mention it, or when a service method is called by no interface. This list is generated from it.</p>
+    </div>
+    <div class="counts">
+      <div><span class="n">{{tested}}</span><span class="l">tested</span></div>
+      <div><span class="n">{{impl}}</span><span class="l">implemented</span></div>
+      <div><span class="n">{{plan}}</span><span class="l">planned</span></div>
+      <div><span class="n">{{python_lines}}</span><span class="l">lines of Python</span></div>
+      <div><span class="n">{{rust_lines}}</span><span class="l">lines of Rust</span></div>
+    </div>
+    <ul class="capgrid">
+{{capability_index}}
+    </ul>
+    <p style="margin-top:1.4rem"><a class="btn quiet" href="capabilities.html">Every capability, with its note</a></p>
+  </div>
+</section>
+
+<section id="get">
+  <div class="wrap">
+    <div class="section-head">
+      <p class="eyebrow">Get it</p>
+      <h2>An installer for each platform, none of them signed</h2>
+      <p class="muted">Signing needs a certificate this project does not have. An unsigned installer is honest about what it is; a self-signed one would teach an operator to click through the warning that is supposed to protect them. Each system will warn, and each warning is correct. Verify the download against its <code>SHA256SUMS</code>, install, then run <code>vigil doctor</code>.</p>
+    </div>
+    <div class="platforms">
+      <div class="platform">
+        <h3>Windows <span class="unsigned">unsigned</span></h3>
+        <ul>
+          <li><code>vigil-{{version}}-windows-x64.msi</code><span>Program Files, Start menu, PATH</span></li>
+          <li><code>…-windows-x64-setup.exe</code><span>the same, as NSIS</span></li>
+          <li><code>…-windows-x64.zip</code><span>unpack anywhere; needs nothing</span></li>
+        </ul>
+        <p class="where">Then <code>vigil doctor</code>, or open <strong>Vigil</strong> from the Start menu for the window.</p>
+      </div>
+      <div class="platform">
+        <h3>Linux <span class="unsigned">unsigned</span></h3>
+        <ul>
+          <li><code>vigil-{{version}}-linux-x64.deb</code><span><code>apt install ./…deb</code> → /opt/vigil, /usr/bin</span></li>
+          <li><code>…-linux-x64.tar.gz</code><span>unpack anywhere; needs nothing</span></li>
+        </ul>
+        <p class="where">Then <code>vigil doctor</code>. <code>vigil service install</code> writes a systemd user unit and shows it first.</p>
+      </div>
+      <div class="platform">
+        <h3>macOS <span class="unsigned">unsigned</span></h3>
+        <ul>
+          <li><code>vigil-{{version}}-macos-arm64.pkg</code><span>/usr/local/vigil, /usr/local/bin, Vigil.app</span></li>
+          <li><code>…-macos-arm64.dmg</code><span>the package, on a disk image</span></li>
+          <li><code>…-macos-arm64.tar.gz</code><span>unpack anywhere; needs nothing</span></li>
+        </ul>
+        <p class="where">Gatekeeper refuses a double-click on an unsigned package: right-click, <em>Open</em>. Then <code>vigil doctor</code>.</p>
+      </div>
+    </div>
+    <div class="getit-note">
+      <p><a class="btn" href="https://github.com/haidar-farhat/V.I.G.I.L._Vision_Intelligence_and_Geospatial_ncident_Layer/releases">Releases</a></p>
+      <p class="muted small">Each installer is built on its own platform's CI runner, installed there, and asked to run <code>doctor</code> and find its engine core before it is published. Or build it yourself:</p>
+      <pre><code>git clone https://github.com/haidar-farhat/V.I.G.I.L._Vision_Intelligence_and_Geospatial_ncident_Layer
+cd V.I.G.I.L._Vision_Intelligence_and_Geospatial_ncident_Layer/v2
+pip install -e ".[dev]"
+python tasks.py check        # the core, the offline audit, every suite
+python tasks.py package      # dist/vigil
+python tasks.py installer    # dist/installers, for this platform</code></pre>
+    </div>
+  </div>
+</section>
+
+<section id="stands">
+  <div class="wrap">
+    <div class="section-head">
+      <p class="eyebrow">Where it stands</p>
+      <h2>Why this page does not say "production ready"</h2>
+      <p class="muted">The software is measured; the site it will run at is not. These are the things that stop this being deployable, in the order they pay off, and none of them is a code problem.</p>
+    </div>
+    <div class="ready">
+      <div><span class="k">1</span><div><h3>There is no labelled dataset</h3><p>The model is an ONNX file the operator supplies, and the shipped one is stock COCO weights that have never seen the site. <code>vigil dataset export</code> writes the corpus and <code>vigil eval</code> scores against corrected labels — and refuses a validation set that shares a day with training. What is missing is the labels, and that needs a person.</p></div></div>
+      <div><span class="k">2</span><div><h3>It has never run on a physical IP camera</h3><p>Every run so far is a laptop webcam; the longest is ten minutes. RTSP reconnection, packet loss and H.264 corruption are handled in code and exercised by nothing real. The gate that asked for an hour on a real camera before building anything consequential on top was waived, and the decision record says so.</p></div></div>
+      <div><span class="k">3</span><div><h3>The appearance thresholds are provisional</h3><p>Now measured live per scene rather than fixed, but the only real footage measured is one indoor clip. <code>tools/calibrate.py</code> reads the constants off unlabelled video; it should run on a night from each camera before anything else.</p></div></div>
+      <div><span class="k">4</span><div><h3>Throughput is measured on one integrated GPU</h3><p>DirectML took detection from 38.5 ms to 4.5 ms here. Nobody has run this on a deployment machine, and the multi-camera claim rests on that number.</p></div></div>
+    </div>
+    <p class="getit-note"><a class="btn quiet" href="https://github.com/haidar-farhat/V.I.G.I.L._Vision_Intelligence_and_Geospatial_ncident_Layer/blob/v2/v2/PRODUCTION_READINESS.md">The full account: what is measured and what is not</a></p>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    <span>Sentinel Vision {{version}} · rendered from commit <span class="mono">{{commit}}</span> on {{built}} · MIT</span>
+    <span><a href="https://github.com/haidar-farhat/V.I.G.I.L._Vision_Intelligence_and_Geospatial_ncident_Layer">Source</a> · <a href="https://github.com/haidar-farhat/V.I.G.I.L._Vision_Intelligence_and_Geospatial_ncident_Layer/blob/v2/v2/DECISIONS.md">Decisions</a> · <a href="https://github.com/haidar-farhat/V.I.G.I.L._Vision_Intelligence_and_Geospatial_ncident_Layer/blob/v2/v2/ROADMAP.md">Roadmap</a> · no analytics on this page</span>
+  </div>
+</footer>
+
+</body>
+</html>
