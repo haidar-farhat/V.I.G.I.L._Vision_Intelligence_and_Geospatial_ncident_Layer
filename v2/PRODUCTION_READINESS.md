@@ -218,14 +218,20 @@ test on the cost matrix (`core/src/assign.rs`) and by the milling scenario.
 
 | | Count | |
 |---|---|---|
-| Python | 298 | `python tasks.py test` |
-| Rust | 53 | `cargo test --lib --release` |
-| **Total** | **351** | `python tasks.py check` runs both plus the offline audit |
+| Python | 454 | `python tasks.py test` |
+| Rust | 77 | `cargo test --lib --release` |
+| **Total** | **531** | `python tasks.py check` runs both plus the offline audit |
+
+*Counted 2026-09-07 by `pytest --collect-only` and `#[test]`. The public page
+(`python tasks.py site`) reads both counts from the tree at build time rather
+than from this table, which had been stale for a day.*
 
 New suites: `test_geo.py` (rewritten around known-answer geometry),
 `test_tracking.py` (rewritten; every test names a way the old tracker was
 wrong), `test_native.py`, `test_perception.py`, `test_mapping.py`,
-`test_coverage.py`.
+`test_coverage.py`; and, from 2026-09-07, `test_installers.py` (the WiX
+source opened as XML and the `.deb` as the `ar` and `tar` it is) and
+`test_public_page.py` (no placeholder left standing on the public page).
 
 Geometry is tested against closed forms wherever one exists — the centre
 column of a frame, the height column of the Jacobian, a level camera — and
@@ -281,10 +287,15 @@ error with range.
    `MAX_REIDENTIFY_DISTANCE` needs raising and `MAX_APPEARANCE_DISTANCE` needs
    watching. Until somebody runs the fragmentation measurement on real video,
    both numbers are provisional.
-3. **83 ms per frame of detection on a CPU** is ~12 fps for **one** camera.
-   The multi-camera claim in this product is not supported by this machine.
-   `onnxruntime-gpu` or `onnxruntime-directml` is the answer and `vigil doctor`
-   now says which one you have — but nobody has run this on a GPU.
+3. ~~**83 ms per frame of detection on a CPU.**~~ **Narrowed, not closed.**
+   DirectML is adopted (§8B): the shipped session runs in 4.5 ms on this
+   machine's integrated GPU against 38.5 ms on its CPU, and the packaged
+   build's `vigil doctor` reads `DmlExecutionProvider`. What remains is that
+   this is **one laptop's integrated GPU**, measured under load. Nobody has
+   run this on a deployment machine, and the multi-camera claim rests on that
+   number until somebody does. The CPU figure still holds for a machine
+   without DirectML, and `doctor` says which one you have. (This item and §8B
+   contradicted each other for a day; §8B was right.)
 
 ### Known and bounded
 
@@ -347,9 +358,32 @@ error with range.
     appearance descriptor is per-camera; nothing yet carries it into the
     correlator, so two cameras seeing the same person still link on geometry.
 11. **CI has never run.** The workflow is written; the numbers in this
-    document come from one developer machine under load.
-12. **No installer, no code signing**, and the packaged bundle's engine core
-    has not been tested from a frozen build — only from a checkout.
+    document come from one developer machine under load. **Found on
+    2026-09-07, and worse than this line said:** the v2 job installed no Rust
+    toolchain, and `tasks.py check` builds and tests the core only when
+    `cargo` is present — so had it run, the 77 Rust tests and the Python–Rust
+    cross-check in `tests/test_native.py` would have skipped silently and the
+    job would have been green. The v2 jobs now live in
+    `.github/workflows/v2.yml`, which installs the toolchain, fails outright
+    when the core has not loaded under the suite, and builds, installs and
+    runs an installer on each of the three platforms. It still has not run:
+    it triggers on a push to `v2` or `main`, and that push is a person's to
+    make.
+12. ~~**No installer**~~, **no code signing.** Narrowed on 2026-09-07.
+    `python tasks.py installer` builds an archive on every platform; an MSI
+    (WiX 3) and an NSIS setup on Windows; a `.deb` on Linux, written in pure
+    Python and read back by `tests/test_installers.py`; and a `.pkg` and
+    `.dmg` on macOS. The Windows MSI was built on this machine, extracted
+    again with `msiexec /a` and compared file for file with the bundle, and
+    the packaged `vigil doctor` reports the engine core loaded from the
+    frozen tree at ABI 5 with DirectML active. The Linux and macOS installers
+    are built, installed and asked to run `doctor` only on their own CI
+    runners — which (item 11) have not yet run, so neither is claimed here.
+    **Still missing: a signing certificate.** Every installer says UNSIGNED
+    in its own metadata and every platform will warn, correctly. Found while
+    building them: `torch` had been swept into the bundle by `--collect-all
+    onnxruntime` — 371 MiB of an 831 MiB tree that nothing here imports —
+    and is now excluded.
 
 ### Not attempted
 
@@ -614,8 +648,11 @@ holds, lowering it is a free improvement in tracking responsiveness.
 ## 9. How to check any of this
 
 ```bash
-python tasks.py core           # build and test the Rust core (53 tests)
-python tasks.py check          # offline audit + 298 Python tests
+python tasks.py core           # build and test the Rust core (77 tests)
+python tasks.py check          # the core, the offline audit, 454 Python tests
+python tasks.py package        # dist/vigil, then:
+python tasks.py installer      # an installer for this platform, unsigned and saying so
+python tasks.py site           # the public page, rendered from the manifest
 python tasks.py bench          # the cost and quality numbers above
 python tools/camera_check.py   # the whole pipeline against a real camera
 python -m vigil doctor         # whether this installation will work

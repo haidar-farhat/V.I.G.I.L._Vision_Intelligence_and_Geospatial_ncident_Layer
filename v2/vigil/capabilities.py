@@ -395,8 +395,16 @@ MANIFEST: tuple[Capability, ...] = (
                "**Nothing has been scored: no labelled dataset exists for this site**, and this module says "
                "so rather than producing a number",
                ),
-    Capability("packaging", "One executable, built and camera-tested by the task runner", State.IMPL,
-               (), (), "`tasks.py package` builds dist/vigil/vigil.exe; `exetest` ran it on device:0 with recording and passed on 2026-09-05 (README.md); no installer, no signing"),
+    Capability("packaging", "One bundle, camera-tested by the task runner, and an installer per platform", State.IMPL,
+               (), (),
+               "`tasks.py package` builds dist/vigil — `vigil.exe` and `vigil-console.exe` on Windows, the bare names "
+               "elsewhere, sharing one `_internal` — and `exetest` runs it on device:0 (README.md). `tasks.py installer` "
+               "builds an archive everywhere, an MSI and an NSIS setup on Windows, a `.deb` on Linux and a `.pkg` and "
+               "`.dmg` on macOS, each UNSIGNED and saying so in its own metadata; `tests/test_installers.py` opens the "
+               "WiX source as XML and the `.deb` as the `ar` and `tar` it is, and the Windows MSI is extracted after "
+               "building and compared file for file with the bundle. Each installer is installed and asked to run "
+               "`doctor` on the CI runner that built it. Signing waits on a certificate. IMPL rather than TESTED "
+               "because the builders live in `packaging/`, outside the package this manifest can name"),
     Capability("observability", "An unattended run is watchable: metrics in the log, JSON on demand, a crash file", State.TESTED,
                ("vigil.service.runtime.Runtime.metrics", "vigil.logs.configure"),
                ("tests/test_runtime.py",),
@@ -409,8 +417,20 @@ MANIFEST: tuple[Capability, ...] = (
                "camera. Non-zero exit on any failure, so it can end an install script"),
     Capability("ci", "Every suite on three platforms, and again with the network taken away", State.IMPL,
                (), (),
-               "`.github/workflows/ci.yml` jobs `v2` (ubuntu, windows, macos) and `v2-offline` (outbound traffic dropped, "
-               "and the drop proved before anything runs). Written, never executed: it runs on the first push"),
+               "`.github/workflows/v2.yml`: `check` (ubuntu, windows, macos) installs the Rust toolchain, runs `tasks.py "
+               "check` and then **refuses a green run in which the engine core did not load** — the earlier job "
+               "installed no toolchain, so the 77 Rust tests and the Python-Rust cross-check would have skipped "
+               "silently; `offline` drops outbound traffic at the firewall, proves the drop, and runs the core and every "
+               "suite; `package` builds the bundle and an installer on each platform, installs it there and asks the "
+               "installed product to run `doctor`; a `v*` tag collects the three into a draft release. Written, never "
+               "executed: it runs on the first push to `v2` or `main`"),
+    Capability("public-page", "The public page, rendered from this manifest so its numbers cannot drift", State.IMPL,
+               (), (),
+               "`tasks.py site` renders `site/` into `dist/site` from this manifest, the version, the commit, the line "
+               "counts and pytest's own count of the suite; `.github/workflows/pages.yml` publishes it. "
+               "`tests/test_public_page.py` fails on a placeholder left standing. No analytics, no script beyond a theme "
+               "switch; the fonts are the one thing fetched from outside, and it is a page about the product, not "
+               "the product"),
     Capability("supervise", "Run unattended: restart on crash, a stop file, an OS service registration", State.TESTED,
                ("vigil.service.supervise.supervise", "vigil.service.supervise.service_definition", "vigil.service.supervise.install_service"),
                ("tests/test_supervise.py", "tests/test_cli.py"),

@@ -202,14 +202,29 @@ refuses to run against an executable older than the source, because an old
 binary runs perfectly and a pass against one is evidence for a change it does
 not contain — which has already happened here once, quietly.
 
+**Installers.** `python tasks.py installer` turns that bundle into what this
+platform can install: an archive always; an MSI (WiX 3) and an NSIS setup on
+Windows; a `.deb` on Linux, written in pure Python so it can be read back by
+a test on any machine; a `.pkg` and a `.dmg` on macOS. It makes the same
+refusal `exetest` does when the bundle is older than the source. Every
+installer is **unsigned and says so** in its own metadata — signing needs a
+certificate this repository does not have, and a self-signed one would teach
+an operator to click through the warning that is supposed to protect them.
+The Windows MSI is extracted again after it is built and compared file for
+file with the bundle; the Linux and macOS packages are built, installed and
+asked to run `doctor` on their own CI runners, and nothing is claimed for a
+platform that has not done that.
+
 ## The state of it
 
 | | |
 |---|---|
-| Product code | 21,442 lines of Python, 5,351 lines of Rust behind a C ABI |
-| Tests | 436 Python + 77 Rust, all green through `python tasks.py check` |
-| Capabilities | 42 tested, 2 implemented, **0 planned** ([CAPABILITIES.md](CAPABILITIES.md)) |
-| Packaged | `vigil.exe` for the command line and `vigil-console.exe` for the window, sharing one `_internal` |
+| Product code | 21,973 lines of Python, 5,351 lines of Rust behind a C ABI |
+| Tests | 454 Python + 77 Rust, all green through `python tasks.py check` |
+| Capabilities | 42 tested, 3 implemented, **0 planned** ([CAPABILITIES.md](CAPABILITIES.md)) |
+| Packaged | `vigil.exe` for the command line and `vigil-console.exe` for the window, sharing one `_internal` — 400 MiB, down from 831 once `torch` (imported by nothing) was excluded |
+| Installers | `python tasks.py installer`: MSI and NSIS on Windows, `.deb` on Linux, `.pkg` and `.dmg` on macOS, an archive everywhere — **all unsigned, and saying so** |
+| Public page | `python tasks.py site` renders it from the manifest; `.github/workflows/pages.yml` publishes it |
 
 **Two executables, one tree.** `vigil.exe` is console-subsystem so every
 command prints, pipes and redirects; `vigil-console.exe` is GUI-subsystem so
@@ -228,9 +243,10 @@ algorithms and `tests/test_native.py` holds them to the same answers — but
 
 Not built, and not pretended: **any training or labelling pipeline** — the model is an
 ONNX file the operator supplies and the shipped one is stock COCO weights,
-which have never seen this site; installers and code signing, which need a
-certificate; and **a model that can name a weapon**, which is the operator's
-to supply — the mechanism is here and tested, the weights are not.
+which have never seen this site; **code signing**, which needs a certificate,
+so every installer says it is unsigned; and **a model that can name a
+weapon**, which is the operator's to supply — the mechanism is here and
+tested, the weights are not.
 
 Faces, plates and the subject register **are** built, off by default behind one
 switch (`vigil identity show`), and every threshold in them is an assumption
@@ -245,6 +261,7 @@ those needs.
 
 | When (UTC) | What ran | Result |
 |---|---|---|
+| 2026-09-07 10:55 | packaged `vigil.exe`, `exetest --seconds 20 --record`, from the bundle rebuilt without `torch` (400 MiB, 1,203 files, down from 831 MiB and 3,956) | **PASS in 23 s** at 30 fps, recording, exit 0, no traceback; `doctor` in the frozen tree reads the engine core at ABI 5 and `DmlExecutionProvider`. The same bundle went into `vigil-2.0.0a1-windows-x64.msi` (151 MiB, WiX 3), which was extracted again with `msiexec /a` and matched the bundle file for file — 1,203 files, nothing missing, nothing extra. No NSIS on this machine, so no `-setup.exe` here; the Linux `.deb` and macOS `.pkg` exist only as code and tests until CI runs. |
 | 2026-09-06 21:53 | `VIGIL.exe` from the repository root, 20 s on `device:0`, after the console was reworked | **PASS**, exit 0. The window only — no command line, no terminal behind it. Every verb now sits under the thing it acts on, and every panel heading reads in full: *1 of 1 placed*, *yolov8n-seg — watching 80 classes with masks · f828ccfa4b69*, *no map yet — 61 frame(s) folded in*. Two eliding bugs were found by photographing it and fixed: a right-aligned heading label given a cap wider than itself is clipped by Qt **from the left**, so the wall read *"olov8n-seg — watching 80 classes with …"* — correctly ellipsised at the end and missing its first letter; and a stretch spacer beside a stretching label split the heading between them, eliding a sentence that had room to be read. |
 | 2026-09-06 21:20 | packaged `vigil.exe`, `exetest --seconds 20 --record --console`, after the identity, suppression-kernel and evaluation work | **PASS in 24 s**, with migrations 6 to 9 applied inside the packaged build. Faces and plates ship **off**: `vigil identity show` reads "faces and plates are OFF: no face is embedded, no plate is read, and no biometric row is written". |
 | 2026-09-06 21:05 | the four Phase 8 candidates, measured before any was rewritten | The measurement decided what to write **and what not to**. NumPy soft-NMS on 300 proposals: **4.92 ms**, against about 12.5 ms for the detection itself — and tiling runs it once per tile. In Rust: **0.044 ms, 138x**, returning identical indices including ties. Two candidates on the same list were left alone after measuring: the assignment cost matrix at **5 microseconds** and mask decode at 0.9 ms. The appearance descriptor got neither — `cv2.calcHist` with a mask is 3.5x faster than indexing the pixels out and counting them in NumPy, with identical results over 300 randomised crops, so 12 detections went **3.61 ms to 1.49 ms** with no new implementation of a colour space to keep in step. |
